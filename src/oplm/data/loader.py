@@ -10,7 +10,7 @@ from oplm.data.dataset import InterleavedDataset, ShardedProteinDataset
 from oplm.data.tokenizer import ProteinTokenizer
 
 
-def build_train_dataloader(cfg: OplmConfig) -> DataLoader:
+def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, str]]:
     """Build a training DataLoader from config.
 
     Parses ``cfg.data.train`` to determine dataset path(s) and sampling
@@ -45,6 +45,7 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader:
         for entry in entries
     ]
 
+    dataset: ShardedProteinDataset | InterleavedDataset
     if len(datasets) == 1:
         dataset = datasets[0]
     else:

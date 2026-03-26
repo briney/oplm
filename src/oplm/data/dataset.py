@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pyarrow.parquet as pq
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 from torch.utils.data import IterableDataset, get_worker_info
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Sequence
 
 
 # Golden ratio constant for seed mixing
@@ -21,7 +21,7 @@ _SEED_MASK = 0xFFFF_FFFF
 _PARQUET_SUFFIXES = {".parquet", ".parq", ".pq"}
 
 
-class ShardedProteinDataset(IterableDataset):
+class ShardedProteinDataset(IterableDataset[dict[str, str]]):
     """Iterable dataset over parquet files containing protein sequences.
 
     Handles both a single parquet file and a directory of parquet shards.
@@ -146,7 +146,7 @@ class ShardedProteinDataset(IterableDataset):
                 emitted += 1
 
 
-class InterleavedDataset(IterableDataset):
+class InterleavedDataset(IterableDataset[dict[str, str]]):
     """Interleave samples from multiple iterable datasets by fraction.
 
     Each iteration step selects a dataset probabilistically according to
@@ -165,7 +165,7 @@ class InterleavedDataset(IterableDataset):
 
     def __init__(
         self,
-        datasets: list[IterableDataset],
+        datasets: Sequence[IterableDataset[dict[str, str]]],
         fractions: list[float],
         *,
         num_samples: int | None = None,

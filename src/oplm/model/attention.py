@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Select FlashAttention backend once at import time
 _flash_attn_func = None
 try:
-    from flash_attn import flash_attn_func as _flash_attn_func  # type: ignore[no-redef]
+    from flash_attn import flash_attn_func as _flash_attn_func  # type: ignore[import-not-found, no-redef]
 
     logger.info("Using flash_attn backend for attention")
 except ImportError:
@@ -73,6 +73,7 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, config.norm_eps) if config.qk_norm else None
 
         # Rotary embeddings
+        self.rope: RotaryEmbedding | PartialRotaryEmbedding
         if config.partial_rope:
             self.rope = PartialRotaryEmbedding(
                 rope_dim=config.rope_dim or 32,
@@ -150,6 +151,7 @@ class Attention(nn.Module):
 
         # 3. Q/K normalization
         if self.q_norm is not None:
+            assert self.k_norm is not None
             q = self.q_norm(q)
             k = self.k_norm(k)
 

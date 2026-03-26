@@ -70,4 +70,5 @@ class FFN(nn.Module):
         if self.conv_d is not None:
             h = self.conv_d(h)
 
-        return self.down_proj(h)  # (B, T, D)
+        out: Tensor = self.down_proj(h)  # (B, T, D)
+        return out

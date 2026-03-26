@@ -186,11 +186,13 @@ class OplmEncoder(nn.Module):
         if self.attn_residual is not None:
             state = BlockAttentionResidualState(blocks=[x], partial_block=None, step_count=0)
 
-        for i, block in enumerate(self.blocks):
+        for i, blk in enumerate(self.blocks):
+            block: TransformerBlock = blk  # type: ignore[assignment]
             # Get value embedding for this layer (if any)
             ve = self.value_embedding(input_ids, x, i) if self.value_embedding is not None else None
 
             if state is not None:
+                assert self.attn_residual is not None
                 if self.gradient_checkpointing and self.training:
                     x, v_first, state = torch_checkpoint(
                         block.forward_with_attn_res,
@@ -249,7 +251,8 @@ class MLMHead(nn.Module):
             Logits ``(B, T, V)``.
         """
         x = self.activation(self.norm(self.dense(hidden_states)))
-        return self.projection(x)
+        logits: Tensor = self.projection(x)
+        return logits
 
 
 class OplmForMLM(nn.Module):

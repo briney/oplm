@@ -38,7 +38,7 @@ class TokenEmbedding(nn.Module):
         Returns:
             Embedded tensor of shape ``(B, T, D)``.
         """
-        x = self.embed(input_ids) * self.scale
+        x: Tensor = self.embed(input_ids) * self.scale
         if self.post_norm is not None:
             x = self.post_norm(x)
         return x
@@ -93,8 +93,8 @@ class ValueEmbedding(nn.Module):
         if layer_idx not in self.layer_map:
             return None
         idx = self.layer_map[layer_idx]
-        ve = self.embeds[idx](input_ids)  # (B, T, kv_dim)
+        ve: Tensor = self.embeds[idx](input_ids)  # (B, T, kv_dim)
         gate_input = x[..., : self.gate_dim]  # (B, T, gate_dim)
-        gate = 2.0 * torch.sigmoid(self.gates[idx](gate_input))  # (B, T, num_kv_heads)
+        gate: Tensor = 2.0 * torch.sigmoid(self.gates[idx](gate_input))  # (B, T, num_kv_heads)
         ve = ve.view(*ve.shape[:-1], self.num_kv_heads, self.head_dim)  # (B, T, KV_H, D_head)
         return gate.unsqueeze(-1) * ve  # (B, T, KV_H, D_head)

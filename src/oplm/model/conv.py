@@ -41,4 +41,5 @@ class BidirectionalDepthwiseConv(nn.Module):
             Output tensor of shape ``(B, T, D)``.
         """
         # (B, T, D) -> (B, D, T) -> Conv1d -> (B, D, T) -> (B, T, D)
-        return self.act(self.conv(x.transpose(1, 2)).transpose(1, 2))
+        out: Tensor = self.act(self.conv(x.transpose(1, 2)).transpose(1, 2))
+        return out

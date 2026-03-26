@@ -18,6 +18,10 @@ class RotaryEmbedding(nn.Module):
     Precomputes inverse frequencies and cos/sin cache up to ``max_seq_len``.
     """
 
+    inv_freq: Tensor
+    cos_cached: Tensor
+    sin_cached: Tensor
+
     def __init__(self, dim: int, max_seq_len: int = 2048, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
