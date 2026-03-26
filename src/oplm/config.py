@@ -196,7 +196,7 @@ def get_preset_config(preset: str) -> DictConfig:
         )
     preset_dir = files("oplm.configs.model.presets")
     yaml_text = preset_dir.joinpath(f"{preset}.yaml").read_text()
-    return cast(DictConfig, OmegaConf.create(yaml_text))
+    return cast("DictConfig", OmegaConf.create(yaml_text))
 
 
 # Fields in ModelConfig that are derived from other fields in __post_init__.
@@ -338,13 +338,13 @@ def load_config(argv: list[str]) -> OplmConfig:
     if preset is not None:
         overrides.append(get_preset_config(preset))
     if config_path is not None:
-        overrides.append(cast(DictConfig, OmegaConf.load(config_path)))
+        overrides.append(cast("DictConfig", OmegaConf.load(config_path)))
     if remaining:
         overrides.append(OmegaConf.from_dotlist(remaining))
 
     # Merge all overrides into base
     for ov in overrides:
-        base = cast(DictConfig, OmegaConf.merge(base, ov))
+        base = cast("DictConfig", OmegaConf.merge(base, ov))
 
     # Find which model fields were explicitly provided by the user
     explicit_model_keys: set[str] = set()
