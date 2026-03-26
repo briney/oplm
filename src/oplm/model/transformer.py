@@ -1,0 +1,306 @@
+"""Transformer assembly: blocks, encoder, MLM head, and top-level model."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+from oplm.model.attention import Attention
+from oplm.model.conv import BidirectionalDepthwiseConv
+from oplm.model.embedding import TokenEmbedding, ValueEmbedding
+from oplm.model.ffn import FFN
+from oplm.model.norm import RMSNorm
+from oplm.model.residual import BlockAttentionResidual, BlockAttentionResidualState
+
+if TYPE_CHECKING:
+    from oplm.config import ModelConfig
+
+
+class TransformerBlock(nn.Module):
+    """Single transformer layer with pre-norm residual connections.
+
+    Supports two forward paths:
+    - Standard residual: ``forward()`` — ``x + sublayer(norm(x))``
+    - Attention residuals: ``forward_with_attn_res()`` — learned depth-wise
+      aggregation replaces fixed residual connections.
+
+    Convolutions at positions A (pre-attention) and C (pre-FFN) are optionally
+    inserted based on ``config.conv_positions``.
+    """
+
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.attn_pre_norm = RMSNorm(config.hidden_dim, config.norm_eps)
+        self.ffn_pre_norm = RMSNorm(config.hidden_dim, config.norm_eps)
+        self.attention = Attention(config, layer_idx)
+        self.ffn = FFN(config)
+        self.conv_a = (
+            BidirectionalDepthwiseConv(
+                config.hidden_dim, config.conv_kernel_size, config.conv_activation
+            )
+            if "A" in config.conv_positions
+            else None
+        )
+        self.conv_c = (
+            BidirectionalDepthwiseConv(
+                config.hidden_dim, config.conv_kernel_size, config.conv_activation
+            )
+            if "C" in config.conv_positions
+            else None
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        v_first: Tensor | None = None,
+        attention_mask: Tensor | None = None,
+        value_embed: Tensor | None = None,
+        need_weights: bool = False,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
+        """Standard pre-norm residual forward pass.
+
+        Args:
+            x: Hidden state ``(B, T, D)``.
+            v_first: First layer's V for cross-layer value residuals.
+            attention_mask: Attention mask ``(B, 1, T, T)`` or ``(B, 1, 1, T)``.
+            value_embed: Value embedding ``(B, T, KV_H, D_head)`` or None.
+            need_weights: If True, return per-head attention weights.
+
+        Returns:
+            Tuple of (output, v_first, attn_weights) where attn_weights is
+            ``(B, H, T, T)`` if need_weights else None.
+        """
+        # Attention sublayer
+        residual = x
+        if self.conv_a is not None:
+            x = self.conv_a(x)
+        attn_out, v_first_out, attn_weights = self.attention(
+            self.attn_pre_norm(x), v_first, attention_mask, value_embed, need_weights
+        )
+        if v_first_out is not None:
+            v_first = v_first_out
+        x = residual + attn_out
+
+        # FFN sublayer
+        residual = x
+        if self.conv_c is not None:
+            x = self.conv_c(x)
+        x = residual + self.ffn(self.ffn_pre_norm(x))
+
+        return x, v_first, attn_weights
+
+    def forward_with_attn_res(
+        self,
+        v_first: Tensor | None,
+        attention_mask: Tensor | None,
+        value_embed: Tensor | None,
+        attn_res: BlockAttentionResidual,
+        state: BlockAttentionResidualState,
+    ) -> tuple[Tensor, Tensor | None, BlockAttentionResidualState]:
+        """Attention residuals forward pass.
+
+        Replaces fixed residual connections with learned depth-wise attention
+        over block representations.
+
+        Args:
+            v_first: First layer's V for cross-layer value residuals.
+            attention_mask: Attention mask.
+            value_embed: Value embedding or None.
+            attn_res: Block attention residual module.
+            state: Current block accumulation state.
+
+        Returns:
+            Tuple of (hidden, v_first, updated_state) where hidden is the
+            aggregated representation ``(B, T, D)``.
+        """
+        # Attention sublayer
+        h = attn_res.aggregate(state, 2 * self.layer_idx)
+        if self.conv_a is not None:
+            h = self.conv_a(h)
+        attn_out, v_first_out, _ = self.attention(
+            self.attn_pre_norm(h), v_first, attention_mask, value_embed
+        )
+        if v_first_out is not None:
+            v_first = v_first_out
+        state = attn_res.accumulate(state, attn_out)
+
+        # FFN sublayer
+        h = attn_res.aggregate(state, 2 * self.layer_idx + 1)
+        if self.conv_c is not None:
+            h = self.conv_c(h)
+        ffn_out = self.ffn(self.ffn_pre_norm(h))
+        state = attn_res.accumulate(state, ffn_out)
+
+        # Re-aggregate over updated state so the FFN output is on the
+        # forward path (otherwise the last layer's FFN params are dead).
+        x = attn_res.aggregate(state, 2 * self.layer_idx + 1)
+        return x, v_first, state
+
+
+class OplmEncoder(nn.Module):
+    """OPLM encoder backbone.
+
+    Stacks ``TransformerBlock`` layers with optional value embeddings,
+    cross-layer value residuals, block attention residuals, and gradient
+    checkpointing.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.embedding = TokenEmbedding(config)
+        self.value_embedding = ValueEmbedding(config) if config.num_value_embeds > 0 else None
+        self.blocks = nn.ModuleList([TransformerBlock(config, i) for i in range(config.num_layers)])
+        self.attn_residual = BlockAttentionResidual(config) if config.attn_residual else None
+        self.final_norm = RMSNorm(config.hidden_dim, config.norm_eps)
+        self.gradient_checkpointing = config.gradient_checkpointing
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor | None = None,
+        need_weights: bool = False,
+    ) -> tuple[Tensor, list[Tensor] | None]:
+        """Encode input token IDs.
+
+        Args:
+            input_ids: Token IDs ``(B, T)``.
+            attention_mask: Attention mask ``(B, 1, T, T)`` or ``(B, 1, 1, T)``.
+            need_weights: If True, collect per-layer attention weights.
+
+        Returns:
+            Tuple of (hidden_states, attn_weights) where hidden_states is
+            ``(B, T, D)`` and attn_weights is a list of ``(B, H, T, T)``
+            tensors (one per layer) or None.
+        """
+        x = self.embedding(input_ids)  # (B, T, D)
+        v_first: Tensor | None = None
+        all_attn_weights: list[Tensor] = []
+
+        # Initialize AttnRes state with token embedding as first "block"
+        state: BlockAttentionResidualState | None = None
+        if self.attn_residual is not None:
+            state = BlockAttentionResidualState(blocks=[x], partial_block=None, step_count=0)
+
+        for i, block in enumerate(self.blocks):
+            # Get value embedding for this layer (if any)
+            ve = self.value_embedding(input_ids, x, i) if self.value_embedding is not None else None
+
+            if state is not None:
+                if self.gradient_checkpointing and self.training:
+                    x, v_first, state = torch_checkpoint(
+                        block.forward_with_attn_res,
+                        v_first,
+                        attention_mask,
+                        ve,
+                        self.attn_residual,
+                        state,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, v_first, state = block.forward_with_attn_res(
+                        v_first, attention_mask, ve, self.attn_residual, state
+                    )
+            else:
+                if self.gradient_checkpointing and self.training:
+                    x, v_first, layer_weights = torch_checkpoint(
+                        block.forward,
+                        x,
+                        v_first,
+                        attention_mask,
+                        ve,
+                        need_weights,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, v_first, layer_weights = block(x, v_first, attention_mask, ve, need_weights)
+                if layer_weights is not None:
+                    all_attn_weights.append(layer_weights)
+
+        hidden = self.final_norm(x)  # (B, T, D)
+        return hidden, all_attn_weights if need_weights else None
+
+
+class MLMHead(nn.Module):
+    """Masked language modeling head.
+
+    Projects encoder hidden states to vocabulary logits via
+    dense → norm → GELU → projection.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.norm = RMSNorm(config.hidden_dim, config.norm_eps)
+        self.activation = nn.GELU()
+        self.projection = nn.Linear(config.hidden_dim, config.vocab_size)
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """Project hidden states to vocabulary logits.
+
+        Args:
+            hidden_states: Encoder output ``(B, T, D)``.
+
+        Returns:
+            Logits ``(B, T, V)``.
+        """
+        x = self.activation(self.norm(self.dense(hidden_states)))
+        return self.projection(x)
+
+
+class OplmForMLM(nn.Module):
+    """OPLM model with masked language modeling head.
+
+    Combines :class:`OplmEncoder` and :class:`MLMHead` with optional
+    embedding weight tying and cross-entropy loss computation.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.encoder = OplmEncoder(config)
+        self.mlm_head = MLMHead(config)
+        if config.tie_embeddings:
+            self.mlm_head.projection.weight = self.encoder.embedding.embed.weight
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor | None = None,
+        labels: Tensor | None = None,
+        need_weights: bool = False,
+    ) -> dict[str, Tensor | list[Tensor] | None]:
+        """Forward pass with optional MLM loss.
+
+        Args:
+            input_ids: Token IDs ``(B, T)``.
+            attention_mask: Attention mask.
+            labels: MLM targets ``(B, T)`` with ``-100`` for non-masked positions.
+            need_weights: If True, include per-layer attention weights.
+
+        Returns:
+            Dict with keys ``"logits"`` ``(B, T, V)``, ``"loss"`` (scalar or
+            None), and ``"attention_weights"`` (list of ``(B, H, T, T)`` or
+            None).
+        """
+        hidden, attn_weights = self.encoder(input_ids, attention_mask, need_weights)
+        logits = self.mlm_head(hidden)
+
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
+            )
+
+        result: dict[str, Tensor | list[Tensor] | None] = {
+            "logits": logits,
+            "loss": loss,
+        }
+        if attn_weights is not None:
+            result["attention_weights"] = attn_weights
+        return result
