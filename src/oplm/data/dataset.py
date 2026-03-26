@@ -63,9 +63,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, str]]):
         elif self._path.is_file() and self._path.suffix.lower() in _PARQUET_SUFFIXES:
             shard_paths = [self._path]
         else:
-            raise RuntimeError(
-                f"Expected a parquet file or directory of shards, got {self._path}"
-            )
+            raise RuntimeError(f"Expected a parquet file or directory of shards, got {self._path}")
 
         self._shards: list[Path] = []
         self._rows_per_shard: list[int] = []
