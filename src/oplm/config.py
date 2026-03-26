@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from importlib.resources import files
+from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -134,12 +135,38 @@ class TrainConfig:
 
 
 @dataclass
-class DataConfig:
-    """Data configuration (stub)."""
+class TrainDatasetEntry:
+    """Parsed configuration for a single training dataset.
 
-    dataset: str = ""
+    Populated by :func:`parse_train_configs`, not directly from YAML.
+    """
+
+    name: str
+    path: str
+    fraction: float
+
+
+@dataclass
+class DataConfig:
+    """Data configuration for training datasets and loading."""
+
+    # Training dataset(s). Accepts a str path (single dataset) or a dict of
+    # {name: {path, fraction}} (multiple datasets). Parsed at runtime via
+    # parse_train_configs(). See configs/data/base.yaml for syntax examples.
+    train: Any = None
+
+    # Sequence and masking
     max_length: int = 1024
     mask_prob: float = 0.15
+
+    # DataLoader settings
+    num_workers: int = 4
+    pin_memory: bool = True
+    prefetch_factor: int = 4
+
+    # Shard iteration behavior (only affects sharded parquet directories)
+    shuffle_shards: bool = True
+    shuffle_rows: bool = True
 
 
 @dataclass
@@ -179,6 +206,98 @@ def get_preset_config(preset: str) -> DictConfig:
 _DERIVED_MODEL_FIELDS = ("head_dim", "ffn_dim", "rope_dim", "nope_dim")
 
 
+def parse_train_configs(raw: Any) -> list[TrainDatasetEntry]:
+    """Normalize a raw ``data.train`` config value into structured dataset entries.
+
+    Supports three forms:
+
+    * ``None`` or empty dict → empty list (no training data)
+    * String path → single dataset at 100% sampling
+    * Dict of ``{name: {path, fraction}}`` → multiple datasets with fractions
+
+    Fractions are normalized to sum to 1.0. Omitted fractions share the
+    remaining mass equally among unspecified entries.
+
+    Args:
+        raw: The ``data.train`` value from config — a string, dict, or None.
+
+    Returns:
+        List of :class:`TrainDatasetEntry` with normalized fractions.
+
+    Raises:
+        ValueError: If the config structure is invalid or fractions are negative.
+    """
+    if raw is None:
+        return []
+
+    if isinstance(raw, str):
+        if not raw:
+            return []
+        return [TrainDatasetEntry(name="default", path=raw, fraction=1.0)]
+
+    if isinstance(raw, dict):
+        if len(raw) == 0:
+            return []
+
+        entries: list[TrainDatasetEntry] = []
+        for name, value in raw.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                entries.append(TrainDatasetEntry(name=str(name), path=value, fraction=-1.0))
+            elif isinstance(value, dict):
+                path = value.get("path")
+                if path is None:
+                    continue
+                frac = value.get("fraction")
+                entries.append(
+                    TrainDatasetEntry(
+                        name=str(name),
+                        path=str(path),
+                        fraction=float(frac) if frac is not None else -1.0,
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"Invalid train config for {name!r}: expected str or dict, "
+                    f"got {type(value).__name__}"
+                )
+
+        if len(entries) == 0:
+            return []
+        if len(entries) == 1:
+            entries[0].fraction = 1.0
+            return entries
+
+        # Validate specified fractions
+        for e in entries:
+            if e.fraction != -1.0 and e.fraction < 0:
+                raise ValueError(f"data.train.{e.name}.fraction must be >= 0")
+
+        # Fill unspecified fractions: share remaining mass equally
+        specified_total = sum(e.fraction for e in entries if e.fraction >= 0)
+        unspecified = [e for e in entries if e.fraction < 0]
+        if unspecified:
+            remaining = max(0.0, 1.0 - specified_total)
+            default_frac = remaining / len(unspecified) if remaining > 0 else 0.0
+            for e in unspecified:
+                e.fraction = default_frac
+
+        # Normalize to sum to 1.0
+        total = sum(e.fraction for e in entries)
+        if total <= 0:
+            eq = 1.0 / len(entries)
+            for e in entries:
+                e.fraction = eq
+        else:
+            for e in entries:
+                e.fraction = e.fraction / total
+
+        return entries
+
+    raise ValueError(f"Invalid data.train config type: {type(raw).__name__}")
+
+
 def load_config(argv: list[str]) -> OplmConfig:
     """Load config from defaults, optional preset, optional YAML file, and CLI overrides.
 
@@ -193,6 +312,10 @@ def load_config(argv: list[str]) -> OplmConfig:
         Fully resolved and validated OplmConfig.
     """
     base: DictConfig = OmegaConf.structured(OplmConfig)
+
+    # Disable struct mode to allow dynamic keys under data.train
+    # (data.train can be a string path or a nested dict of datasets).
+    OmegaConf.set_struct(base, False)
 
     # Extract --config and --preset flags
     config_path: str | None = None

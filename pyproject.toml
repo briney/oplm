@@ -33,6 +33,7 @@ train = [
     "accelerate>=0.30",
     "wandb>=0.16",
     "datasets>=2.18",
+    "pyarrow>=14.0",
 ]
 flash = [
     "flash-attn>=2.5",

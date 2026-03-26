@@ -9,7 +9,16 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from oplm.config import ModelConfig, OplmConfig, TrainConfig, load_config, round_multiple
+from oplm.config import (
+    DataConfig,
+    ModelConfig,
+    OplmConfig,
+    TrainConfig,
+    TrainDatasetEntry,
+    load_config,
+    parse_train_configs,
+    round_multiple,
+)
 
 
 class TestRoundMultiple:
@@ -104,6 +113,107 @@ class TestModelConfigValidation:
             ModelConfig(partial_rope=True, rope_dim=16, nope_dim=16, head_dim=64)
 
 
+class TestParseTrainConfigs:
+    def test_none_returns_empty(self) -> None:
+        assert parse_train_configs(None) == []
+
+    def test_empty_string_returns_empty(self) -> None:
+        assert parse_train_configs("") == []
+
+    def test_empty_dict_returns_empty(self) -> None:
+        assert parse_train_configs({}) == []
+
+    def test_string_path(self) -> None:
+        entries = parse_train_configs("/path/to/dataset")
+        assert len(entries) == 1
+        assert entries[0].name == "default"
+        assert entries[0].path == "/path/to/dataset"
+        assert entries[0].fraction == 1.0
+
+    def test_single_dict_entry(self) -> None:
+        raw = {"uniref": {"path": "/data/uniref", "fraction": 0.7}}
+        entries = parse_train_configs(raw)
+        assert len(entries) == 1
+        assert entries[0].name == "uniref"
+        assert entries[0].path == "/data/uniref"
+        assert entries[0].fraction == 1.0  # single entry always 1.0
+
+    def test_multiple_with_fractions(self) -> None:
+        raw = {
+            "ds_a": {"path": "/a", "fraction": 0.6},
+            "ds_b": {"path": "/b", "fraction": 0.4},
+        }
+        entries = parse_train_configs(raw)
+        assert len(entries) == 2
+        assert entries[0].fraction == pytest.approx(0.6)
+        assert entries[1].fraction == pytest.approx(0.4)
+
+    def test_fractions_normalized(self) -> None:
+        raw = {
+            "ds_a": {"path": "/a", "fraction": 3.0},
+            "ds_b": {"path": "/b", "fraction": 1.0},
+        }
+        entries = parse_train_configs(raw)
+        assert entries[0].fraction == pytest.approx(0.75)
+        assert entries[1].fraction == pytest.approx(0.25)
+
+    def test_omitted_fractions_shared(self) -> None:
+        raw = {
+            "ds_a": {"path": "/a", "fraction": 0.5},
+            "ds_b": {"path": "/b"},
+            "ds_c": {"path": "/c"},
+        }
+        entries = parse_train_configs(raw)
+        total = sum(e.fraction for e in entries)
+        assert total == pytest.approx(1.0)
+        # ds_a gets 0.5 / total, ds_b and ds_c split remaining 0.5
+        assert entries[1].fraction == pytest.approx(entries[2].fraction)
+
+    def test_all_fractions_omitted(self) -> None:
+        raw = {
+            "ds_a": {"path": "/a"},
+            "ds_b": {"path": "/b"},
+            "ds_c": {"path": "/c"},
+        }
+        entries = parse_train_configs(raw)
+        for e in entries:
+            assert e.fraction == pytest.approx(1.0 / 3.0)
+
+    def test_string_values_in_dict(self) -> None:
+        raw = {"ds_a": "/path/a", "ds_b": "/path/b"}
+        entries = parse_train_configs(raw)
+        assert len(entries) == 2
+        assert entries[0].path == "/path/a"
+        assert entries[1].path == "/path/b"
+
+    def test_negative_fraction_raises(self) -> None:
+        raw = {
+            "ds_a": {"path": "/a", "fraction": -0.5},
+            "ds_b": {"path": "/b", "fraction": 0.5},
+        }
+        with pytest.raises(ValueError, match="fraction must be >= 0"):
+            parse_train_configs(raw)
+
+    def test_invalid_type_raises(self) -> None:
+        with pytest.raises(ValueError, match="Invalid data.train config type"):
+            parse_train_configs(42)  # type: ignore[arg-type]
+
+    def test_invalid_entry_type_raises(self) -> None:
+        with pytest.raises(ValueError, match="Invalid train config"):
+            parse_train_configs({"ds_a": 42})  # type: ignore[dict-item]
+
+    def test_none_values_skipped(self) -> None:
+        raw = {"ds_a": {"path": "/a"}, "ds_b": None}
+        entries = parse_train_configs(raw)
+        assert len(entries) == 1
+        assert entries[0].fraction == 1.0
+
+    def test_missing_path_skipped(self) -> None:
+        raw = {"ds_a": {"path": "/a"}, "ds_b": {"fraction": 0.5}}
+        entries = parse_train_configs(raw)
+        assert len(entries) == 1
+
+
 class TestOplmConfig:
     def test_default_composition(self) -> None:
         cfg = OplmConfig()
@@ -144,3 +254,47 @@ class TestLoadConfig:
     def test_derived_fields_computed(self) -> None:
         cfg = load_config(["model.hidden_dim=256", "model.num_heads=4", "model.num_kv_heads=2"])
         assert cfg.model.head_dim == 64  # 256 // 4
+
+    def test_data_train_single_path(self) -> None:
+        cfg = load_config(["data.train=/path/to/dataset"])
+        assert cfg.data.train == "/path/to/dataset"
+
+    def test_data_train_multi_dataset(self) -> None:
+        cfg = load_config([
+            "data.train.ds_a.path=/path/a",
+            "data.train.ds_a.fraction=0.6",
+            "data.train.ds_b.path=/path/b",
+            "data.train.ds_b.fraction=0.4",
+        ])
+        assert isinstance(cfg.data.train, dict)
+        entries = parse_train_configs(cfg.data.train)
+        assert len(entries) == 2
+        paths = {e.path for e in entries}
+        assert paths == {"/path/a", "/path/b"}
+
+    def test_data_train_from_yaml(self, tmp_path: Path) -> None:
+        yaml_content = (
+            "data:\n"
+            "  train:\n"
+            "    uniref:\n"
+            "      path: /data/uniref\n"
+            "      fraction: 0.7\n"
+            "    bfd:\n"
+            "      path: /data/bfd\n"
+            "      fraction: 0.3\n"
+        )
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(yaml_content)
+
+        cfg = load_config(["--config", str(config_file)])
+        entries = parse_train_configs(cfg.data.train)
+        assert len(entries) == 2
+        assert entries[0].fraction == pytest.approx(0.7)
+        assert entries[1].fraction == pytest.approx(0.3)
+
+    def test_data_config_defaults(self) -> None:
+        cfg = load_config([])
+        assert cfg.data.max_length == 1024
+        assert cfg.data.mask_prob == 0.15
+        assert cfg.data.num_workers == 4
+        assert cfg.data.train is None

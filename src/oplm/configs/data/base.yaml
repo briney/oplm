@@ -1,0 +1,35 @@
+# Training dataset(s).
+#
+# Single dataset (100% sampling):
+#   train: /path/to/dataset
+# (CLI: data.train=/path/to/dataset)
+#
+# Multiple datasets with fractional sampling:
+#   train:
+#     uniref50:
+#       path: /data/uniref50/
+#       fraction: 0.6
+#     bfd:
+#       path: /data/bfd/
+#       fraction: 0.4
+# (CLI: data.train.uniref50.path=/data/uniref50/ data.train.uniref50.fraction=0.6 ...)
+#
+# Notes:
+#   - Each dataset path can be a single .parquet file or a directory of shards.
+#   - Fractions are normalized to sum to 1.0.
+#   - Omitted fractions share the remaining mass equally.
+#   - Parquet files must have columns: sequence_id, sequence.
+train: null
+
+# Sequence and masking
+max_length: 1024
+mask_prob: 0.15
+
+# DataLoader settings
+num_workers: 4
+pin_memory: true
+prefetch_factor: 4
+
+# Shard iteration behavior (only affects sharded parquet directories)
+shuffle_shards: true
+shuffle_rows: true
