@@ -1,0 +1,6 @@
+# ~350M parameters — Proust-scale
+model:
+  hidden_dim: 1024
+  num_layers: 24
+  num_heads: 16
+  num_kv_heads: 4

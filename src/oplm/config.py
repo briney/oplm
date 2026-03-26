@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from importlib.resources import files
 
 from omegaconf import DictConfig, OmegaConf
+
+AVAILABLE_PRESETS = ("small", "medium", "base", "large", "xlarge")
 
 
 def round_multiple(x: float, multiple: int) -> int:
@@ -148,40 +151,90 @@ class OplmConfig:
     data: DataConfig = field(default_factory=DataConfig)
 
 
+def get_preset_config(preset: str) -> DictConfig:
+    """Load a model size preset by name.
+
+    Args:
+        preset: One of ``"small"``, ``"medium"``, ``"base"``, ``"large"``, ``"xlarge"``.
+
+    Returns:
+        DictConfig loaded from the preset YAML.
+
+    Raises:
+        ValueError: If the preset name is not recognized.
+    """
+    if preset not in AVAILABLE_PRESETS:
+        raise ValueError(
+            f"Unknown preset {preset!r}. Available presets: {', '.join(AVAILABLE_PRESETS)}"
+        )
+    preset_dir = files("oplm.configs.model.presets")
+    yaml_text = preset_dir.joinpath(f"{preset}.yaml").read_text()
+    return OmegaConf.create(yaml_text)
+
+
+# Fields in ModelConfig that are derived from other fields in __post_init__.
+# These must be reset to None before OmegaConf.to_object() when they were not
+# explicitly set by the user, so that __post_init__ recomputes them from the
+# (potentially overridden) source dimensions.
+_DERIVED_MODEL_FIELDS = ("head_dim", "ffn_dim", "rope_dim", "nope_dim")
+
+
 def load_config(argv: list[str]) -> OplmConfig:
-    """Load config from defaults, optional YAML file, and CLI overrides.
+    """Load config from defaults, optional preset, optional YAML file, and CLI overrides.
+
+    Merge order (later overrides earlier): defaults → preset → YAML file → CLI overrides.
 
     Args:
         argv: Command-line arguments (e.g. sys.argv[1:]).
-            Supports ``--config <path>`` for YAML files and dotlist overrides
-            like ``model.num_layers=32``.
+            Supports ``--preset <name>`` for size presets, ``--config <path>``
+            for YAML files, and dotlist overrides like ``model.num_layers=32``.
 
     Returns:
         Fully resolved and validated OplmConfig.
     """
     base: DictConfig = OmegaConf.structured(OplmConfig)
 
-    # Extract --config flag
+    # Extract --config and --preset flags
     config_path: str | None = None
+    preset: str | None = None
     remaining: list[str] = []
     i = 0
     while i < len(argv):
         if argv[i] == "--config" and i + 1 < len(argv):
             config_path = argv[i + 1]
             i += 2
+        elif argv[i] == "--preset" and i + 1 < len(argv):
+            preset = argv[i + 1]
+            i += 2
         else:
             remaining.append(argv[i])
             i += 1
 
-    # Merge YAML file if provided
+    # Collect explicit overrides to track which model fields the user set
+    overrides: list[DictConfig] = []
+    if preset is not None:
+        overrides.append(get_preset_config(preset))
     if config_path is not None:
-        yaml_cfg = OmegaConf.load(config_path)
-        base = OmegaConf.merge(base, yaml_cfg)
-
-    # Merge CLI dotlist overrides
+        overrides.append(OmegaConf.load(config_path))
     if remaining:
-        cli_cfg = OmegaConf.from_dotlist(remaining)
-        base = OmegaConf.merge(base, cli_cfg)
+        overrides.append(OmegaConf.from_dotlist(remaining))
+
+    # Merge all overrides into base
+    for ov in overrides:
+        base = OmegaConf.merge(base, ov)
+
+    # Find which model fields were explicitly provided by the user
+    explicit_model_keys: set[str] = set()
+    for ov in overrides:
+        ov_dict = OmegaConf.to_container(ov, resolve=True)
+        if isinstance(ov_dict, dict) and "model" in ov_dict:
+            explicit_model_keys.update(ov_dict["model"].keys())
+
+    # Reset derived fields not explicitly set so __post_init__ recomputes
+    # them from the (potentially overridden) source dimensions.
+    for fname in _DERIVED_MODEL_FIELDS:
+        if fname not in explicit_model_keys:
+            base.model[fname] = None
 
     # Convert to dataclass instances (triggers __post_init__ validation)
     cfg: OplmConfig = OmegaConf.to_object(base)  # type: ignore[assignment]

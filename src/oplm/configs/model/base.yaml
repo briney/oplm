@@ -1,0 +1,47 @@
+# OPLM default model configuration
+# All values match ModelConfig dataclass defaults.
+model:
+  hidden_dim: 768
+  num_layers: 12
+  num_heads: 12
+  num_kv_heads: 4
+  ffn_activation: swiglu
+  vocab_size: 33
+  max_seq_len: 2048
+
+  # Attention features
+  shared_kv: false
+  qk_norm: true
+  output_gate: false
+  query_dependent_gate: false
+  post_sdpa_norm: false
+
+  # Positional encoding
+  rope_theta: 10000.0
+  partial_rope: false
+
+  # Cross-layer value residuals
+  value_residual: false
+  value_residual_lambda_init: 0.5
+
+  # Value embeddings
+  num_value_embeds: 0
+  value_embed_gate_dim: 16
+
+  # Depthwise convolutions
+  conv_positions: ""
+  conv_kernel_size: 7
+  conv_activation: true
+
+  # Attention residuals
+  attn_residual: false
+  attn_residual_block_size: 8
+
+  # Normalization
+  norm_eps: 1.0e-6
+  post_embed_norm: false
+
+  # Training features
+  gradient_checkpointing: false
+  tie_embeddings: false
+  dtype: bfloat16

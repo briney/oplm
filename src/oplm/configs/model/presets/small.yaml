@@ -1,0 +1,6 @@
+# ~25M parameters — fast ablation
+model:
+  hidden_dim: 256
+  num_layers: 6
+  num_heads: 4
+  num_kv_heads: 2
