@@ -391,7 +391,9 @@ class Attention(nn.Module):
         v_first: Tensor | None = None,      # for cross-layer value residual
         attention_mask: Tensor | None = None,
         value_embed: Tensor | None = None,  # from ValueEmbedding
-    ) -> tuple[Tensor, Tensor | None]:      # (output, v_first_out)
+        need_weights: bool = False,         # return per-head attention weights
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
+        # (output, v_first_out, attn_weights)
 ```
 
 #### Projection strategy
@@ -423,13 +425,15 @@ All projections are bias-free.
         v = λ_v * v + λ_first * v_first
     [If value_residual and layer_idx == 0]
         v_first_out = v                               # store for later layers
-8.  Compute attention (FlashAttention or SDPA, causal=False)
+8.  Compute attention:
+        [If need_weights]  Manual: softmax(Q·K^T / √d + mask) · V → attn_weights (B, H, T, T)
+        [Else]             FlashAttention or SDPA (causal=False)
 9.  [If post_sdpa_norm] Apply RMSNorm to attention output
 10. [If output_gate]
         gate = sigmoid(gate_params or gate_proj(q_features))
         output = gate * attn_output
 11. Output projection: Linear(num_heads * head_dim → hidden_dim)
-12. Return (output, v_first_out)
+12. Return (output, v_first_out, attn_weights)
 ```
 
 #### FlashAttention fallback chain
@@ -439,6 +443,17 @@ Backend selected once at import time (try/except), not per forward call:
 1. **`flash_attn.flash_attn_func`** with `causal=False` — optimal for bidirectional
 2. **`F.scaled_dot_product_attention`** — PyTorch native SDPA (uses FlashAttention
    or memory-efficient backend internally based on input shapes)
+
+#### Attention weight extraction
+
+When `need_weights=True` is passed to `forward()`, the module bypasses
+FlashAttention/SDPA and computes attention manually:
+`softmax(Q @ K^T / sqrt(d_k) + mask) @ V`. This returns per-head attention weights
+of shape `(B, H, T, T)` as the third element of the return tuple.
+
+This is a per-call runtime flag (not a config toggle) since it is typically False
+during training and True during evaluation for metrics like precision@L. When False
+(the default), the optimized FlashAttention/SDPA path is used with zero overhead.
 
 #### GQA mechanics
 
@@ -755,9 +770,11 @@ class OplmEncoder(nn.Module):
         self,
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> Tensor:
+        need_weights: bool = False,
+    ) -> tuple[Tensor, list[Tensor] | None]:
         x = self.embedding(input_ids)
         v_first: Tensor | None = None
+        all_attn_weights: list[Tensor] = []
 
         # Initialize AttnRes state with token embedding as first "block"
         state = None
@@ -775,9 +792,14 @@ class OplmEncoder(nn.Module):
                     x, v_first, attention_mask, ve, self.attn_residual, state,
                 )
             else:
-                x, v_first = block(x, v_first, attention_mask, ve)
+                x, v_first, layer_weights = block(
+                    x, v_first, attention_mask, ve, need_weights,
+                )
+                if layer_weights is not None:
+                    all_attn_weights.append(layer_weights)
 
-        return self.final_norm(x)  # (B, T, D)
+        hidden = self.final_norm(x)  # (B, T, D)
+        return hidden, all_attn_weights if need_weights else None
 ```
 
 ### `MLMHead`
@@ -811,8 +833,9 @@ class OplmForMLM(nn.Module):
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
         labels: Tensor | None = None,
+        need_weights: bool = False,
     ) -> dict[str, Tensor]:
-        hidden = self.encoder(input_ids, attention_mask)
+        hidden, attn_weights = self.encoder(input_ids, attention_mask, need_weights)
         logits = self.mlm_head(hidden)
 
         loss = None
@@ -824,7 +847,10 @@ class OplmForMLM(nn.Module):
                 ignore_index=-100,
             )
 
-        return {"logits": logits, "loss": loss}
+        result = {"logits": logits, "loss": loss}
+        if attn_weights is not None:
+            result["attention_weights"] = attn_weights
+        return result
 ```
 
 ### FSDP wrapping strategy
@@ -1031,12 +1057,17 @@ memory overhead when off.
 | Post-embed norm | `post_embed_norm` | `False` | No norm after embedding |
 | Gradient ckpt | `gradient_checkpointing` | `False` | No checkpointing |
 | Tied embeddings | `tie_embeddings` | `False` | Separate MLM head weights |
+| Attention weights | `need_weights` (runtime) | `False` (default) | FlashAttn/SDPA, no weight matrix |
 
 **Zero-overhead principle**: When a feature is disabled, no `nn.Module` or
 `nn.Parameter` is created for it. The forward-path check `if self.module is not None`
 is a single pointer check that `torch.compile` / JIT eliminates. This ensures
 ablation experiments are fair (disabled features don't consume memory or add
 overhead) and production runs carry no penalty for unused features.
+
+**Runtime flags**: `need_weights` is not a config toggle but a per-call parameter on
+`Attention.forward()`. It is listed here for completeness. When False, the optimized
+attention backend is used with no overhead.
 
 ---
 

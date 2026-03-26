@@ -32,6 +32,9 @@ class Attention(nn.Module):
 
     All optional features are resolved at ``__init__`` time — no dynamic
     branching in ``forward()``. Disabled features create no parameters.
+    The ``need_weights`` flag is an exception: it is a per-call runtime choice
+    (typically False for training, True for eval) following the convention of
+    ``torch.nn.MultiheadAttention``.
 
     Features (all togglable via config):
         - GQA (``num_kv_heads < num_heads``)
@@ -112,7 +115,8 @@ class Attention(nn.Module):
         v_first: Tensor | None = None,
         attention_mask: Tensor | None = None,
         value_embed: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor | None]:
+        need_weights: bool = False,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         """Compute attention.
 
         Args:
@@ -120,10 +124,13 @@ class Attention(nn.Module):
             v_first: First layer's V for cross-layer value residuals.
             attention_mask: Additive attention mask ``(B, 1, T, T)`` or ``(B, 1, 1, T)``.
             value_embed: Gated value embedding ``(B, T, KV_H, D_head)`` from ValueEmbedding.
+            need_weights: If True, compute and return per-head attention weights
+                using manual attention (bypasses FlashAttention/SDPA). Default False.
 
         Returns:
-            Tuple of (output ``(B, T, D)``, v_first_out).
+            Tuple of (output ``(B, T, D)``, v_first_out, attn_weights).
             ``v_first_out`` is non-None only at layer 0 when value_residual is enabled.
+            ``attn_weights`` is ``(B, H, T, T)`` when need_weights=True, else None.
         """
         B, T, _ = x.shape
 
@@ -171,7 +178,9 @@ class Attention(nn.Module):
                 v = lambda_v * v + lambda_first * v_first
 
         # 8. Compute attention
-        attn_out = self._attention(q, k, v, attention_mask)  # (B, T, H, D_head)
+        attn_out, attn_weights = self._attention(  # (B, T, H, D_head)
+            q, k, v, attention_mask, need_weights
+        )
 
         # 9. Post-SDPA normalization
         if self.post_sdpa_norm is not None:
@@ -191,7 +200,7 @@ class Attention(nn.Module):
         attn_out = attn_out.reshape(B, T, -1)  # (B, T, num_heads * head_dim)
         output = self.o_proj(attn_out)  # (B, T, D)
 
-        return output, v_first_out
+        return output, v_first_out, attn_weights
 
     def _attention(
         self,
@@ -199,21 +208,39 @@ class Attention(nn.Module):
         k: Tensor,
         v: Tensor,
         attention_mask: Tensor | None,
-    ) -> Tensor:
-        """Dispatch to FlashAttention or PyTorch SDPA.
+        need_weights: bool = False,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Dispatch to manual attention, FlashAttention, or PyTorch SDPA.
 
         Args:
             q, k, v: Tensors of shape ``(B, T, H, D_head)``.
             attention_mask: Optional additive mask.
+            need_weights: If True, compute attention manually and return
+                per-head weight matrix. Bypasses FlashAttention/SDPA.
 
         Returns:
-            Attention output ``(B, T, H, D_head)``.
+            Tuple of (attention output ``(B, T, H, D_head)``, attn_weights).
+            ``attn_weights`` is ``(B, H, T, T)`` when need_weights=True, else None.
         """
+        # Manual path: materialize attention weights for eval metrics
+        if need_weights:
+            q = q.transpose(1, 2)  # (B, H, T, D_head)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            scale = q.size(-1) ** -0.5
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, T, T)
+            if attention_mask is not None:
+                scores = scores + attention_mask
+            weights = scores.softmax(dim=-1)  # (B, H, T, T)
+            attn_out = torch.matmul(weights, v)  # (B, H, T, D_head)
+            return attn_out.transpose(1, 2), weights  # (B, T, H, D_head), (B, H, T, T)
+
+        # FlashAttention path
         if _flash_attn_func is not None and attention_mask is None:
             # flash_attn expects (B, T, H, D) layout and returns same
-            return _flash_attn_func(q, k, v, causal=False)
+            return _flash_attn_func(q, k, v, causal=False), None
 
-        # PyTorch SDPA expects (B, H, T, D)
+        # PyTorch SDPA path
         q = q.transpose(1, 2)  # (B, H, T, D_head)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -221,4 +248,4 @@ class Attention(nn.Module):
         attn_out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attention_mask, is_causal=False
         )
-        return attn_out.transpose(1, 2)  # (B, T, H, D_head)
+        return attn_out.transpose(1, 2), None  # (B, T, H, D_head)
