@@ -1,72 +1,25 @@
-"""End-to-end tests: small model trains a few steps, loss decreases.
+"""End-to-end integration tests: real protein data, full Trainer pipeline.
 
-NOTE: This module uses a vanilla training loop with synthetic protein sequences.
-Once the real training infrastructure (Trainer, Dataset, DataLoader) is
-implemented, these tests should be updated to exercise the actual training
-workflow with real data, so that the e2e tests reproduce real-world usage.
+Tests the complete training workflow with real sequences from the test fixtures
+parquet shard. Covers CPU training, GPU training with bf16 mixed precision,
+and various model feature combinations.
 """
 
 from __future__ import annotations
 
-import random
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
-from torch.optim import AdamW
 
-from oplm.config import ModelConfig
+from oplm.config import ModelConfig, OplmConfig, TrainConfig
 from oplm.data.tokenizer import ProteinTokenizer
 from oplm.model.transformer import OplmForMLM
 
-# Standard amino acid alphabet for synthetic data
-AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
-
-
-def _random_protein(min_len: int = 20, max_len: int = 50) -> str:
-    """Generate a random protein sequence."""
-    length = random.randint(min_len, max_len)
-    return "".join(random.choice(AMINO_ACIDS) for _ in range(length))
-
-
-def _make_mlm_batch(
-    tokenizer: ProteinTokenizer,
-    sequences: list[str],
-    mask_prob: float = 0.15,
-    max_length: int = 64,
-) -> dict[str, torch.Tensor]:
-    """Tokenize sequences and apply random MLM masking.
-
-    Returns dict with input_ids, attention_mask, and labels.
-    Labels are -100 for non-masked positions (ignored in cross-entropy).
-    """
-    batch = tokenizer.batch_encode(sequences, max_length=max_length)
-    input_ids = batch["input_ids"]
-    attention_mask = batch["attention_mask"]
-
-    # Build labels: clone original, set non-masked to -100
-    labels = input_ids.clone()
-    labels[attention_mask == 0] = -100
-
-    # Create mask: skip special tokens (cls=0, pad=1, eos=2)
-    special_mask = (input_ids <= 2)
-    maskable = attention_mask.bool() & ~special_mask
-
-    # Random masking
-    rand = torch.rand_like(input_ids, dtype=torch.float)
-    mask = (rand < mask_prob) & maskable
-
-    # Replace masked positions with <mask> token in input
-    input_ids = input_ids.clone()
-    input_ids[mask] = tokenizer.mask_token_id
-
-    # Only compute loss on masked positions
-    labels[~mask] = -100
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-    }
+if TYPE_CHECKING:
+    from oplm.training import Trainer
 
 
 def _small_config(**overrides: object) -> ModelConfig:
@@ -76,142 +29,152 @@ def _small_config(**overrides: object) -> ModelConfig:
         "num_heads": 4,
         "num_kv_heads": 2,
         "num_layers": 2,
-        "max_seq_len": 64,
+        "max_seq_len": 128,
     }
     defaults.update(overrides)
     return ModelConfig(**defaults)
 
 
+def _run_training(
+    training_parquet: Path,
+    model_overrides: dict[str, object] | None = None,
+    *,
+    mixed_precision: str = "no",
+    batch_size: int = 8,
+    max_steps: int = 20,
+) -> tuple[Trainer, list[float]]:
+    """Run a short training loop with real data and return trainer + captured losses."""
+    from oplm.training import Trainer
+
+    cfg = OplmConfig(
+        model=_small_config(**(model_overrides or {})),
+        train=TrainConfig(
+            max_steps=max_steps,
+            batch_size=batch_size,
+            lr=1e-3,
+            warmup_steps=5,
+            log_every=5,
+            eval_every=100,
+            save_every=100,
+            wandb_enabled=False,
+            mixed_precision=mixed_precision,
+            output_dir=tempfile.mkdtemp(),
+        ),
+    )
+    cfg.data.train = str(training_parquet)
+    cfg.data.max_length = 128
+    cfg.data.num_workers = 0
+
+    trainer = Trainer(cfg)
+
+    losses: list[float] = []
+    orig_log = trainer._log_step
+
+    def _capture_log(loss: float) -> None:
+        losses.append(loss)
+        orig_log(loss)
+
+    trainer._log_step = _capture_log  # type: ignore[method-assign]
+    trainer.train()
+
+    return trainer, losses
+
+
 # ---------------------------------------------------------------------------
-# E2E training: loss decreases
+# E2E training: real data through the full Trainer pipeline
 # ---------------------------------------------------------------------------
 
 
 class TestE2ETraining:
-    """Verify a small model can train and learn from synthetic protein data.
+    """Full pipeline: real protein data -> DataLoader -> Trainer -> loss decreases."""
 
-    TODO: Replace vanilla training loop with the real Trainer once implemented.
-    TODO: Replace synthetic data with real protein sequences and DataLoader.
-    """
+    def test_loss_decreases(self, training_parquet: Path) -> None:
+        """Train a small model on real sequences, verify loss drops."""
+        trainer, losses = _run_training(training_parquet)
 
-    def test_loss_decreases(self) -> None:
-        """Train for 10 steps, verify final loss < initial loss."""
-        torch.manual_seed(42)
-        random.seed(42)
-
-        cfg = _small_config()
-        model = OplmForMLM(cfg)
-        tokenizer = ProteinTokenizer()
-        optimizer = AdamW(model.parameters(), lr=1e-3)
-
-        # Generate synthetic protein sequences
-        sequences = [_random_protein() for _ in range(32)]
-
-        model.train()
-        losses: list[float] = []
-        num_steps = 10
-        batch_size = 8
-
-        for step in range(num_steps):
-            # Sample a mini-batch
-            batch_seqs = sequences[
-                (step * batch_size) % len(sequences):
-                (step * batch_size) % len(sequences) + batch_size
-            ]
-            batch = _make_mlm_batch(tokenizer, batch_seqs, mask_prob=0.15)
-
-            result = model(
-                input_ids=batch["input_ids"],
-                labels=batch["labels"],
-            )
-            loss = result["loss"]
-            losses.append(loss.item())
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        # Loss should decrease (compare average of first 3 vs last 3)
-        avg_first = sum(losses[:3]) / 3
-        avg_last = sum(losses[-3:]) / 3
+        assert len(losses) >= 4
+        assert trainer.global_step == 20
+        assert trainer.tokens_seen > 0
+        avg_first = sum(losses[:2]) / 2
+        avg_last = sum(losses[-2:]) / 2
         assert avg_last < avg_first, (
-            f"Loss did not decrease: first 3 avg={avg_first:.4f}, "
-            f"last 3 avg={avg_last:.4f}"
+            f"Loss did not decrease: first 2 avg={avg_first:.4f}, last 2 avg={avg_last:.4f}"
         )
 
-    def test_loss_decreases_with_features(self) -> None:
-        """Same test with value residuals, convolutions, and value embeddings."""
-        torch.manual_seed(42)
-        random.seed(42)
-
-        cfg = _small_config(
-            value_residual=True,
-            conv_positions="AC",
-            num_value_embeds=1,
-            qk_norm=True,
-        )
-        model = OplmForMLM(cfg)
-        tokenizer = ProteinTokenizer()
-        optimizer = AdamW(model.parameters(), lr=1e-3)
-
-        sequences = [_random_protein() for _ in range(32)]
-
-        model.train()
-        losses: list[float] = []
-
-        for step in range(10):
-            batch_seqs = sequences[
-                (step * 8) % len(sequences):
-                (step * 8) % len(sequences) + 8
-            ]
-            batch = _make_mlm_batch(tokenizer, batch_seqs, mask_prob=0.15)
-            result = model(input_ids=batch["input_ids"], labels=batch["labels"])
-            loss = result["loss"]
-            losses.append(loss.item())
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        avg_first = sum(losses[:3]) / 3
-        avg_last = sum(losses[-3:]) / 3
-        assert avg_last < avg_first, (
-            f"Loss did not decrease: first 3 avg={avg_first:.4f}, "
-            f"last 3 avg={avg_last:.4f}"
+    def test_loss_decreases_with_features(self, training_parquet: Path) -> None:
+        """Train with value residuals, convolutions, and value embeddings."""
+        _, losses = _run_training(
+            training_parquet,
+            model_overrides={
+                "value_residual": True,
+                "conv_positions": "AC",
+                "num_value_embeds": 1,
+                "qk_norm": True,
+            },
         )
 
-    def test_loss_decreases_with_attn_residual(self) -> None:
-        """Same test with attention residuals enabled."""
-        torch.manual_seed(42)
-        random.seed(42)
-
-        cfg = _small_config(attn_residual=True, attn_residual_block_size=1)
-        model = OplmForMLM(cfg)
-        tokenizer = ProteinTokenizer()
-        optimizer = AdamW(model.parameters(), lr=1e-3)
-
-        sequences = [_random_protein() for _ in range(32)]
-
-        model.train()
-        losses: list[float] = []
-
-        for step in range(10):
-            batch_seqs = sequences[
-                (step * 8) % len(sequences):
-                (step * 8) % len(sequences) + 8
-            ]
-            batch = _make_mlm_batch(tokenizer, batch_seqs, mask_prob=0.15)
-            result = model(input_ids=batch["input_ids"], labels=batch["labels"])
-            loss = result["loss"]
-            losses.append(loss.item())
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        avg_first = sum(losses[:3]) / 3
-        avg_last = sum(losses[-3:]) / 3
+        assert len(losses) >= 4
+        avg_first = sum(losses[:2]) / 2
+        avg_last = sum(losses[-2:]) / 2
         assert avg_last < avg_first, (
-            f"Loss did not decrease: first 3 avg={avg_first:.4f}, "
-            f"last 3 avg={avg_last:.4f}"
+            f"Loss did not decrease: first 2 avg={avg_first:.4f}, last 2 avg={avg_last:.4f}"
+        )
+
+    def test_loss_decreases_with_attn_residual(self, training_parquet: Path) -> None:
+        """Train with attention residuals enabled."""
+        _, losses = _run_training(
+            training_parquet,
+            model_overrides={"attn_residual": True, "attn_residual_block_size": 1},
+        )
+
+        assert len(losses) >= 4
+        avg_first = sum(losses[:2]) / 2
+        avg_last = sum(losses[-2:]) / 2
+        assert avg_last < avg_first, (
+            f"Loss did not decrease: first 2 avg={avg_first:.4f}, last 2 avg={avg_last:.4f}"
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_loss_decreases_cuda_bf16(self, training_parquet: Path) -> None:
+        """Train on GPU with bf16 mixed precision."""
+        trainer, losses = _run_training(
+            training_parquet,
+            mixed_precision="bf16",
+            batch_size=16,
+        )
+
+        assert len(losses) >= 4
+        assert trainer.global_step == 20
+        avg_first = sum(losses[:2]) / 2
+        avg_last = sum(losses[-2:]) / 2
+        assert avg_last < avg_first, (
+            f"Loss did not decrease: first 2 avg={avg_first:.4f}, last 2 avg={avg_last:.4f}"
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_loss_decreases_cuda_bf16_with_features(self, training_parquet: Path) -> None:
+        """Train on GPU with bf16 and all model features enabled."""
+        _, losses = _run_training(
+            training_parquet,
+            model_overrides={
+                "value_residual": True,
+                "conv_positions": "AC",
+                "num_value_embeds": 1,
+                "qk_norm": True,
+                "attn_residual": True,
+                "attn_residual_block_size": 1,
+            },
+            mixed_precision="bf16",
+            batch_size=16,
+        )
+
+        assert len(losses) >= 4
+        avg_first = sum(losses[:2]) / 2
+        avg_last = sum(losses[-2:]) / 2
+        assert avg_last < avg_first, (
+            f"Loss did not decrease: first 2 avg={avg_first:.4f}, last 2 avg={avg_last:.4f}"
         )
 
 
