@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from oplm.eval.tasks import sequence  # noqa: F401
-
-# Future task modules register themselves on import:
-# from oplm.eval.tasks import structure
+from oplm.eval.tasks import (
+    sequence,  # noqa: F401
+    structure,  # noqa: F401
+)

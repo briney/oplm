@@ -11,6 +11,7 @@ from oplm.eval.tasks.base import EvalTask
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
+    from torch import Tensor
     from torch.utils.data import DataLoader
 
     from oplm.config import EvalDatasetEntry, OplmConfig
@@ -34,7 +35,7 @@ class SequenceEvalTask(EvalTask):
 
     def __init__(self, entry: EvalDatasetEntry, cfg: OplmConfig) -> None:
         super().__init__(entry, cfg)
-        self._dataloader: DataLoader | None = None
+        self._dataloader: DataLoader[dict[str, Tensor]] | None = None
 
     def evaluate(
         self,

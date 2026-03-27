@@ -5,12 +5,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from oplm.eval.tasks.base import EvalTask
 
 EVAL_TASK_REGISTRY: dict[str, type[EvalTask]] = {}
 
 
-def register_eval_task(type_name: str):  # noqa: ANN201
+def register_eval_task(type_name: str) -> Callable[[type[EvalTask]], type[EvalTask]]:
     """Decorator to register an EvalTask subclass for a dataset type.
 
     Args:

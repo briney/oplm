@@ -29,3 +29,12 @@ def training_parquet() -> Path:
     if not path.exists():
         pytest.skip(f"Training fixture not found: {path}")
     return path
+
+
+@pytest.fixture(scope="session")
+def structure_fixtures_dir() -> Path:
+    """Path to the directory containing PDB test fixtures."""
+    path = FIXTURES_DIR / "eval" / "structures"
+    if not path.exists():
+        pytest.skip(f"Structure fixtures not found: {path}")
+    return path

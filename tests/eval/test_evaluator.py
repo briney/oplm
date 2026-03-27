@@ -8,7 +8,7 @@ import pytest
 
 from oplm.config import EvalDatasetEntry, OplmConfig, TrainConfig
 from oplm.eval.evaluator import Evaluator
-from oplm.eval.registry import EVAL_TASK_REGISTRY, register_eval_task
+from oplm.eval.registry import EVAL_TASK_REGISTRY
 from oplm.eval.tasks.base import EvalTask
 
 
@@ -60,10 +60,12 @@ class TestEvaluator:
         assert evaluator.tasks[0].eval_every == 100
 
     def test_multiple_tasks(self) -> None:
-        cfg = _make_cfg({
-            "ds1": {"path": "/data1", "type": "_stub"},
-            "ds2": {"path": "/data2", "type": "_stub", "eval_every": 500},
-        })
+        cfg = _make_cfg(
+            {
+                "ds1": {"path": "/data1", "type": "_stub"},
+                "ds2": {"path": "/data2", "type": "_stub", "eval_every": 500},
+            }
+        )
         evaluator = Evaluator(cfg)
         assert len(evaluator.tasks) == 2
 
@@ -92,10 +94,12 @@ class TestEvaluator:
         model.eval.assert_not_called()
 
     def test_mixed_schedules(self) -> None:
-        cfg = _make_cfg({
-            "fast": {"path": "/f", "type": "_stub", "eval_every": 10},
-            "slow": {"path": "/s", "type": "_stub", "eval_every": 50},
-        })
+        cfg = _make_cfg(
+            {
+                "fast": {"path": "/f", "type": "_stub", "eval_every": 10},
+                "slow": {"path": "/s", "type": "_stub", "eval_every": 50},
+            }
+        )
         evaluator = Evaluator(cfg)
         model = MagicMock()
         accelerator = MagicMock()

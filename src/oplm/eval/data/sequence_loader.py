@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from torch import Tensor
 from torch.utils.data import DataLoader
 
 from oplm.data.collate import MLMCollator
@@ -68,7 +69,7 @@ class DeterministicMLMCollator(MLMCollator):
 def build_sequence_eval_dataloader(
     path: str,
     cfg: OplmConfig,
-) -> DataLoader:
+) -> DataLoader[dict[str, Tensor]]:
     """Build an eval DataLoader from parquet files.
 
     Uses the same :class:`ShardedProteinDataset` and :class:`ProteinTokenizer`
@@ -102,7 +103,7 @@ def build_sequence_eval_dataloader(
 
     num_workers = cfg.data.num_workers
     return DataLoader(
-        dataset,
+        dataset,  # type: ignore[arg-type]
         batch_size=cfg.train.batch_size,
         collate_fn=collator,
         num_workers=num_workers,

@@ -9,6 +9,7 @@ import torch
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
+    from torch import Tensor
     from torch.utils.data import DataLoader
 
     from oplm.model.transformer import OplmForMLM
@@ -18,7 +19,7 @@ _PERPLEXITY_CAP = 1000.0
 
 def compute_mlm_metrics(
     model: OplmForMLM,
-    dataloader: DataLoader,
+    dataloader: DataLoader[dict[str, Tensor]],
     accelerator: Accelerator,
 ) -> dict[str, float]:
     """Compute MLM metrics over an eval DataLoader.

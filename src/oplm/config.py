@@ -225,6 +225,7 @@ class EvalDatasetEntry:
     type: str  # "sequence", "structure", "proteingym", ...
     eval_every: int | None = None  # Per-dataset override; None → use train.eval_every
     metrics: list[str] | None = None  # Override default metrics; None → use type defaults
+    extra: dict[str, Any] = field(default_factory=dict)  # Task-specific config
 
 
 @dataclass
@@ -435,6 +436,10 @@ def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEnt
             if raw_metrics is not None:
                 metrics = [str(m) for m in raw_metrics]
 
+            # Collect task-specific config keys into extra dict
+            _KNOWN_EVAL_KEYS = {"path", "type", "eval_every", "metrics"}
+            extra = {k: v for k, v in value.items() if k not in _KNOWN_EVAL_KEYS}
+
             entries.append(
                 EvalDatasetEntry(
                     name=str(name),
@@ -442,6 +447,7 @@ def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEnt
                     type=str(eval_type),
                     eval_every=eval_every if eval_every is not None else default_eval_every,
                     metrics=metrics,
+                    extra=extra,
                 )
             )
 

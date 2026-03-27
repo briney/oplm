@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from oplm.config import EvalDatasetEntry, parse_eval_configs
+from oplm.config import parse_eval_configs
 
 
 class TestParseEvalConfigs:
@@ -70,3 +70,42 @@ class TestParseEvalConfigs:
     def test_non_dict_raw_raises(self) -> None:
         with pytest.raises(ValueError, match="Invalid data.eval config type"):
             parse_eval_configs("/just/a/string", default_eval_every=1000)
+
+    def test_extra_keys_preserved(self) -> None:
+        raw = {
+            "pdb": {
+                "path": "/data/structures",
+                "type": "structure",
+                "contact_threshold": 8.0,
+                "l_divisor": 2,
+                "use_cbeta": True,
+            },
+        }
+        entries = parse_eval_configs(raw, default_eval_every=1000)
+        assert entries[0].extra == {
+            "contact_threshold": 8.0,
+            "l_divisor": 2,
+            "use_cbeta": True,
+        }
+
+    def test_empty_extra_by_default(self) -> None:
+        raw = {"heldout": {"path": "/data/heldout", "type": "sequence"}}
+        entries = parse_eval_configs(raw, default_eval_every=1000)
+        assert entries[0].extra == {}
+
+    def test_extra_excludes_known_keys(self) -> None:
+        raw = {
+            "pdb": {
+                "path": "/data/structures",
+                "type": "structure",
+                "eval_every": 5000,
+                "metrics": ["precision_at_L"],
+                "logreg_c": 0.15,
+            },
+        }
+        entries = parse_eval_configs(raw, default_eval_every=1000)
+        assert "path" not in entries[0].extra
+        assert "type" not in entries[0].extra
+        assert "eval_every" not in entries[0].extra
+        assert "metrics" not in entries[0].extra
+        assert entries[0].extra == {"logreg_c": 0.15}
