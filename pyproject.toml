@@ -84,3 +84,14 @@ python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "numpy",
+    "numpy.*",
+    "pyarrow",
+    "pyarrow.*",
+    "flash_attn",
+    "flash_attn.*",
+]
+ignore_missing_imports = true

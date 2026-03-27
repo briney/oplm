@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pyarrow.parquet as pq  # type: ignore[import-untyped]
+import pyarrow.parquet as pq
 from torch.utils.data import IterableDataset, get_worker_info
 
 if TYPE_CHECKING:

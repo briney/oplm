@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Select FlashAttention backend once at import time
 _flash_attn_func = None
 try:
-    from flash_attn import (  # type: ignore[import-not-found, no-redef]
+    from flash_attn import (  # type: ignore[no-redef]
         flash_attn_func as _flash_attn_func,
     )
 
