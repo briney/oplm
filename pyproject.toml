@@ -26,6 +26,7 @@ dependencies = [
     "omegaconf>=2.3",
     "typer>=0.9",
     "rich>=13.0",
+    "numpy>=1.26",
     "pyarrow>=14.0",
 ]
 
