@@ -3,37 +3,28 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from accelerate import Accelerator
     from torch.utils.data import DataLoader
 
     from oplm.config import OplmConfig
-    from oplm.model.transformer import OplmForMLM
+    from oplm.eval.evaluator import Evaluator
 
 logger = logging.getLogger(__name__)
-
-# Type alias for the eval callback.
-# Receives (unwrapped_model, accelerator, global_step) -> metrics dict.
-EvalFn = Callable[["OplmForMLM", "Accelerator", int], dict[str, float]]
 
 
 class Trainer:
     """Training loop for OPLM with accelerate, wandb, and rich progress.
 
     Args:
-        cfg: Full OPLM configuration.
-        eval_fn: Optional evaluation callback. Receives the unwrapped model,
-            accelerator, and current global step. Returns a dict of metric
-            name to value.
+        cfg: Full OPLM configuration. If ``data.eval`` is configured, an
+            :class:`~oplm.eval.Evaluator` is built automatically.
     """
 
     def __init__(
         self,
         cfg: OplmConfig,
-        eval_fn: EvalFn | None = None,
     ) -> None:
         from accelerate import Accelerator
         from accelerate.utils import set_seed
@@ -44,7 +35,13 @@ class Trainer:
         from oplm.training.optim import build_optimizer, build_scheduler
 
         self.cfg = cfg
-        self.eval_fn = eval_fn
+
+        # Build evaluator from config if eval datasets are specified
+        self.evaluator: Evaluator | None = None
+        if cfg.data.eval is not None:
+            from oplm.eval import Evaluator
+
+            self.evaluator = Evaluator(cfg)
 
         # Seed everything
         set_seed(cfg.train.seed)
@@ -189,12 +186,11 @@ class Trainer:
                     self._log_step(current_loss)
 
                 # Evaluation
-                if self.global_step % cfg.eval_every == 0:
-                    eval_metrics = self.evaluate()
+                eval_metrics = self._run_eval()
+                if eval_metrics:
                     if "eval/loss" in eval_metrics:
                         self._last_eval_loss = eval_metrics["eval/loss"]
-                    if eval_metrics:
-                        self.accelerator.log(eval_metrics, step=self.global_step)
+                    self.accelerator.log(eval_metrics, step=self.global_step)
 
                 # Checkpointing
                 if self.global_step % cfg.save_every == 0:
@@ -220,20 +216,18 @@ class Trainer:
                 progress.stop()
             self.accelerator.end_training()
 
-    def evaluate(self) -> dict[str, float]:
-        """Run evaluation via the eval callback.
+    def _run_eval(self) -> dict[str, float]:
+        """Run all due evaluations for the current step.
 
-        Returns:
-            Dict of metric name to value. Empty if no eval_fn is set.
+        Delegates to the :class:`~oplm.eval.Evaluator`, which handles per-task
+        scheduling internally. Returns an empty dict (no-op) when no evals are
+        due or no evaluator is configured.
         """
-        if self.eval_fn is None:
+        if self.evaluator is None:
             return {}
 
-        self.model.eval()
         unwrapped = self.accelerator.unwrap_model(self.model)
-        metrics = self.eval_fn(unwrapped, self.accelerator, self.global_step)
-        self.model.train()
-        return metrics
+        return self.evaluator(unwrapped, self.accelerator, self.global_step)
 
     # ------------------------------------------------------------------
     # Internal helpers

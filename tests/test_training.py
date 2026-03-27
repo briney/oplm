@@ -399,20 +399,26 @@ class TestTrainerIntegration:
         assert trainer.global_step == 20
         assert trainer.tokens_seen > 0
 
-    def test_trainer_with_eval_fn(self, parquet_dataset: Path) -> None:
-        """Test that eval_fn callback is invoked."""
+    def test_trainer_with_evaluator(self, parquet_dataset: Path) -> None:
+        """Test that Evaluator is invoked via config-driven eval datasets."""
         torch.manual_seed(42)
         random.seed(42)
 
         eval_calls: list[int] = []
 
-        def mock_eval(
-            model: object,
-            accelerator: object,
-            step: int,
-        ) -> dict[str, float]:
-            eval_calls.append(step)
-            return {"eval/loss": 1.0}
+        # Patch in a mock eval task via the registry
+        from oplm.config import EvalDatasetEntry
+        from oplm.eval.registry import EVAL_TASK_REGISTRY
+        from oplm.eval.tasks.base import EvalTask
+
+        class _MockTask(EvalTask):
+            default_metrics = ["loss"]
+
+            def evaluate(self, model: object, accelerator: object) -> dict[str, float]:
+                eval_calls.append(0)  # just count calls
+                return {"loss": 1.0}
+
+        EVAL_TASK_REGISTRY["_mock"] = _MockTask
 
         cfg = OplmConfig(
             model=_small_model_config(),
@@ -430,17 +436,20 @@ class TestTrainerIntegration:
             ),
         )
         cfg.data.train = str(parquet_dataset)
+        cfg.data.eval = {"mock_ds": {"path": "/fake", "type": "_mock"}}
         cfg.data.max_length = 64
         cfg.data.num_workers = 0
 
         from oplm.training import Trainer
 
-        trainer = Trainer(cfg, eval_fn=mock_eval)
-        trainer.train()
+        try:
+            trainer = Trainer(cfg)
+            trainer.train()
 
-        # eval_fn should have been called at steps 10 and 20
-        assert 10 in eval_calls
-        assert 20 in eval_calls
+            # Evaluator should have been called at steps 10 and 20
+            assert len(eval_calls) == 2
+        finally:
+            EVAL_TASK_REGISTRY.pop("_mock", None)
 
     def test_trainer_checkpoint_saved(self, parquet_dataset: Path) -> None:
         """Test that checkpoints are saved."""

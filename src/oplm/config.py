@@ -214,6 +214,20 @@ class TrainDatasetEntry:
 
 
 @dataclass
+class EvalDatasetEntry:
+    """Parsed configuration for a single evaluation dataset.
+
+    Populated by :func:`parse_eval_configs`, not directly from YAML.
+    """
+
+    name: str
+    path: str
+    type: str  # "sequence", "structure", "proteingym", ...
+    eval_every: int | None = None  # Per-dataset override; None → use train.eval_every
+    metrics: list[str] | None = None  # Override default metrics; None → use type defaults
+
+
+@dataclass
 class DataConfig:
     """Data configuration for training datasets and loading."""
 
@@ -221,6 +235,10 @@ class DataConfig:
     # {name: {path, fraction}} (multiple datasets). Parsed at runtime via
     # parse_train_configs(). See configs/data/base.yaml for syntax examples.
     train: Any = None
+
+    # Evaluation dataset(s). Accepts a dict of {name: {path, type, ...}}.
+    # Parsed at runtime via parse_eval_configs().
+    eval: Any = None
 
     # Sequence and masking
     max_length: int = 1024
@@ -363,6 +381,73 @@ def parse_train_configs(raw: Any) -> list[TrainDatasetEntry]:
         return entries
 
     raise ValueError(f"Invalid data.train config type: {type(raw).__name__}")
+
+
+def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEntry]:
+    """Normalize a raw ``data.eval`` config value into structured eval dataset entries.
+
+    Supports two forms:
+
+    * ``None`` or empty dict → empty list (no eval data)
+    * Dict of ``{name: {path, type, eval_every?, metrics?}}`` → multiple eval datasets
+
+    Args:
+        raw: The ``data.eval`` value from config — a dict or None.
+        default_eval_every: Fallback ``eval_every`` from ``train.eval_every``.
+
+    Returns:
+        List of :class:`EvalDatasetEntry` with resolved eval_every values.
+
+    Raises:
+        ValueError: If the config structure is invalid or required fields are missing.
+    """
+    if raw is None:
+        return []
+
+    if isinstance(raw, dict):
+        if len(raw) == 0:
+            return []
+
+        entries: list[EvalDatasetEntry] = []
+        for name, value in raw.items():
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                raise ValueError(
+                    f"Invalid eval config for {name!r}: expected dict with 'path' and 'type', "
+                    f"got {type(value).__name__}"
+                )
+
+            path = value.get("path")
+            if path is None:
+                raise ValueError(f"Eval dataset {name!r} is missing required 'path' field")
+
+            eval_type = value.get("type")
+            if eval_type is None:
+                raise ValueError(f"Eval dataset {name!r} is missing required 'type' field")
+
+            eval_every = value.get("eval_every")
+            if eval_every is not None:
+                eval_every = int(eval_every)
+
+            raw_metrics = value.get("metrics")
+            metrics: list[str] | None = None
+            if raw_metrics is not None:
+                metrics = [str(m) for m in raw_metrics]
+
+            entries.append(
+                EvalDatasetEntry(
+                    name=str(name),
+                    path=str(path),
+                    type=str(eval_type),
+                    eval_every=eval_every if eval_every is not None else default_eval_every,
+                    metrics=metrics,
+                )
+            )
+
+        return entries
+
+    raise ValueError(f"Invalid data.eval config type: {type(raw).__name__}")
 
 
 def load_config(argv: list[str]) -> OplmConfig:
