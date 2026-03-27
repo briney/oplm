@@ -26,6 +26,7 @@ dependencies = [
     "omegaconf>=2.3",
     "typer>=0.9",
     "rich>=13.0",
+    "pyarrow>=14.0",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +34,6 @@ train = [
     "accelerate>=0.30",
     "wandb>=0.16",
     "datasets>=2.18",
-    "pyarrow>=14.0",
 ]
 flash = [
     "flash-attn>=2.5",
