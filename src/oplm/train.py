@@ -24,11 +24,10 @@ def main(cfg: OplmConfig | None = None) -> None:
 
         cfg = load_config(sys.argv[1:])
 
-    # TODO: instantiate model, optimizer, dataloader, training loop
-    raise NotImplementedError(
-        "Training loop not yet implemented. "
-        "Model and config are ready — see docs/ARCHITECTURE.md for next steps."
-    )
+    from oplm.training import Trainer
+
+    trainer = Trainer(cfg)
+    trainer.train()
 
 
 if __name__ == "__main__":

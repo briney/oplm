@@ -122,16 +122,83 @@ class ModelConfig:
             )
 
 
+_VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
+_VALID_OPTIMIZERS = ("adamw",)
+_VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
+
+
 @dataclass
 class TrainConfig:
-    """Training configuration (stub)."""
+    """Training configuration."""
 
-    lr: float = 1e-4
+    # Duration
+    max_steps: int = 50_000
+    max_epochs: int | None = None
+
+    # Batch
     batch_size: int = 32
-    max_steps: int = 100_000
+    gradient_accumulation_steps: int = 1
+
+    # Optimizer
+    optimizer: str = "adamw"
+    lr: float = 1e-4
+    min_lr: float = 0.0
+    weight_decay: float = 0.01
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.98
+    adam_eps: float = 1e-8
+    max_grad_norm: float = 1.0
+
+    # Scheduler
+    scheduler: str = "warmup_linear"
+    warmup_steps: int = 5_000
+    stable_fraction: float = 0.0
+
+    # Logging
+    log_every: int = 10
+    eval_every: int = 10_000
+    wandb_project: str = "oplm"
+    wandb_run_name: str | None = None
+    wandb_enabled: bool = True
+
+    # Checkpointing
+    save_every: int = 10_000
+    save_total_limit: int = 3
+    resume_from: str | None = None
+
+    # Infrastructure
     seed: int = 42
     output_dir: str = "outputs"
     config_path: str | None = None
+    mixed_precision: str = "bf16"
+
+    def __post_init__(self) -> None:
+        """Validate training configuration."""
+        if self.optimizer not in _VALID_OPTIMIZERS:
+            raise ValueError(
+                f"optimizer must be one of {_VALID_OPTIMIZERS}, got {self.optimizer!r}"
+            )
+        if self.scheduler not in _VALID_SCHEDULERS:
+            raise ValueError(
+                f"scheduler must be one of {_VALID_SCHEDULERS}, got {self.scheduler!r}"
+            )
+        if self.mixed_precision not in _VALID_MIXED_PRECISION:
+            raise ValueError(
+                f"mixed_precision must be one of {_VALID_MIXED_PRECISION}, "
+                f"got {self.mixed_precision!r}"
+            )
+        if self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
+        if self.min_lr < 0:
+            raise ValueError(f"min_lr must be >= 0, got {self.min_lr}")
+        if self.min_lr > self.lr:
+            raise ValueError(f"min_lr ({self.min_lr}) must be <= lr ({self.lr})")
+        if not 0.0 <= self.stable_fraction < 1.0:
+            raise ValueError(f"stable_fraction must be in [0, 1), got {self.stable_fraction}")
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError(
+                f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
+            )
 
 
 @dataclass

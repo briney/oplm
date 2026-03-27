@@ -94,5 +94,9 @@ module = [
     "pyarrow.*",
     "flash_attn",
     "flash_attn.*",
+    "accelerate",
+    "accelerate.*",
+    "wandb",
+    "wandb.*",
 ]
 ignore_missing_imports = true
