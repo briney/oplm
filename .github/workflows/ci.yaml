@@ -22,7 +22,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev,train]"
+        run: pip install -e ".[dev,train,eval]"
 
       - name: Lint
         run: ruff check src/

@@ -54,7 +54,7 @@ def _residue_to_one_letter(residue_name: str) -> str:
     try:
         from Bio.Data.IUPACData import protein_letters_3to1
 
-        return protein_letters_3to1.get(residue_name.capitalize(), "X")
+        return str(protein_letters_3to1.get(residue_name.capitalize(), "X"))
     except ImportError as e:
         raise ImportError(
             "Structure evaluation requires biopython. Install with: pip install oplm[eval]"
