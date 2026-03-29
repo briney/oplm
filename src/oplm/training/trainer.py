@@ -28,6 +28,7 @@ class Trainer:
     ) -> None:
         from accelerate import Accelerator
         from accelerate.utils import set_seed
+        from rich.console import Console
 
         from oplm.data.loader import build_train_dataloader
         from oplm.model.transformer import OplmForMLM
@@ -35,13 +36,6 @@ class Trainer:
         from oplm.training.optim import build_optimizer, build_scheduler
 
         self.cfg = cfg
-
-        # Build evaluator from config if eval datasets are specified
-        self.evaluator: Evaluator | None = None
-        if cfg.data.eval is not None:
-            from oplm.eval import Evaluator
-
-            self.evaluator = Evaluator(cfg)
 
         # Seed everything
         set_seed(cfg.train.seed)
@@ -55,13 +49,42 @@ class Trainer:
             project_dir=cfg.train.output_dir,
         )
 
+        # Status helper for user-facing messages (main process only)
+        _console = Console()
+
+        def _status(msg: str) -> None:
+            if self.accelerator.is_main_process:
+                _console.print(msg)
+
+        # Init wandb early so login prompt appears before slow setup steps
+        if cfg.train.wandb_enabled:
+            _status("[dim]Initializing wandb...[/dim]")
+            init_kwargs: dict[str, Any] = {}
+            if cfg.train.wandb_run_name is not None:
+                init_kwargs["wandb"] = {"name": cfg.train.wandb_run_name}
+            self.accelerator.init_trackers(
+                project_name=cfg.train.wandb_project,
+                config=_config_to_flat_dict(cfg),
+                init_kwargs=init_kwargs,
+            )
+
+        # Build evaluator from config if eval datasets are specified
+        self.evaluator: Evaluator | None = None
+        if cfg.data.eval is not None:
+            _status("[dim]Building evaluator...[/dim]")
+            from oplm.eval import Evaluator
+
+            self.evaluator = Evaluator(cfg)
+
         # Model
+        _status("[dim]Building model...[/dim]")
         model = OplmForMLM(cfg.model)
         if cfg.model.gradient_checkpointing:
             model.encoder.gradient_checkpointing = True
 
-        # Optimizer and scheduler
+        # Optimizer and dataloader
         optimizer = build_optimizer(model, cfg.train)
+        _status("[dim]Loading training data...[/dim]")
         dataloader = build_train_dataloader(cfg)
 
         # Compute total_steps
@@ -69,6 +92,7 @@ class Trainer:
         scheduler = build_scheduler(optimizer, cfg.train, self.total_steps)
 
         # Prepare with accelerate
+        _status("[dim]Preparing for training...[/dim]")
         self.model, self.optimizer, self.dataloader, self.scheduler = self.accelerator.prepare(
             model, optimizer, dataloader, scheduler
         )
@@ -88,18 +112,8 @@ class Trainer:
 
         # Resume from checkpoint
         if cfg.train.resume_from is not None:
+            _status("[dim]Resuming from checkpoint...[/dim]")
             self._resume_from_checkpoint(cfg.train.resume_from)
-
-        # Init wandb
-        if cfg.train.wandb_enabled:
-            init_kwargs: dict[str, Any] = {}
-            if cfg.train.wandb_run_name is not None:
-                init_kwargs["wandb"] = {"name": cfg.train.wandb_run_name}
-            self.accelerator.init_trackers(
-                project_name=cfg.train.wandb_project,
-                config=_config_to_flat_dict(cfg),
-                init_kwargs=init_kwargs,
-            )
 
     def train(self) -> None:
         """Run the training loop."""
