@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from importlib.resources import files
+from pathlib import Path
 from typing import Any, cast
 
 from omegaconf import DictConfig, OmegaConf
@@ -72,6 +73,8 @@ class ModelConfig:
     # Training features
     gradient_checkpointing: bool = False
     tie_embeddings: bool = False
+    # Reserved for a future model-construction dtype surface. Runtime precision
+    # is currently controlled by ``train.mixed_precision``.
     dtype: str = "bfloat16"
 
     def __post_init__(self) -> None:
@@ -169,6 +172,7 @@ class TrainConfig:
     # Infrastructure
     seed: int = 42
     output_dir: str = "outputs"
+    # Provenance field populated by ``load_config()`` when a YAML file is used.
     config_path: str | None = None
     mixed_precision: str = "bf16"
 
@@ -436,6 +440,12 @@ def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEnt
             if raw_metrics is not None:
                 metrics = [str(m) for m in raw_metrics]
 
+            if "extra" in value:
+                raise ValueError(
+                    f"Eval dataset {name!r} uses deprecated nested 'extra' config. "
+                    "Put task-specific keys directly on the dataset entry instead."
+                )
+
             # Collect task-specific config keys into extra dict
             _KNOWN_EVAL_KEYS = {"path", "type", "eval_every", "metrics"}
             extra = {k: v for k, v in value.items() if k not in _KNOWN_EVAL_KEYS}
@@ -467,7 +477,8 @@ def load_config(argv: list[str]) -> OplmConfig:
             for YAML files, and dotlist overrides like ``model.num_layers=32``.
 
     Returns:
-        Fully resolved and validated OplmConfig.
+        Fully resolved and validated OplmConfig. If a YAML file was used,
+        ``cfg.train.config_path`` is populated with its absolute path.
     """
     base: DictConfig = OmegaConf.structured(OplmConfig)
 
@@ -482,7 +493,7 @@ def load_config(argv: list[str]) -> OplmConfig:
     i = 0
     while i < len(argv):
         if argv[i] == "--config" and i + 1 < len(argv):
-            config_path = argv[i + 1]
+            config_path = str(Path(argv[i + 1]).expanduser().resolve())
             i += 2
         elif argv[i] == "--preset" and i + 1 < len(argv):
             preset = argv[i + 1]
@@ -519,4 +530,5 @@ def load_config(argv: list[str]) -> OplmConfig:
 
     # Convert to dataclass instances (triggers __post_init__ validation)
     cfg: OplmConfig = OmegaConf.to_object(base)  # type: ignore[assignment]
+    cfg.train.config_path = config_path
     return cfg

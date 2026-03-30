@@ -71,6 +71,17 @@ class TestParseEvalConfigs:
         with pytest.raises(ValueError, match="Invalid data.eval config type"):
             parse_eval_configs("/just/a/string", default_eval_every=1000)
 
+    def test_nested_extra_raises_with_guidance(self) -> None:
+        raw = {
+            "structures": {
+                "path": "/data/structures",
+                "type": "structure",
+                "extra": {"contact_threshold": 8.0},
+            },
+        }
+        with pytest.raises(ValueError, match="deprecated nested 'extra' config"):
+            parse_eval_configs(raw, default_eval_every=1000)
+
     def test_extra_keys_preserved(self) -> None:
         raw = {
             "pdb": {

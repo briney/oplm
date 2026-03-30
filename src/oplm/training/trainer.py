@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from torch.utils.data import DataLoader
 
     from oplm.config import OplmConfig
     from oplm.eval.evaluator import Evaluator
+    from oplm.training.callbacks import TrainerCallback
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,7 @@ class Trainer:
     def __init__(
         self,
         cfg: OplmConfig,
+        callbacks: Sequence[TrainerCallback] | None = None,
     ) -> None:
         from accelerate import Accelerator
         from accelerate.utils import set_seed
@@ -36,6 +41,7 @@ class Trainer:
         from oplm.training.optim import build_optimizer, build_scheduler
 
         self.cfg = cfg
+        self.callbacks = list(callbacks or [])
 
         # Seed everything
         set_seed(cfg.train.seed)
@@ -145,6 +151,7 @@ class Trainer:
             )
             progress.start()
 
+        self._emit_train_start()
         self.model.train()
         data_iter = iter(self.dataloader)
         current_loss = float("nan")
@@ -160,14 +167,11 @@ class Trainer:
                     data_iter = iter(self.dataloader)
                     batch = next(data_iter)
 
-                # Convert (B, T) int mask -> (B, 1, 1, T) bool for SDPA
-                attention_mask = batch["attention_mask"].unsqueeze(1).unsqueeze(1).bool()
-
                 # Forward + backward inside accumulation context
                 with self.accelerator.accumulate(self.model):
                     outputs = self.model(
                         input_ids=batch["input_ids"],
-                        attention_mask=attention_mask,
+                        attention_mask=batch["attention_mask"],
                         labels=batch["labels"],
                     )
                     loss = outputs["loss"]
@@ -202,9 +206,11 @@ class Trainer:
                 # Evaluation
                 eval_metrics = self._run_eval()
                 if eval_metrics:
-                    if "eval/loss" in eval_metrics:
-                        self._last_eval_loss = eval_metrics["eval/loss"]
-                    self.accelerator.log(eval_metrics, step=self.global_step)
+                    eval_loss = self._extract_eval_loss(eval_metrics)
+                    if eval_loss is not None:
+                        self._last_eval_loss = eval_loss
+                    self._log_metrics(eval_metrics)
+                    self._emit_eval_end(eval_metrics)
 
                 # Checkpointing
                 if self.global_step % cfg.save_every == 0:
@@ -228,6 +234,7 @@ class Trainer:
         finally:
             if progress is not None:
                 progress.stop()
+            self._emit_train_end()
             self.accelerator.end_training()
 
     def _run_eval(self) -> dict[str, float]:
@@ -292,12 +299,13 @@ class Trainer:
             "train/flops": cumulative_flops,
             "train/lr": self.scheduler.get_last_lr()[0],
         }
-        self.accelerator.log(metrics, step=self.global_step)
+        self._log_metrics(metrics)
 
     def _save_checkpoint(self) -> None:
         """Save a training checkpoint."""
         from oplm.training.checkpoint import save_checkpoint
 
+        checkpoint_dir = Path(self.cfg.train.output_dir) / f"checkpoint-{self.global_step}"
         save_checkpoint(
             accelerator=self.accelerator,
             cfg=self.cfg,
@@ -307,6 +315,7 @@ class Trainer:
             tokens_seen=self.tokens_seen,
             save_total_limit=self.cfg.train.save_total_limit,
         )
+        self._emit_checkpoint_saved(checkpoint_dir)
 
     def _resume_from_checkpoint(self, checkpoint_dir: str) -> None:
         """Resume training state from a checkpoint."""
@@ -328,6 +337,58 @@ class Trainer:
             self.epoch,
             self.tokens_seen,
         )
+
+    @staticmethod
+    def _extract_eval_loss(metrics: dict[str, float]) -> float | None:
+        """Extract a progress-bar loss from evaluator output."""
+        if "eval/loss" in metrics:
+            return metrics["eval/loss"]
+
+        losses = [value for key, value in metrics.items() if key.endswith("/loss")]
+        if not losses:
+            return None
+        return sum(losses) / len(losses)
+
+    def _log_metrics(self, metrics: dict[str, float]) -> None:
+        """Log metrics and notify callbacks."""
+        self.accelerator.log(metrics, step=self.global_step)
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_log(self, dict(metrics), self.global_step)
+
+    def _emit_train_start(self) -> None:
+        """Notify callbacks that training is starting."""
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_train_start(self)
+
+    def _emit_eval_end(self, metrics: dict[str, float]) -> None:
+        """Notify callbacks that evaluation completed."""
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_eval_end(self, dict(metrics), self.global_step)
+
+    def _emit_checkpoint_saved(self, checkpoint_dir: Path) -> None:
+        """Notify callbacks that a checkpoint was saved."""
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_checkpoint_saved(self, checkpoint_dir, self.global_step)
+
+    def _emit_train_end(self) -> None:
+        """Notify callbacks that training has ended."""
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_train_end(self)
 
 
 def _config_to_flat_dict(cfg: OplmConfig) -> dict[str, Any]:

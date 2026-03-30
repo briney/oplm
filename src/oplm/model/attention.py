@@ -125,7 +125,9 @@ class Attention(nn.Module):
         Args:
             x: Hidden state ``(B, T, D)``.
             v_first: First layer's V for cross-layer value residuals.
-            attention_mask: Additive attention mask ``(B, 1, T, T)`` or ``(B, 1, 1, T)``.
+            attention_mask: Normalized 4D attention mask. Boolean masks are
+                interpreted as keep-masks; floating masks are interpreted as
+                additive bias terms.
             value_embed: Gated value embedding ``(B, T, KV_H, D_head)`` from ValueEmbedding.
             need_weights: If True, compute and return per-head attention weights
                 using manual attention (bypasses FlashAttention/SDPA). Default False.
@@ -218,7 +220,7 @@ class Attention(nn.Module):
 
         Args:
             q, k, v: Tensors of shape ``(B, T, H, D_head)``.
-            attention_mask: Optional additive mask.
+            attention_mask: Optional normalized 4D mask.
             need_weights: If True, compute attention manually and return
                 per-head weight matrix. Bypasses FlashAttention/SDPA.
 
@@ -234,7 +236,10 @@ class Attention(nn.Module):
             scale = q.size(-1) ** -0.5
             scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, T, T)
             if attention_mask is not None:
-                scores = scores + attention_mask
+                if attention_mask.dtype == torch.bool:
+                    scores = scores.masked_fill(~attention_mask, torch.finfo(scores.dtype).min)
+                else:
+                    scores = scores + attention_mask.to(dtype=scores.dtype)
             weights = scores.softmax(dim=-1)  # (B, H, T, T)
             attn_out = torch.matmul(weights, v)  # (B, H, T, D_head)
             return attn_out.transpose(1, 2), weights  # (B, T, H, D_head), (B, H, T, T)

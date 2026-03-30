@@ -50,10 +50,7 @@ def compute_mlm_metrics(
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # Convert (B, T) int mask → (B, 1, 1, T) bool for SDPA
-            attn_mask_4d = attention_mask.unsqueeze(1).unsqueeze(1).bool()
-
-            outputs = model(input_ids, attention_mask=attn_mask_4d, labels=labels)
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
             logits = outputs["logits"]  # (B, T, V)
 
             # Mask of positions that have labels (not -100)

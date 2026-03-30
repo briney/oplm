@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+_FAST_TRAINING_ROWS = 256
 
 
 @pytest.fixture(autouse=True)
@@ -23,11 +26,24 @@ def _reset_accelerator_state() -> None:
 
 
 @pytest.fixture(scope="session")
-def training_parquet() -> Path:
-    """Path to the real training sequences parquet file."""
+def full_training_parquet() -> Path:
+    """Path to the full real training sequences parquet file."""
     path = FIXTURES_DIR / "training" / "test_sequences.parquet"
     if not path.exists():
         pytest.skip(f"Training fixture not found: {path}")
+    return path
+
+
+@pytest.fixture(scope="session")
+def training_parquet(
+    full_training_parquet: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Small real-data parquet fixture derived from the full training dataset."""
+    path = tmp_path_factory.mktemp("fixtures") / "test_sequences_fast.parquet"
+    parquet_file = pq.ParquetFile(full_training_parquet)
+    first_batch = next(parquet_file.iter_batches(batch_size=_FAST_TRAINING_ROWS))
+    pq.write_table(pa.Table.from_batches([first_batch]), path)
     return path
 
 

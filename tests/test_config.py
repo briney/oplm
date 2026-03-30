@@ -241,6 +241,7 @@ class TestLoadConfig:
         cfg = load_config(["--config", str(config_file)])
         assert cfg.model.hidden_dim == 512
         assert cfg.model.num_heads == 8
+        assert cfg.train.config_path == str(config_file.resolve())
 
     def test_yaml_plus_overrides(self, tmp_path: Path) -> None:
         yaml_content = "model:\n  hidden_dim: 512\n  num_heads: 8\n  num_kv_heads: 4\n"

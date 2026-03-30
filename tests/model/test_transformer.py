@@ -154,6 +154,15 @@ class TestOplmEncoder:
         hidden, _ = encoder(input_ids, attention_mask=mask)
         assert hidden.shape == (B, T, cfg.hidden_dim)
 
+    def test_with_2d_attention_mask(self) -> None:
+        cfg = _make_config()
+        encoder = OplmEncoder(cfg)
+        input_ids = torch.randint(0, VOCAB, (B, T))
+        mask = torch.ones(B, T, dtype=torch.long)
+        mask[:, -2:] = 0
+        hidden, _ = encoder(input_ids, attention_mask=mask)
+        assert hidden.shape == (B, T, cfg.hidden_dim)
+
     def test_with_value_embeddings(self) -> None:
         cfg = _make_config(num_value_embeds=2)
         encoder = OplmEncoder(cfg)
@@ -344,16 +353,12 @@ class TestOplmForMLM:
     def test_tie_embeddings(self) -> None:
         cfg = _make_config(tie_embeddings=True)
         model = OplmForMLM(cfg)
-        assert (
-            model.mlm_head.projection.weight is model.encoder.embedding.embed.weight
-        )
+        assert model.mlm_head.projection.weight is model.encoder.embedding.embed.weight
 
     def test_no_tie_embeddings(self) -> None:
         cfg = _make_config(tie_embeddings=False)
         model = OplmForMLM(cfg)
-        assert (
-            model.mlm_head.projection.weight is not model.encoder.embedding.embed.weight
-        )
+        assert model.mlm_head.projection.weight is not model.encoder.embedding.embed.weight
 
     def test_attention_weights_returned(self) -> None:
         cfg = _make_config()

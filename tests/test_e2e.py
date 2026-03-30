@@ -16,6 +16,7 @@ import torch
 from oplm.config import DataConfig, ModelConfig, OplmConfig, TrainConfig
 from oplm.data.tokenizer import ProteinTokenizer
 from oplm.model.transformer import OplmForMLM
+from oplm.training import TrainerCallback
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,6 +35,16 @@ def _small_config(**overrides: object) -> ModelConfig:
     }
     defaults.update(overrides)
     return ModelConfig(**defaults)
+
+
+class _MetricRecorder(TrainerCallback):
+    """Capture trainer logs through the callback surface."""
+
+    def __init__(self) -> None:
+        self.logged: list[tuple[int, dict[str, float]]] = []
+
+    def on_log(self, trainer: object, metrics: dict[str, float], step: int) -> None:
+        self.logged.append((step, metrics))
 
 
 def _run_training(
@@ -66,18 +77,11 @@ def _run_training(
     cfg.data.max_length = 128
     cfg.data.num_workers = 0
 
-    trainer = Trainer(cfg)
-
-    losses: list[float] = []
-    orig_log = trainer._log_step
-
-    def _capture_log(loss: float) -> None:
-        losses.append(loss)
-        orig_log(loss)
-
-    trainer._log_step = _capture_log  # type: ignore[method-assign]
+    recorder = _MetricRecorder()
+    trainer = Trainer(cfg, callbacks=[recorder])
     trainer.train()
 
+    losses = [metrics["train/loss"] for _, metrics in recorder.logged if "train/loss" in metrics]
     return trainer, losses
 
 
@@ -279,26 +283,18 @@ class TestE2ETrainingWithEval:
             ),
         )
 
-        trainer = Trainer(cfg)
+        recorder = _MetricRecorder()
+        trainer = Trainer(cfg, callbacks=[recorder])
         assert trainer.evaluator is not None
         assert trainer.evaluator.has_tasks
 
-        # Capture eval metrics via accelerator.log
-        logged_metrics: list[dict[str, float]] = []
-        orig_log = trainer.accelerator.log
-
-        def _capture_log(values: dict[str, float], **kwargs: object) -> None:
-            logged_metrics.append(values)
-            orig_log(values, **kwargs)
-
-        trainer.accelerator.log = _capture_log
         trainer.train()
 
         # Eval should have fired at steps 10 and 20
-        assert len(logged_metrics) >= 2
+        assert len(recorder.logged) >= 2
         # Check that eval metrics are present
         combined = {}
-        for m in logged_metrics:
+        for _, m in recorder.logged:
             combined.update(m)
 
         assert "eval/test/loss" in combined
@@ -340,20 +336,13 @@ class TestE2ETrainingWithEval:
             ),
         )
 
-        trainer = Trainer(cfg)
-        logged_metrics: list[dict[str, float]] = []
-        orig_log = trainer.accelerator.log
-
-        def _capture_log(values: dict[str, float], **kwargs: object) -> None:
-            logged_metrics.append(values)
-            orig_log(values, **kwargs)
-
-        trainer.accelerator.log = _capture_log
+        recorder = _MetricRecorder()
+        trainer = Trainer(cfg, callbacks=[recorder])
         trainer.train()
 
-        assert len(logged_metrics) >= 1
+        assert len(recorder.logged) >= 1
         combined = {}
-        for m in logged_metrics:
+        for _, m in recorder.logged:
             combined.update(m)
 
         assert "eval/test/loss" in combined
@@ -397,24 +386,17 @@ class TestE2ETrainingWithEval:
             ),
         )
 
-        trainer = Trainer(cfg)
+        recorder = _MetricRecorder()
+        trainer = Trainer(cfg, callbacks=[recorder])
         assert trainer.evaluator is not None
         assert len(trainer.evaluator.tasks) == 2
 
         # Track which step each log call occurs at
-        logged_at_step: list[tuple[int, dict[str, float]]] = []
-        orig_log = trainer.accelerator.log
-
-        def _capture_log(values: dict[str, float], step: int = 0, **kwargs: object) -> None:
-            logged_at_step.append((step or trainer.global_step, values))
-            orig_log(values, step=step, **kwargs)
-
-        trainer.accelerator.log = _capture_log
         trainer.train()
 
         # Step 10: fast fires, slow doesn't
         step10_metrics = {}
-        for step, metrics in logged_at_step:
+        for step, metrics in recorder.logged:
             if step == 10:
                 step10_metrics.update(metrics)
 
@@ -423,7 +405,7 @@ class TestE2ETrainingWithEval:
 
         # Step 20: both fire
         step20_metrics = {}
-        for step, metrics in logged_at_step:
+        for step, metrics in recorder.logged:
             if step == 20:
                 step20_metrics.update(metrics)
 

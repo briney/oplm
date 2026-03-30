@@ -37,6 +37,15 @@ class SequenceEvalTask(EvalTask):
         super().__init__(entry, cfg)
         self._dataloader: DataLoader[dict[str, Tensor]] | None = None
 
+    def _reset_dataloader_state(self) -> None:
+        """Reset deterministic loader state before each evaluation pass."""
+        if self._dataloader is None:
+            return
+
+        reset = getattr(self._dataloader.collate_fn, "reset", None)
+        if callable(reset):
+            reset()
+
     def evaluate(
         self,
         model: OplmForMLM,
@@ -57,6 +66,7 @@ class SequenceEvalTask(EvalTask):
         """
         if self._dataloader is None:
             self._dataloader = build_sequence_eval_dataloader(self.path, self.cfg)
+        self._reset_dataloader_state()
 
         all_metrics = compute_mlm_metrics(model, self._dataloader, accelerator)
 

@@ -12,6 +12,7 @@ from oplm.model.attention import Attention
 from oplm.model.conv import BidirectionalDepthwiseConv
 from oplm.model.embedding import TokenEmbedding, ValueEmbedding
 from oplm.model.ffn import FFN
+from oplm.model.masking import normalize_attention_mask
 from oplm.model.norm import RMSNorm
 from oplm.model.residual import BlockAttentionResidual, BlockAttentionResidualState
 
@@ -66,7 +67,7 @@ class TransformerBlock(nn.Module):
         Args:
             x: Hidden state ``(B, T, D)``.
             v_first: First layer's V for cross-layer value residuals.
-            attention_mask: Attention mask ``(B, 1, T, T)`` or ``(B, 1, 1, T)``.
+            attention_mask: Normalized 4D attention mask.
             value_embed: Value embedding ``(B, T, KV_H, D_head)`` or None.
             need_weights: If True, return per-head attention weights.
 
@@ -108,7 +109,7 @@ class TransformerBlock(nn.Module):
 
         Args:
             v_first: First layer's V for cross-layer value residuals.
-            attention_mask: Attention mask.
+            attention_mask: Normalized 4D attention mask.
             value_embed: Value embedding or None.
             attn_res: Block attention residual module.
             state: Current block accumulation state.
@@ -169,7 +170,7 @@ class OplmEncoder(nn.Module):
 
         Args:
             input_ids: Token IDs ``(B, T)``.
-            attention_mask: Attention mask ``(B, 1, T, T)`` or ``(B, 1, 1, T)``.
+            attention_mask: Public keep mask ``(B, T)`` or a pre-expanded 4D mask.
             need_weights: If True, collect per-layer attention weights.
 
         Returns:
@@ -178,6 +179,7 @@ class OplmEncoder(nn.Module):
             tensors (one per layer) or None.
         """
         x = self.embedding(input_ids)  # (B, T, D)
+        attention_mask = normalize_attention_mask(attention_mask)
         v_first: Tensor | None = None
         all_attn_weights: list[Tensor] = []
 
@@ -280,7 +282,7 @@ class OplmForMLM(nn.Module):
 
         Args:
             input_ids: Token IDs ``(B, T)``.
-            attention_mask: Attention mask.
+            attention_mask: Public keep mask ``(B, T)`` or a pre-expanded 4D mask.
             labels: MLM targets ``(B, T)`` with ``-100`` for non-masked positions.
             need_weights: If True, include per-layer attention weights.
 

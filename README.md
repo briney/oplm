@@ -19,7 +19,7 @@ OPLM integrates ideas from [Proust](https://arxiv.org/abs/2602.01845) (grouped-q
 - **Distributed training** via HuggingFace Accelerate with FSDP, mixed precision (bf16/fp16), and gradient checkpointing
 - **Optional FlashAttention** support for efficient long-sequence training
 - **Built-in evaluation** for MLM metrics (loss, accuracy, perplexity) and structure-based contact prediction
-- **Five model presets** from 25M to 15B parameters
+- **Five model presets** from 4.8M to 11.0B parameters
 
 ---
 
@@ -133,6 +133,17 @@ with torch.no_grad():
 print(hidden.shape)  # (2, 512, 768)
 ```
 
+For checkpoint-backed inference, use the shared loader so training-produced checkpoint
+directories work without manual state-dict handling:
+
+```python
+from oplm.inference import load_model_for_inference, resolve_inference_config
+
+checkpoint = "outputs/medium-run/checkpoint-10000"
+cfg = resolve_inference_config(checkpoint)
+model = load_model_for_inference(checkpoint, cfg)
+```
+
 ### Masked language modeling
 
 ```python
@@ -161,7 +172,9 @@ oplm train --config configs/my_run.yaml
 oplm train --preset medium
 
 # preset + overrides
-oplm train --preset large model.num_layers=16 train.lr=3e-4
+oplm train --preset large \
+  --override model.num_layers=16 \
+  --override train.lr=3e-4
 
 # distributed training with Accelerate
 accelerate launch -m oplm.train --config configs/my_run.yaml
@@ -171,7 +184,7 @@ accelerate launch -m oplm.train --config configs/my_run.yaml
 
 ```bash
 oplm encode MKWVTFISLLLLFSSAYS MLPGLALLLLAAWTARA \
-  --model /path/to/checkpoint.pt \
+  --model /path/to/checkpoint-10000 \
   --output embeddings.pt
 ```
 
@@ -199,15 +212,22 @@ oplm info --preset medium
 
 OPLM uses a layered config system: **defaults -> preset -> YAML file -> CLI overrides**, with later sources taking priority.
 
+The canonical field-by-field reference lives in [configs/README.md](configs/README.md).
+Runtime precision is controlled by `train.mixed_precision`; `model.dtype` is currently a
+reserved placeholder.
+`oplm` CLI commands take repeated `--override key=value` flags, while
+`accelerate launch -m oplm.train ...` still passes raw dotlist overrides through to
+`load_config()`.
+
 ### Model presets
 
 | Preset   | Parameters | Layers | Hidden | Heads | KV Heads |
 |----------|-----------|--------|--------|-------|----------|
-| `small`  | ~25M      | 6      | 256    | 4     | 2        |
-| `medium` | ~150M     | 12     | 768    | 12    | 4        |
-| `base`   | ~350M     | 24     | 1024   | 16    | 4        |
-| `large`  | ~3B       | 32     | 2560   | 32    | 8        |
-| `xlarge` | ~15B      | 40     | 5120   | 40    | 8        |
+| `small`  | ~4.8M     | 6      | 256    | 4     | 2        |
+| `medium` | ~76.2M    | 12     | 768    | 12    | 4        |
+| `base`   | ~271.7M   | 24     | 1024   | 16    | 4        |
+| `large`  | ~2.2B     | 32     | 2560   | 32    | 8        |
+| `xlarge` | ~11.0B    | 40     | 5120   | 40    | 8        |
 
 ### YAML config example
 
@@ -272,9 +292,8 @@ data:
       path: /path/to/pdb_directory
       type: structure
       eval_every: 10_000
-      extra:
-        contact_threshold: 8.0
-        use_logistic_regression: true
+      contact_threshold: 8.0
+      use_logistic_regression: true
 ```
 
 Evaluation runs automatically during training at the configured interval, with results logged to Weights & Biases.

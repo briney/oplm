@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from oplm.config import AVAILABLE_PRESETS, load_config
+from oplm.inference import load_model_for_inference, resolve_inference_config
 
 app = typer.Typer(name="oplm", help="Open Protein Language Model")
 console = Console()
@@ -20,7 +21,10 @@ _PRESET_HELP = f"Model size preset ({', '.join(AVAILABLE_PRESETS)})"
 
 ConfigOpt = Annotated[str | None, typer.Option("--config", "-c", help="Path to YAML config")]
 PresetOpt = Annotated[str | None, typer.Option("--preset", "-p", help=_PRESET_HELP)]
-OverridesArg = Annotated[list[str] | None, typer.Argument(help="Config overrides (key=value)")]
+OverridesOpt = Annotated[
+    list[str] | None,
+    typer.Option("--override", help="Config override (key=value). Repeat as needed."),
+]
 
 
 def _build_argv(
@@ -43,7 +47,7 @@ def _build_argv(
 def train(
     config: ConfigOpt = None,
     preset: PresetOpt = None,
-    overrides: OverridesArg = None,
+    overrides: OverridesOpt = None,
 ) -> None:
     """Launch training.
 
@@ -61,29 +65,29 @@ def train(
 @app.command()
 def encode(
     sequences: Annotated[list[str], typer.Argument(help="Protein sequences to encode")],
-    model_path: Annotated[str, typer.Option("--model", "-m", help="Path to model checkpoint")],
+    model_path: Annotated[
+        str,
+        typer.Option("--model", "-m", help="Path to model weights file or checkpoint directory"),
+    ],
     output: Annotated[
         str, typer.Option("--output", "-o", help="Output file path")
     ] = "embeddings.pt",
     config: ConfigOpt = None,
     preset: PresetOpt = None,
-    overrides: Annotated[
-        list[str] | None, typer.Option("--override", help="Config overrides")
-    ] = None,
+    overrides: OverridesOpt = None,
 ) -> None:
     """Encode protein sequences to embeddings."""
     import torch
 
     from oplm.data.tokenizer import ProteinTokenizer
-    from oplm.model import OplmForMLM
 
-    cfg = load_config(_build_argv(config, preset, overrides))
-
-    # Load model
-    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
-    model = OplmForMLM(cfg.model)
-    model.load_state_dict(checkpoint)
-    model.eval()
+    cfg = resolve_inference_config(
+        model_path,
+        config_path=config,
+        preset=preset,
+        overrides=overrides,
+    )
+    model = load_model_for_inference(model_path, cfg)
 
     # Tokenize and encode
     tokenizer = ProteinTokenizer()
@@ -101,7 +105,7 @@ def encode(
 def info(
     config: ConfigOpt = None,
     preset: PresetOpt = None,
-    overrides: OverridesArg = None,
+    overrides: OverridesOpt = None,
 ) -> None:
     """Print model config and parameter count."""
     import torch

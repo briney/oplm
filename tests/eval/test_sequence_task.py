@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
+import pytest
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -181,6 +183,44 @@ class TestSequenceEvalTaskEvaluate:
         dl_second = task._dataloader
 
         assert dl_first is dl_second
+
+    def test_repeated_evaluate_is_stable(self, training_parquet: Path) -> None:
+        """Repeated evaluations should return identical metrics."""
+        cfg = _make_cfg(max_length=64, batch_size=4)
+        entry = _make_entry(path=str(training_parquet))
+        task = SequenceEvalTask(entry, cfg)
+
+        model = OplmForMLM(cfg.model)
+        model.eval()
+
+        acc = MagicMock()
+        acc.device = __import__("torch").device("cpu")
+        acc.reduce = lambda tensor, reduction: tensor
+
+        first_metrics = task.evaluate(model, acc)
+        second_metrics = task.evaluate(model, acc)
+
+        assert second_metrics == first_metrics
+
+    @pytest.mark.slow
+    def test_evaluate_with_full_fixture(self, full_training_parquet: Path) -> None:
+        """The full held-out parquet should still support an end-to-end eval pass."""
+        cfg = _make_cfg(max_length=64, batch_size=256)
+        entry = _make_entry(path=str(full_training_parquet))
+        task = SequenceEvalTask(entry, cfg)
+
+        model = OplmForMLM(cfg.model)
+        model.eval()
+
+        acc = MagicMock()
+        acc.device = __import__("torch").device("cpu")
+        acc.reduce = lambda tensor, reduction: tensor
+
+        metrics = task.evaluate(model, acc)
+
+        assert metrics["loss"] > 0.0
+        assert 0.0 <= metrics["accuracy"] <= 1.0
+        assert metrics["perplexity"] > 1.0
 
 
 class TestSequenceEvalTaskIntegration:

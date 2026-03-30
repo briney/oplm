@@ -128,6 +128,22 @@ class TestAttentionNeedWeights:
         _, _, weights = attn(x, attention_mask=mask, need_weights=True)
         assert weights[:, :, :, 4:].abs().max() < 1e-6
 
+    def test_bool_mask_matches_default_path(self) -> None:
+        """Boolean keep-masks should behave the same in SDPA and manual paths."""
+        cfg = _make_config()
+        attn = Attention(cfg, layer_idx=0)
+        attn.eval()
+        x = torch.randn(2, 8, cfg.hidden_dim)
+        mask = torch.ones(2, 1, 1, 8, dtype=torch.bool)
+        mask[:, :, :, 4:] = False
+
+        with torch.no_grad():
+            out_default, _, _ = attn(x, attention_mask=mask, need_weights=False)
+            out_manual, _, weights = attn(x, attention_mask=mask, need_weights=True)
+
+        torch.testing.assert_close(out_default, out_manual, atol=1e-4, rtol=1e-4)
+        assert weights[:, :, :, 4:].abs().max() < 1e-6
+
     def test_with_shared_kv(self) -> None:
         cfg = _make_config(shared_kv=True)
         attn = Attention(cfg, layer_idx=0)

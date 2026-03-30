@@ -190,11 +190,9 @@ class StructureEvalTask(EvalTask):
 
         # Forward pass with attention weights
         with torch.no_grad():
-            # Expand 2D mask to 4D: (B, 1, 1, T) for the encoder
-            attn_mask_4d = attention_mask.unsqueeze(1).unsqueeze(1).bool()
             outputs = model(
                 input_ids=input_ids,
-                attention_mask=attn_mask_4d,
+                attention_mask=attention_mask,
                 need_weights=True,
             )
 
@@ -207,7 +205,7 @@ class StructureEvalTask(EvalTask):
             attn_weights_cpu.append(sliced)
 
         # Free GPU memory
-        del raw_attn, outputs, input_ids, attention_mask, attn_mask_4d
+        del raw_attn, outputs, input_ids, attention_mask
         if device.type == "cuda":
             torch.cuda.empty_cache()
 

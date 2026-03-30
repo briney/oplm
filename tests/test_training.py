@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import random
 import tempfile
 from pathlib import Path
@@ -14,6 +13,7 @@ import pytest
 import torch
 
 from oplm.config import ModelConfig, OplmConfig, TrainConfig
+from oplm.training import TrainerCallback
 from oplm.training.flops import estimate_flops_per_token
 from oplm.training.optim import build_optimizer, build_scheduler, get_schedule_fn
 
@@ -36,6 +36,34 @@ def _small_model_config(**overrides: object) -> ModelConfig:
     }
     defaults.update(overrides)
     return ModelConfig(**defaults)
+
+
+class _MetricRecorder(TrainerCallback):
+    """Capture trainer events without monkeypatching internals."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.ended = False
+        self.train_losses: list[float] = []
+        self.eval_events: list[tuple[int, dict[str, float]]] = []
+        self.checkpoints: list[Path] = []
+
+    def on_train_start(self, trainer: object) -> None:
+        self.started = True
+
+    def on_log(self, trainer: object, metrics: dict[str, float], step: int) -> None:
+        loss = metrics.get("train/loss")
+        if loss is not None:
+            self.train_losses.append(loss)
+
+    def on_eval_end(self, trainer: object, metrics: dict[str, float], step: int) -> None:
+        self.eval_events.append((step, metrics))
+
+    def on_checkpoint_saved(self, trainer: object, checkpoint_dir: Path, step: int) -> None:
+        self.checkpoints.append(checkpoint_dir)
+
+    def on_train_end(self, trainer: object) -> None:
+        self.ended = True
 
 
 @pytest.fixture()
@@ -87,9 +115,7 @@ class TestScheduler:
         assert fn(midpoint) == pytest.approx(0.5, abs=0.01)
 
     def test_min_ratio(self) -> None:
-        fn = get_schedule_fn(
-            "warmup_linear", warmup_steps=100, total_steps=1000, min_ratio=0.1
-        )
+        fn = get_schedule_fn("warmup_linear", warmup_steps=100, total_steps=1000, min_ratio=0.1)
         assert fn(0) == pytest.approx(0.0)
         assert fn(100) == pytest.approx(1.0)
         # At end, should decay to min_ratio, not 0
@@ -161,8 +187,7 @@ class TestOptimizer:
         assert no_decay_group["weight_decay"] == 0.0
 
         # All 1D params should be in no_decay group
-        for p in no_decay_group["params"]:
-            assert p.ndim <= 1 or True  # embed params can be 2D
+        assert all(p.ndim <= 2 for p in no_decay_group["params"])
 
         # Decay group should have 2D+ params
         for p in decay_group["params"]:
@@ -296,9 +321,7 @@ class TestCheckpoint:
             )
 
         # Only the 2 most recent should remain
-        checkpoint_dirs = sorted(
-            d for d in tmp_path.iterdir() if d.name.startswith("checkpoint-")
-        )
+        checkpoint_dirs = sorted(d for d in tmp_path.iterdir() if d.name.startswith("checkpoint-"))
         assert len(checkpoint_dirs) == 2
         assert checkpoint_dirs[0].name == "checkpoint-300"
         assert checkpoint_dirs[1].name == "checkpoint-400"
@@ -355,6 +378,19 @@ class TestTrainConfigValidation:
 class TestTrainerIntegration:
     """Test the full Trainer with synthetic parquet data."""
 
+    def test_extract_eval_loss_averages_dataset_losses(self) -> None:
+        from oplm.training import Trainer
+
+        eval_loss = Trainer._extract_eval_loss(
+            {
+                "eval/heldout/loss": 2.0,
+                "eval/heldout/accuracy": 0.5,
+                "eval/structures/loss": 4.0,
+            }
+        )
+
+        assert eval_loss == pytest.approx(3.0)
+
     def test_trainer_loss_decreases(self, parquet_dataset: Path) -> None:
         """Train a small model for 20 steps, verify loss decreases."""
         torch.manual_seed(42)
@@ -381,21 +417,13 @@ class TestTrainerIntegration:
 
         from oplm.training import Trainer
 
-        trainer = Trainer(cfg)
-
-        # Capture losses via a simple eval_fn that records train loss
-        losses: list[float] = []
-        orig_log = trainer._log_step
-
-        def _capture_log(loss: float) -> None:
-            losses.append(loss)
-            orig_log(loss)
-
-        trainer._log_step = _capture_log  # type: ignore[method-assign]
-
+        recorder = _MetricRecorder()
+        trainer = Trainer(cfg, callbacks=[recorder])
         trainer.train()
 
-        assert len(losses) > 0
+        assert recorder.started
+        assert recorder.ended
+        assert len(recorder.train_losses) > 0
         assert trainer.global_step == 20
         assert trainer.tokens_seen > 0
 
@@ -407,7 +435,6 @@ class TestTrainerIntegration:
         eval_calls: list[int] = []
 
         # Patch in a mock eval task via the registry
-        from oplm.config import EvalDatasetEntry
         from oplm.eval.registry import EVAL_TASK_REGISTRY
         from oplm.eval.tasks.base import EvalTask
 
@@ -443,11 +470,64 @@ class TestTrainerIntegration:
         from oplm.training import Trainer
 
         try:
-            trainer = Trainer(cfg)
+            recorder = _MetricRecorder()
+            trainer = Trainer(cfg, callbacks=[recorder])
             trainer.train()
 
             # Evaluator should have been called at steps 10 and 20
             assert len(eval_calls) == 2
+            assert trainer._last_eval_loss == pytest.approx(1.0)
+        finally:
+            EVAL_TASK_REGISTRY.pop("_mock", None)
+
+    def test_trainer_callbacks_receive_eval_and_checkpoint_events(
+        self, parquet_dataset: Path
+    ) -> None:
+        """Callbacks expose a stable observation surface for trainer lifecycle events."""
+        from oplm.eval.registry import EVAL_TASK_REGISTRY
+        from oplm.eval.tasks.base import EvalTask
+        from oplm.training import Trainer
+
+        class _MockTask(EvalTask):
+            default_metrics = ["loss"]
+
+            def evaluate(self, model: object, accelerator: object) -> dict[str, float]:
+                return {"loss": 1.5}
+
+        EVAL_TASK_REGISTRY["_mock"] = _MockTask
+
+        cfg = OplmConfig(
+            model=_small_model_config(),
+            train=TrainConfig(
+                max_steps=3,
+                batch_size=8,
+                lr=1e-3,
+                warmup_steps=1,
+                log_every=1,
+                eval_every=2,
+                save_every=2,
+                wandb_enabled=False,
+                mixed_precision="no",
+                output_dir=tempfile.mkdtemp(),
+            ),
+        )
+        cfg.data.train = str(parquet_dataset)
+        cfg.data.eval = {"mock_ds": {"path": "/fake", "type": "_mock"}}
+        cfg.data.max_length = 64
+        cfg.data.num_workers = 0
+
+        try:
+            recorder = _MetricRecorder()
+            trainer = Trainer(cfg, callbacks=[recorder])
+            trainer.train()
+
+            assert recorder.started
+            assert recorder.ended
+            assert len(recorder.train_losses) == 3
+            assert [step for step, _ in recorder.eval_events] == [2]
+            assert recorder.eval_events[0][1] == {"eval/mock_ds/loss": 1.5}
+            assert trainer._last_eval_loss == pytest.approx(1.5)
+            assert [path.name for path in recorder.checkpoints] == ["checkpoint-2", "checkpoint-3"]
         finally:
             EVAL_TASK_REGISTRY.pop("_mock", None)
 
@@ -482,9 +562,7 @@ class TestTrainerIntegration:
         trainer.train()
 
         output_path = Path(output_dir)
-        checkpoints = sorted(
-            d for d in output_path.iterdir() if d.name.startswith("checkpoint-")
-        )
+        checkpoints = sorted(d for d in output_path.iterdir() if d.name.startswith("checkpoint-"))
         assert len(checkpoints) >= 2  # save_every=5 -> step 5 and final at step 10
 
         # Verify trainer state in the final checkpoint
