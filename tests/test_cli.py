@@ -82,6 +82,7 @@ def _create_inference_checkpoint(tmp_path: Path) -> tuple[Path, torch.Tensor]:
         output_dir=str(tmp_path),
         global_step=1,
         epoch=0,
+        samples_seen=0,
         tokens_seen=0,
         save_total_limit=1,
     )

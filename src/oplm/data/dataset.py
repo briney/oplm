@@ -26,7 +26,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, str]]):
 
     Handles both a single parquet file and a directory of parquet shards.
     Loads one shard at a time to bound memory usage. Supports deterministic
-    per-epoch shuffling and distributed rank/worker striping.
+    per-epoch shuffling and worker striping. Distributed process sharding is
+    delegated to the training launcher (for example, Accelerate).
 
     Parquet files must contain columns ``sequence_id`` (str) and
     ``sequence`` (str).
@@ -72,12 +73,16 @@ class ShardedProteinDataset(IterableDataset[dict[str, str]]):
             self._shards.append(sp)
             self._rows_per_shard.append(pf.metadata.num_rows)
 
-        self._offsets = np.cumsum([0] + self._rows_per_shard[:-1]).tolist()
         self._total_rows = sum(self._rows_per_shard)
 
     def __len__(self) -> int:
-        """Approximate dataset length (total rows / world_size)."""
-        return self._total_rows // max(1, _get_world_size())
+        """Return the total number of raw examples in the dataset."""
+        return self.total_length
+
+    @property
+    def total_length(self) -> int:
+        """Return the total number of raw examples in the dataset."""
+        return self._total_rows
 
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch for deterministic shuffling.
@@ -91,8 +96,6 @@ class ShardedProteinDataset(IterableDataset[dict[str, str]]):
         self._epoch += 1
         seed_base = (_PHI ^ self._seed) + (self._epoch * _PRIME)
 
-        rank, world_size = _get_rank_and_world()
-
         wi = get_worker_info()
         if wi is None:
             num_workers, worker_id = 1, 0
@@ -105,28 +108,17 @@ class ShardedProteinDataset(IterableDataset[dict[str, str]]):
             rng = np.random.default_rng(seed_base & _SEED_MASK)
             rng.shuffle(shard_indices)
 
-        # Cap per-rank to keep equal counts across ranks
-        per_rank_cap = self._total_rows // max(1, world_size)
-        emitted = 0
-
         for s_idx in shard_indices:
-            if emitted >= per_rank_cap:
-                break
             nrows = self._rows_per_shard[s_idx]
-            offset = self._offsets[s_idx]
-
-            # Global striping: assign rows to this rank
-            rank_rows = [i for i in range(nrows) if ((offset + i) % world_size) == rank]
-            if not rank_rows:
-                continue
-
+            row_indices = list(range(nrows))
             if self._shuffle_rows:
                 rng_rows = np.random.default_rng((seed_base + 1009 + s_idx) & _SEED_MASK)
-                rng_rows.shuffle(rank_rows)
+                rng_rows.shuffle(row_indices)
 
-            # Worker striping within rank
-            rank_rows = rank_rows[worker_id::num_workers]
-            if not rank_rows:
+            # Worker striping happens within a process; distributed sharding is
+            # handled by the outer dataloader wrapper.
+            worker_rows = row_indices[worker_id::num_workers]
+            if not worker_rows:
                 continue
 
             # Read only needed columns from this shard
@@ -134,14 +126,11 @@ class ShardedProteinDataset(IterableDataset[dict[str, str]]):
             seq_ids = table.column("sequence_id")
             sequences = table.column("sequence")
 
-            for i in rank_rows:
-                if emitted >= per_rank_cap:
-                    break
+            for i in worker_rows:
                 yield {
                     "sequence_id": seq_ids[i].as_py(),
                     "sequence": sequences[i].as_py(),
                 }
-                emitted += 1
 
 
 class InterleavedDataset(IterableDataset[dict[str, str]]):
@@ -200,6 +189,11 @@ class InterleavedDataset(IterableDataset[dict[str, str]]):
         self._num_samples = num_samples
 
     def __len__(self) -> int:
+        return self.total_length
+
+    @property
+    def total_length(self) -> int:
+        """Return the nominal number of samples in one mixed-data epoch."""
         return self._num_samples
 
     def set_epoch(self, epoch: int) -> None:
@@ -238,20 +232,3 @@ class InterleavedDataset(IterableDataset[dict[str, str]]):
             except StopIteration:
                 iters[ds_idx] = iter(self._datasets[ds_idx])
                 yield next(iters[ds_idx])
-
-
-def _get_rank_and_world() -> tuple[int, int]:
-    """Get distributed rank and world size, defaulting to (0, 1)."""
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank(), dist.get_world_size()
-    except Exception:
-        pass
-    return 0, 1
-
-
-def _get_world_size() -> int:
-    """Get distributed world size, defaulting to 1."""
-    return _get_rank_and_world()[1]

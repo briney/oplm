@@ -24,6 +24,7 @@ def save_checkpoint(
     output_dir: str,
     global_step: int,
     epoch: int,
+    samples_seen: int,
     tokens_seen: int,
     save_total_limit: int = 3,
 ) -> None:
@@ -39,6 +40,7 @@ def save_checkpoint(
         output_dir: Base output directory (checkpoints saved under subdirs).
         global_step: Current global training step.
         epoch: Current epoch number.
+        samples_seen: Cumulative training samples processed globally.
         tokens_seen: Cumulative training tokens processed.
         save_total_limit: Maximum number of checkpoints to keep.
     """
@@ -50,6 +52,7 @@ def save_checkpoint(
         state = {
             "global_step": global_step,
             "epoch": epoch,
+            "samples_seen": samples_seen,
             "tokens_seen": tokens_seen,
         }
         state_path = checkpoint_dir / "trainer_state.json"
@@ -79,7 +82,8 @@ def load_checkpoint(
         checkpoint_dir: Path to the checkpoint directory.
 
     Returns:
-        Dict with keys ``global_step``, ``epoch``, ``tokens_seen``.
+        Dict with keys ``global_step``, ``epoch``, ``tokens_seen``, and
+        optionally ``samples_seen`` for backward compatibility.
 
     Raises:
         FileNotFoundError: If the checkpoint directory or state file is missing.

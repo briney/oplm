@@ -6,6 +6,7 @@ Run distributed:  accelerate launch -m oplm.train --config configs/my_run.yaml m
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
@@ -24,6 +25,7 @@ _DEEPSPEED_ENV_VARS = (
     "ACCELERATE_DEEPSPEED_MOE_LAYER_CLS_NAMES",
     "ACCELERATE_CONFIG_DS_FIELDS",
 )
+_DEEPSPEED_LOGGER_NAME = "DeepSpeed"
 
 
 def _env_flag_is_enabled(value: str | None) -> bool:
@@ -56,6 +58,11 @@ def _ensure_triton_cache_dir(
     raise RuntimeError("Unable to create a Triton cache directory for training.")
 
 
+def _set_deepspeed_logger_enabled(enabled: bool) -> None:
+    logger = logging.getLogger(_DEEPSPEED_LOGGER_NAME)
+    logger.disabled = not enabled
+
+
 def _bootstrap_training_environment(
     env: MutableMapping[str, str] | None = None,
     *,
@@ -63,12 +70,14 @@ def _bootstrap_training_environment(
     tmp_dir: Path | None = None,
 ) -> Path:
     runtime_env = os.environ if env is None else env
+    deepspeed_enabled = _env_flag_is_enabled(runtime_env.get(_DEEPSPEED_OPT_IN_ENV))
 
-    if not _env_flag_is_enabled(runtime_env.get(_DEEPSPEED_OPT_IN_ENV)):
+    if not deepspeed_enabled:
         runtime_env["ACCELERATE_USE_DEEPSPEED"] = "false"
         for key in _DEEPSPEED_ENV_VARS[1:]:
             runtime_env.pop(key, None)
 
+    _set_deepspeed_logger_enabled(deepspeed_enabled)
     return _ensure_triton_cache_dir(runtime_env, home_dir=home_dir, tmp_dir=tmp_dir)
 
 

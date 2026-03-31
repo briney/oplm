@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -94,6 +95,7 @@ class Trainer:
         optimizer = build_optimizer(model, cfg.train)
         _status("[dim]Loading training data...[/dim]")
         dataloader = build_train_dataloader(cfg)
+        raw_dataset_size = self._get_dataset_size_from_dataloader(dataloader)
 
         # Compute total_steps
         self.total_steps = self._compute_total_steps(cfg, dataloader)
@@ -116,7 +118,7 @@ class Trainer:
         self.flops_per_token = estimate_flops_per_token(cfg.model)
 
         # Dataset size for fractional epoch computation
-        self._dataset_size = self._get_dataset_size()
+        self._dataset_size = raw_dataset_size
 
         # Resume from checkpoint
         if cfg.train.resume_from is not None:
@@ -265,21 +267,15 @@ class Trainer:
                 * cfg.train.gradient_accumulation_steps
                 * self.accelerator.num_processes
             )
-            steps_per_epoch = max(1, dataset_size // effective_batch)
+            steps_per_epoch = max(1, math.ceil(dataset_size / effective_batch))
             return steps_per_epoch * cfg.train.max_epochs
         return cfg.train.max_steps
 
     @staticmethod
     def _get_dataset_size_from_dataloader(dataloader: DataLoader) -> int:  # type: ignore[type-arg]
         """Get the dataset size from the dataloader."""
-        try:
-            return len(dataloader.dataset)  # type: ignore[arg-type]
-        except TypeError:
-            return 0
-
-    def _get_dataset_size(self) -> int:
-        """Get dataset size for fractional epoch computation."""
-        return self._get_dataset_size_from_dataloader(self.dataloader)
+        dataset = getattr(dataloader, "dataset", None)
+        return _resolve_total_length(dataset)
 
     def _fractional_epoch(self) -> float:
         """Compute the current fractional epoch."""
@@ -289,6 +285,10 @@ class Trainer:
 
     def _set_dataset_epoch(self, epoch: int) -> None:
         """Propagate epoch to the dataset for deterministic shuffling."""
+        if hasattr(self.dataloader, "set_epoch"):
+            self.dataloader.set_epoch(epoch)
+            return
+
         dataset = self.dataloader.dataset
         if hasattr(dataset, "set_epoch"):
             dataset.set_epoch(epoch)
@@ -301,6 +301,7 @@ class Trainer:
         metrics = {
             "train/loss": loss,
             "train/epoch": fractional_epoch,
+            "train/samples": self._samples_seen,
             "train/tokens": self.tokens_seen,
             "train/flops": cumulative_flops,
             "train/lr": self.scheduler.get_last_lr()[0],
@@ -318,6 +319,7 @@ class Trainer:
             output_dir=self.cfg.train.output_dir,
             global_step=self.global_step,
             epoch=self.epoch,
+            samples_seen=self._samples_seen,
             tokens_seen=self.tokens_seen,
             save_total_limit=self.cfg.train.save_total_limit,
         )
@@ -331,17 +333,26 @@ class Trainer:
         self.global_step = state["global_step"]
         self.epoch = state["epoch"]
         self.tokens_seen = state["tokens_seen"]
-
-        # Approximate samples_seen from tokens and dataset for epoch tracking
-        if self._dataset_size > 0:
-            self._samples_seen = int(self._fractional_epoch() * self._dataset_size)
+        self._samples_seen = int(
+            state.get("samples_seen", self.global_step * self._global_effective_batch_size())
+        )
+        self._set_dataset_epoch(self.epoch)
 
         logger.info(
-            "Resumed from checkpoint %s (step=%d, epoch=%d, tokens=%d)",
+            "Resumed from checkpoint %s (step=%d, epoch=%d, samples=%d, tokens=%d)",
             checkpoint_dir,
             self.global_step,
             self.epoch,
+            self._samples_seen,
             self.tokens_seen,
+        )
+
+    def _global_effective_batch_size(self) -> int:
+        """Return the batch size represented by one optimizer step."""
+        return (
+            self.cfg.train.batch_size
+            * self.cfg.train.gradient_accumulation_steps
+            * self.accelerator.num_processes
         )
 
     @staticmethod
@@ -409,3 +420,24 @@ def _config_to_flat_dict(cfg: OplmConfig) -> dict[str, Any]:
         else:
             flat[section_name] = section
     return flat
+
+
+def _resolve_total_length(dataset: object) -> int:
+    """Resolve the raw dataset length through wrapper layers."""
+    if dataset is None:
+        return 0
+
+    total_length = getattr(dataset, "total_length", None)
+    if total_length is not None:
+        return int(total_length)
+
+    child_dataset = getattr(dataset, "dataset", None)
+    if child_dataset is not None and child_dataset is not dataset:
+        child_length = _resolve_total_length(child_dataset)
+        if child_length > 0:
+            return child_length
+
+    try:
+        return len(dataset)  # type: ignore[arg-type]
+    except TypeError:
+        return 0

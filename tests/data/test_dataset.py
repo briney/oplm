@@ -78,6 +78,7 @@ class TestShardedProteinDataset:
     def test_len(self, sharded_dir: Path) -> None:
         ds = ShardedProteinDataset(sharded_dir)
         assert len(ds) == 10
+        assert ds.total_length == 10
 
     def test_shuffle_changes_order(self, sharded_dir: Path) -> None:
         ds = ShardedProteinDataset(sharded_dir, shuffle_shards=True, shuffle_rows=True, seed=42)
@@ -139,6 +140,7 @@ class TestInterleavedDataset:
         interleaved = InterleavedDataset([ds_a, ds_b], [0.5, 0.5], seed=42)
         samples = list(interleaved)
         assert len(samples) == 10  # 5 + 5
+        assert interleaved.total_length == 10
 
     def test_fraction_approximate(self, tmp_path: Path) -> None:
         # Create two datasets, sample heavily from one

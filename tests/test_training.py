@@ -45,6 +45,7 @@ class _MetricRecorder(TrainerCallback):
     def __init__(self) -> None:
         self.started = False
         self.ended = False
+        self.logged: list[tuple[int, dict[str, float | int]]] = []
         self.train_losses: list[float] = []
         self.eval_events: list[tuple[int, dict[str, float]]] = []
         self.checkpoints: list[Path] = []
@@ -53,6 +54,7 @@ class _MetricRecorder(TrainerCallback):
         self.started = True
 
     def on_log(self, trainer: object, metrics: dict[str, float], step: int) -> None:
+        self.logged.append((step, dict(metrics)))
         loss = metrics.get("train/loss")
         if loss is not None:
             self.train_losses.append(loss)
@@ -283,6 +285,7 @@ class TestCheckpoint:
             output_dir=str(tmp_path),
             global_step=100,
             epoch=2,
+            samples_seen=1600,
             tokens_seen=50000,
             save_total_limit=3,
         )
@@ -295,6 +298,7 @@ class TestCheckpoint:
         state = load_checkpoint(accelerator, str(checkpoint_dir))
         assert state["global_step"] == 100
         assert state["epoch"] == 2
+        assert state["samples_seen"] == 1600
         assert state["tokens_seen"] == 50000
 
     def test_checkpoint_rotation(self, tmp_path: Path) -> None:
@@ -317,6 +321,7 @@ class TestCheckpoint:
                 output_dir=str(tmp_path),
                 global_step=step,
                 epoch=0,
+                samples_seen=step * 8,
                 tokens_seen=step * 500,
                 save_total_limit=2,
             )
@@ -412,6 +417,92 @@ class TestTrainerIntegration:
         total_steps = trainer._compute_total_steps(cfg, dataloader)
 
         assert total_steps == 10
+
+    def test_get_dataset_size_unwraps_iterable_dataset_shards(self, parquet_dataset: Path) -> None:
+        from accelerate.data_loader import IterableDatasetShard
+
+        from oplm.data.dataset import ShardedProteinDataset
+        from oplm.training import Trainer
+
+        dataset = ShardedProteinDataset(parquet_dataset, shuffle_shards=False, shuffle_rows=False)
+        wrapped = IterableDatasetShard(
+            dataset,
+            batch_size=8,
+            num_processes=8,
+            process_index=0,
+        )
+
+        dataset_size = Trainer._get_dataset_size_from_dataloader(SimpleNamespace(dataset=wrapped))
+
+        assert dataset_size == len(dataset)
+        assert dataset_size != len(wrapped)
+
+    def test_log_step_uses_total_dataset_size_for_fractional_epoch(self) -> None:
+        from oplm.training import Trainer
+
+        logged: list[tuple[dict[str, float | int], int]] = []
+        trainer = Trainer.__new__(Trainer)
+        trainer._dataset_size = 600_000_000
+        trainer._samples_seen = 960_000
+        trainer.tokens_seen = 48_000_000
+        trainer.flops_per_token = 2.0
+        trainer.global_step = 3750
+        trainer.scheduler = SimpleNamespace(get_last_lr=lambda: [1e-4])
+        trainer.callbacks = []
+        trainer.accelerator = SimpleNamespace(
+            log=lambda metrics, step: logged.append((dict(metrics), step)),
+            is_main_process=False,
+        )
+
+        trainer._log_step(1.25)
+
+        assert len(logged) == 1
+        metrics, step = logged[0]
+        assert step == 3750
+        assert metrics["train/epoch"] == pytest.approx(0.0016)
+        assert metrics["train/samples"] == 960_000
+
+    def test_resume_from_checkpoint_restores_samples_seen(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import oplm.training.checkpoint as checkpoint_module
+
+        from oplm.training import Trainer
+
+        restored_epoch: list[int] = []
+        trainer = Trainer.__new__(Trainer)
+        trainer.accelerator = SimpleNamespace(num_processes=8)
+        trainer.cfg = OplmConfig(
+            train=TrainConfig(
+                batch_size=4,
+                gradient_accumulation_steps=2,
+                wandb_enabled=False,
+                mixed_precision="no",
+            )
+        )
+        trainer.dataloader = SimpleNamespace(set_epoch=lambda epoch: restored_epoch.append(epoch))
+        trainer._dataset_size = 10_000
+        trainer.global_step = 0
+        trainer.epoch = 0
+        trainer.tokens_seen = 0
+        trainer._samples_seen = 0
+
+        monkeypatch.setattr(
+            checkpoint_module,
+            "load_checkpoint",
+            lambda accelerator, checkpoint_dir: {
+                "global_step": 7,
+                "epoch": 3,
+                "samples_seen": 448,
+                "tokens_seen": 1024,
+            },
+        )
+
+        trainer._resume_from_checkpoint("/fake/checkpoint")
+
+        assert trainer.global_step == 7
+        assert trainer.epoch == 3
+        assert trainer._samples_seen == 448
+        assert trainer.tokens_seen == 1024
+        assert restored_epoch == [3]
 
     def test_trainer_scheduler_tracks_global_steps(
         self,
@@ -638,3 +729,4 @@ class TestTrainerIntegration:
         assert final_ckpt.exists()
         state = json.loads((final_ckpt / "trainer_state.json").read_text())
         assert state["global_step"] == trainer.global_step
+        assert state["samples_seen"] == trainer._samples_seen
