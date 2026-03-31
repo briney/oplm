@@ -54,6 +54,7 @@ class Trainer:
             log_with=log_with,
             project_dir=cfg.train.output_dir,
             dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
+            step_scheduler_with_optimizer=False,
         )
 
         # Status helper for user-facing messages (main process only)
@@ -178,14 +179,13 @@ class Trainer:
                     loss = outputs["loss"]
                     self.accelerator.backward(loss)
 
-                    if cfg.max_grad_norm > 0:
+                    if cfg.max_grad_norm > 0 and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(
                             self.model.parameters(),
                             cfg.max_grad_norm,
                         )
 
                     self.optimizer.step()
-                    self.scheduler.step()
                     self.optimizer.zero_grad()
 
                 # Track tokens and samples
@@ -197,6 +197,7 @@ class Trainer:
                 if not self.accelerator.sync_gradients:
                     continue
 
+                self.scheduler.step()
                 self.global_step += 1
                 current_loss = loss.item()
 
@@ -259,7 +260,11 @@ class Trainer:
         """Compute total training steps from config."""
         if cfg.train.max_epochs is not None:
             dataset_size = self._get_dataset_size_from_dataloader(dataloader)
-            effective_batch = cfg.train.batch_size * cfg.train.gradient_accumulation_steps
+            effective_batch = (
+                cfg.train.batch_size
+                * cfg.train.gradient_accumulation_steps
+                * self.accelerator.num_processes
+            )
             steps_per_epoch = max(1, dataset_size // effective_batch)
             return steps_per_epoch * cfg.train.max_epochs
         return cfg.train.max_steps

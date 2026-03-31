@@ -6,6 +6,7 @@ import json
 import random
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -390,6 +391,73 @@ class TestTrainerIntegration:
         )
 
         assert eval_loss == pytest.approx(3.0)
+
+    def test_compute_total_steps_uses_global_effective_batch(self) -> None:
+        from oplm.training import Trainer
+
+        trainer = Trainer.__new__(Trainer)
+        trainer.accelerator = SimpleNamespace(num_processes=8)
+        cfg = OplmConfig(
+            train=TrainConfig(
+                max_steps=999,
+                max_epochs=2,
+                batch_size=4,
+                gradient_accumulation_steps=2,
+                wandb_enabled=False,
+                mixed_precision="no",
+            )
+        )
+        dataloader = SimpleNamespace(dataset=list(range(320)))
+
+        total_steps = trainer._compute_total_steps(cfg, dataloader)
+
+        assert total_steps == 10
+
+    def test_trainer_scheduler_tracks_global_steps(
+        self,
+        parquet_dataset: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scheduler should advance once per global optimizer step."""
+        import accelerate.scheduler as accelerate_scheduler
+
+        from oplm.training import Trainer
+
+        class _FakeAcceleratorState:
+            def __init__(self) -> None:
+                self.num_processes = 8
+
+        monkeypatch.setattr(
+            accelerate_scheduler,
+            "AcceleratorState",
+            lambda: _FakeAcceleratorState(),
+        )
+
+        cfg = OplmConfig(
+            model=_small_model_config(),
+            train=TrainConfig(
+                max_steps=4,
+                batch_size=8,
+                gradient_accumulation_steps=2,
+                lr=1e-3,
+                warmup_steps=4,
+                log_every=1,
+                eval_every=100,
+                save_every=100,
+                wandb_enabled=False,
+                mixed_precision="no",
+                output_dir=tempfile.mkdtemp(),
+            ),
+        )
+        cfg.data.train = str(parquet_dataset)
+        cfg.data.max_length = 64
+        cfg.data.num_workers = 0
+
+        trainer = Trainer(cfg)
+        trainer.train()
+
+        assert trainer.global_step == 4
+        assert trainer.scheduler.scheduler.last_epoch == trainer.global_step
 
     def test_trainer_loss_decreases(self, parquet_dataset: Path) -> None:
         """Train a small model for 20 steps, verify loss decreases."""
