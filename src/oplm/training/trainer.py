@@ -32,7 +32,7 @@ class Trainer:
         callbacks: Sequence[TrainerCallback] | None = None,
     ) -> None:
         from accelerate import Accelerator
-        from accelerate.utils import set_seed
+        from accelerate.utils import DataLoaderConfiguration, set_seed
         from rich.console import Console
 
         from oplm.data.loader import build_train_dataloader
@@ -53,6 +53,7 @@ class Trainer:
             gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
             log_with=log_with,
             project_dir=cfg.train.output_dir,
+            dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
         )
 
         # Status helper for user-facing messages (main process only)
