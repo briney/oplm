@@ -180,6 +180,11 @@ oplm train --preset large \
 accelerate launch -m oplm.train --config configs/my_run.yaml
 ```
 
+Standard one-node multi-GPU runs use plain Accelerate/DDP. If your shell or
+launcher environment enables DeepSpeed globally, `oplm.train` disables it by
+default to avoid DeepSpeed/Triton startup noise; set `OPLM_ENABLE_DEEPSPEED=1`
+to opt back in intentionally.
+
 ### Encode sequences
 
 ```bash
