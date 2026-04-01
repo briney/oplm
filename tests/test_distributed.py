@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
@@ -180,6 +181,10 @@ def test_training_bootstrap_falls_back_to_tmp_triton_cache_dir(tmp_path: Path) -
     assert cache_dir.exists()
 
 
+@pytest.mark.skipif(
+    not importlib.util.find_spec("deepspeed"),
+    reason="deepspeed not installed",
+)
 def test_training_bootstrap_suppresses_deepspeed_import_logs() -> None:
     """Bootstrap should silence DeepSpeed's import-time logger noise."""
     result = subprocess.run(
