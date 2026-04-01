@@ -18,6 +18,7 @@ from oplm.config import (
     OplmConfig,
     TrainConfig,
 )
+from oplm.eval.data.structure_loader import load_structures
 from oplm.eval.registry import EVAL_TASK_REGISTRY
 from oplm.eval.tasks.structure import StructureEvalTask
 from oplm.model.transformer import OplmForMLM
@@ -84,6 +85,10 @@ class TestStructureEvalTaskInit:
         assert task.logreg_n_train == 20
         assert task.logreg_n_iterations == 5
         assert task.logreg_c == 0.15
+        assert task.use_categorical_jacobian is False
+        assert task.categorical_jacobian_sample_size is None
+        assert task.categorical_jacobian_sample_seed == 42
+        assert task.categorical_jacobian_mutation_batch_size == 20
         assert task.max_structures is None
 
     def test_extra_config_parsed(self) -> None:
@@ -94,6 +99,10 @@ class TestStructureEvalTaskInit:
                 "l_divisor": 2,
                 "use_cbeta": False,
                 "logreg_c": 0.5,
+                "use_categorical_jacobian": True,
+                "categorical_jacobian_sample_size": 7,
+                "categorical_jacobian_sample_seed": 123,
+                "categorical_jacobian_mutation_batch_size": 5,
                 "max_structures": 50,
             }
         )
@@ -103,7 +112,28 @@ class TestStructureEvalTaskInit:
         assert task.l_divisor == 2
         assert task.use_cbeta is False
         assert task.logreg_c == 0.5
+        assert task.use_categorical_jacobian is True
+        assert task.categorical_jacobian_sample_size == 7
+        assert task.categorical_jacobian_sample_seed == 123
+        assert task.categorical_jacobian_mutation_batch_size == 5
         assert task.max_structures == 50
+
+    def test_categorical_jacobian_extends_default_metrics(self) -> None:
+        cfg = _make_cfg()
+        entry = _make_entry(extra={"use_categorical_jacobian": True})
+        task = StructureEvalTask(entry, cfg)
+
+        assert task.metrics == ["precision_at_L", "categorical_jacobian_precision_at_L"]
+
+    def test_explicit_metrics_override_categorical_jacobian_defaults(self) -> None:
+        cfg = _make_cfg()
+        entry = _make_entry(
+            metrics=["precision_at_L_5"],
+            extra={"use_categorical_jacobian": True},
+        )
+        task = StructureEvalTask(entry, cfg)
+
+        assert task.metrics == ["precision_at_L_5"]
 
     def test_lazy_loading(self) -> None:
         cfg = _make_cfg()
@@ -136,6 +166,39 @@ class TestStructureEvalTaskEvaluate:
 
         assert "precision_at_L" in metrics
         assert 0.0 <= metrics["precision_at_L"] <= 1.0
+
+    @pytest.mark.slow
+    def test_evaluate_returns_categorical_jacobian_precision(
+        self,
+        structure_fixtures_dir: Path,
+    ) -> None:
+        """evaluate() should return categorical_jacobian_precision_at_L in [0, 1]."""
+        cfg = _make_cfg(max_length=128)
+        entry = _make_entry(
+            path=str(structure_fixtures_dir),
+            metrics=["categorical_jacobian_precision_at_L"],
+            extra={
+                "categorical_jacobian_sample_size": 1,
+                "categorical_jacobian_sample_seed": 42,
+                "categorical_jacobian_mutation_batch_size": 20,
+            },
+        )
+        task = StructureEvalTask(entry, cfg)
+
+        model = OplmForMLM(cfg.model)
+        model.eval()
+
+        acc = MagicMock()
+        acc.device = torch.device("cpu")
+        acc.process_index = 0
+        acc.num_processes = 1
+
+        metrics_1 = task.evaluate(model, acc)
+        metrics_2 = task.evaluate(model, acc)
+
+        assert "categorical_jacobian_precision_at_L" in metrics_1
+        assert 0.0 <= metrics_1["categorical_jacobian_precision_at_L"] <= 1.0
+        assert metrics_1 == metrics_2
 
     @pytest.mark.slow
     def test_evaluate_filters_metrics(self, structure_fixtures_dir: Path) -> None:
@@ -180,6 +243,32 @@ class TestStructureEvalTaskEvaluate:
         structures_second = task._structures
 
         assert structures_first is structures_second
+
+    def test_categorical_jacobian_subset_is_deterministic(
+        self,
+        structure_fixtures_dir: Path,
+    ) -> None:
+        cfg = _make_cfg(max_length=128)
+        entry = _make_entry(
+            path=str(structure_fixtures_dir),
+            extra={
+                "use_categorical_jacobian": True,
+                "categorical_jacobian_sample_size": 2,
+                "categorical_jacobian_sample_seed": 7,
+            },
+        )
+        task = StructureEvalTask(entry, cfg)
+        task._structures = load_structures(structure_fixtures_dir)
+
+        subset_1 = task._select_categorical_jacobian_structure_names(
+            needs_categorical_jacobian=True
+        )
+        subset_2 = task._select_categorical_jacobian_structure_names(
+            needs_categorical_jacobian=True
+        )
+
+        assert subset_1 == subset_2
+        assert len(subset_1) == 2
 
 
 class TestStructureEvalTaskIntegration:
@@ -254,3 +343,47 @@ class TestStructureEvalTaskIntegration:
 
         assert "eval/pdb/precision_at_L" in metrics
         assert 0.0 <= metrics["eval/pdb/precision_at_L"] <= 1.0
+
+    @pytest.mark.slow
+    def test_evaluator_runs_categorical_jacobian_metric(
+        self,
+        structure_fixtures_dir: Path,
+    ) -> None:
+        """End-to-end: Evaluator can emit Jacobian-based structure metrics."""
+        from oplm.eval.evaluator import Evaluator
+
+        cfg = OplmConfig(
+            model=ModelConfig(
+                hidden_dim=32,
+                num_layers=2,
+                num_heads=2,
+                num_kv_heads=2,
+                max_seq_len=128,
+            ),
+            train=TrainConfig(batch_size=1, eval_every=10),
+            data=DataConfig(
+                max_length=128,
+                num_workers=0,
+                eval={
+                    "pdb": {
+                        "path": str(structure_fixtures_dir),
+                        "type": "structure",
+                        "metrics": ["categorical_jacobian_precision_at_L"],
+                        "categorical_jacobian_sample_size": 1,
+                    }
+                },
+            ),
+        )
+
+        evaluator = Evaluator(cfg)
+        model = OplmForMLM(cfg.model)
+
+        acc = MagicMock()
+        acc.device = torch.device("cpu")
+        acc.process_index = 0
+        acc.num_processes = 1
+
+        metrics = evaluator(model, acc, global_step=10)
+
+        assert "eval/pdb/categorical_jacobian_precision_at_L" in metrics
+        assert 0.0 <= metrics["eval/pdb/categorical_jacobian_precision_at_L"] <= 1.0

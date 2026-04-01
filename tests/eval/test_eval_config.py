@@ -90,6 +90,8 @@ class TestParseEvalConfigs:
                 "contact_threshold": 8.0,
                 "l_divisor": 2,
                 "use_cbeta": True,
+                "use_categorical_jacobian": True,
+                "categorical_jacobian_sample_size": 12,
             },
         }
         entries = parse_eval_configs(raw, default_eval_every=1000)
@@ -97,6 +99,8 @@ class TestParseEvalConfigs:
             "contact_threshold": 8.0,
             "l_divisor": 2,
             "use_cbeta": True,
+            "use_categorical_jacobian": True,
+            "categorical_jacobian_sample_size": 12,
         }
 
     def test_empty_extra_by_default(self) -> None:

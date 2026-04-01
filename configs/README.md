@@ -165,6 +165,10 @@ Structure eval loads PDB/CIF files and supports these task-specific keys:
 | `logreg_n_train` | `int` | `20` | Structures reserved for probe training. |
 | `logreg_n_iterations` | `int` | `5` | Cross-validation iterations for the probe. |
 | `logreg_c` | `float` | `0.15` | Inverse regularization strength for the probe. |
+| `use_categorical_jacobian` | `bool` | `false` | Enable unsupervised categorical-Jacobian P@L alongside the attention/logreg metrics. |
+| `categorical_jacobian_sample_size` | `int \| null` | `null` | Optional deterministic subset size used only for the Jacobian path. |
+| `categorical_jacobian_sample_seed` | `int` | `42` | Seed for Jacobian subset sampling. |
+| `categorical_jacobian_mutation_batch_size` | `int` | `20` | Number of mutant sequences per Jacobian forward pass. |
 | `max_structures` | `int \| null` | `null` | Optional cap on structures loaded from disk. |
 
 ### ProteinGym
@@ -233,6 +237,8 @@ data:
       eval_every: 2000
       contact_threshold: 8.0
       use_logistic_regression: true
+      use_categorical_jacobian: true
+      categorical_jacobian_sample_size: 12
 ```
 
 ### Multi-Dataset Train Mix
