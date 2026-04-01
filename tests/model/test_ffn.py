@@ -119,12 +119,19 @@ class TestFFNConvD:
         cfg = _make_config(conv_positions="D")
         ffn = FFN(cfg)
         assert ffn.conv_d is not None
+        assert ffn.conv_d.conv.kernel_size == (cfg.conv_kernel_size,)
 
     def test_conv_d_output_shape(self) -> None:
         cfg = _make_config(conv_positions="D")
         ffn = FFN(cfg)
         x = torch.randn(B, T, cfg.hidden_dim)
         assert ffn(x).shape == (B, T, cfg.hidden_dim)
+
+    def test_conv_d_uses_resolved_kernel_size(self) -> None:
+        cfg = _make_config(conv_positions="D", conv_kernel_size=3)
+        ffn = FFN(cfg, conv_kernel_size=9)
+        assert ffn.conv_d is not None
+        assert ffn.conv_d.conv.kernel_size == (9,)
 
     def test_conv_d_with_all_activations(self) -> None:
         """Canon-D should work with every activation variant."""

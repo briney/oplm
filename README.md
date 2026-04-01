@@ -13,7 +13,7 @@ OPLM integrates ideas from [Proust](https://arxiv.org/abs/2602.01845) (grouped-q
 - **Encoder-native architecture** -- fully bidirectional attention for masked language modeling on protein sequences
 - **Grouped-query attention** with optional shared K/V projections, Q/K normalization, output gating, and partial RoPE
 - **Cross-layer value residuals** and **learned attention residuals** for improved gradient flow
-- **Bidirectional depthwise convolutions** at configurable positions (pre-attention, pre-FFN, post-FFN expansion)
+- **Bidirectional depthwise convolutions** at configurable positions with static or scheduled kernel sizes
 - **SwiGLU, ReLU^2, or GELU** feed-forward activations
 - **Ablation-friendly** -- all architectural features are togglable with no overhead when off
 - **Distributed training** via HuggingFace Accelerate with FSDP, mixed precision (bf16/fp16), and gradient checkpointing
@@ -248,6 +248,11 @@ model:
   partial_rope: true
   value_residual: true
   conv_positions: "AC"
+  conv_kernel_size: 3
+  conv_kernel_schedule: block_step
+  conv_kernel_increment: 2
+  conv_kernel_block_size: 2
+  conv_kernel_max_size: 9
   attn_residual: true
 
 train:

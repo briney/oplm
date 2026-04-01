@@ -31,6 +31,10 @@ model:
   # Depthwise convolutions
   conv_positions: ""
   conv_kernel_size: 7
+  conv_kernel_schedule: static
+  conv_kernel_increment: 2
+  conv_kernel_block_size: 1
+  conv_kernel_max_size: null
   conv_activation: true
 
   # Attention residuals

@@ -10,11 +10,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from oplm.config import (
-    DataConfig,
     ModelConfig,
     OplmConfig,
     TrainConfig,
-    TrainDatasetEntry,
     load_config,
     parse_train_configs,
     round_multiple,
@@ -39,6 +37,10 @@ class TestModelConfigDefaults:
         assert cfg.hidden_dim == 768
         assert cfg.num_layers == 12
         assert cfg.num_heads == 12
+        assert cfg.conv_kernel_schedule == "static"
+        assert cfg.conv_kernel_increment == 2
+        assert cfg.conv_kernel_block_size == 1
+        assert cfg.conv_kernel_max_size is None
 
     def test_head_dim_derived(self) -> None:
         cfg = ModelConfig()
@@ -88,6 +90,42 @@ class TestModelConfigValidation:
         with pytest.raises(ValueError, match="conv_kernel_size.*must be odd"):
             ModelConfig(conv_kernel_size=6)
 
+    def test_invalid_conv_kernel_schedule(self) -> None:
+        with pytest.raises(ValueError, match="conv_kernel_schedule"):
+            ModelConfig(conv_kernel_schedule="per_layer")
+
+    def test_conv_kernel_increment_must_be_non_negative_even(self) -> None:
+        with pytest.raises(ValueError, match="conv_kernel_increment"):
+            ModelConfig(conv_kernel_schedule="block_step", conv_kernel_increment=3)
+
+        with pytest.raises(ValueError, match="conv_kernel_increment"):
+            ModelConfig(conv_kernel_schedule="block_step", conv_kernel_increment=-2)
+
+    def test_conv_kernel_block_size_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="conv_kernel_block_size"):
+            ModelConfig(conv_kernel_schedule="block_step", conv_kernel_block_size=0)
+
+    def test_conv_kernel_max_size_must_be_odd(self) -> None:
+        with pytest.raises(ValueError, match="conv_kernel_max_size.*must be odd"):
+            ModelConfig(conv_kernel_schedule="block_step", conv_kernel_max_size=8)
+
+    def test_conv_kernel_max_size_must_not_be_smaller_than_base(self) -> None:
+        with pytest.raises(ValueError, match="conv_kernel_max_size"):
+            ModelConfig(
+                conv_kernel_schedule="block_step",
+                conv_kernel_size=7,
+                conv_kernel_max_size=5,
+            )
+
+    def test_static_schedule_ignores_schedule_only_fields(self) -> None:
+        cfg = ModelConfig(
+            conv_kernel_schedule="static",
+            conv_kernel_increment=-2,
+            conv_kernel_block_size=0,
+            conv_kernel_max_size=8,
+        )
+        assert cfg.conv_kernel_size_for_layer(3) == 7
+
     def test_invalid_conv_positions(self) -> None:
         with pytest.raises(ValueError, match="conv_positions"):
             ModelConfig(conv_positions="X")
@@ -111,6 +149,40 @@ class TestModelConfigValidation:
     def test_partial_rope_dimension_mismatch(self) -> None:
         with pytest.raises(ValueError, match="nope_dim.*rope_dim.*must equal head_dim"):
             ModelConfig(partial_rope=True, rope_dim=16, nope_dim=16, head_dim=64)
+
+
+class TestConvKernelSchedule:
+    def test_static_returns_same_kernel_for_all_layers(self) -> None:
+        cfg = ModelConfig(conv_kernel_size=9)
+        assert [cfg.conv_kernel_size_for_layer(i) for i in range(4)] == [9, 9, 9, 9]
+
+    def test_block_step_increments_every_layer(self) -> None:
+        cfg = ModelConfig(
+            conv_kernel_size=3,
+            conv_kernel_schedule="block_step",
+            conv_kernel_increment=2,
+            conv_kernel_block_size=1,
+        )
+        assert [cfg.conv_kernel_size_for_layer(i) for i in range(4)] == [3, 5, 7, 9]
+
+    def test_block_step_increments_by_block(self) -> None:
+        cfg = ModelConfig(
+            conv_kernel_size=3,
+            conv_kernel_schedule="block_step",
+            conv_kernel_increment=2,
+            conv_kernel_block_size=2,
+        )
+        assert [cfg.conv_kernel_size_for_layer(i) for i in range(6)] == [3, 3, 5, 5, 7, 7]
+
+    def test_block_step_clamps_to_max_size(self) -> None:
+        cfg = ModelConfig(
+            conv_kernel_size=3,
+            conv_kernel_schedule="block_step",
+            conv_kernel_increment=2,
+            conv_kernel_block_size=2,
+            conv_kernel_max_size=7,
+        )
+        assert [cfg.conv_kernel_size_for_layer(i) for i in range(8)] == [3, 3, 5, 5, 7, 7, 7, 7]
 
 
 class TestParseTrainConfigs:
@@ -261,12 +333,14 @@ class TestLoadConfig:
         assert cfg.data.train == "/path/to/dataset"
 
     def test_data_train_multi_dataset(self) -> None:
-        cfg = load_config([
-            "data.train.ds_a.path=/path/a",
-            "data.train.ds_a.fraction=0.6",
-            "data.train.ds_b.path=/path/b",
-            "data.train.ds_b.fraction=0.4",
-        ])
+        cfg = load_config(
+            [
+                "data.train.ds_a.path=/path/a",
+                "data.train.ds_a.fraction=0.6",
+                "data.train.ds_b.path=/path/b",
+                "data.train.ds_b.fraction=0.4",
+            ]
+        )
         assert isinstance(cfg.data.train, dict)
         entries = parse_train_configs(cfg.data.train)
         assert len(entries) == 2

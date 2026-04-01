@@ -67,7 +67,11 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | `model.num_value_embeds` | `int` | `0` | `0` disables value embeddings; positive values enable first/last N layers. | active |
 | `model.value_embed_gate_dim` | `int` | `16` | Hidden size of the value-embedding gate. | active |
 | `model.conv_positions` | `str` | `""` | Any combination of `A`, `C`, `D`. | active |
-| `model.conv_kernel_size` | `int` | `7` | Must be odd. | active |
+| `model.conv_kernel_size` | `int` | `7` | Must be odd; exact size in `static` mode and starting size in `block_step`. | active |
+| `model.conv_kernel_schedule` | `str` | `static` | `static` or `block_step`. | active |
+| `model.conv_kernel_increment` | `int` | `2` | Used by `block_step`; must be a non-negative even integer. | active |
+| `model.conv_kernel_block_size` | `int` | `1` | Used by `block_step`; increment once every N layers. | active |
+| `model.conv_kernel_max_size` | `int \| null` | `null` | Optional saturating clamp for `block_step`; must be odd when set. | active |
 | `model.conv_activation` | `bool` | `true` | Apply SiLU inside depthwise convolutions. | active |
 | `model.attn_residual` | `bool` | `false` | Enable block attention residuals. | active |
 | `model.attn_residual_block_size` | `int` | `8` | Must divide `model.num_layers` when attention residuals are enabled. | active |

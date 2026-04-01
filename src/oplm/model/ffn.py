@@ -26,10 +26,13 @@ class FFN(nn.Module):
     when ``"D"`` appears in ``conv_positions``.
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, conv_kernel_size: int | None = None) -> None:
         super().__init__()
         hidden_dim = config.hidden_dim
         ffn_dim = config.ffn_dim or 4 * hidden_dim
+        self.conv_kernel_size = (
+            config.conv_kernel_size if conv_kernel_size is None else conv_kernel_size
+        )
         self.activation = config.ffn_activation
 
         if self.activation == "swiglu":
@@ -44,7 +47,7 @@ class FFN(nn.Module):
         self.conv_d = (
             BidirectionalDepthwiseConv(
                 ffn_dim,
-                kernel_size=config.conv_kernel_size,
+                kernel_size=self.conv_kernel_size,
                 activation=config.conv_activation,
             )
             if "D" in config.conv_positions

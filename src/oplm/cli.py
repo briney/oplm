@@ -169,6 +169,16 @@ def info(
     features.add_row("Value embeds", ve_str)
     cv_str = cfg.model.conv_positions if cfg.model.conv_positions else "[dim]none[/dim]"
     features.add_row("Conv positions", cv_str)
+    if cfg.model.conv_kernel_schedule == "static":
+        conv_kernel_str = str(cfg.model.conv_kernel_size)
+    else:
+        conv_kernel_str = (
+            f"{cfg.model.conv_kernel_size} +{cfg.model.conv_kernel_increment} "
+            f"every {cfg.model.conv_kernel_block_size} layer(s)"
+        )
+        if cfg.model.conv_kernel_max_size is not None:
+            conv_kernel_str += f", max {cfg.model.conv_kernel_max_size}"
+    features.add_row("Conv kernels", conv_kernel_str)
     features.add_row("Attn residual", _status(cfg.model.attn_residual))
     features.add_row("Gradient ckpt", _status(cfg.model.gradient_checkpointing))
     features.add_row("Tied embeddings", _status(cfg.model.tie_embeddings))

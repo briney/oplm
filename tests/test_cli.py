@@ -130,6 +130,37 @@ class TestCli:
         assert "Hidden dim" in result.stdout
         assert "80" in result.stdout
 
+    def test_info_command_shows_dynamic_conv_schedule(
+        self, tmp_path: Path, training_parquet: Path
+    ) -> None:
+        config_path = _write_train_config(tmp_path, training_parquet)
+
+        result = runner.invoke(
+            app,
+            [
+                "info",
+                "--config",
+                str(config_path),
+                "--override",
+                "model.conv_positions=ACD",
+                "--override",
+                "model.conv_kernel_size=3",
+                "--override",
+                "model.conv_kernel_schedule=block_step",
+                "--override",
+                "model.conv_kernel_increment=2",
+                "--override",
+                "model.conv_kernel_block_size=2",
+                "--override",
+                "model.conv_kernel_max_size=7",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Conv kernels" in result.stdout
+        assert "+2 every 2 layer(s)" in result.stdout
+        assert "max 7" in result.stdout
+
     def test_train_command(self, tmp_path: Path, training_parquet: Path) -> None:
         config_path = _write_train_config(tmp_path, training_parquet)
         output_dir = tmp_path / "outputs"

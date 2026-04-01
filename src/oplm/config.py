@@ -14,6 +14,7 @@ from typing import Any, cast
 from omegaconf import DictConfig, OmegaConf
 
 AVAILABLE_PRESETS = ("small", "medium", "base", "large", "xlarge")
+_VALID_CONV_KERNEL_SCHEDULES = ("static", "block_step")
 
 
 def round_multiple(x: float, multiple: int) -> int:
@@ -60,6 +61,10 @@ class ModelConfig:
     # Depthwise convolutions
     conv_positions: str = ""
     conv_kernel_size: int = 7
+    conv_kernel_schedule: str = "static"
+    conv_kernel_increment: int = 2
+    conv_kernel_block_size: int = 1
+    conv_kernel_max_size: int | None = None
     conv_activation: bool = True
 
     # Attention residuals (depth-wise, Kimi)
@@ -109,6 +114,32 @@ class ModelConfig:
             )
         if self.conv_kernel_size % 2 == 0:
             raise ValueError(f"conv_kernel_size ({self.conv_kernel_size}) must be odd")
+        if self.conv_kernel_schedule not in _VALID_CONV_KERNEL_SCHEDULES:
+            raise ValueError(
+                "conv_kernel_schedule must be one of "
+                f"{_VALID_CONV_KERNEL_SCHEDULES}, got {self.conv_kernel_schedule!r}"
+            )
+        if self.conv_kernel_schedule == "block_step":
+            if self.conv_kernel_increment < 0 or self.conv_kernel_increment % 2 != 0:
+                raise ValueError(
+                    "conv_kernel_increment "
+                    f"({self.conv_kernel_increment}) must be a non-negative even integer"
+                )
+            if self.conv_kernel_block_size < 1:
+                raise ValueError(
+                    "conv_kernel_block_size " f"({self.conv_kernel_block_size}) must be >= 1"
+                )
+            if self.conv_kernel_max_size is not None:
+                if self.conv_kernel_max_size % 2 == 0:
+                    raise ValueError(
+                        f"conv_kernel_max_size ({self.conv_kernel_max_size}) must be odd"
+                    )
+                if self.conv_kernel_max_size < self.conv_kernel_size:
+                    raise ValueError(
+                        "conv_kernel_max_size "
+                        f"({self.conv_kernel_max_size}) must be >= conv_kernel_size "
+                        f"({self.conv_kernel_size})"
+                    )
         if self.conv_positions and not all(c in "ACD" for c in self.conv_positions):
             raise ValueError(
                 f"conv_positions ({self.conv_positions!r}) must only contain 'A', 'C', 'D'"
@@ -123,6 +154,19 @@ class ModelConfig:
             raise ValueError(
                 f"ffn_activation must be one of {valid_activations}, got {self.ffn_activation!r}"
             )
+
+    def conv_kernel_size_for_layer(self, layer_idx: int) -> int:
+        """Return the effective convolution kernel size for a given layer."""
+        if self.conv_kernel_schedule == "static":
+            return self.conv_kernel_size
+
+        kernel_size = (
+            self.conv_kernel_size
+            + (layer_idx // self.conv_kernel_block_size) * self.conv_kernel_increment
+        )
+        if self.conv_kernel_max_size is not None:
+            kernel_size = min(kernel_size, self.conv_kernel_max_size)
+        return kernel_size
 
 
 _VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")

@@ -35,20 +35,25 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.conv_kernel_size = config.conv_kernel_size_for_layer(layer_idx)
         self.attn_pre_norm = RMSNorm(config.hidden_dim, config.norm_eps)
         self.ffn_pre_norm = RMSNorm(config.hidden_dim, config.norm_eps)
         self.attention = Attention(config, layer_idx)
-        self.ffn = FFN(config)
+        self.ffn = FFN(config, conv_kernel_size=self.conv_kernel_size)
         self.conv_a = (
             BidirectionalDepthwiseConv(
-                config.hidden_dim, config.conv_kernel_size, config.conv_activation
+                config.hidden_dim,
+                self.conv_kernel_size,
+                config.conv_activation,
             )
             if "A" in config.conv_positions
             else None
         )
         self.conv_c = (
             BidirectionalDepthwiseConv(
-                config.hidden_dim, config.conv_kernel_size, config.conv_activation
+                config.hidden_dim,
+                self.conv_kernel_size,
+                config.conv_activation,
             )
             if "C" in config.conv_positions
             else None

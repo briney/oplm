@@ -162,6 +162,43 @@ class TestTransformerBlock:
         out, _, _ = block(x)
         assert out.shape == (B, T, cfg.hidden_dim)
 
+    def test_dynamic_conv_kernel_schedule_shared_across_positions(self) -> None:
+        cfg = _make_config(
+            conv_positions="ACD",
+            conv_kernel_size=3,
+            conv_kernel_schedule="block_step",
+            conv_kernel_increment=2,
+            conv_kernel_block_size=2,
+            conv_kernel_max_size=7,
+            num_layers=6,
+        )
+        encoder = OplmEncoder(cfg)
+        expected_kernels = [3, 3, 5, 5, 7, 7]
+
+        for idx, expected_kernel in enumerate(expected_kernels):
+            block = encoder.blocks[idx]
+            assert block.conv_kernel_size == expected_kernel
+            assert block.conv_a is not None
+            assert block.conv_c is not None
+            assert block.ffn.conv_d is not None
+            assert block.conv_a.conv.kernel_size == (expected_kernel,)
+            assert block.conv_c.conv.kernel_size == (expected_kernel,)
+            assert block.ffn.conv_d.conv.kernel_size == (expected_kernel,)
+
+    def test_static_conv_kernel_size_applies_to_all_layers(self) -> None:
+        cfg = _make_config(conv_positions="ACD", conv_kernel_size=9, num_layers=4)
+        encoder = OplmEncoder(cfg)
+
+        for idx in range(cfg.num_layers):
+            block = encoder.blocks[idx]
+            assert block.conv_kernel_size == 9
+            assert block.conv_a is not None
+            assert block.conv_c is not None
+            assert block.ffn.conv_d is not None
+            assert block.conv_a.conv.kernel_size == (9,)
+            assert block.conv_c.conv.kernel_size == (9,)
+            assert block.ffn.conv_d.conv.kernel_size == (9,)
+
     def test_with_attention_mask(self) -> None:
         cfg = _make_config()
         block = TransformerBlock(cfg, layer_idx=0)
