@@ -326,7 +326,7 @@ class StructureEvalTask(EvalTask):
                         input_ids=batch_input_ids_device,
                         attention_mask=batch_attention_mask,
                     )
-                batch_logits = (
+                batch_logits: torch.Tensor = (
                     batch_outputs["logits"][:, 1 : seq_len + 1]
                     .index_select(-1, canonical_token_ids_device)
                     .detach()

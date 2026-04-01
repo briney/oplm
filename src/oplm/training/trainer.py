@@ -268,7 +268,7 @@ class Trainer:
                 * self.accelerator.num_processes
             )
             steps_per_epoch = max(1, math.ceil(dataset_size / effective_batch))
-            return steps_per_epoch * cfg.train.max_epochs
+            return int(steps_per_epoch * cfg.train.max_epochs)
         return cfg.train.max_steps
 
     @staticmethod
@@ -349,7 +349,7 @@ class Trainer:
 
     def _global_effective_batch_size(self) -> int:
         """Return the batch size represented by one optimizer step."""
-        return (
+        return int(
             self.cfg.train.batch_size
             * self.cfg.train.gradient_accumulation_steps
             * self.accelerator.num_processes
