@@ -22,7 +22,7 @@
 train: null
 
 # Sequence and masking
-max_length: 1024
+max_length: 512
 mask_prob: 0.15
 
 # DataLoader settings

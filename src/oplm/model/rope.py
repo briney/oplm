@@ -22,7 +22,7 @@ class RotaryEmbedding(nn.Module):
     cos_cached: Tensor
     sin_cached: Tensor
 
-    def __init__(self, dim: int, max_seq_len: int = 2048, theta: float = 10000.0) -> None:
+    def __init__(self, dim: int, max_seq_len: int = 512, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
@@ -82,7 +82,7 @@ class PartialRotaryEmbedding(nn.Module):
         self,
         rope_dim: int,
         nope_dim: int,
-        max_seq_len: int = 2048,
+        max_seq_len: int = 512,
         theta: float = 10000.0,
     ) -> None:
         super().__init__()

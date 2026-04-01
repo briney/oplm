@@ -295,7 +295,7 @@ class TestLoadConfig:
 
     def test_data_config_defaults(self) -> None:
         cfg = load_config([])
-        assert cfg.data.max_length == 1024
+        assert cfg.data.max_length == 512
         assert cfg.data.mask_prob == 0.15
         assert cfg.data.num_workers == 4
         assert cfg.data.train is None

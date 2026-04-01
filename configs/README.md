@@ -52,7 +52,7 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | `model.ffn_dim` | `int \| null` | derived | Auto-computed from `ffn_activation` when omitted. | derived |
 | `model.ffn_activation` | `str` | `swiglu` | `swiglu`, `relu_squared`, or `gelu`. | active |
 | `model.vocab_size` | `int` | `33` | Tokenizer vocabulary size. | active |
-| `model.max_seq_len` | `int` | `2048` | Max sequence length supported by RoPE cache and embedding tables. | active |
+| `model.max_seq_len` | `int` | `512` | Max sequence length supported by RoPE cache and embedding tables. | active |
 | `model.shared_kv` | `bool` | `false` | Share K and V projections. | active |
 | `model.qk_norm` | `bool` | `true` | Apply RMSNorm to Q and K before attention. | active |
 | `model.output_gate` | `bool` | `false` | Enable attention output gating. | active |
@@ -115,7 +115,7 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | --- | --- | --- | --- | --- |
 | `data.train` | `str \| dict \| null` | `null` | Single parquet path or named dataset map with optional fractions. | active |
 | `data.eval` | `dict \| null` | `null` | Named eval dataset map. See [Eval Datasets](#eval-datasets). | active |
-| `data.max_length` | `int` | `1024` | Max tokenized length used by train and eval loaders. | active |
+| `data.max_length` | `int` | `512` | Max tokenized length used by train and eval loaders. | active |
 | `data.mask_prob` | `float` | `0.15` | BERT-style MLM masking probability. | active |
 | `data.num_workers` | `int` | `4` | PyTorch DataLoader workers. | active |
 | `data.pin_memory` | `bool` | `true` | Pin host memory for DataLoader batches. | active |

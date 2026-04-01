@@ -34,7 +34,7 @@ class ModelConfig:
     ffn_dim: int | None = None
     ffn_activation: str = "swiglu"
     vocab_size: int = 33
-    max_seq_len: int = 2048
+    max_seq_len: int = 512
 
     # Attention features
     shared_kv: bool = False
@@ -246,7 +246,7 @@ class DataConfig:
     eval: Any = None
 
     # Sequence and masking
-    max_length: int = 1024
+    max_length: int = 512
     mask_prob: float = 0.15
 
     # DataLoader settings
