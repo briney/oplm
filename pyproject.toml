@@ -22,7 +22,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "torch>=2.4.0",
+    "torch>=2.10.0",
     "omegaconf>=2.3",
     "typer>=0.9",
     "rich>=13.0",

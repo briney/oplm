@@ -126,8 +126,9 @@ class ModelConfig:
 
 
 _VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
-_VALID_OPTIMIZERS = ("adamw",)
+_VALID_OPTIMIZERS = ("adamw", "muon")
 _VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
+_VALID_MUON_ADJUST_LR_FNS = ("match_rms_adamw", "original")
 
 
 @dataclass
@@ -150,6 +151,10 @@ class TrainConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.98
     adam_eps: float = 1e-8
+    muon_adjust_lr_fn: str = "match_rms_adamw"
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5
     max_grad_norm: float = 1.0
 
     # Scheduler
@@ -182,6 +187,11 @@ class TrainConfig:
             raise ValueError(
                 f"optimizer must be one of {_VALID_OPTIMIZERS}, got {self.optimizer!r}"
             )
+        if self.muon_adjust_lr_fn not in _VALID_MUON_ADJUST_LR_FNS:
+            raise ValueError(
+                f"muon_adjust_lr_fn must be one of {_VALID_MUON_ADJUST_LR_FNS}, "
+                f"got {self.muon_adjust_lr_fn!r}"
+            )
         if self.scheduler not in _VALID_SCHEDULERS:
             raise ValueError(
                 f"scheduler must be one of {_VALID_SCHEDULERS}, got {self.scheduler!r}"
@@ -197,6 +207,10 @@ class TrainConfig:
             raise ValueError(f"min_lr must be >= 0, got {self.min_lr}")
         if self.min_lr > self.lr:
             raise ValueError(f"min_lr ({self.min_lr}) must be <= lr ({self.lr})")
+        if self.muon_momentum < 0:
+            raise ValueError(f"muon_momentum must be >= 0, got {self.muon_momentum}")
+        if self.muon_ns_steps < 1:
+            raise ValueError(f"muon_ns_steps must be >= 1, got {self.muon_ns_steps}")
         if not 0.0 <= self.stable_fraction < 1.0:
             raise ValueError(f"stable_fraction must be in [0, 1), got {self.stable_fraction}")
         if self.gradient_accumulation_steps < 1:

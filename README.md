@@ -16,7 +16,7 @@ OPLM integrates ideas from [Proust](https://arxiv.org/abs/2602.01845) (grouped-q
 - **Bidirectional depthwise convolutions** at configurable positions (pre-attention, pre-FFN, post-FFN expansion)
 - **SwiGLU, ReLU^2, or GELU** feed-forward activations
 - **Ablation-friendly** -- all architectural features are togglable with no overhead when off
-- **Distributed training** via HuggingFace Accelerate with FSDP, mixed precision (bf16/fp16), and gradient checkpointing
+- **Distributed training** via HuggingFace Accelerate with FSDP, mixed precision (bf16/fp16), gradient checkpointing, and optional Muon optimization
 - **Optional FlashAttention** support for efficient long-sequence training
 - **Built-in evaluation** for MLM metrics (loss, accuracy, perplexity) and structure-based contact prediction
 - **Five model presets** from 4.8M to 11.0B parameters
@@ -25,7 +25,7 @@ OPLM integrates ideas from [Proust](https://arxiv.org/abs/2602.01845) (grouped-q
 
 ## Installation
 
-**Requirements:** Python 3.11+ and PyTorch 2.4+
+**Requirements:** Python 3.11+ and PyTorch 2.10+
 
 ### From PyPI
 
@@ -179,6 +179,10 @@ oplm train --preset large \
 # distributed training with Accelerate
 accelerate launch -m oplm.train --config configs/my_run.yaml
 ```
+
+Set `train.optimizer=muon` to enable the built-in Muon optimizer for eligible
+hidden 2D weights while keeping AdamW on embeddings, norms, biases, and the MLM
+head.
 
 Standard one-node multi-GPU runs use plain Accelerate/DDP. If your shell or
 launcher environment enables DeepSpeed globally, `oplm.train` disables it by

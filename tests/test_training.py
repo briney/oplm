@@ -16,7 +16,14 @@ import torch
 from oplm.config import ModelConfig, OplmConfig, TrainConfig
 from oplm.training import TrainerCallback
 from oplm.training.flops import estimate_flops_per_token
-from oplm.training.optim import build_optimizer, build_scheduler, get_schedule_fn
+from oplm.training.optim import (
+    build_optimizer,
+    build_optimizers,
+    build_scheduler,
+    build_schedulers,
+    get_schedule_fn,
+    partition_optimizer_params,
+)
 
 # Standard amino acid alphabet for synthetic data
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
@@ -165,6 +172,31 @@ class TestScheduler:
         # LR should be at peak after warmup
         assert scheduler.get_last_lr()[0] == pytest.approx(cfg.lr, rel=0.01)
 
+    def test_build_schedulers_for_muon_optimizer_pair(self) -> None:
+        """Muon mode should create one scheduler per optimizer."""
+        from oplm.model.transformer import OplmForMLM
+
+        cfg = _small_model_config()
+        model = OplmForMLM(cfg)
+        train_cfg = TrainConfig(
+            optimizer="muon",
+            lr=1e-3,
+            warmup_steps=10,
+            max_steps=100,
+            scheduler="warmup_linear",
+        )
+
+        optimizers = build_optimizers(model, train_cfg)
+        schedulers = build_schedulers(optimizers, train_cfg, total_steps=100)
+
+        assert len(optimizers) == 2
+        assert len(schedulers) == 2
+        for optimizer, scheduler in zip(optimizers, schedulers, strict=True):
+            for _ in range(10):
+                optimizer.step()
+                scheduler.step()
+            assert scheduler.get_last_lr()[0] == pytest.approx(train_cfg.lr, rel=0.01)
+
 
 # ---------------------------------------------------------------------------
 # Optimizer tests
@@ -211,6 +243,78 @@ class TestOptimizer:
 
         model_params = {id(p) for p in model.parameters() if p.requires_grad}
         assert optim_params == model_params
+
+    def test_muon_builds_primary_and_auxiliary_optimizers(self) -> None:
+        from oplm.model.transformer import OplmForMLM
+
+        cfg = _small_model_config()
+        model = OplmForMLM(cfg)
+        train_cfg = TrainConfig(
+            optimizer="muon",
+            lr=1e-3,
+            weight_decay=0.01,
+            muon_adjust_lr_fn="match_rms_adamw",
+        )
+
+        optimizer = build_optimizer(model, train_cfg)
+        optimizers = build_optimizers(model, train_cfg)
+
+        assert isinstance(optimizer, torch.optim.Muon)
+        assert len(optimizers) == 2
+        assert isinstance(optimizers[0], torch.optim.Muon)
+        assert isinstance(optimizers[1], torch.optim.AdamW)
+        assert optimizers[0].param_groups[0]["adjust_lr_fn"] == "match_rms_adamw"
+        assert optimizers[1].param_groups[0]["weight_decay"] == 0.01
+        assert optimizers[1].param_groups[1]["weight_decay"] == 0.0
+
+    def test_muon_partition_excludes_embeddings_heads_and_conv_kernels(self) -> None:
+        from oplm.model.transformer import OplmForMLM
+
+        cfg = _small_model_config(conv_positions="ACD", num_value_embeds=1)
+        model = OplmForMLM(cfg)
+        train_cfg = TrainConfig(optimizer="muon", lr=1e-3, weight_decay=0.01)
+        groups = partition_optimizer_params(model, train_cfg)
+        named_params = {
+            name: param for name, param in model.named_parameters() if param.requires_grad
+        }
+        muon_ids = {id(param) for param in groups.muon_params}
+        adamw_decay_ids = {id(param) for param in groups.adamw_decay_params}
+        adamw_no_decay_ids = {id(param) for param in groups.adamw_no_decay_params}
+        muon_names = {name for name, param in named_params.items() if id(param) in muon_ids}
+        adamw_decay_names = {
+            name for name, param in named_params.items() if id(param) in adamw_decay_ids
+        }
+        adamw_no_decay_names = {
+            name for name, param in named_params.items() if id(param) in adamw_no_decay_ids
+        }
+
+        assert "encoder.embedding.embed.weight" in adamw_no_decay_names
+        assert "encoder.value_embedding.gates.0.weight" in adamw_no_decay_names
+        assert "mlm_head.dense.weight" in adamw_decay_names
+        assert "mlm_head.projection.weight" in adamw_decay_names
+        assert "encoder.blocks.0.conv_a.conv.weight" in adamw_decay_names
+        assert all(named_params[name].ndim == 2 for name in muon_names)
+        assert all("embed" not in name for name in muon_names)
+        assert all(not name.startswith("mlm_head.") for name in muon_names)
+
+    def test_muon_partition_accounts_for_all_params_once(self) -> None:
+        from oplm.model.transformer import OplmForMLM
+
+        cfg = _small_model_config(conv_positions="ACD", num_value_embeds=1)
+        model = OplmForMLM(cfg)
+        train_cfg = TrainConfig(optimizer="muon", lr=1e-3)
+        groups = partition_optimizer_params(model, train_cfg)
+
+        optim_param_ids = {
+            id(param)
+            for param in [
+                *groups.muon_params,
+                *groups.adamw_decay_params,
+                *groups.adamw_no_decay_params,
+            ]
+        }
+        model_param_ids = {id(param) for param in model.parameters() if param.requires_grad}
+        assert optim_param_ids == model_param_ids
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +368,20 @@ class TestFlops:
 
 class TestCheckpoint:
     """Test checkpoint save/load."""
+
+    class _ToyMuonModule(torch.nn.Module):
+        """Tiny module with one Muon weight and auxiliary AdamW parameters."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4)
+            self.hidden = torch.nn.Linear(4, 4, bias=False)
+            self.norm = torch.nn.LayerNorm(4)
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            hidden = self.embed(input_ids).sum(dim=1)
+            hidden = self.hidden(hidden)
+            return self.norm(hidden).sum()
 
     def test_save_and_load_trainer_state(self, tmp_path: Path) -> None:
         from accelerate import Accelerator
@@ -332,6 +450,65 @@ class TestCheckpoint:
         assert checkpoint_dirs[0].name == "checkpoint-300"
         assert checkpoint_dirs[1].name == "checkpoint-400"
 
+    def test_save_and_load_trainer_state_with_multiple_optimizers(self, tmp_path: Path) -> None:
+        from accelerate import Accelerator
+
+        from oplm.training.checkpoint import load_checkpoint, save_checkpoint
+
+        accelerator = Accelerator(cpu=True)
+        cfg = OplmConfig(train=TrainConfig(output_dir=str(tmp_path), optimizer="muon"))
+        model = self._ToyMuonModule()
+        muon = torch.optim.Muon([model.hidden.weight], lr=1e-3)
+        adamw = torch.optim.AdamW(
+            [
+                {"params": [model.embed.weight], "weight_decay": 0.01},
+                {"params": [model.norm.weight, model.norm.bias], "weight_decay": 0.0},
+            ],
+            lr=1e-3,
+        )
+        muon_scheduler = torch.optim.lr_scheduler.LambdaLR(muon, lambda step: 1.0)
+        adamw_scheduler = torch.optim.lr_scheduler.LambdaLR(adamw, lambda step: 1.0)
+        model, muon, adamw, muon_scheduler, adamw_scheduler = accelerator.prepare(
+            model,
+            muon,
+            adamw,
+            muon_scheduler,
+            adamw_scheduler,
+        )
+
+        input_ids = torch.randint(0, 8, (2, 3))
+        loss = model(input_ids)
+        accelerator.backward(loss)
+        muon.step()
+        adamw.step()
+        muon.zero_grad()
+        adamw.zero_grad()
+        muon_scheduler.step()
+        adamw_scheduler.step()
+
+        save_checkpoint(
+            accelerator=accelerator,
+            cfg=cfg,
+            output_dir=str(tmp_path),
+            global_step=10,
+            epoch=1,
+            samples_seen=20,
+            tokens_seen=60,
+            save_total_limit=3,
+        )
+
+        checkpoint_dir = tmp_path / "checkpoint-10"
+        assert (checkpoint_dir / "optimizer.bin").exists()
+        assert (checkpoint_dir / "optimizer_1.bin").exists()
+        assert (checkpoint_dir / "scheduler.bin").exists()
+        assert (checkpoint_dir / "scheduler_1.bin").exists()
+
+        state = load_checkpoint(accelerator, str(checkpoint_dir))
+        assert state["global_step"] == 10
+        assert state["epoch"] == 1
+        assert state["samples_seen"] == 20
+        assert state["tokens_seen"] == 60
+
 
 # ---------------------------------------------------------------------------
 # TrainConfig validation tests
@@ -344,16 +521,26 @@ class TestTrainConfigValidation:
     def test_defaults(self) -> None:
         cfg = TrainConfig()
         assert cfg.max_steps == 50_000
+        assert cfg.optimizer == "adamw"
         assert cfg.scheduler == "warmup_linear"
         assert cfg.mixed_precision == "bf16"
+        assert cfg.muon_adjust_lr_fn == "match_rms_adamw"
 
     def test_invalid_scheduler(self) -> None:
         with pytest.raises(ValueError, match="scheduler"):
             TrainConfig(scheduler="invalid")
 
+    def test_muon_optimizer_is_valid(self) -> None:
+        cfg = TrainConfig(optimizer="muon")
+        assert cfg.optimizer == "muon"
+
     def test_invalid_optimizer(self) -> None:
         with pytest.raises(ValueError, match="optimizer"):
             TrainConfig(optimizer="sgd")
+
+    def test_invalid_muon_adjust_lr_fn(self) -> None:
+        with pytest.raises(ValueError, match="muon_adjust_lr_fn"):
+            TrainConfig(muon_adjust_lr_fn="invalid")
 
     def test_invalid_mixed_precision(self) -> None:
         with pytest.raises(ValueError, match="mixed_precision"):
@@ -366,6 +553,14 @@ class TestTrainConfigValidation:
     def test_min_lr_exceeds_lr(self) -> None:
         with pytest.raises(ValueError, match="min_lr"):
             TrainConfig(lr=1e-4, min_lr=1e-3)
+
+    def test_negative_muon_momentum(self) -> None:
+        with pytest.raises(ValueError, match="muon_momentum"):
+            TrainConfig(muon_momentum=-0.1)
+
+    def test_invalid_muon_ns_steps(self) -> None:
+        with pytest.raises(ValueError, match="muon_ns_steps"):
+            TrainConfig(muon_ns_steps=0)
 
     def test_invalid_stable_fraction(self) -> None:
         with pytest.raises(ValueError, match="stable_fraction"):
@@ -462,9 +657,10 @@ class TestTrainerIntegration:
         assert metrics["train/epoch"] == pytest.approx(0.0016)
         assert metrics["train/samples"] == 960_000
 
-    def test_resume_from_checkpoint_restores_samples_seen(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resume_from_checkpoint_restores_samples_seen(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import oplm.training.checkpoint as checkpoint_module
-
         from oplm.training import Trainer
 
         restored_epoch: list[int] = []
@@ -549,6 +745,58 @@ class TestTrainerIntegration:
 
         assert trainer.global_step == 4
         assert trainer.scheduler.scheduler.last_epoch == trainer.global_step
+
+    def test_trainer_muon_optimizers_and_schedulers_track_global_steps(
+        self,
+        parquet_dataset: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Muon mode should step all wrapped optimizers and schedulers together."""
+        import accelerate.scheduler as accelerate_scheduler
+
+        from oplm.training import Trainer
+
+        class _FakeAcceleratorState:
+            def __init__(self) -> None:
+                self.num_processes = 8
+
+        monkeypatch.setattr(
+            accelerate_scheduler,
+            "AcceleratorState",
+            lambda: _FakeAcceleratorState(),
+        )
+
+        cfg = OplmConfig(
+            model=_small_model_config(),
+            train=TrainConfig(
+                optimizer="muon",
+                max_steps=4,
+                batch_size=8,
+                gradient_accumulation_steps=2,
+                lr=1e-3,
+                warmup_steps=4,
+                log_every=1,
+                eval_every=100,
+                save_every=100,
+                wandb_enabled=False,
+                mixed_precision="no",
+                output_dir=tempfile.mkdtemp(),
+            ),
+        )
+        cfg.data.train = str(parquet_dataset)
+        cfg.data.max_length = 64
+        cfg.data.num_workers = 0
+
+        trainer = Trainer(cfg)
+        trainer.train()
+
+        assert trainer.global_step == 4
+        assert len(trainer.optimizers) == 2
+        assert len(trainer.schedulers) == 2
+        assert all(
+            scheduler.scheduler.last_epoch == trainer.global_step
+            for scheduler in trainer.schedulers
+        )
 
     def test_trainer_loss_decreases(self, parquet_dataset: Path) -> None:
         """Train a small model for 20 steps, verify loss decreases."""
