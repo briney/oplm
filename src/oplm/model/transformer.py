@@ -101,7 +101,8 @@ class TransformerBlock(nn.Module):
         value_embed: Tensor | None,
         attn_res: BlockAttentionResidual,
         state: BlockAttentionResidualState,
-    ) -> tuple[Tensor, Tensor | None, BlockAttentionResidualState]:
+        materialize_output: bool = True,
+    ) -> tuple[Tensor | None, Tensor | None, BlockAttentionResidualState]:
         """Attention residuals forward pass.
 
         Replaces fixed residual connections with learned depth-wise attention
@@ -113,10 +114,13 @@ class TransformerBlock(nn.Module):
             value_embed: Value embedding or None.
             attn_res: Block attention residual module.
             state: Current block accumulation state.
+            materialize_output: Whether to materialize the post-FFN hidden
+                state for downstream consumers.
 
         Returns:
             Tuple of (hidden, v_first, updated_state) where hidden is the
-            aggregated representation ``(B, T, D)``.
+            post-FFN aggregated representation ``(B, T, D)`` when requested,
+            else None.
         """
         # Attention sublayer
         h = attn_res.aggregate(state, 2 * self.layer_idx)
@@ -136,9 +140,12 @@ class TransformerBlock(nn.Module):
         ffn_out = self.ffn(self.ffn_pre_norm(h))
         state = attn_res.accumulate(state, ffn_out)
 
-        # Re-aggregate over updated state so the FFN output is on the
-        # forward path (otherwise the last layer's FFN params are dead).
-        x = attn_res.aggregate(state, 2 * self.layer_idx + 1)
+        x: Tensor | None = None
+        if materialize_output:
+            # Re-aggregate over the updated state only when a downstream
+            # consumer needs the layer output or the encoder needs its final
+            # hidden state.
+            x = attn_res.aggregate(state, 2 * self.layer_idx + 1)
         return x, v_first, state
 
 
@@ -178,7 +185,7 @@ class OplmEncoder(nn.Module):
             ``(B, T, D)`` and attn_weights is a list of ``(B, H, T, T)``
             tensors (one per layer) or None.
         """
-        x = self.embedding(input_ids)  # (B, T, D)
+        x: Tensor | None = self.embedding(input_ids)  # (B, T, D)
         attention_mask = normalize_attention_mask(attention_mask)
         v_first: Tensor | None = None
         all_attn_weights: list[Tensor] = []
@@ -186,15 +193,25 @@ class OplmEncoder(nn.Module):
         # Initialize AttnRes state with token embedding as first "block"
         state: BlockAttentionResidualState | None = None
         if self.attn_residual is not None:
+            assert x is not None
             state = BlockAttentionResidualState(blocks=[x], partial_block=None, step_count=0)
 
         for i, blk in enumerate(self.blocks):
             block: TransformerBlock = blk  # type: ignore[assignment]
-            # Get value embedding for this layer (if any)
-            ve = self.value_embedding(input_ids, x, i) if self.value_embedding is not None else None
+            uses_value_embed = self.value_embedding is not None and self.value_embedding.uses_layer(
+                i
+            )
+            ve: Tensor | None = None
+            if uses_value_embed:
+                assert self.value_embedding is not None
+                assert x is not None
+                ve = self.value_embedding(input_ids, x, i)
 
             if state is not None:
                 assert self.attn_residual is not None
+                materialize_output = i == len(self.blocks) - 1 or (
+                    self.value_embedding is not None and self.value_embedding.uses_layer(i + 1)
+                )
                 if self.gradient_checkpointing and self.training:
                     x, v_first, state = torch_checkpoint(
                         block.forward_with_attn_res,
@@ -203,13 +220,20 @@ class OplmEncoder(nn.Module):
                         ve,
                         self.attn_residual,
                         state,
+                        materialize_output,
                         use_reentrant=False,
                     )
                 else:
                     x, v_first, state = block.forward_with_attn_res(
-                        v_first, attention_mask, ve, self.attn_residual, state
+                        v_first,
+                        attention_mask,
+                        ve,
+                        self.attn_residual,
+                        state,
+                        materialize_output=materialize_output,
                     )
             else:
+                assert x is not None
                 if self.gradient_checkpointing and self.training:
                     x, v_first, layer_weights = torch_checkpoint(
                         block.forward,
@@ -225,6 +249,7 @@ class OplmEncoder(nn.Module):
                 if layer_weights is not None:
                     all_attn_weights.append(layer_weights)
 
+        assert x is not None
         hidden = self.final_norm(x)  # (B, T, D)
         return hidden, all_attn_weights if need_weights else None
 

@@ -82,6 +82,15 @@ class TestValueEmbedding:
         assert ve(ids, x, layer_idx=10) is not None
         assert ve(ids, x, layer_idx=11) is not None
 
+    def test_uses_layer(self) -> None:
+        cfg = self._make_config()
+        ve = ValueEmbedding(cfg)
+        assert ve.uses_layer(0)
+        assert ve.uses_layer(1)
+        assert not ve.uses_layer(5)
+        assert ve.uses_layer(10)
+        assert ve.uses_layer(11)
+
     def test_layer_map_correct(self) -> None:
         cfg = self._make_config(num_layers=12, num_value_embeds=3)
         ve = ValueEmbedding(cfg)

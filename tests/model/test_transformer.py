@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import copy
+from unittest import mock
+
 import pytest
 import torch
 
 from oplm.config import ModelConfig
+from oplm.model.masking import normalize_attention_mask
+from oplm.model.residual import BlockAttentionResidualState
 from oplm.model.transformer import MLMHead, OplmEncoder, OplmForMLM, TransformerBlock
 
 
@@ -23,6 +28,81 @@ def _make_config(**kwargs: object) -> ModelConfig:
 
 B, T = 2, 8
 VOCAB = 33
+
+
+def _run_attn_residual_eager_reference(
+    encoder: OplmEncoder,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the pre-optimization eager residual-attention encoder path."""
+    assert encoder.attn_residual is not None
+
+    x: torch.Tensor | None = encoder.embedding(input_ids)
+    normalized_attention_mask = normalize_attention_mask(attention_mask)
+    v_first: torch.Tensor | None = None
+    state = BlockAttentionResidualState(blocks=[x], partial_block=None, step_count=0)
+
+    for i, block in enumerate(encoder.blocks):
+        ve: torch.Tensor | None = None
+        if encoder.value_embedding is not None and encoder.value_embedding.uses_layer(i):
+            assert x is not None
+            ve = encoder.value_embedding(input_ids, x, i)
+        x, v_first, state = block.forward_with_attn_res(
+            v_first=v_first,
+            attention_mask=normalized_attention_mask,
+            value_embed=ve,
+            attn_res=encoder.attn_residual,
+            state=state,
+            materialize_output=True,
+        )
+
+    assert x is not None
+    return encoder.final_norm(x)
+
+
+def _assert_encoder_grads_match(
+    actual: OplmEncoder,
+    expected: OplmEncoder,
+    *,
+    atol: float = 1e-6,
+    rtol: float = 1e-5,
+) -> None:
+    """Assert encoder parameter gradients match exactly."""
+    for (name, param), (expected_name, expected_param) in zip(
+        actual.named_parameters(), expected.named_parameters(), strict=True
+    ):
+        assert name == expected_name
+        assert param.grad is not None, f"Missing gradient for {name}"
+        assert expected_param.grad is not None, f"Missing reference gradient for {name}"
+        torch.testing.assert_close(param.grad, expected_param.grad, atol=atol, rtol=rtol)
+
+
+def _run_mlm_with_eager_attn_residual_encoder(
+    model: OplmForMLM,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor | None]:
+    """Run the MLM head on top of the eager residual-attention encoder path."""
+    hidden = _run_attn_residual_eager_reference(model.encoder, input_ids)
+    logits = model.mlm_head(hidden)
+    loss: torch.Tensor | None = None
+    if labels is not None:
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            ignore_index=-100,
+        )
+    return {"logits": logits, "loss": loss}
+
+
+def _dead_parameter_names(module: torch.nn.Module) -> list[str]:
+    """Return the parameter names whose gradients are absent or identically zero."""
+    dead_params = []
+    for name, param in module.named_parameters():
+        if param.requires_grad and (param.grad is None or param.grad.abs().sum() == 0):
+            dead_params.append(name)
+    return dead_params
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +183,7 @@ class TestTransformerBlockAttnRes:
     def test_attn_res_forward(self) -> None:
         cfg = _make_config(attn_residual=True, attn_residual_block_size=2)
         block = TransformerBlock(cfg, layer_idx=0)
-        from oplm.model.residual import BlockAttentionResidual, BlockAttentionResidualState
+        from oplm.model.residual import BlockAttentionResidual
 
         attn_res = BlockAttentionResidual(cfg)
         embed = torch.randn(B, T, cfg.hidden_dim)
@@ -118,6 +198,27 @@ class TestTransformerBlockAttnRes:
         )
         assert out.shape == (B, T, cfg.hidden_dim)
         assert new_state.step_count == 2  # attn + FFN sublayers
+
+    def test_attn_res_forward_can_skip_materialization(self) -> None:
+        cfg = _make_config(attn_residual=True, attn_residual_block_size=2)
+        block = TransformerBlock(cfg, layer_idx=0)
+        from oplm.model.residual import BlockAttentionResidual
+
+        attn_res = BlockAttentionResidual(cfg)
+        embed = torch.randn(B, T, cfg.hidden_dim)
+        state = BlockAttentionResidualState(blocks=[embed])
+
+        out, v_first, new_state = block.forward_with_attn_res(
+            v_first=None,
+            attention_mask=None,
+            value_embed=None,
+            attn_res=attn_res,
+            state=state,
+            materialize_output=False,
+        )
+        assert out is None
+        assert v_first is None
+        assert new_state.step_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +298,64 @@ class TestOplmEncoder:
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for {name}"
                 break  # just check first param is sufficient
+
+    @pytest.mark.parametrize("num_value_embeds", [0, 2])
+    def test_attn_residual_matches_eager_reference(self, num_value_embeds: int) -> None:
+        torch.manual_seed(0)
+        cfg = _make_config(
+            attn_residual=True,
+            attn_residual_block_size=2,
+            num_value_embeds=num_value_embeds,
+        )
+        encoder = OplmEncoder(cfg)
+        eager_encoder = copy.deepcopy(encoder)
+
+        input_ids = torch.randint(0, VOCAB, (B, T))
+        attention_mask = torch.ones(B, T, dtype=torch.long)
+        attention_mask[:, -2:] = 0
+        grad_weight = torch.randn(B, T, cfg.hidden_dim)
+
+        hidden, _ = encoder(input_ids, attention_mask=attention_mask)
+        eager_hidden = _run_attn_residual_eager_reference(
+            eager_encoder,
+            input_ids,
+            attention_mask=attention_mask,
+        )
+
+        torch.testing.assert_close(hidden, eager_hidden, atol=1e-6, rtol=1e-5)
+
+        loss = (hidden * grad_weight).sum()
+        eager_loss = (eager_hidden * grad_weight).sum()
+        loss.backward()
+        eager_loss.backward()
+        _assert_encoder_grads_match(encoder, eager_encoder)
+
+    def test_attn_residual_skips_intermediate_post_ffn_materialization(self) -> None:
+        cfg = _make_config(attn_residual=True, attn_residual_block_size=2, num_layers=4)
+        encoder = OplmEncoder(cfg)
+        assert encoder.attn_residual is not None
+
+        input_ids = torch.randint(0, VOCAB, (B, T))
+        step_indices: list[int] = []
+        original_aggregate = encoder.attn_residual.aggregate
+
+        def counting_aggregate(
+            state: BlockAttentionResidualState,
+            step_idx: int,
+        ) -> torch.Tensor:
+            step_indices.append(step_idx)
+            return original_aggregate(state, step_idx)
+
+        with mock.patch.object(
+            encoder.attn_residual,
+            "aggregate",
+            side_effect=counting_aggregate,
+        ) as aggregate_mock:
+            hidden, _ = encoder(input_ids)
+
+        assert hidden.shape == (B, T, cfg.hidden_dim)
+        assert aggregate_mock.call_count == 2 * cfg.num_layers + 1
+        assert step_indices == [0, 1, 2, 3, 4, 5, 6, 7, 7]
 
 
 # ---------------------------------------------------------------------------
@@ -393,10 +552,7 @@ class TestFullModelGradient:
         labels = torch.randint(0, VOCAB, (B, T))
         result = model(input_ids, labels=labels)
         result["loss"].backward()
-        dead_params = []
-        for name, param in model.named_parameters():
-            if param.requires_grad and (param.grad is None or param.grad.abs().sum() == 0):
-                dead_params.append(name)
+        dead_params = _dead_parameter_names(model)
         assert len(dead_params) == 0, f"Dead parameters: {dead_params}"
 
     def test_all_params_receive_gradients_with_features(self) -> None:
@@ -413,8 +569,34 @@ class TestFullModelGradient:
         labels = torch.randint(0, VOCAB, (B, T))
         result = model(input_ids, labels=labels)
         result["loss"].backward()
-        dead_params = []
-        for name, param in model.named_parameters():
-            if param.requires_grad and (param.grad is None or param.grad.abs().sum() == 0):
-                dead_params.append(name)
+        dead_params = _dead_parameter_names(model)
         assert len(dead_params) == 0, f"Dead parameters: {dead_params}"
+
+    @pytest.mark.parametrize("num_value_embeds", [0, 2])
+    def test_all_params_receive_gradients_with_attn_residual(
+        self,
+        num_value_embeds: int,
+    ) -> None:
+        cfg = _make_config(
+            attn_residual=True,
+            attn_residual_block_size=2,
+            num_value_embeds=num_value_embeds,
+        )
+        model = OplmForMLM(cfg)
+        eager_model = copy.deepcopy(model)
+        input_ids = torch.randint(0, VOCAB, (B, T))
+        labels = torch.randint(0, VOCAB, (B, T))
+        result = model(input_ids, labels=labels)
+        eager_result = _run_mlm_with_eager_attn_residual_encoder(
+            eager_model,
+            input_ids,
+            labels=labels,
+        )
+        assert result["loss"] is not None
+        assert eager_result["loss"] is not None
+        torch.testing.assert_close(result["logits"], eager_result["logits"], atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(result["loss"], eager_result["loss"], atol=1e-6, rtol=1e-5)
+        result["loss"].backward()
+        eager_result["loss"].backward()
+
+        assert _dead_parameter_names(model) == _dead_parameter_names(eager_model)

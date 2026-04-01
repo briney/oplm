@@ -78,6 +78,10 @@ class ValueEmbedding(nn.Module):
             self.layer_map[i] = i
             self.layer_map[config.num_layers - n + i] = i
 
+    def uses_layer(self, layer_idx: int) -> bool:
+        """Return whether a layer consumes a value embedding."""
+        return layer_idx in self.layer_map
+
     def forward(self, input_ids: Tensor, x: Tensor, layer_idx: int) -> Tensor | None:
         """Compute gated value embedding for a given layer.
 
@@ -90,7 +94,7 @@ class ValueEmbedding(nn.Module):
             Gated value embedding ``(B, T, KV_H, D_head)`` or None if this
             layer does not use value embeddings.
         """
-        if layer_idx not in self.layer_map:
+        if not self.uses_layer(layer_idx):
             return None
         idx = self.layer_map[layer_idx]
         ve: Tensor = self.embeds[idx](input_ids)  # (B, T, kv_dim)
