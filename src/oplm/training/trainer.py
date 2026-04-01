@@ -39,7 +39,7 @@ class Trainer:
         from oplm.data.loader import build_train_dataloader
         from oplm.model.transformer import OplmForMLM
         from oplm.training.flops import estimate_flops_per_token
-        from oplm.training.optim import build_optimizer, build_scheduler
+        from oplm.training.optim import build_optimizers, build_schedulers
 
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
@@ -92,20 +92,25 @@ class Trainer:
             model.encoder.gradient_checkpointing = True
 
         # Optimizer and dataloader
-        optimizer = build_optimizer(model, cfg.train)
+        optimizers = build_optimizers(model, cfg.train)
         _status("[dim]Loading training data...[/dim]")
         dataloader = build_train_dataloader(cfg)
         raw_dataset_size = self._get_dataset_size_from_dataloader(dataloader)
 
         # Compute total_steps
         self.total_steps = self._compute_total_steps(cfg, dataloader)
-        scheduler = build_scheduler(optimizer, cfg.train, self.total_steps)
+        schedulers = build_schedulers(optimizers, cfg.train, self.total_steps)
 
         # Prepare with accelerate
         _status("[dim]Preparing for training...[/dim]")
-        self.model, self.optimizer, self.dataloader, self.scheduler = self.accelerator.prepare(
-            model, optimizer, dataloader, scheduler
-        )
+        prepared = self.accelerator.prepare(model, *optimizers, dataloader, *schedulers)
+        num_optimizers = len(optimizers)
+        self.model = prepared[0]
+        self.optimizers = list(prepared[1 : 1 + num_optimizers])
+        self.optimizer = self.optimizers[0]
+        self.dataloader = prepared[1 + num_optimizers]
+        self.schedulers = list(prepared[2 + num_optimizers :])
+        self.scheduler = self.schedulers[0]
 
         # Training state
         self.global_step = 0
@@ -187,8 +192,10 @@ class Trainer:
                             cfg.max_grad_norm,
                         )
 
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    for optimizer in self.optimizers:
+                        optimizer.step()
+                    for optimizer in self.optimizers:
+                        optimizer.zero_grad()
 
                 # Track tokens and samples
                 tokens_in_batch = batch["attention_mask"].sum().item()
@@ -199,7 +206,8 @@ class Trainer:
                 if not self.accelerator.sync_gradients:
                     continue
 
-                self.scheduler.step()
+                for scheduler in self.schedulers:
+                    scheduler.step()
                 self.global_step += 1
                 current_loss = loss.item()
 

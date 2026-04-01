@@ -25,6 +25,7 @@ def _write_distributed_config(
     tmp_path: Path,
     training_parquet: Path,
     *,
+    optimizer: str = "adamw",
     max_steps: int | None = 2,
     max_epochs: int | None = None,
     batch_size: int = 2,
@@ -46,6 +47,7 @@ def _write_distributed_config(
               num_kv_heads: 2
               max_seq_len: 64
             train:
+              optimizer: {optimizer}
               {duration_line}
               batch_size: {batch_size}
               lr: 0.001
@@ -214,6 +216,27 @@ def test_training_bootstrap_suppresses_deepspeed_import_logs() -> None:
 def test_cpu_distributed_training_smoke(tmp_path: Path, training_parquet: Path) -> None:
     """A two-process CPU accelerate launch should complete and save a checkpoint."""
     config_path = _write_distributed_config(tmp_path, training_parquet)
+    output_dir = tmp_path / "outputs"
+    result = _run_accelerate_training(tmp_path, config_path)
+
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+    combined_output = result.stdout + "\n" + result.stderr
+    assert "Setting ds_accelerator to" not in combined_output
+    assert "TorchCheckpointEngine" not in combined_output
+    assert ".triton/autotune" not in combined_output
+
+    trainer_state_path = output_dir / "checkpoint-2" / "trainer_state.json"
+    assert trainer_state_path.exists()
+
+    trainer_state = json.loads(trainer_state_path.read_text())
+    assert trainer_state["global_step"] == 2
+    assert trainer_state["tokens_seen"] > 0
+
+
+@pytest.mark.slow
+def test_cpu_distributed_training_smoke_muon(tmp_path: Path, training_parquet: Path) -> None:
+    """A two-process CPU accelerate launch should complete with Muon enabled."""
+    config_path = _write_distributed_config(tmp_path, training_parquet, optimizer="muon")
     output_dir = tmp_path / "outputs"
     result = _run_accelerate_training(tmp_path, config_path)
 

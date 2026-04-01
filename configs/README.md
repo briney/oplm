@@ -89,13 +89,17 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | `train.max_epochs` | `int \| null` | `null` | Optional epoch-based stop condition. | active |
 | `train.batch_size` | `int` | `32` | Per-process batch size before gradient accumulation. | active |
 | `train.gradient_accumulation_steps` | `int` | `1` | Must be `>= 1`. | active |
-| `train.optimizer` | `str` | `adamw` | Currently only `adamw`. | active |
+| `train.optimizer` | `str` | `adamw` | `adamw` (default) or `muon`. Muon uses a hybrid Muon+AdamW partitioning. | active |
 | `train.lr` | `float` | `1e-4` | Peak learning rate. | active |
 | `train.min_lr` | `float` | `0.0` | Must be `>= 0` and `<= train.lr`. | active |
-| `train.weight_decay` | `float` | `0.01` | AdamW weight decay. | active |
-| `train.adam_beta1` | `float` | `0.9` | AdamW beta1. | active |
-| `train.adam_beta2` | `float` | `0.98` | AdamW beta2. | active |
-| `train.adam_eps` | `float` | `1e-8` | AdamW epsilon. | active |
+| `train.weight_decay` | `float` | `0.01` | Shared decoupled weight decay for AdamW and Muon. | active |
+| `train.adam_beta1` | `float` | `0.9` | AdamW beta1. Reused by Muon's auxiliary AdamW optimizer. | active |
+| `train.adam_beta2` | `float` | `0.98` | AdamW beta2. Reused by Muon's auxiliary AdamW optimizer. | active |
+| `train.adam_eps` | `float` | `1e-8` | AdamW epsilon. Reused by Muon's auxiliary AdamW optimizer. | active |
+| `train.muon_adjust_lr_fn` | `str` | `match_rms_adamw` | `match_rms_adamw` or `original`. | active |
+| `train.muon_momentum` | `float` | `0.95` | Muon momentum. Must be `>= 0`. | active |
+| `train.muon_nesterov` | `bool` | `true` | Enable Muon Nesterov momentum. | active |
+| `train.muon_ns_steps` | `int` | `5` | Muon Newton-Schulz steps. Must be `>= 1`. | active |
 | `train.max_grad_norm` | `float` | `1.0` | Set to `0` to disable clipping. | active |
 | `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, or `wsd_cosine`. | active |
 | `train.warmup_steps` | `int` | `5000` | Must be `>= 0`. | active |
