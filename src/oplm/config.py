@@ -127,7 +127,7 @@ class ModelConfig:
                 )
             if self.conv_kernel_block_size < 1:
                 raise ValueError(
-                    "conv_kernel_block_size " f"({self.conv_kernel_block_size}) must be >= 1"
+                    f"conv_kernel_block_size ({self.conv_kernel_block_size}) must be >= 1"
                 )
             if self.conv_kernel_max_size is not None:
                 if self.conv_kernel_max_size % 2 == 0:
