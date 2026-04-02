@@ -21,10 +21,15 @@ if TYPE_CHECKING:
 
 
 class TransformerBlock(nn.Module):
-    """Single transformer layer with pre-norm residual connections.
+    """Single transformer layer with configurable normalization.
 
-    Supports two forward paths:
-    - Standard residual: ``forward()`` — ``x + sublayer(norm(x))``
+    Supports three normalization strategies via config:
+    - Pre-norm (default): ``x + sublayer(norm(x))``
+    - Post-norm: ``norm(x + sublayer(x))``
+    - Sandwich norm: ``x + norm₂(sublayer(norm₁(x)))`` — overrides pre/post
+
+    And two forward paths:
+    - Standard residual: ``forward()``
     - Attention residuals: ``forward_with_attn_res()`` — learned depth-wise
       aggregation replaces fixed residual connections.
 
@@ -36,8 +41,24 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.conv_kernel_size = config.conv_kernel_size_for_layer(layer_idx)
-        self.attn_pre_norm = RMSNorm(config.hidden_dim, config.norm_eps)
-        self.ffn_pre_norm = RMSNorm(config.hidden_dim, config.norm_eps)
+
+        # Pre-sublayer norms (used by pre_norm and sandwich_norm)
+        needs_pre = config.pre_norm or config.sandwich_norm
+        self.attn_pre_norm = RMSNorm(config.hidden_dim, config.norm_eps) if needs_pre else None
+        self.ffn_pre_norm = RMSNorm(config.hidden_dim, config.norm_eps) if needs_pre else None
+
+        # Post-residual norms (classic post-norm, ignored when sandwich_norm)
+        needs_post = config.post_norm and not config.sandwich_norm
+        self.attn_post_norm = RMSNorm(config.hidden_dim, config.norm_eps) if needs_post else None
+        self.ffn_post_norm = RMSNorm(config.hidden_dim, config.norm_eps) if needs_post else None
+
+        # Post-sublayer norms (sandwich norm: norm after sublayer, before residual)
+        self.attn_sandwich_norm = (
+            RMSNorm(config.hidden_dim, config.norm_eps) if config.sandwich_norm else None
+        )
+        self.ffn_sandwich_norm = (
+            RMSNorm(config.hidden_dim, config.norm_eps) if config.sandwich_norm else None
+        )
         self.attention = Attention(config, layer_idx)
         self.ffn = FFN(config, conv_kernel_size=self.conv_kernel_size)
         self.conv_a = (
@@ -84,18 +105,29 @@ class TransformerBlock(nn.Module):
         residual = x
         if self.conv_a is not None:
             x = self.conv_a(x)
+        attn_input = self.attn_pre_norm(x) if self.attn_pre_norm is not None else x
         attn_out, v_first_out, attn_weights = self.attention(
-            self.attn_pre_norm(x), v_first, attention_mask, value_embed, need_weights
+            attn_input, v_first, attention_mask, value_embed, need_weights
         )
         if v_first_out is not None:
             v_first = v_first_out
+        if self.attn_sandwich_norm is not None:
+            attn_out = self.attn_sandwich_norm(attn_out)
         x = residual + attn_out
+        if self.attn_post_norm is not None:
+            x = self.attn_post_norm(x)
 
         # FFN sublayer
         residual = x
         if self.conv_c is not None:
             x = self.conv_c(x)
-        x = residual + self.ffn(self.ffn_pre_norm(x))
+        ffn_input = self.ffn_pre_norm(x) if self.ffn_pre_norm is not None else x
+        ffn_out = self.ffn(ffn_input)
+        if self.ffn_sandwich_norm is not None:
+            ffn_out = self.ffn_sandwich_norm(ffn_out)
+        x = residual + ffn_out
+        if self.ffn_post_norm is not None:
+            x = self.ffn_post_norm(x)
 
         return x, v_first, attn_weights
 
@@ -131,8 +163,9 @@ class TransformerBlock(nn.Module):
         h = attn_res.aggregate(state, 2 * self.layer_idx)
         if self.conv_a is not None:
             h = self.conv_a(h)
+        attn_input = self.attn_pre_norm(h) if self.attn_pre_norm is not None else h
         attn_out, v_first_out, _ = self.attention(
-            self.attn_pre_norm(h), v_first, attention_mask, value_embed
+            attn_input, v_first, attention_mask, value_embed
         )
         if v_first_out is not None:
             v_first = v_first_out
@@ -142,7 +175,8 @@ class TransformerBlock(nn.Module):
         h = attn_res.aggregate(state, 2 * self.layer_idx + 1)
         if self.conv_c is not None:
             h = self.conv_c(h)
-        ffn_out = self.ffn(self.ffn_pre_norm(h))
+        ffn_input = self.ffn_pre_norm(h) if self.ffn_pre_norm is not None else h
+        ffn_out = self.ffn(ffn_input)
         state = attn_res.accumulate(state, ffn_out)
 
         x: Tensor | None = None

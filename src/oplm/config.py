@@ -74,6 +74,9 @@ class ModelConfig:
     # Normalization
     norm_eps: float = 1e-6
     post_embed_norm: bool = False
+    pre_norm: bool = True
+    post_norm: bool = False
+    sandwich_norm: bool = False
 
     # Training features
     gradient_checkpointing: bool = False

@@ -27,7 +27,7 @@ def _make_config(**kwargs: object) -> ModelConfig:
 
 
 B, T = 2, 8
-VOCAB = 33
+VOCAB = 32
 
 
 def _run_attn_residual_eager_reference(
@@ -206,6 +206,25 @@ class TestTransformerBlock:
         mask = torch.ones(B, 1, 1, T)
         mask[:, :, :, -2:] = 0  # mask out last 2 positions
         out, _, _ = block(x, attention_mask=mask)
+        assert out.shape == (B, T, cfg.hidden_dim)
+
+    def test_post_norm_output_shape(self) -> None:
+        cfg = _make_config(pre_norm=False, post_norm=True)
+        block = TransformerBlock(cfg, layer_idx=0)
+        assert block.attn_pre_norm is None
+        assert block.attn_post_norm is not None
+        x = torch.randn(B, T, cfg.hidden_dim)
+        out, _, _ = block(x)
+        assert out.shape == (B, T, cfg.hidden_dim)
+
+    def test_sandwich_norm_output_shape(self) -> None:
+        cfg = _make_config(sandwich_norm=True)
+        block = TransformerBlock(cfg, layer_idx=0)
+        assert block.attn_pre_norm is not None
+        assert block.attn_sandwich_norm is not None
+        assert block.attn_post_norm is None
+        x = torch.randn(B, T, cfg.hidden_dim)
+        out, _, _ = block(x)
         assert out.shape == (B, T, cfg.hidden_dim)
 
 
@@ -444,6 +463,27 @@ class TestEncoderAblationMatrix:
         hidden, _ = encoder(input_ids)
         assert hidden.shape == (B, T, cfg.hidden_dim)
 
+    @pytest.mark.parametrize(
+        "pre_norm,post_norm,sandwich_norm",
+        [
+            (True, False, False),  # default pre-norm
+            (False, True, False),  # post-norm only
+            (True, True, False),  # pre + post
+            (False, False, True),  # sandwich
+        ],
+    )
+    def test_norm_strategy_combinations(
+        self,
+        pre_norm: bool,
+        post_norm: bool,
+        sandwich_norm: bool,
+    ) -> None:
+        cfg = _make_config(pre_norm=pre_norm, post_norm=post_norm, sandwich_norm=sandwich_norm)
+        encoder = OplmEncoder(cfg)
+        input_ids = torch.randint(0, VOCAB, (B, T))
+        hidden, _ = encoder(input_ids)
+        assert hidden.shape == (B, T, cfg.hidden_dim)
+
     @pytest.mark.parametrize("ffn_activation", ["swiglu", "relu_squared", "gelu"])
     @pytest.mark.parametrize("partial_rope", [False, True])
     def test_activation_and_rope_combinations(
@@ -487,6 +527,20 @@ class TestZeroOverheadWhenDisabled:
         n_no = sum(p.numel() for p in OplmEncoder(cfg_no).parameters())
         n_ve = sum(p.numel() for p in OplmEncoder(cfg_ve).parameters())
         assert n_ve > n_no
+
+    def test_post_norm_adds_parameters(self) -> None:
+        cfg_no = _make_config(post_norm=False)
+        cfg_post = _make_config(post_norm=True)
+        n_no = sum(p.numel() for p in OplmEncoder(cfg_no).parameters())
+        n_post = sum(p.numel() for p in OplmEncoder(cfg_post).parameters())
+        assert n_post > n_no
+
+    def test_sandwich_norm_adds_parameters(self) -> None:
+        cfg_no = _make_config(sandwich_norm=False)
+        cfg_sw = _make_config(sandwich_norm=True)
+        n_no = sum(p.numel() for p in OplmEncoder(cfg_no).parameters())
+        n_sw = sum(p.numel() for p in OplmEncoder(cfg_sw).parameters())
+        assert n_sw > n_no
 
     def test_no_attn_residual_overhead(self) -> None:
         cfg_no = _make_config(attn_residual=False)
@@ -601,6 +655,26 @@ class TestFullModelGradient:
             output_gate=True,
             qk_norm=True,
         )
+        model = OplmForMLM(cfg)
+        input_ids = torch.randint(0, VOCAB, (B, T))
+        labels = torch.randint(0, VOCAB, (B, T))
+        result = model(input_ids, labels=labels)
+        result["loss"].backward()
+        dead_params = _dead_parameter_names(model)
+        assert len(dead_params) == 0, f"Dead parameters: {dead_params}"
+
+    def test_all_params_receive_gradients_post_norm(self) -> None:
+        cfg = _make_config(pre_norm=False, post_norm=True)
+        model = OplmForMLM(cfg)
+        input_ids = torch.randint(0, VOCAB, (B, T))
+        labels = torch.randint(0, VOCAB, (B, T))
+        result = model(input_ids, labels=labels)
+        result["loss"].backward()
+        dead_params = _dead_parameter_names(model)
+        assert len(dead_params) == 0, f"Dead parameters: {dead_params}"
+
+    def test_all_params_receive_gradients_sandwich_norm(self) -> None:
+        cfg = _make_config(sandwich_norm=True)
         model = OplmForMLM(cfg)
         input_ids = torch.randint(0, VOCAB, (B, T))
         labels = torch.randint(0, VOCAB, (B, T))

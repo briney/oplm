@@ -44,6 +44,9 @@ model:
   # Normalization
   norm_eps: 1.0e-6
   post_embed_norm: false
+  pre_norm: true
+  post_norm: false
+  sandwich_norm: false
 
   # Training features
   gradient_checkpointing: false

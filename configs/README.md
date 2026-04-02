@@ -78,6 +78,9 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | `model.attn_residual_block_size` | `int` | `8` | Must divide `model.num_layers` when attention residuals are enabled. | active |
 | `model.norm_eps` | `float` | `1e-6` | RMSNorm epsilon. | active |
 | `model.post_embed_norm` | `bool` | `false` | Apply RMSNorm after token embedding lookup. | active |
+| `model.pre_norm` | `bool` | `true` | Pre-norm: apply RMSNorm before each sublayer. | active |
+| `model.post_norm` | `bool` | `false` | Post-norm: apply RMSNorm after residual addition. | active |
+| `model.sandwich_norm` | `bool` | `false` | Sandwich norm: pre+post-sublayer norms. Overrides pre_norm and post_norm. | active |
 | `model.gradient_checkpointing` | `bool` | `false` | Enables activation checkpointing in the encoder. | active |
 | `model.tie_embeddings` | `bool` | `false` | Tie MLM projection weights to token embeddings. | active |
 | `model.dtype` | `str` | `bfloat16` | Reserved placeholder; runtime precision is controlled by `train.mixed_precision`. | unused |
