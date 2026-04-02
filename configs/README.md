@@ -52,7 +52,7 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | `model.head_dim` | `int \| null` | derived | Auto-computed as `hidden_dim // num_heads` when omitted. | derived |
 | `model.ffn_dim` | `int \| null` | derived | Auto-computed from `ffn_activation` when omitted. | derived |
 | `model.ffn_activation` | `str` | `swiglu` | `swiglu`, `relu_squared`, or `gelu`. | active |
-| `model.vocab_size` | `int` | `33` | Tokenizer vocabulary size. | active |
+| `model.vocab_size` | `int` | `32` | Tokenizer vocabulary size. | active |
 | `model.max_seq_len` | `int` | `512` | Canonical context length and initial RoPE cache size used by train, eval, and inference. | active |
 | `model.shared_kv` | `bool` | `false` | Share K and V projections. | active |
 | `model.qk_norm` | `bool` | `true` | Apply RMSNorm to Q and K before attention. | active |

@@ -34,7 +34,7 @@ def _make_tiny_model() -> OplmForMLM:
 def _make_eval_batch(
     batch_size: int = 4,
     seq_len: int = 16,
-    vocab_size: int = 33,
+    vocab_size: int = 32,
     mask_count: int = 3,
 ) -> dict[str, torch.Tensor]:
     """Create a synthetic eval batch with known masked positions."""

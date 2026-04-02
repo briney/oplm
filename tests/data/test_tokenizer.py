@@ -14,7 +14,7 @@ class TestProteinTokenizer:
         return ProteinTokenizer()
 
     def test_vocab_size(self, tokenizer: ProteinTokenizer) -> None:
-        assert tokenizer.vocab_size == 33
+        assert tokenizer.vocab_size == 32
 
     def test_special_token_ids(self, tokenizer: ProteinTokenizer) -> None:
         assert tokenizer.cls_token_id == 0

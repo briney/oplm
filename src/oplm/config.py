@@ -34,7 +34,7 @@ class ModelConfig:
     head_dim: int | None = None
     ffn_dim: int | None = None
     ffn_activation: str = "swiglu"
-    vocab_size: int = 33
+    vocab_size: int = 32
     max_seq_len: int = 512
 
     # Attention features

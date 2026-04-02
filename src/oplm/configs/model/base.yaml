@@ -6,7 +6,7 @@ model:
   num_heads: 12
   num_kv_heads: 4
   ffn_activation: swiglu
-  vocab_size: 33
+  vocab_size: 32
   max_seq_len: 512
 
   # Attention features

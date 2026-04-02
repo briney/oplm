@@ -13,7 +13,7 @@ VOCAB: dict[str, int] = {
     "P": 15, "K": 16, "Q": 17, "N": 18, "F": 19,
     "Y": 20, "M": 21, "H": 22, "W": 23, "C": 24,
     "B": 25, "U": 26, "Z": 27, "O": 28, "X": 29,
-    ".": 30, "-": 31, "<null>": 32,
+    ".": 30, "-": 31,
 }
 # fmt: on
 
@@ -21,7 +21,7 @@ ID_TO_TOKEN: dict[int, str] = {v: k for k, v in VOCAB.items()}
 
 
 class ProteinTokenizer:
-    """ESM-compatible protein tokenizer with 33 tokens.
+    """Protein tokenizer with 32 tokens.
 
     No external dependencies -- dict-based lookup, not sentencepiece/BPE.
     """
