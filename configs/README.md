@@ -20,8 +20,7 @@ Notes:
 - `train.config_path` is populated automatically when `--config` is used.
 - Runtime precision is controlled by `train.mixed_precision`. `model.dtype` is currently a
   reserved placeholder and is not consumed by the runtime path.
-- `model.max_seq_len` is the canonical sequence-length setting for training, eval, and
-  inference. `data.max_length` remains a deprecated compatibility alias.
+- `model.max_seq_len` is the sequence-length setting for training, eval, and inference.
 - Eval task-specific keys live directly on each `data.eval.<name>` entry. Do not nest them
   under `extra:`.
 
@@ -125,7 +124,6 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | --- | --- | --- | --- | --- |
 | `data.train` | `str \| dict \| null` | `null` | Single parquet path or named dataset map with optional fractions. | active |
 | `data.eval` | `dict \| null` | `null` | Named eval dataset map. See [Eval Datasets](#eval-datasets). | active |
-| `data.max_length` | `int` | `512` | Deprecated compatibility alias for `model.max_seq_len`. `load_config()` copies it into `model.max_seq_len` and warns. | deprecated |
 | `data.mask_prob` | `float` | `0.15` | BERT-style MLM masking probability. | active |
 | `data.num_workers` | `int` | `4` | PyTorch DataLoader workers. | active |
 | `data.pin_memory` | `bool` | `true` | Pin host memory for DataLoader batches. | active |

@@ -32,7 +32,7 @@ def _make_cfg(max_length: int = 64, batch_size: int = 4) -> OplmConfig:
             max_seq_len=max_length,
         ),
         train=TrainConfig(batch_size=batch_size, eval_every=100),
-        data=DataConfig(max_length=max_length, num_workers=0),
+        data=DataConfig(num_workers=0),
     )
 
 
@@ -240,7 +240,6 @@ class TestSequenceEvalTaskIntegration:
             ),
             train=TrainConfig(batch_size=4, eval_every=10),
             data=DataConfig(
-                max_length=64,
                 num_workers=0,
                 eval={
                     "heldout": {
@@ -270,7 +269,6 @@ class TestSequenceEvalTaskIntegration:
             ),
             train=TrainConfig(batch_size=4, eval_every=10),
             data=DataConfig(
-                max_length=64,
                 num_workers=0,
                 eval={
                     "heldout": {

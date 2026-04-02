@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import pytest
 import torch
 from accelerate import Accelerator
 
@@ -18,19 +17,18 @@ if TYPE_CHECKING:
 
 def test_checkpoint_inference_uses_unified_sequence_length(tmp_path: Path) -> None:
     """Checkpoint-backed inference should see the same sequence length as training."""
-    with pytest.warns(DeprecationWarning, match="data.max_length"):
-        cfg = load_config(
-            [
-                "model.hidden_dim=64",
-                "model.num_layers=2",
-                "model.num_heads=4",
-                "model.num_kv_heads=2",
-                "data.max_length=96",
-                f"train.output_dir={tmp_path}",
-                "train.wandb_enabled=false",
-                "train.mixed_precision=\"no\"",
-            ]
-        )
+    cfg = load_config(
+        [
+            "model.hidden_dim=64",
+            "model.num_layers=2",
+            "model.num_heads=4",
+            "model.num_kv_heads=2",
+            "model.max_seq_len=96",
+            f"train.output_dir={tmp_path}",
+            "train.wandb_enabled=false",
+            "train.mixed_precision=\"no\"",
+        ]
+    )
 
     accelerator = Accelerator(cpu=True)
     model = torch.nn.Linear(4, 4)
@@ -49,7 +47,9 @@ def test_checkpoint_inference_uses_unified_sequence_length(tmp_path: Path) -> No
         save_total_limit=1,
     )
 
+    config_text = (tmp_path / "checkpoint-1" / "config.yaml").read_text()
+    assert "max_length" not in config_text
+
     resolved = resolve_inference_config(tmp_path / "checkpoint-1")
 
     assert resolved.model.max_seq_len == 96
-    assert resolved.data.max_length == 96

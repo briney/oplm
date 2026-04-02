@@ -6,7 +6,6 @@ Uses OmegaConf for YAML serialization, CLI overrides, and type-safe merging.
 from __future__ import annotations
 
 import math
-import warnings
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
@@ -304,11 +303,7 @@ class DataConfig:
     # Parsed at runtime via parse_eval_configs().
     eval: Any = None
 
-    # Sequence and masking
-    # Deprecated compatibility alias for model.max_seq_len. load_config()
-    # mirrors the resolved model value back into this field so serialized
-    # configs stay coherent while the alias remains supported.
-    max_length: int = 512
+    # Sequence masking
     mask_prob: float = 0.15
 
     # DataLoader settings
@@ -369,42 +364,17 @@ def _lookup_nested_mapping_value(mapping: Any, path: tuple[str, ...]) -> Any:
     return current
 
 
-def _normalize_sequence_length_config(
-    base: DictConfig,
-    override_dicts: list[Any],
-) -> None:
-    """Canonicalize sequence length onto model.max_seq_len.
-
-    `data.max_length` remains a deprecated compatibility alias. When the alias
-    is provided on its own, copy it into `model.max_seq_len` and emit a
-    deprecation warning. If both keys are provided and disagree, fail fast.
-    The resolved model length is always mirrored back into `data.max_length`
-    so downstream config serialization stays coherent.
-    """
-    explicit_model_max_seq_len = any(
-        _lookup_nested_mapping_value(ov, ("model", "max_seq_len")) is not _NESTED_VALUE_MISSING
-        for ov in override_dicts
-    )
-    explicit_data_max_length = any(
+def _reject_removed_sequence_length_alias(override_dicts: list[Any]) -> None:
+    """Reject removed sequence-length overrides before merging them into the config."""
+    has_removed_alias = any(
         _lookup_nested_mapping_value(ov, ("data", "max_length")) is not _NESTED_VALUE_MISSING
         for ov in override_dicts
     )
-
-    if explicit_data_max_length:
-        if explicit_model_max_seq_len and base.model.max_seq_len != base.data.max_length:
-            raise ValueError(
-                "Conflicting sequence length settings: `model.max_seq_len` and deprecated "
-                "`data.max_length` are both set but differ. Use `model.max_seq_len` as the "
-                "canonical sequence-length setting."
-            )
-        warnings.warn(
-            "`data.max_length` is deprecated; use `model.max_seq_len` instead.",
-            DeprecationWarning,
-            stacklevel=3,
+    if has_removed_alias:
+        raise ValueError(
+            "`data.max_length` has been removed. Use `model.max_seq_len` as the "
+            "sequence-length setting."
         )
-        base.model.max_seq_len = base.data.max_length
-
-    base.data.max_length = base.model.max_seq_len
 
 
 def parse_train_configs(raw: Any) -> list[TrainDatasetEntry]:
@@ -622,11 +592,12 @@ def load_config(argv: list[str]) -> OplmConfig:
     if remaining:
         overrides.append(OmegaConf.from_dotlist(remaining))
 
+    override_dicts = [OmegaConf.to_container(ov, resolve=True) for ov in overrides]
+    _reject_removed_sequence_length_alias(override_dicts)
+
     # Merge all overrides into base
     for ov in overrides:
         base = cast("DictConfig", OmegaConf.merge(base, ov))
-
-    override_dicts = [OmegaConf.to_container(ov, resolve=True) for ov in overrides]
 
     # Find which model fields were explicitly provided by the user
     explicit_model_keys: set[str] = set()
@@ -634,8 +605,6 @@ def load_config(argv: list[str]) -> OplmConfig:
         model_dict = ov_dict.get("model") if isinstance(ov_dict, dict) else None
         if isinstance(model_dict, dict):
             explicit_model_keys.update(model_dict.keys())
-
-    _normalize_sequence_length_config(base, override_dicts)
 
     # Reset derived fields not explicitly set so __post_init__ recomputes
     # them from the (potentially overridden) source dimensions.

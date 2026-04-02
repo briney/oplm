@@ -130,7 +130,7 @@ class TestBuildSequenceEvalDataloader:
         cfg = OplmConfig(
             model=ModelConfig(max_seq_len=128),
             train=TrainConfig(batch_size=4),
-            data=DataConfig(max_length=128, num_workers=0),
+            data=DataConfig(num_workers=0),
         )
         dl = build_sequence_eval_dataloader(str(training_parquet), cfg)
 
@@ -146,7 +146,7 @@ class TestBuildSequenceEvalDataloader:
         cfg = OplmConfig(
             model=ModelConfig(max_seq_len=128),
             train=TrainConfig(batch_size=4),
-            data=DataConfig(max_length=128, num_workers=0),
+            data=DataConfig(num_workers=0),
         )
         dl1 = build_sequence_eval_dataloader(str(training_parquet), cfg)
         dl2 = build_sequence_eval_dataloader(str(training_parquet), cfg)
@@ -162,7 +162,7 @@ class TestBuildSequenceEvalDataloader:
         cfg = OplmConfig(
             model=ModelConfig(max_seq_len=64),
             train=TrainConfig(batch_size=2),
-            data=DataConfig(max_length=64, num_workers=0),
+            data=DataConfig(num_workers=0),
         )
 
         def get_first_n_ids(n: int) -> list[torch.Tensor]:
@@ -184,7 +184,7 @@ class TestBuildSequenceEvalDataloader:
         cfg = OplmConfig(
             model=ModelConfig(max_seq_len=32),
             train=TrainConfig(batch_size=4),
-            data=DataConfig(max_length=128, num_workers=0),
+            data=DataConfig(num_workers=0),
         )
 
         dl = build_sequence_eval_dataloader(str(training_parquet), cfg)

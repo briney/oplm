@@ -40,10 +40,10 @@ def _write_parquet(path: Path, sequences: list[tuple[str, str]]) -> None:
 def _make_config(train_data: str | dict, batch_size: int = 4) -> OplmConfig:
     """Build a minimal config for testing."""
     return OplmConfig(
+        model=ModelConfig(max_seq_len=64),
         train=TrainConfig(batch_size=batch_size, seed=42),
         data=DataConfig(
             train=train_data,
-            max_length=64,
             mask_prob=0.15,
             num_workers=0,
             pin_memory=False,
@@ -139,7 +139,6 @@ class TestBuildTrainDataloader:
             train=TrainConfig(batch_size=1, seed=42),
             data=DataConfig(
                 train=str(path),
-                max_length=64,
                 mask_prob=0.15,
                 num_workers=0,
                 pin_memory=False,
@@ -151,13 +150,13 @@ class TestBuildTrainDataloader:
 
         assert batch["input_ids"].shape == (1, 16)
 
-    def test_legacy_data_max_length_alias_still_drives_truncation(self, tmp_path: Path) -> None:
+    def test_removed_data_max_length_override_raises(self, tmp_path: Path) -> None:
         path = tmp_path / "train.parquet"
         long_sequences = [("seq_0", "A" * 80)]
         _write_parquet(path, long_sequences)
 
-        with pytest.warns(DeprecationWarning, match="data.max_length"):
-            cfg = load_config(
+        with pytest.raises(ValueError, match="data.max_length.*removed"):
+            load_config(
                 [
                     f"data.train={path}",
                     "data.max_length=16",
@@ -166,10 +165,3 @@ class TestBuildTrainDataloader:
                     "data.pin_memory=false",
                 ]
             )
-
-        loader = build_train_dataloader(cfg)
-        batch = next(iter(loader))
-
-        assert cfg.model.max_seq_len == 16
-        assert cfg.data.max_length == 16
-        assert batch["input_ids"].shape == (1, 16)

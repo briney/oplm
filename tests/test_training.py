@@ -737,7 +737,7 @@ class TestTrainerIntegration:
             ),
         )
         cfg.data.train = str(parquet_dataset)
-        cfg.data.max_length = 64
+        cfg.model.max_seq_len = 64
         cfg.data.num_workers = 0
 
         trainer = Trainer(cfg)
@@ -784,7 +784,7 @@ class TestTrainerIntegration:
             ),
         )
         cfg.data.train = str(parquet_dataset)
-        cfg.data.max_length = 64
+        cfg.model.max_seq_len = 64
         cfg.data.num_workers = 0
 
         trainer = Trainer(cfg)
@@ -819,7 +819,7 @@ class TestTrainerIntegration:
             ),
         )
         cfg.data.train = str(parquet_dataset)
-        cfg.data.max_length = 64
+        cfg.model.max_seq_len = 64
         cfg.data.num_workers = 0
 
         from oplm.training import Trainer
@@ -871,7 +871,7 @@ class TestTrainerIntegration:
         )
         cfg.data.train = str(parquet_dataset)
         cfg.data.eval = {"mock_ds": {"path": "/fake", "type": "_mock"}}
-        cfg.data.max_length = 64
+        cfg.model.max_seq_len = 64
         cfg.data.num_workers = 0
 
         from oplm.training import Trainer
@@ -920,7 +920,7 @@ class TestTrainerIntegration:
         )
         cfg.data.train = str(parquet_dataset)
         cfg.data.eval = {"mock_ds": {"path": "/fake", "type": "_mock"}}
-        cfg.data.max_length = 64
+        cfg.model.max_seq_len = 64
         cfg.data.num_workers = 0
 
         try:
@@ -960,7 +960,7 @@ class TestTrainerIntegration:
             ),
         )
         cfg.data.train = str(parquet_dataset)
-        cfg.data.max_length = 64
+        cfg.model.max_seq_len = 64
         cfg.data.num_workers = 0
 
         from oplm.training import Trainer

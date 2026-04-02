@@ -34,7 +34,7 @@ def _make_cfg(max_length: int = 128) -> OplmConfig:
             max_seq_len=max_length,
         ),
         train=TrainConfig(batch_size=1, eval_every=100),
-        data=DataConfig(max_length=max_length, num_workers=0),
+        data=DataConfig(num_workers=0),
     )
 
 
@@ -153,7 +153,7 @@ class TestStructureEvalTaskInit:
                 max_seq_len=16,
             ),
             train=TrainConfig(batch_size=1, eval_every=100),
-            data=DataConfig(max_length=128, num_workers=0),
+            data=DataConfig(num_workers=0),
         )
         entry = _make_entry()
         task = StructureEvalTask(entry, cfg)
@@ -309,7 +309,6 @@ class TestStructureEvalTaskIntegration:
             ),
             train=TrainConfig(batch_size=1, eval_every=10),
             data=DataConfig(
-                max_length=128,
                 num_workers=0,
                 eval={
                     "pdb": {
@@ -342,7 +341,6 @@ class TestStructureEvalTaskIntegration:
             ),
             train=TrainConfig(batch_size=1, eval_every=10),
             data=DataConfig(
-                max_length=128,
                 num_workers=0,
                 eval={
                     "pdb": {
@@ -384,7 +382,6 @@ class TestStructureEvalTaskIntegration:
             ),
             train=TrainConfig(batch_size=1, eval_every=10),
             data=DataConfig(
-                max_length=128,
                 num_workers=0,
                 eval={
                     "pdb": {

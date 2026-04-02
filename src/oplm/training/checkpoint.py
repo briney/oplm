@@ -60,13 +60,7 @@ def save_checkpoint(
         state_path.write_text(json.dumps(state, indent=2))
 
         # Save frozen config
-        cfg_to_save = deepcopy(cfg)
-        cfg_to_save.data.max_length = cfg.model.max_seq_len
-        cfg_config = OmegaConf.to_container(OmegaConf.structured(cfg_to_save), resolve=True)
-        if isinstance(cfg_config, dict):
-            data_cfg = cfg_config.get("data")
-            if isinstance(data_cfg, dict):
-                data_cfg.pop("max_length", None)
+        cfg_config = OmegaConf.to_container(OmegaConf.structured(deepcopy(cfg)), resolve=True)
         config_path = checkpoint_dir / "config.yaml"
         config_path.write_text(OmegaConf.to_yaml(OmegaConf.create(cfg_config)))
 

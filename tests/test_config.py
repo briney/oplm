@@ -308,25 +308,17 @@ class TestLoadConfig:
     def test_model_max_seq_len_override_is_canonical(self) -> None:
         cfg = load_config(["model.max_seq_len=256"])
         assert cfg.model.max_seq_len == 256
-        assert cfg.data.max_length == 256
 
-    def test_legacy_data_max_length_override_maps_with_warning(self) -> None:
-        with pytest.warns(DeprecationWarning, match="data.max_length"):
-            cfg = load_config(["data.max_length=256"])
+    def test_removed_data_max_length_override_raises(self) -> None:
+        with pytest.raises(ValueError, match="data.max_length.*removed"):
+            load_config(["data.max_length=256"])
 
-        assert cfg.model.max_seq_len == 256
-        assert cfg.data.max_length == 256
+    def test_removed_data_max_length_yaml_key_raises(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("data:\n  max_length: 256\n")
 
-    def test_equal_dual_sequence_length_settings_warn_and_pass(self) -> None:
-        with pytest.warns(DeprecationWarning, match="data.max_length"):
-            cfg = load_config(["model.max_seq_len=256", "data.max_length=256"])
-
-        assert cfg.model.max_seq_len == 256
-        assert cfg.data.max_length == 256
-
-    def test_mismatched_dual_sequence_length_settings_raise(self) -> None:
-        with pytest.raises(ValueError, match="Conflicting sequence length settings"):
-            load_config(["model.max_seq_len=256", "data.max_length=128"])
+        with pytest.raises(ValueError, match="data.max_length.*removed"):
+            load_config(["--config", str(config_file)])
 
     def test_yaml_file(self, tmp_path: Path) -> None:
         yaml_content = "model:\n  hidden_dim: 512\n  num_heads: 8\n  num_kv_heads: 4\n"
@@ -393,7 +385,6 @@ class TestLoadConfig:
     def test_data_config_defaults(self) -> None:
         cfg = load_config([])
         assert cfg.model.max_seq_len == 512
-        assert cfg.data.max_length == 512
         assert cfg.data.mask_prob == 0.15
         assert cfg.data.num_workers == 4
         assert cfg.data.train is None

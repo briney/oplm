@@ -74,7 +74,7 @@ def _run_training(
         ),
     )
     cfg.data.train = str(training_parquet)
-    cfg.data.max_length = 128
+    cfg.model.max_seq_len = 128
     cfg.data.num_workers = 0
 
     recorder = _MetricRecorder()
@@ -272,7 +272,6 @@ class TestE2ETrainingWithEval:
             ),
             data=DataConfig(
                 train=str(training_parquet),
-                max_length=128,
                 num_workers=0,
                 eval={
                     "test": {
@@ -324,7 +323,6 @@ class TestE2ETrainingWithEval:
             ),
             data=DataConfig(
                 train=str(training_parquet),
-                max_length=128,
                 num_workers=0,
                 eval={
                     "test": {
@@ -369,7 +367,6 @@ class TestE2ETrainingWithEval:
             ),
             data=DataConfig(
                 train=str(training_parquet),
-                max_length=128,
                 num_workers=0,
                 eval={
                     "fast": {
@@ -432,7 +429,7 @@ class TestE2ETrainingWithEval:
             ),
         )
         cfg.data.train = str(training_parquet)
-        cfg.data.max_length = 128
+        cfg.model.max_seq_len = 128
         cfg.data.num_workers = 0
 
         trainer = Trainer(cfg)

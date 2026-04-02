@@ -158,7 +158,7 @@ class TestComputeMlmMetrics:
                 max_seq_len=64,
             ),
             train=TrainConfig(batch_size=4),
-            data=DataConfig(max_length=64, num_workers=0),
+            data=DataConfig(num_workers=0),
         )
         model = OplmForMLM(cfg.model)
         model.eval()
