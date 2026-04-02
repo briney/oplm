@@ -29,4 +29,7 @@ class RMSNorm(nn.Module):
         Returns:
             Normalized tensor of the same shape.
         """
-        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+        # Match the affine scale to the activation dtype so mixed-precision
+        # runs can use the fused kernel while keeping the master weight in FP32.
+        weight = self.weight if self.weight.dtype == x.dtype else self.weight.to(dtype=x.dtype)
+        return F.rms_norm(x, (self.dim,), weight, self.eps)
