@@ -58,7 +58,7 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, str]]:
     tokenizer = ProteinTokenizer()
     collator = MLMCollator(
         tokenizer,
-        max_length=cfg.data.max_length,
+        max_length=cfg.model.max_seq_len,
         mask_prob=cfg.data.mask_prob,
     )
 

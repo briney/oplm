@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from pathlib import Path
 
-from oplm.config import DataConfig, OplmConfig, TrainConfig
+from oplm.config import DataConfig, ModelConfig, OplmConfig, TrainConfig
 from oplm.data.tokenizer import ProteinTokenizer
 from oplm.eval.data.sequence_loader import (
     _EVAL_MASK_PROB,
@@ -128,6 +128,7 @@ class TestBuildSequenceEvalDataloader:
     def test_builds_from_parquet(self, training_parquet: Path) -> None:
         """Should build a DataLoader from a real parquet file."""
         cfg = OplmConfig(
+            model=ModelConfig(max_seq_len=128),
             train=TrainConfig(batch_size=4),
             data=DataConfig(max_length=128, num_workers=0),
         )
@@ -143,6 +144,7 @@ class TestBuildSequenceEvalDataloader:
     def test_deterministic_across_calls(self, training_parquet: Path) -> None:
         """Two DataLoaders from the same config should yield identical first batches."""
         cfg = OplmConfig(
+            model=ModelConfig(max_seq_len=128),
             train=TrainConfig(batch_size=4),
             data=DataConfig(max_length=128, num_workers=0),
         )
@@ -158,6 +160,7 @@ class TestBuildSequenceEvalDataloader:
     def test_no_shuffling(self, training_parquet: Path) -> None:
         """Eval DataLoader should iterate in the same order every time."""
         cfg = OplmConfig(
+            model=ModelConfig(max_seq_len=64),
             train=TrainConfig(batch_size=2),
             data=DataConfig(max_length=64, num_workers=0),
         )
@@ -176,3 +179,15 @@ class TestBuildSequenceEvalDataloader:
 
         for b1, b2 in zip(run1, run2, strict=True):
             torch.testing.assert_close(b1, b2)
+
+    def test_uses_model_max_seq_len_for_batch_length(self, training_parquet: Path) -> None:
+        cfg = OplmConfig(
+            model=ModelConfig(max_seq_len=32),
+            train=TrainConfig(batch_size=4),
+            data=DataConfig(max_length=128, num_workers=0),
+        )
+
+        dl = build_sequence_eval_dataloader(str(training_parquet), cfg)
+        batch = next(iter(dl))
+
+        assert batch["input_ids"].shape == (4, 32)

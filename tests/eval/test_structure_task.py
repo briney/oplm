@@ -18,7 +18,7 @@ from oplm.config import (
     OplmConfig,
     TrainConfig,
 )
-from oplm.eval.data.structure_loader import load_structures
+from oplm.eval.data.structure_loader import StructureData, load_structures
 from oplm.eval.registry import EVAL_TASK_REGISTRY
 from oplm.eval.tasks.structure import StructureEvalTask
 from oplm.model.transformer import OplmForMLM
@@ -142,6 +142,28 @@ class TestStructureEvalTaskInit:
 
         assert task._structures is None
         assert task._tokenizer is None
+
+    def test_structure_eligibility_uses_model_max_seq_len(self) -> None:
+        cfg = OplmConfig(
+            model=ModelConfig(
+                hidden_dim=32,
+                num_layers=2,
+                num_heads=2,
+                num_kv_heads=2,
+                max_seq_len=16,
+            ),
+            train=TrainConfig(batch_size=1, eval_every=100),
+            data=DataConfig(max_length=128, num_workers=0),
+        )
+        entry = _make_entry()
+        task = StructureEvalTask(entry, cfg)
+        struct = StructureData(
+            name="too_long",
+            sequence="A" * 20,
+            coords=torch.zeros(20, 3, 3),
+        )
+
+        assert task._is_structure_eligible(struct) is False
 
 
 class TestStructureEvalTaskEvaluate:

@@ -60,7 +60,6 @@ def _write_distributed_config(
               output_dir: {output_dir}
             data:
               train: {training_parquet}
-              max_length: 64
               num_workers: 0
               pin_memory: false
             """

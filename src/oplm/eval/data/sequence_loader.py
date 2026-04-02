@@ -97,7 +97,7 @@ def build_sequence_eval_dataloader(
     tokenizer = ProteinTokenizer()
     collator = DeterministicMLMCollator(
         tokenizer,
-        max_length=cfg.data.max_length,
+        max_length=cfg.model.max_seq_len,
         seed=_EVAL_SEED,
     )
 

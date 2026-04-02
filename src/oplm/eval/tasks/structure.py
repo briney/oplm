@@ -262,7 +262,7 @@ class StructureEvalTask(EvalTask):
                 "Skipping %s: sequence length %d exceeds max_length %d",
                 struct.name,
                 seq_len,
-                self.cfg.data.max_length - 2,
+                self.cfg.model.max_seq_len - 2,
             )
             return None, None
 
@@ -391,7 +391,7 @@ class StructureEvalTask(EvalTask):
 
     def _is_structure_eligible(self, struct: StructureData) -> bool:
         """Cheap length eligibility check before running a model forward."""
-        return len(struct.sequence) + 2 <= self.cfg.data.max_length
+        return len(struct.sequence) + 2 <= self.cfg.model.max_seq_len
 
     def _select_categorical_jacobian_structure_names(
         self,

@@ -45,7 +45,6 @@ def _write_train_config(tmp_path: Path, training_parquet: Path) -> Path:
               output_dir: {tmp_path / "outputs"}
             data:
               train: {training_parquet}
-              max_length: 64
               num_workers: 0
               pin_memory: false
             """

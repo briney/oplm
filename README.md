@@ -224,6 +224,8 @@ OPLM uses a layered config system: **defaults -> preset -> YAML file -> CLI over
 The canonical field-by-field reference lives in [configs/README.md](configs/README.md).
 Runtime precision is controlled by `train.mixed_precision`; `model.dtype` is currently a
 reserved placeholder.
+`model.max_seq_len` is the canonical sequence-length setting for training, eval, and
+inference. `data.max_length` remains available only as a deprecated compatibility alias.
 `oplm` CLI commands take repeated `--override key=value` flags, while
 `accelerate launch -m oplm.train ...` still passes raw dotlist overrides through to
 `load_config()`.
@@ -246,6 +248,7 @@ model:
   num_layers: 12
   num_heads: 12
   num_kv_heads: 4
+  max_seq_len: 1024
   ffn_activation: swiglu
   shared_kv: false
   qk_norm: true
@@ -270,7 +273,6 @@ train:
 
 data:
   train: /path/to/sequences.parquet
-  max_length: 1024
   mask_prob: 0.15
 ```
 

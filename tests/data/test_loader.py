@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
 
-from oplm.config import DataConfig, OplmConfig, TrainConfig
+if TYPE_CHECKING:
+    from pathlib import Path
+
+from oplm.config import DataConfig, ModelConfig, OplmConfig, TrainConfig, load_config
 from oplm.data.loader import build_train_dataloader
 
 SEQUENCES = [
@@ -125,3 +128,48 @@ class TestBuildTrainDataloader:
         for batch in loader:
             total_samples += batch["input_ids"].shape[0]
         assert total_samples > 0
+
+    def test_uses_model_max_seq_len_for_truncation(self, tmp_path: Path) -> None:
+        path = tmp_path / "train.parquet"
+        long_sequences = [("seq_0", "A" * 80), ("seq_1", "C" * 40)]
+        _write_parquet(path, long_sequences)
+
+        cfg = OplmConfig(
+            model=ModelConfig(max_seq_len=16),
+            train=TrainConfig(batch_size=1, seed=42),
+            data=DataConfig(
+                train=str(path),
+                max_length=64,
+                mask_prob=0.15,
+                num_workers=0,
+                pin_memory=False,
+            ),
+        )
+
+        loader = build_train_dataloader(cfg)
+        batch = next(iter(loader))
+
+        assert batch["input_ids"].shape == (1, 16)
+
+    def test_legacy_data_max_length_alias_still_drives_truncation(self, tmp_path: Path) -> None:
+        path = tmp_path / "train.parquet"
+        long_sequences = [("seq_0", "A" * 80)]
+        _write_parquet(path, long_sequences)
+
+        with pytest.warns(DeprecationWarning, match="data.max_length"):
+            cfg = load_config(
+                [
+                    f"data.train={path}",
+                    "data.max_length=16",
+                    "train.batch_size=1",
+                    "data.num_workers=0",
+                    "data.pin_memory=false",
+                ]
+            )
+
+        loader = build_train_dataloader(cfg)
+        batch = next(iter(loader))
+
+        assert cfg.model.max_seq_len == 16
+        assert cfg.data.max_length == 16
+        assert batch["input_ids"].shape == (1, 16)

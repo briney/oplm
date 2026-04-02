@@ -22,6 +22,9 @@
 train: null
 
 # Sequence and masking
+# max_length is a deprecated compatibility alias for model.max_seq_len.
+# load_config() maps it into model.max_seq_len and mirrors the resolved value
+# back here so saved configs stay coherent.
 max_length: 512
 mask_prob: 0.15
 
