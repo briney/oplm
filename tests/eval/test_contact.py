@@ -488,8 +488,8 @@ class TestComputeLogregPrecisionAtL:
         assert 0.0 <= p <= 1.0
 
     @pytest.mark.slow
-    def test_with_real_structures(self, structure_fixtures_dir: Path) -> None:
-        """End-to-end with real structures and a tiny model."""
+    def test_with_real_structures(self, structure_logreg_fixtures_dir: Path) -> None:
+        """End-to-end logreg with real structures and a tiny model."""
         from oplm.config import ModelConfig
         from oplm.data.tokenizer import ProteinTokenizer
         from oplm.model.transformer import OplmForMLM
@@ -500,7 +500,7 @@ class TestComputeLogregPrecisionAtL:
         model.eval()
         tokenizer = ProteinTokenizer()
 
-        structures = load_structures(structure_fixtures_dir)
+        structures = load_structures(structure_logreg_fixtures_dir)
         contact_data_list: list[StructureContactData] = []
 
         for s in structures:
@@ -523,6 +523,5 @@ class TestComputeLogregPrecisionAtL:
             cd = build_structure_contact_data(attn_contacts, true_contacts, seq_len)
             contact_data_list.append(cd)
 
-        # Too few for logreg (3 structures, n_train=20), so falls back
         p = compute_logreg_precision_at_l(contact_data_list)
         assert 0.0 <= p <= 1.0
