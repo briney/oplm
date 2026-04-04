@@ -36,13 +36,11 @@ train = [
     "deepspeed>=0.14",
     "wandb>=0.16",
     "datasets>=2.18",
+    "biopython>=1.83",
+    "scikit-learn>=1.4",
 ]
 flash = [
     "flash-attn>=2.5",
-]
-eval = [
-    "biopython>=1.83",
-    "scikit-learn>=1.4",
 ]
 dev = [
     "pytest>=8.0",

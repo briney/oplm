@@ -349,7 +349,7 @@ def compute_logreg_precision_at_l(
         from sklearn.linear_model import LogisticRegression
     except ImportError as e:
         raise ImportError(
-            "Logistic regression P@L requires scikit-learn. Install with: pip install oplm[eval]"
+            "Logistic regression P@L requires scikit-learn. Install with: pip install oplm[train]"
         ) from e
 
     if len(structures) < n_train + 1:

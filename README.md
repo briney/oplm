@@ -50,11 +50,8 @@ pip install oplm[train]
 # FlashAttention for efficient long-sequence training
 pip install oplm[flash]
 
-# structure-based evaluation (BioPython, scikit-learn)
-pip install oplm[eval]
-
 # everything
-pip install oplm[train,eval,flash]
+pip install oplm[train,flash]
 
 # development (pytest, ruff, mypy)
 pip install oplm[dev]

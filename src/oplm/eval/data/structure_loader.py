@@ -57,7 +57,7 @@ def _residue_to_one_letter(residue_name: str) -> str:
         return str(protein_letters_3to1.get(residue_name.capitalize(), "X"))
     except ImportError as e:
         raise ImportError(
-            "Structure evaluation requires biopython. Install with: pip install oplm[eval]"
+            "Structure evaluation requires biopython. Install with: pip install oplm[train]"
         ) from e
 
 
@@ -74,7 +74,7 @@ def _parse_single_structure(filepath: Path) -> StructureData | None:
         from Bio.PDB import MMCIFParser, PDBParser  # type: ignore[attr-defined]
     except ImportError as e:
         raise ImportError(
-            "Structure evaluation requires biopython. Install with: pip install oplm[eval]"
+            "Structure evaluation requires biopython. Install with: pip install oplm[train]"
         ) from e
 
     suffix = filepath.suffix.lower()
