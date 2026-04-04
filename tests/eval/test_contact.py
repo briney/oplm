@@ -495,16 +495,21 @@ class TestComputeLogregPrecisionAtL:
         from oplm.model.transformer import OplmForMLM
 
         # Small model for testing
-        cfg = ModelConfig(hidden_dim=32, num_layers=2, num_heads=2, num_kv_heads=2)
+        max_length = 256
+        cfg = ModelConfig(
+            hidden_dim=32, num_layers=2, num_heads=2, num_kv_heads=2, max_seq_len=max_length
+        )
         model = OplmForMLM(cfg)
         model.eval()
         tokenizer = ProteinTokenizer()
 
         structures = load_structures(structure_logreg_fixtures_dir)
+        # Filter by length, matching StructureEvalTask._is_structure_eligible
+        structures = [s for s in structures if len(s.sequence) + 2 <= max_length]
         contact_data_list: list[StructureContactData] = []
 
         for s in structures:
-            tokens = tokenizer.batch_encode([s.sequence], max_length=128)
+            tokens = tokenizer.batch_encode([s.sequence], max_length=max_length)
             with torch.no_grad():
                 outputs = model(
                     input_ids=tokens["input_ids"],
@@ -523,5 +528,6 @@ class TestComputeLogregPrecisionAtL:
             cd = build_structure_contact_data(attn_contacts, true_contacts, seq_len)
             contact_data_list.append(cd)
 
+        assert len(contact_data_list) >= 15
         p = compute_logreg_precision_at_l(contact_data_list)
         assert 0.0 <= p <= 1.0
