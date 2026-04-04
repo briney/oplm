@@ -382,8 +382,8 @@ def compute_logreg_precision_at_l(
 
         # Fit logistic regression
         logreg = LogisticRegression(
+            penalty="l1",
             C=logreg_c,
-            l1_ratio=1.0,
             solver="liblinear",
             max_iter=1000,
             random_state=seed,
