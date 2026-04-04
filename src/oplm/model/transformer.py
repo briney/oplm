@@ -164,9 +164,7 @@ class TransformerBlock(nn.Module):
         if self.conv_a is not None:
             h = self.conv_a(h)
         attn_input = self.attn_pre_norm(h) if self.attn_pre_norm is not None else h
-        attn_out, v_first_out, _ = self.attention(
-            attn_input, v_first, attention_mask, value_embed
-        )
+        attn_out, v_first_out, _ = self.attention(attn_input, v_first, attention_mask, value_embed)
         if v_first_out is not None:
             v_first = v_first_out
         state = attn_res.accumulate(state, attn_out)
