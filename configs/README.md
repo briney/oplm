@@ -107,7 +107,7 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | `train.max_grad_norm` | `float` | `1.0` | Set to `0` to disable clipping. | active |
 | `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, or `wsd_cosine`. | active |
 | `train.warmup_steps` | `int` | `5000` | Must be `>= 0`. | active |
-| `train.stable_fraction` | `float` | `0.0` | Must be in `[0, 1)`. | active |
+| `train.stable_steps` | `int` | `0` | Must be `>= 0`. | active |
 | `train.log_every` | `int` | `10` | Train-metric logging cadence in optimizer steps. | active |
 | `train.eval_every` | `int` | `10000` | Default eval cadence for datasets without a per-dataset override. | active |
 | `train.wandb_project` | `str` | `oplm` | W&B project name. | active |

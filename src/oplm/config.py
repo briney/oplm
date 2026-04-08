@@ -207,7 +207,7 @@ class TrainConfig:
     # Scheduler
     scheduler: str = "warmup_linear"
     warmup_steps: int = 5_000
-    stable_fraction: float = 0.0
+    stable_steps: int = 0
 
     # Logging
     log_every: int = 10
@@ -258,8 +258,8 @@ class TrainConfig:
             raise ValueError(f"muon_momentum must be >= 0, got {self.muon_momentum}")
         if self.muon_ns_steps < 1:
             raise ValueError(f"muon_ns_steps must be >= 1, got {self.muon_ns_steps}")
-        if not 0.0 <= self.stable_fraction < 1.0:
-            raise ValueError(f"stable_fraction must be in [0, 1), got {self.stable_fraction}")
+        if self.stable_steps < 0:
+            raise ValueError(f"stable_steps must be >= 0, got {self.stable_steps}")
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"

@@ -136,7 +136,7 @@ class TestScheduler:
             "wsd_linear",
             warmup_steps=100,
             total_steps=1000,
-            stable_fraction=0.5,
+            stable_steps=500,
         )
         # Warmup
         assert fn(0) == pytest.approx(0.0)
@@ -152,7 +152,7 @@ class TestScheduler:
             "wsd_cosine",
             warmup_steps=100,
             total_steps=1000,
-            stable_fraction=0.5,
+            stable_steps=500,
         )
         assert fn(300) == pytest.approx(1.0)
         assert fn(1000) == pytest.approx(0.0, abs=1e-6)
@@ -562,9 +562,9 @@ class TestTrainConfigValidation:
         with pytest.raises(ValueError, match="muon_ns_steps"):
             TrainConfig(muon_ns_steps=0)
 
-    def test_invalid_stable_fraction(self) -> None:
-        with pytest.raises(ValueError, match="stable_fraction"):
-            TrainConfig(stable_fraction=1.0)
+    def test_invalid_stable_steps(self) -> None:
+        with pytest.raises(ValueError, match="stable_steps"):
+            TrainConfig(stable_steps=-1)
 
     def test_invalid_gradient_accumulation(self) -> None:
         with pytest.raises(ValueError, match="gradient_accumulation_steps"):

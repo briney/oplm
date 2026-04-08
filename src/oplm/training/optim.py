@@ -165,7 +165,7 @@ def get_schedule_fn(
     warmup_steps: int,
     total_steps: int,
     min_ratio: float = 0.0,
-    stable_fraction: float = 0.0,
+    stable_steps: int = 0,
 ) -> Callable[[int], float]:
     """Return a step -> lr_multiplier function for LambdaLR.
 
@@ -180,7 +180,7 @@ def get_schedule_fn(
         warmup_steps: Number of linear warmup steps.
         total_steps: Total training steps.
         min_ratio: Minimum LR as a fraction of peak LR (min_lr / lr).
-        stable_fraction: Fraction of total steps at peak LR after warmup
+        stable_steps: Number of steps at peak LR after warmup
             (only meaningful for WSD schedules).
 
     Returns:
@@ -189,7 +189,7 @@ def get_schedule_fn(
     is_wsd = scheduler_name.startswith("wsd_")
     is_cosine = scheduler_name.endswith("_cosine")
 
-    stable_steps = int(total_steps * stable_fraction) if is_wsd else 0
+    stable_steps = stable_steps if is_wsd else 0
     decay_steps = max(1, total_steps - warmup_steps - stable_steps)
 
     def schedule_fn(current_step: int) -> float:
@@ -234,7 +234,7 @@ def build_scheduler(
         warmup_steps=cfg.warmup_steps,
         total_steps=total_steps,
         min_ratio=min_ratio,
-        stable_fraction=cfg.stable_fraction,
+        stable_steps=cfg.stable_steps,
     )
 
     return LambdaLR(optimizer, schedule_fn)
