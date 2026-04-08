@@ -167,3 +167,13 @@ class TestAttentionNeedWeights:
         output, _, weights = attn(x, need_weights=True)
         assert output.shape == (2, 8, cfg.hidden_dim)
         assert weights is not None
+
+
+def test_flash_attn_sentinel_consistency() -> None:
+    """Verify _flash_attn_func and _flash_attn_version are in sync."""
+    from oplm.model.attention import _flash_attn_func, _flash_attn_version
+
+    if _flash_attn_func is not None:
+        assert _flash_attn_version in ("v2", "v4")
+    else:
+        assert _flash_attn_version is None

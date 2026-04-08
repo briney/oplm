@@ -17,16 +17,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Select FlashAttention backend once at import time
+# Select FlashAttention backend once at import time.
+# flash-attn v4 (Blackwell/Hopper) and flash-attn v2/v3 (Hopper/Ampere) install
+# into the same ``flash_attn`` namespace and are mutually exclusive. We prefer v4
+# when available, fall back to v2/v3, then to PyTorch SDPA.
 _flash_attn_func = None
+_flash_attn_version: str | None = None
 try:
-    from flash_attn import (  # type: ignore[no-redef]
+    from flash_attn.cute import (  # type: ignore[no-redef]
         flash_attn_func as _flash_attn_func,
     )
 
-    logger.info("Using flash_attn backend for attention")
+    _flash_attn_version = "v4"
+    logger.info("Using flash_attn v4 (CUTE) backend for attention")
 except ImportError:
-    logger.info("flash_attn not available, using PyTorch SDPA backend")
+    try:
+        from flash_attn import (  # type: ignore[no-redef]
+            flash_attn_func as _flash_attn_func,
+        )
+
+        _flash_attn_version = "v2"
+        logger.info("Using flash_attn v2/v3 backend for attention")
+    except ImportError:
+        logger.info("flash_attn not available, using PyTorch SDPA backend")
 
 
 class Attention(nn.Module):

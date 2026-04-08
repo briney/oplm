@@ -17,7 +17,7 @@ OPLM integrates ideas from [Proust](https://arxiv.org/abs/2602.01845) (grouped-q
 - **SwiGLU, ReLU^2, or GELU** feed-forward activations
 - **Ablation-friendly** -- all architectural features are togglable with no overhead when off
 - **Distributed training** via HuggingFace Accelerate with FSDP, mixed precision (bf16/fp16), gradient checkpointing, and optional Muon optimization
-- **Optional FlashAttention** support for efficient long-sequence training
+- **Optional FlashAttention** support (v2/v3 and v4) for efficient long-sequence training
 - **Built-in evaluation** for MLM metrics (loss, accuracy, perplexity) and structure-based contact prediction
 - **Five model presets** from 4.8M to 11.0B parameters
 
@@ -47,10 +47,13 @@ pip install -e .
 # distributed training with Accelerate + Weights & Biases logging
 pip install oplm[train]
 
-# FlashAttention for efficient long-sequence training
+# FlashAttention v2/v3 (Ampere/Hopper GPUs)
 pip install oplm[flash]
 
-# everything
+# FlashAttention v4 (Blackwell/Hopper GPUs)
+pip install oplm[flash4]
+
+# everything (pick one flash variant)
 pip install oplm[train,flash]
 
 # development (pytest, ruff, mypy)
