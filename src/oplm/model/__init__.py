@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from .embedding import OplmEmbedding, cls_pool, mean_pool
 from .outputs import LogitsConfig, LogitsOutput
 
-__all__ = ["LogitsConfig", "LogitsOutput"]
+__all__ = [
+    "LogitsConfig",
+    "LogitsOutput",
+    "OplmEmbedding",
+    "cls_pool",
+    "mean_pool",
+]
