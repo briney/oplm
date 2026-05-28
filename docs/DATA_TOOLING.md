@@ -212,6 +212,19 @@ instance so they can never drift from the vocabulary:
 > `canonical_amino_acid_ids(tokenizer)`) and reuse it in both the collator and
 > the eval metrics rather than duplicating the literal range.
 
+### 3.3a Aligning per-residue auxiliary vectors
+
+Some features attach a value to each *residue* of the raw sequence — most notably
+per-position masking weights (§4.5.1). Because tokenization truncates, inserts
+`<cls>`/`<eos>`, and pads, a raw per-residue vector must undergo the *same*
+transform to stay positionally aligned with `input_ids`. The tokenizer access
+layer provides this as `align_per_residue(values, *, fill_special, fill_pad, ...)`
+(used by the pad primitive in §4.4): it truncates the vector to match the
+sequence, inserts `fill_special` at `<cls>`/`<eos>`, and pads with `fill_pad`,
+returning a `(B, T)` tensor aligned to the tokens. Keeping this in the tokenizer
+layer (rather than re-deriving offsets in each consumer) means alignment logic
+lives next to the truncation/templating rules it must mirror.
+
 ### 3.4 Hot-loop note
 
 The training collator calls the fast tokenizer's batch encode (Rust) once per
@@ -241,13 +254,20 @@ The pretraining path, and the substrate for sequence-based evaluation.
   directory of parquet shards.
 - Required columns: **`sequence_id`** (str) and **`sequence`** (str, raw
   one-letter amino acids, no special tokens).
-- Only these two columns are read (`pq.read_table(..., columns=[...])`); other
-  columns are ignored.
+- Optional column: **`masking_weights`** (`list[float]`, one weight per residue,
+  length == `len(sequence)`). Used only for per-position weighted masking and
+  only when `data.weighted_masking` is enabled (§4.5.1). When weighted masking is
+  off (the default), this column is **ignored even if present**.
+- Only the columns actually needed are read
+  (`pq.read_table(..., columns=[...])`); other columns are ignored. The
+  `masking_weights` column is read only when `weighted_masking` is on.
 
 ### 4.2 `ShardedProteinDataset`
 
-An `IterableDataset[dict[str, str]]` yielding `{"sequence_id": ..., "sequence": ...}`
-one row at a time (raw strings — tokenization happens in collation).
+An `IterableDataset` yielding `{"sequence_id": ..., "sequence": ...}` one row at a
+time (raw strings — tokenization happens in collation). When `weighted_masking`
+is on, each row additionally carries `"masking_weights": list[float]` (or `None`
+if the row has no weights), so the yielded type is `dict[str, str | list[float]]`.
 
 ```python
 ShardedProteinDataset(
@@ -256,6 +276,7 @@ ShardedProteinDataset(
     shuffle_shards: bool = True,
     shuffle_rows: bool = True,
     seed: int = 0,
+    load_masking_weights: bool = False,   # read the optional masking_weights column
 )
 ```
 
@@ -274,6 +295,10 @@ Behavior:
 - **Worker / rank striping.** Within a shard's (optionally shuffled) row
   sequence, rows are striped so that each `(rank, worker)` sees a disjoint
   subset with no duplication and no gaps.
+- **Optional masking weights.** When `load_masking_weights=True` (set by the
+  builder from `data.weighted_masking`), the `masking_weights` column is read and
+  attached to each row. Rows missing a weight array yield `None` (the collator
+  treats that as uniform weight 1.0). When `False`, the column is never read.
 
 > **Design point — distributed sharding.** The legacy implementation strided
 > only across DataLoader workers and delegated process-level (DDP rank) sharding
@@ -317,7 +342,12 @@ share the same tokenize/pad core.
   to `max_length - 2` (leaving room for `<cls>`/`<eos>`), tokenizes with the
   canonical tokenizer, pads to the batch's longest member with `pad_token_id`,
   and returns `{"input_ids", "attention_mask"}`. **No masking, no labels.** This
-  is what variant, structure, and downstream consumers use.
+  is what variant, structure, and downstream consumers use. The primitive also
+  exposes an alignment helper — `align_per_residue(values, ...)` — that carries a
+  raw per-residue vector (such as `masking_weights`) through the *same*
+  truncation, `<cls>`/`<eos>` insertion, and padding applied to `input_ids`, so
+  the aligned vector is positionally consistent with the tokens (§3.3a). This is
+  the point where per-position weighting touches the tokenizer layer.
 
 - **MLM-mask layer** — `MLMCollator`, which calls the primitive and then applies
   masking, adding `labels`:
@@ -330,24 +360,38 @@ MLMCollator(
     mask_token_prob: float = 0.8,
     random_token_prob: float = 0.1,
     *,
-    deterministic: bool = False,   # eval policy; see §4.6
+    weighted_masking: bool = False,  # use per-position masking_weights; see §4.5.1
+    deterministic: bool = False,     # eval policy; see §4.6
     seed: int = 0,
 )
 ```
 
 ### 4.5 MLM masking scheme
 
-BERT-style masking, fully parameterized, with constants derived from the
-tokenizer (§3.3):
+Masking is **dynamic (RoBERTa-style)**: masks are generated fresh in the collator
+every time an example is drawn, so the same sequence is masked differently across
+epochs. There is no precomputed, epoch-static mask set (the BERT approach). Only
+the **replacement split** is borrowed from BERT (the 80/10/10 rule below).
+Determinism for *evaluation* is a deliberate, scoped exception (§4.6) — it freezes
+the otherwise-dynamic masks so eval metrics are comparable across training steps.
+
+The scheme is fully parameterized, with constants derived from the tokenizer
+(§3.3):
 
 1. **Eligibility.** A position is maskable iff it is a real token
    (`attention_mask == 1`) **and** its id is not in `non_maskable_ids`
    (cls/pad/eos/unk/mask).
-2. **Selection.** Each eligible position is selected with probability
-   `mask_prob` (default 0.15).
+2. **Selection.** A **fixed count** of positions is masked per sequence:
+   `k = round(mask_prob * n_eligible)` (default `mask_prob` 0.15), where
+   `n_eligible` is that sequence's count of eligible positions. The `k` positions
+   are chosen by **weighted sampling without replacement** via Gumbel-top-k
+   (§4.5.1). Uniform masking is the special case where every weight is equal —
+   uniform sampling without replacement of exactly `k` positions. Because the
+   Gumbel noise is resampled on every draw, the chosen positions vary across
+   epochs (the RoBERTa property); only `k` itself is fixed.
 3. **Targets.** For selected positions, `labels` holds the original id; all
    other positions hold the ignore index **`-100`**.
-4. **Replacement** (the 80/10/10 split, now configurable):
+4. **Replacement** (the BERT 80/10/10 split, now configurable):
    - `mask_token_prob` (0.8) → replace with `mask_token_id` (32).
    - `random_token_prob` (0.1) → replace with a uniformly sampled id from
      `canonical_aa_ids` (the 20 standard AAs, 4–23). Ambiguous AAs and
@@ -357,6 +401,59 @@ tokenizer (§3.3):
 > **New config knobs.** `mask_token_prob` and `random_token_prob` were hardcoded
 > in the legacy collator. The target exposes them via `DataConfig` (§8.2) so the
 > split is reproducible from config and ablatable.
+
+#### 4.5.1 Per-position weighted masking
+
+By default masking is **uniform**: every eligible position is equally likely to be
+among the `k` masked. Optionally, masking can be **biased per position** so that
+some residues are masked more or less often than others (e.g. to focus the
+objective on conserved sites, functional motifs, or high-information positions).
+
+**Enabling.** Controlled by a single config flag, **`data.weighted_masking`
+(default `False`)** — *not* by mere presence of the data column. When `False`,
+the `masking_weights` column is ignored even if present, and masking is uniform.
+When `True`, the builder reads the column (§4.2) and the collator applies it.
+
+**Selection — weighted sampling without replacement (Gumbel-top-k).** Weights do
+**not** set an absolute per-position probability, and they are **not** a
+deterministic ranking (we never just take the top-`k` highest-weighted residues).
+Instead, exactly `k = round(mask_prob * n_eligible)` positions are *sampled
+without replacement* with inclusion biased by weight. Per draw, for each eligible
+position `i` with weight `w_i >= 0`:
+
+```
+key_i = log(w_i) + g_i,      g_i = -log(-log(u_i)),   u_i ~ Uniform(0, 1)
+mask  = the k positions with the largest key_i
+```
+
+This is the Gumbel-top-k method (equivalently Efraimidis–Spirakis, `u_i^{1/w_i}`):
+the first-order inclusion probability is ∝ `w_i`, sampling is without replacement,
+and the masked **count is fixed** regardless of weight scale. Properties:
+
+- `w_i = 0` → `log 0 = -∞` → that position is never selected.
+- Uniform masking is `w_i = 1` for all eligible `i` → uniform sampling without
+  replacement of `k` positions (the single shared code path, §4.5 step 2).
+- Weights are **relative**: scaling all weights by a constant changes nothing, so
+  producers need not normalize.
+- If `k` exceeds the number of positive-weight eligible positions, all
+  positive-weight positions are masked (and no zero-weight position ever is).
+- The Gumbel noise is fresh per draw → dynamic masks across epochs; under
+  `deterministic=True` (§4.6) the noise is seeded by batch index for reproducible
+  selection.
+
+**Alignment.** Raw weights are per-*residue* (length `len(sequence)`). They are
+carried through the pad primitive's `align_per_residue` helper (§4.4) so they line
+up with `input_ids`: weight `0.0` is inserted at `<cls>`/`<eos>` and at padding
+(those positions are non-maskable anyway), and weights are truncated identically
+to the sequence. The aligned tensor is `(B, T)`, matching `input_ids`.
+
+**Fallbacks.**
+- `weighted_masking=True` but a row has no weights (`None`) → that sequence uses
+  uniform weight 1.0 everywhere.
+- `weighted_masking=True` but the column is **entirely absent** from the dataset
+  → log a warning once and fall back to uniform masking (do not error).
+- Weight length mismatch with the sequence → error (a data-integrity bug worth
+  surfacing loudly, not silently truncating).
 
 ### 4.6 Determinism for evaluation (policy, not a fork)
 
@@ -377,6 +474,10 @@ Every sequence batch (training and sequence-eval) has identical structure:
 | `input_ids`      | `(B,T)` | `torch.long` | canonical IDs; `<cls> … <eos>`; padded      |
 | `attention_mask` | `(B,T)` | `torch.long` | 1 = real token, 0 = padding                 |
 | `labels`         | `(B,T)` | `torch.long` | original id at masked positions, else `-100`|
+
+Per-position `masking_weights` (when used) are consumed **inside** the collator to
+bias selection (§4.5.1) and are **not** emitted in the batch — the model batch is
+exactly the three keys above, identical with or without weighted masking.
 
 `B` = `train.batch_size`; `T` = batch-max length, capped at `model.max_seq_len`.
 The pad primitive's output omits `labels` (it produces only the first two keys).
@@ -548,14 +649,19 @@ Fields consumed from sibling configs:
 
 ### 8.2 New knobs to add
 
-To un-hardcode the masking split (§4.5), add to `DataConfig`:
+To un-hardcode the masking split (§4.5) and enable per-position weighting
+(§4.5.1), add to `DataConfig`:
 
-| Field               | Type    | Default | Meaning                                    |
-| ------------------- | ------- | ------- | ------------------------------------------ |
-| `mask_token_prob`   | `float` | `0.8`   | fraction of masked positions → `<mask>`    |
-| `random_token_prob` | `float` | `0.1`   | fraction of masked positions → random AA   |
+| Field               | Type    | Default | Meaning                                                  |
+| ------------------- | ------- | ------- | -------------------------------------------------------- |
+| `mask_token_prob`   | `float` | `0.8`   | fraction of masked positions → `<mask>`                  |
+| `random_token_prob` | `float` | `0.1`   | fraction of masked positions → random AA                 |
+| `weighted_masking`  | `bool`  | `False` | use the `masking_weights` column to bias per-position masking (§4.5.1); when `False`, the column is ignored and masking is uniform |
 
-Validation: both in `[0, 1]` and `mask_token_prob + random_token_prob <= 1`.
+Validation: `mask_token_prob` and `random_token_prob` in `[0, 1]` and
+`mask_token_prob + random_token_prob <= 1`. `weighted_masking` lives in
+`DataConfig` (not `TrainConfig`) for consistency with the other masking knobs —
+the entire masking policy is described in one config block.
 
 ### 8.3 Dataset entries and parsing
 
@@ -600,6 +706,7 @@ data:
   mask_prob: 0.15
   mask_token_prob: 0.8
   random_token_prob: 0.1
+  weighted_masking: false   # set true to honor the masking_weights column
   num_workers: 4
   pin_memory: true
   prefetch_factor: 4
@@ -638,11 +745,12 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
 
 1. `parse_train_configs(cfg.data.train)` → `list[TrainDatasetEntry]`.
 2. One `ShardedProteinDataset` per entry, with
-   `shuffle_shards/​shuffle_rows` from `cfg.data` and `seed=cfg.train.seed`.
+   `shuffle_shards/​shuffle_rows` from `cfg.data`, `seed=cfg.train.seed`, and
+   `load_masking_weights=cfg.data.weighted_masking`.
 3. If >1 entry, wrap in `InterleavedDataset` with the entries' fractions.
 4. `MLMCollator(tokenizer, max_length=cfg.model.max_seq_len,
    mask_prob=cfg.data.mask_prob, mask_token_prob=…, random_token_prob=…,
-   deterministic=False)`.
+   weighted_masking=cfg.data.weighted_masking, deterministic=False)`.
 5. Wrap in `DataLoader(batch_size=cfg.train.batch_size,
    collate_fn=collator, num_workers=…, pin_memory=…, prefetch_factor=…)`.
 
@@ -731,13 +839,29 @@ make large fixtures session-scoped.
   `mask_token_id == 32`, `canonical_aa_ids == range(4, 24)`,
   `special_ids == {0,1,2,3,32}`. This is the test that would have caught the
   legacy off-by-one vocabulary bug.
-- **Sequence determinism.** Same `(seed, epoch)` ⇒ byte-identical batch order
-  and (with `deterministic=True`) identical mask patterns; different epochs ⇒
-  different order.
-- **Masking correctness.** Over many batches: selection rate ≈ `mask_prob`; the
-  80/10/10 split within tolerance; special tokens and padding never selected;
-  `labels == -100` exactly at unmasked positions and the original id at masked
-  positions; random replacements drawn only from `canonical_aa_ids`.
+- **Sequence determinism.** Same `(seed, epoch)` ⇒ byte-identical batch *order*;
+  different epochs ⇒ different order. With `deterministic=True`, identical mask
+  patterns for the same batch index.
+- **Dynamic (RoBERTa) masking.** With `deterministic=False`, the *same* example
+  drawn in two different epochs receives *different* mask patterns (assert the
+  masked-position sets differ across epochs for a fixed sequence). Confirms masks
+  are regenerated per draw, not precomputed once.
+- **Masking correctness.** Exactly `k = round(mask_prob * n_eligible)` positions
+  masked per sequence (fixed count, no duplicates — sampling without replacement);
+  the 80/10/10 split within tolerance over many batches; special tokens and
+  padding never selected; `labels == -100` exactly at unmasked positions and the
+  original id at masked positions; random replacements drawn only from
+  `canonical_aa_ids`.
+- **Weighted masking.** With `weighted_masking=False`, a present `masking_weights`
+  column is ignored (selection is uniform-over-`k`). With `weighted_masking=True`:
+  count stays exactly `k`; empirical inclusion frequency over many draws is
+  monotonic in `w_i` and approximately ∝ `w_i` (Gumbel-top-k); `w_i = 0` positions
+  are never masked; multiplying all weights by a constant leaves the distribution
+  unchanged (scale-invariance); when positive-weight positions `< k`, all of them
+  (and only them) are masked; weights align correctly through
+  truncation/`<cls>`/`<eos>`/padding (alignment test against `input_ids`); rows
+  with `None` weights fall back to uniform; an entirely-absent column warns and
+  falls back to uniform; a length-mismatched weight array raises.
 - **Padding/truncation.** Sequences longer than `max_length - 2` are truncated;
   shapes are `(B, T)` with `T <= max_seq_len`; `attention_mask` matches padding.
 - **Striping coverage.** Across `(rank, worker)` combinations, the union of
@@ -758,8 +882,8 @@ make large fixtures session-scoped.
 | Current symbol / location                         | Target                                                         |
 | ------------------------------------------------- | -------------------------------------------------------------- |
 | `data/tokenizer.py::ProteinTokenizer`             | **Removed.** Use `OplmTokenizerFast` (§3); `data/tokenizer.py` becomes a thin accessor + derived id constants. |
-| `data/dataset.py` (Sharded/Interleaved)           | `data/sequence/dataset.py` (add explicit rank-aware striping)  |
-| `data/collate.py::MLMCollator`                    | `data/sequence/collate.py` — split into pad primitive + mask layer; add `deterministic`/`seed`; derive id constants from tokenizer; expose `mask_token_prob`/`random_token_prob` from config |
+| `data/dataset.py` (Sharded/Interleaved)           | `data/sequence/dataset.py` (add explicit rank-aware striping; optional `masking_weights` column via `load_masking_weights`) |
+| `data/collate.py::MLMCollator`                    | `data/sequence/collate.py` — split into pad primitive (+ `align_per_residue` helper) and mask layer; add `deterministic`/`seed`; add `weighted_masking` + per-position weight support; derive id constants from tokenizer; expose `mask_token_prob`/`random_token_prob`/`weighted_masking` from config |
 | `data/loader.py::build_train_dataloader`          | `data/sequence/loaders.py::build_train_dataloader`             |
 | `eval/data/sequence_loader.py::build_sequence_eval_dataloader` | `data/sequence/loaders.py::build_sequence_eval_dataloader` (eval policy via args) |
 | `eval/data/sequence_loader.py::DeterministicMLMCollator` | **Removed.** Replaced by `MLMCollator(deterministic=True)` (§4.6) |
@@ -775,6 +899,12 @@ Hardcoded constants to lift out:
 - `mask_token_prob=0.8`, `random_token_prob=0.1` → `DataConfig` (§8.2).
 - The fixed eval mask probability / seed in `sequence_loader.py` → builder
   arguments with documented defaults.
+
+New capabilities (no legacy equivalent):
+
+- `weighted_masking` flag + optional `masking_weights` parquet column +
+  `align_per_residue` alignment helper (§4.5.1) — per-position masking control,
+  off by default.
 
 ---
 
