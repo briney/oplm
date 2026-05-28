@@ -26,7 +26,7 @@ This document specifies the OPLM model itself. Concretely:
   gradient-clipping, gradient-accumulation, checkpoint format. → future
   `docs/TRAINER.md`.
 - The eval harness and downstream benchmarks. → future `docs/EVAL.md`.
-- The data pipeline, dataset formats, masking strategy. → future `docs/DATA.md`.
+- The data pipeline, dataset formats, masking strategy. → `docs/DATA_TOOLING.md`.
 - The CLI. → future `docs/CLI.md`.
 - The full YAML config schema beyond the `model:` block (i.e., the `train:`,
   `data:`, `eval:` blocks). → future docs above.
@@ -1642,7 +1642,7 @@ Not addressed in this document:
 - Eval harness and downstream benchmarks (ProteinGym, TAPE, ProteinGlue,
   EVEREST, structure-prediction probes) → `docs/EVAL.md`.
 - Data pipeline, masking strategy, dataset formats, multi-dataset weighting →
-  `docs/DATA.md`.
+  `docs/DATA_TOOLING.md`.
 - CLI surface and `accelerate launch` invocation patterns → `docs/CLI.md`.
 - Exact preset numerical recipes (small/medium/large depth × width × heads)
   → `src/oplm/configs/model/presets/*.yaml`.
