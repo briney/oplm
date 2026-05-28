@@ -1,4 +1,23 @@
-"""Public surface for the OPLM model package — see docs/MODEL_ARCHITECTURE.md."""
+"""Public surface for the OPLM model package.
+
+OPLM is an encoder-only protein language model built on a configurable
+pre-norm transformer backbone. A single :class:`OplmConfig` selects every
+architectural variant — norm operator (LayerNorm / RMSNorm), norm placement
+strategy (pre / sandwich / hybrid / post-SDPA), full vs. partial RoPE, optional
+QK-norm, SwiGLU feed-forward, optional Canon depthwise convolutions, and
+sqrt-depth residual scaling — so the same code path covers the whole design
+space. Attention runs a ``flex_attention`` fast path on CUDA and falls back to a
+manual SDPA implementation everywhere else. The package exposes the backbone
+(:class:`OplmModel`) and the task heads (:class:`OplmForMaskedLM`,
+:class:`OplmForSequenceClassification`, :class:`OplmForTokenClassification`),
+all registered with the HuggingFace Auto* classes and carrying an ESM-C-style
+``tokenize`` / ``encode`` / ``logits`` convenience API via
+:class:`EsmcCompatMixin`. Internal building blocks (norm, rope, embedding, ffn,
+conv, attention, transformer, masking) live in their own modules and are
+re-exported here for convenience.
+
+See ``docs/MODEL_ARCHITECTURE.md`` for the full architecture specification.
+"""
 
 from __future__ import annotations
 

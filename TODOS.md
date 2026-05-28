@@ -1168,14 +1168,14 @@ component tests miss.
 
 ## Phase 15 — Documentation polish
 
-- [ ] **15.1 Update `src/oplm/model/__init__.py`'s top-level docstring** with a
+- [x] **15.1 Update `src/oplm/model/__init__.py`'s top-level docstring** with a
   one-paragraph overview that points readers at `docs/MODEL_ARCHITECTURE.md`.
 
-- [ ] **15.2 Add module-level docstrings** to each helper file describing the
+- [x] **15.2 Add module-level docstrings** to each helper file describing the
   one role of that module (e.g., `rope.py`: "RoPE / partial RoPE applied to Q
   and K post-QK-norm.").
 
-- [ ] **15.3 Update `CLAUDE.md`'s project-structure section** if the new file
+- [x] **15.3 Update `CLAUDE.md`'s project-structure section** if the new file
   list materially changes the previous layout. (The model dir was previously
   populated with a different file set; the new layout matches §19 of the
   architecture doc.)
