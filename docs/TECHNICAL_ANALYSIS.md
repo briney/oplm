@@ -173,11 +173,13 @@ Those examples do not match the actually working training/eval path.
 
 This is the clearest signal that the public model API contract is underspecified.
 
-### 2.4 Override UX is inconsistent
+### 2.4 Override UX (resolved)
 
-`train` and `info` use positional dotlist overrides via `OverridesArg` in [src/oplm/cli.py:23](/home/briney/git/oplm/src/oplm/cli.py#L23), while `encode` uses repeated `--override` options in [src/oplm/cli.py:70](/home/briney/git/oplm/src/oplm/cli.py#L70).
-
-That inconsistency is small, but it is exactly the sort of thing that slows down research use when users expect one override mental model everywhere.
+All CLI commands (`train`, `info`, `encode`) now accept Hydra-style bare
+positional `key=value` overrides — no `--override` flag. For `encode`, which
+also takes protein sequences as positional args, tokens containing `=` are
+partitioned out as overrides and the rest are treated as sequences. Same
+mental model everywhere.
 
 ### 2.5 The training progress UI misses eval loss
 

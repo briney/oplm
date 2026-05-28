@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import fields
 from pathlib import Path
 
@@ -61,15 +62,19 @@ def test_config_reference_mentions_all_eval_task_sections() -> None:
 def test_readme_points_to_config_reference_and_flat_eval_keys() -> None:
     text = README_DOC.read_text()
     assert "[configs/README.md](configs/README.md)" in text
-    assert "--override model.num_layers=16" in text
+    assert "model.num_layers=16" in text
+    assert not re.search(r"--override\s+\S+=", text), "old --override flag invocation in README"
     assert "extra:" not in text
     assert "/path/to/checkpoint.pt" not in text
 
 
-def test_config_reference_documents_cli_override_flags() -> None:
+def test_config_reference_documents_cli_override_syntax() -> None:
     text = CONFIG_DOC.read_text()
-    assert "--override train.max_steps=1000" in text
-    assert "`oplm train`, `oplm info`, and `oplm encode` all use repeated `--override" in text
+    assert "train.max_steps=1000" in text
+    assert not re.search(r"--override\s+\S+=", text), (
+        "old --override flag invocation in configs/README.md"
+    )
+    assert "Hydra-style bare" in text
 
 
 def test_architecture_doc_stays_high_level_and_points_to_live_sources() -> None:

@@ -21,10 +21,11 @@ _PRESET_HELP = f"Model size preset ({', '.join(AVAILABLE_PRESETS)})"
 
 ConfigOpt = Annotated[str | None, typer.Option("--config", "-c", help="Path to YAML config")]
 PresetOpt = Annotated[str | None, typer.Option("--preset", "-p", help=_PRESET_HELP)]
-OverridesOpt = Annotated[
-    list[str] | None,
-    typer.Option("--override", help="Config override (key=value). Repeat as needed."),
-]
+
+# Context settings shared by commands that accept bare dot-notation overrides
+# (e.g. `oplm train model.num_layers=16 train.lr=3e-4`). Unknown ``--flag`` tokens
+# are NOT ignored, so typos like ``--override`` still error loudly.
+_OVERRIDE_CTX = {"allow_extra_args": True}
 
 
 def _build_argv(
@@ -43,17 +44,20 @@ def _build_argv(
     return argv
 
 
-@app.command()
+@app.command(context_settings=_OVERRIDE_CTX)
 def train(
+    ctx: typer.Context,
     config: ConfigOpt = None,
     preset: PresetOpt = None,
-    overrides: OverridesOpt = None,
 ) -> None:
     """Launch training.
 
+    Extra positional args are treated as dot-notation config overrides
+    (e.g. ``model.num_layers=16 train.lr=3e-4``).
+
     For distributed training: accelerate launch -m oplm.train --config <path>
     """
-    cfg = load_config(_build_argv(config, preset, overrides))
+    cfg = load_config(_build_argv(config, preset, ctx.args))
     console.print(f"[bold]Model:[/bold] {cfg.model.num_layers}L / {cfg.model.hidden_dim}D")
     console.print(f"[bold]Output:[/bold] {cfg.train.output_dir}")
 
@@ -64,7 +68,13 @@ def train(
 
 @app.command()
 def encode(
-    sequences: Annotated[list[str], typer.Argument(help="Protein sequences to encode")],
+    args: Annotated[
+        list[str],
+        typer.Argument(
+            help="Protein sequences to encode, plus optional dot-notation overrides "
+            "(tokens containing '=' are treated as overrides).",
+        ),
+    ],
     model_path: Annotated[
         str,
         typer.Option("--model", "-m", help="Path to model weights file or checkpoint directory"),
@@ -74,12 +84,16 @@ def encode(
     ] = "embeddings.pt",
     config: ConfigOpt = None,
     preset: PresetOpt = None,
-    overrides: OverridesOpt = None,
 ) -> None:
     """Encode protein sequences to embeddings."""
     import torch
 
     from oplm.data.tokenizer import ProteinTokenizer
+
+    overrides = [a for a in args if "=" in a]
+    sequences = [a for a in args if "=" not in a]
+    if not sequences:
+        raise typer.BadParameter("At least one protein sequence is required.")
 
     cfg = resolve_inference_config(
         model_path,
@@ -101,18 +115,22 @@ def encode(
     console.print(f"[green]Saved embeddings[/green] {tuple(hidden.shape)} → {out_path}")
 
 
-@app.command()
+@app.command(context_settings=_OVERRIDE_CTX)
 def info(
+    ctx: typer.Context,
     config: ConfigOpt = None,
     preset: PresetOpt = None,
-    overrides: OverridesOpt = None,
 ) -> None:
-    """Print model config and parameter count."""
+    """Print model config and parameter count.
+
+    Extra positional args are treated as dot-notation config overrides
+    (e.g. ``model.num_layers=16 model.hidden_dim=512``).
+    """
     import torch
 
     from oplm.model import OplmForMLM
 
-    cfg = load_config(_build_argv(config, preset, overrides))
+    cfg = load_config(_build_argv(config, preset, ctx.args))
 
     # Build model on meta device to avoid memory allocation
     with torch.device("meta"):

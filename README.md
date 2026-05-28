@@ -171,10 +171,10 @@ oplm train --config configs/my_run.yaml
 # use a size preset
 oplm train --preset medium
 
-# preset + overrides
+# preset + overrides (Hydra-style dot-notation)
 oplm train --preset large \
-  --override model.num_layers=16 \
-  --override train.lr=3e-4
+  model.num_layers=16 \
+  train.lr=3e-4
 
 # distributed training with Accelerate
 accelerate launch -m oplm.train --config configs/my_run.yaml
@@ -225,8 +225,10 @@ The canonical field-by-field reference lives in [configs/README.md](configs/READ
 Runtime precision is controlled by `train.mixed_precision`; `model.dtype` is currently a
 reserved placeholder.
 `model.max_seq_len` is the sequence-length setting for training, eval, and inference.
-`oplm` CLI commands take repeated `--override key=value` flags, while
-`accelerate launch -m oplm.train ...` still passes raw dotlist overrides through to
+Overrides use Hydra-style bare dot-notation: any positional token of the form
+`key.subkey=value` is treated as an override. This works the same way for
+`oplm train ...`, `oplm info ...`, `oplm encode ...`, and the distributed entrypoint
+`accelerate launch -m oplm.train ...`, all of which pass dotlist tokens through to
 `load_config()`.
 
 ### Model presets

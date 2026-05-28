@@ -32,7 +32,7 @@ The live sources of truth are:
 
 ### Training
 
-1. `oplm train` resolves config from `--config`, `--preset`, and repeated `--override` flags.
+1. `oplm train` resolves config from `--config`, `--preset`, and bare positional `key=value` dotlist overrides.
 2. [`src/oplm/train.py`](../src/oplm/train.py) hands the resolved config to [`Trainer`](../src/oplm/training/trainer.py).
 3. `Trainer` builds the accelerator, dataloader, model, optimizer, scheduler, and optional evaluator.
 4. Each optimizer step logs training metrics, runs scheduled eval tasks, and saves checkpoints on cadence.
@@ -54,10 +54,10 @@ The live sources of truth are:
 
 | Entry point | Purpose | Notes |
 | --- | --- | --- |
-| `oplm train` | Single-process or launcher-managed training via the Typer CLI. | Uses repeated `--override key=value` flags. |
+| `oplm train` | Single-process or launcher-managed training via the Typer CLI. | Accepts bare positional `key=value` overrides (Hydra-style). |
 | `oplm info` | Build the model on the meta device and report parameter counts plus enabled features. | Safe for large presets because it avoids real allocation. |
-| `oplm encode` | Load inference weights and write encoder embeddings to disk. | Accepts checkpoint directories directly. |
-| `accelerate launch -m oplm.train ...` | Distributed training entry point. | Keeps raw dotlist passthrough because `accelerate` forwards trailing args directly. |
+| `oplm encode` | Load inference weights and write encoder embeddings to disk. | Accepts checkpoint directories directly; positional tokens containing `=` are treated as overrides. |
+| `accelerate launch -m oplm.train ...` | Distributed training entry point. | Same bare-dotlist syntax — `accelerate` forwards trailing args directly. |
 
 ## Extension Points
 

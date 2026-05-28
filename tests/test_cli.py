@@ -109,9 +109,7 @@ class TestCli:
         assert "OPLM Model Info" in result.stdout
         assert "Hidden dim" in result.stdout
 
-    def test_info_command_accepts_override_flags(
-        self, tmp_path: Path, training_parquet: Path
-    ) -> None:
+    def test_info_command_accepts_overrides(self, tmp_path: Path, training_parquet: Path) -> None:
         config_path = _write_train_config(tmp_path, training_parquet)
 
         result = runner.invoke(
@@ -120,7 +118,6 @@ class TestCli:
                 "info",
                 "--config",
                 str(config_path),
-                "--override",
                 "model.hidden_dim=80",
             ],
         )
@@ -140,17 +137,11 @@ class TestCli:
                 "info",
                 "--config",
                 str(config_path),
-                "--override",
                 "model.conv_positions=ACD",
-                "--override",
                 "model.conv_kernel_size=3",
-                "--override",
                 "model.conv_kernel_schedule=block_step",
-                "--override",
                 "model.conv_kernel_increment=2",
-                "--override",
                 "model.conv_kernel_block_size=2",
-                "--override",
                 "model.conv_kernel_max_size=7",
             ],
         )
@@ -169,9 +160,7 @@ class TestCli:
         assert result.exit_code == 0, result.stdout
         assert (output_dir / "checkpoint-1").exists()
 
-    def test_train_command_accepts_override_flags(
-        self, tmp_path: Path, training_parquet: Path
-    ) -> None:
+    def test_train_command_accepts_overrides(self, tmp_path: Path, training_parquet: Path) -> None:
         config_path = _write_train_config(tmp_path, training_parquet)
         override_output_dir = tmp_path / "override-outputs"
 
@@ -181,7 +170,6 @@ class TestCli:
                 "train",
                 "--config",
                 str(config_path),
-                "--override",
                 f"train.output_dir={override_output_dir}",
             ],
         )
