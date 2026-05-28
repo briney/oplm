@@ -997,7 +997,7 @@ imports them.
 
 ## Phase 13 — Package `__init__.py` and Auto-class registration
 
-- [ ] **13.1 Update `src/oplm/model/__init__.py`** to re-export the public
+- [x] **13.1 Update `src/oplm/model/__init__.py`** to re-export the public
   surface so `from oplm.model import OplmForMaskedLM` works:
   ```python
   from .configuration_oplm import OplmConfig
@@ -1024,7 +1024,7 @@ imports them.
   ]
   ```
 
-- [ ] **13.2 Update `src/oplm/__init__.py`** to register with HF Auto classes
+- [x] **13.2 Update `src/oplm/__init__.py`** to register with HF Auto classes
   AND mark each class for auto-class custom-code copying (§13 of the
   architecture doc):
 
@@ -1068,14 +1068,14 @@ imports them.
   ```
   Keep `__version__` unchanged.
 
-- [ ] **13.3 Verify the registration is idempotent** — re-importing `oplm`
+- [x] **13.3 Verify the registration is idempotent** — re-importing `oplm`
   must not raise. (HF's `register` raises on duplicate by default; if so,
   guard with `try/except` or check the registry first.) The same guard applies
   to `register_for_auto_class` — it sets a class attribute, so the second call
   is a no-op in practice, but wrap it in a try/except if you observe spurious
   warnings under repeated import.
 
-- [ ] **13.4 Push-to-Hub round-trip test** (`tests/model/test_push_to_hub.py`,
+- [x] **13.4 Push-to-Hub round-trip test** (`tests/model/test_push_to_hub.py`,
   mark `@pytest.mark.slow`, requires `HF_TOKEN` and a writable test repo —
   skip when unavailable):
 

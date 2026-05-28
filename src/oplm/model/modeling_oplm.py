@@ -21,11 +21,25 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 
+# A few of these relative imports (`attention`, `conv`, `ffn`, `masking`, `rope`)
+# are not used directly here — they are reached transitively via `transformer`.
+# They are imported anyway so that loading custom code from a local directory
+# with trust_remote_code=True bundles every helper file: HuggingFace copies only
+# a module's *direct* relative imports (depth-1; see
+# transformers.dynamic_module_utils.get_cached_module_file). `_REMOTE_CODE_DEPS`
+# references the otherwise-unused names so linters don't flag them.
+from .attention import OplmAttention
 from .configuration_oplm import OplmConfig
+from .conv import CanonConv
 from .embedding import cls_pool, mean_pool
+from .ffn import SwiGLU
+from .masking import prepare_attention_mask
 from .norm import OplmLayerNorm, OplmRMSNorm, make_norm
 from .outputs import LogitsConfig, LogitsOutput
+from .rope import RotaryEmbedding
 from .transformer import OplmBlock, OplmStack
+
+_REMOTE_CODE_DEPS = (OplmAttention, CanonConv, SwiGLU, prepare_attention_mask, RotaryEmbedding)
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase

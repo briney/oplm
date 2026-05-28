@@ -10,6 +10,15 @@ from transformers import PretrainedConfig
 from .conv import resolve_canon_kernel_sizes
 from .ffn import round_up_to
 
+# When loading custom code from a local directory with trust_remote_code=True,
+# HuggingFace copies only a module's *direct* relative imports (depth-1; see
+# transformers.dynamic_module_utils.get_cached_module_file). `conv` imports
+# `masking` transitively, so import it directly here to guarantee it is bundled
+# alongside this file. Referenced in `_REMOTE_CODE_DEPS` to mark it used.
+from .masking import prepare_attention_mask
+
+_REMOTE_CODE_DEPS = (prepare_attention_mask,)
+
 __all__ = ["OplmConfig"]
 
 
@@ -226,9 +235,7 @@ class OplmConfig(PretrainedConfig):
 
         if self.canon_enabled:
             if not self.canon_positions:
-                raise ValueError(
-                    "canon_positions must be non-empty when canon_enabled=True."
-                )
+                raise ValueError("canon_positions must be non-empty when canon_enabled=True.")
             bad_positions = [p for p in self.canon_positions if p not in _VALID_CANON_POSITIONS]
             if bad_positions:
                 raise ValueError(
