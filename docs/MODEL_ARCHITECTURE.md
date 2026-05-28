@@ -36,8 +36,11 @@ This document specifies the OPLM model itself. Concretely:
 ### 1.3 Design philosophy
 
 OPLM is a **vanilla pre-norm encoder transformer with RoPE and QK-norm**. The
-default config reproduces a textbook modern PLM: RMSNorm everywhere, SwiGLU FFN,
-tied embeddings, standard multi-head attention with `num_heads == num_kv_heads`.
+default config reproduces a textbook modern PLM: LayerNorm everywhere (RMSNorm
+available as a toggle), SwiGLU FFN, untied input/output embeddings, standard
+multi-head attention with `num_heads == num_kv_heads`, residual streams scaled
+by `1/sqrt(L)` at each sublayer for stability at depth, and a BERT-style MLP
+MLM head.
 
 A small, curated set of **research toggles** layers on top, each switchable
 independently from config:
@@ -86,12 +89,17 @@ requires a deliberate revisit, not a flag flip:
 | Feature | Status |
 | --- | --- |
 | Pre-norm | Default |
-| RMSNorm | Default |
+| LayerNorm | Default |
+| RMSNorm | Toggle |
 | RoPE (full) | Default |
 | QK-norm | Default |
 | Standard multi-head attention (`H == H_kv`) | Default |
 | SwiGLU FFN | Default |
-| Tied input/output embeddings | Default |
+| BERT-style MLP MLM head | Default |
+| Untied input/output embeddings | Default |
+| Tied input/output embeddings | Toggle |
+| Residual scaling (`1/sqrt(L)` on each sublayer) | Default |
+| Init scaling on attn/FFN output projections (`1/sqrt(2L)`) | Default |
 | `flex_attention` fast path | Default |
 | Manual fallback when `output_attentions=True` | Default |
 | Canon depthwise conv | Toggle |
@@ -218,10 +226,12 @@ out = model(**inputs)
 
 ## 3. Tokenizer
 
-OPLM uses the **ESM2 / ESM-C 33-token vocabulary**, in the same token order and
-with the same special-token IDs. A batch tokenized for ESM-C is bit-for-bit
-identical to one tokenized for OPLM, which makes switching between the two
-models mechanical at the data layer.
+OPLM uses the **ESM-C 33-token vocabulary**, in the same token order and with
+the same special-token IDs (matches `esm.utils.constants.esm3` from
+`evolutionaryscale/esm`). A batch tokenized for ESM-C is bit-for-bit identical
+to one tokenized for OPLM, which makes switching between the two models
+mechanical at the data layer. Note the id-31 slot that was `<null_1>` in
+ESM-2 is `|` (chain break) in ESM-C; OPLM follows ESM-C.
 
 ### 3.1 Vocabulary
 
@@ -258,7 +268,7 @@ models mechanical at the data layer.
 | 28 | `O` | pyrrolysine |
 | 29 | `.` | gap marker |
 | 30 | `-` | alignment gap |
-| 31 | `<null_1>` | reserved |
+| 31 | `\|` | chain break |
 | 32 | `<mask>` | MLM mask |
 
 ### 3.2 Tokenization rules
@@ -316,7 +326,7 @@ OplmPreTrainedModel(PreTrainedModel)
     └─ (handles init, weight tying)
 
     ├─ OplmModel(OplmPreTrainedModel)
-    │       └─ backbone — embeddings + N × OplmBlock + final RMSNorm
+    │       └─ backbone — embeddings + N × OplmBlock + final norm
     │          returns BaseModelOutput
     │
     ├─ OplmForMaskedLM(OplmPreTrainedModel)
@@ -336,7 +346,7 @@ OplmPreTrainedModel(PreTrainedModel)
 | --- | --- |
 | `OplmConfig` | Carries every model hyperparameter. Subclass of `PretrainedConfig`. Validates field combinations in `__post_init__` / `__init__`. |
 | `OplmPreTrainedModel` | Abstract base. Wires `from_pretrained` / `save_pretrained`, weight init, embedding tying, gradient checkpointing toggle. Never instantiated directly. |
-| `OplmModel` | The encoder backbone. Token embedding → stack of `OplmBlock`s → final RMSNorm. No task head. |
+| `OplmModel` | The encoder backbone. Token embedding → stack of `OplmBlock`s → final norm. No task head. |
 | `OplmForMaskedLM` | Wraps `OplmModel`, adds the MLM projection (tied to embedding by default), computes MLM cross-entropy loss. |
 | `OplmForSequenceClassification` | Wraps `OplmModel`, applies a pooler (mean over non-pad by default) and a linear classifier. |
 | `OplmForTokenClassification` | Wraps `OplmModel`, applies a per-token linear classifier. |
@@ -361,35 +371,47 @@ The HF auto-class registration (see §13) maps:
 ## 5. Transformer block
 
 The block (`OplmBlock`) is the repeating unit of the encoder stack. The default
-configuration is pre-norm with RMSNorm, no Canon convs, and full RoPE.
+configuration is pre-norm with LayerNorm, residual scaling enabled, no Canon
+convs, and full RoPE. Throughout this section "Norm" refers generically to the
+configured `norm_type` (LayerNorm by default; RMSNorm under
+`norm_type = "rmsnorm"`). See §9 for the math of each.
 
 ### 5.1 Default block
 
 ```
-x ─────────────────────────────────────────────────────┐
-  │                                                    │
-  ├─► RMSNorm ──► Attention (QK-norm + RoPE) ──► (+) ──┤
-  │                                                    │
-  │                                                    ▼
-  │                                                    h
-  │                                                    │
-  ├─► RMSNorm ──► SwiGLU FFN ───────────────────► (+) ─┤
-  │                                                    │
-  └────────────────────────────────────────────────────┘
-                                                       │
-                                                       ▼
-                                                       y
+x ─────────────────────────────────────────────────────────────────┐
+  │                                                                │
+  ├─► Norm ──► Attn (QK-norm + RoPE) ──► × (1/sqrt(L)) ──► (+) ────┤
+  │                                                                │
+  │                                                                ▼
+  │                                                                h
+  │                                                                │
+  ├─► Norm ──► SwiGLU FFN ─────────────► × (1/sqrt(L)) ──► (+) ────┤
+  │                                                                │
+  └────────────────────────────────────────────────────────────────┘
+                                                                   │
+                                                                   ▼
+                                                                   y
 ```
 
-Algebraically:
+Algebraically, with `α = 1 / sqrt(L)` when `residual_scaling = "sqrt_num_layers"`
+(default) and `α = 1` when `residual_scaling = "none"`:
 
 ```
-h = x + Attn(RMSNorm(x))
-y = h + FFN(RMSNorm(h))
+h = x + α · Attn(Norm(x))
+y = h + α · FFN(Norm(h))
 ```
 
-The final block's output is followed by one more RMSNorm (the "final norm")
-before being fed to the task head.
+The final block's output is followed by one more Norm (the "final norm") before
+being fed to the task head.
+
+**Why scale.** With residual scaling on, the contribution of each sublayer to
+the residual stream is `O(1/sqrt(L))`, so the total contribution from `2L`
+sublayers stays `O(sqrt(L))` rather than `O(L)`. This is the load-bearing
+stability tool for deep models (target depths in OPLM go up to ~80 layers). The
+literal divisor in the spec is `sqrt(L)` per the project owner's preference; an
+equally defensible alternative is `sqrt(2L)` (since there are `2L` sublayers).
+The two differ only by a constant `sqrt(2)` and can be revisited at scale-up.
 
 ### 5.2 Canon insertion points
 
@@ -399,13 +421,13 @@ more of the following positions (labels match the Canon paper, arXiv
 
 ```
        (A)                         (B)                                 (C)
-x ──► [Conv] ──► RMSNorm ──► [Conv] ──► Attn(QK-norm+RoPE) ──► [Conv] ──► (+) ──► h
+x ──► [Conv] ──► Norm ──► [Conv] ──► Attn(QK-norm+RoPE) ──► [Conv] ──► (+) ──► h
                                                                                   │
                                                                                   │
                                               (D)                                 │
                                              [Conv]                               │
                                                │                                  │
-h ──► RMSNorm ──► SwiGLU FFN ─────────────────────────────────────────────► (+) ──┘
+h ──► Norm ──► SwiGLU FFN ────────────────────────────────────────────────► (+) ──┘
                                                                                   │
                                                                                   ▼
                                                                                   y
@@ -423,33 +445,36 @@ weakest); we accept it for ablation completeness.
 A block with Canon at A+C+D looks like:
 
 ```
-x ──► [Conv_A] ──► RMSNorm ──► Attn ──► [Conv_C] ──► (+) ──► h
-                                                              │
-h ──► RMSNorm ──► [Conv_D] ──► SwiGLU FFN ──────────► (+) ──► y
+x ──► [Conv_A] ──► Norm ──► Attn ──► [Conv_C] ──► (+) ──► h
+                                                           │
+h ──► Norm ──► [Conv_D] ──► SwiGLU FFN ───────────► (+) ──► y
 ```
 
 See §11 for the conv operator spec.
 
 ### 5.3 Normalization placement strategies
 
-`norm_strategy` controls how RMSNorm is placed around each sublayer.
+`norm_strategy` controls how Norm is placed around each sublayer. Residual
+scaling (`α = 1/sqrt(L)` by default) composes orthogonally with placement.
 
 | `norm_strategy` | Attention sublayer | FFN sublayer |
 | --- | --- | --- |
-| `pre` (default) | `h = x + Attn(RMSNorm(x))` | `y = h + FFN(RMSNorm(h))` |
-| `sandwich` | `h = x + RMSNorm₂(Attn(RMSNorm₁(x)))` | `y = h + RMSNorm₄(FFN(RMSNorm₃(h)))` |
-| `hybrid` (arXiv 2503.04598) | `h = x + Attn(RMSNorm(x))` (pre) | `y = RMSNorm(h + FFN(h))` (post) |
-| `post_sdpa` | `h = x + RMSNorm(Attn(RMSNorm(x)))` (RMSNorm only on attn output, FFN unchanged) | `y = h + FFN(RMSNorm(h))` |
+| `pre` (default) | `h = x + α · Attn(Norm(x))` | `y = h + α · FFN(Norm(h))` |
+| `sandwich` | `h = x + α · Norm₂(Attn(Norm₁(x)))` | `y = h + α · Norm₄(FFN(Norm₃(h)))` |
+| `hybrid` (arXiv 2503.04598) | `h = x + α · Attn(Norm(x))` (pre) | `y = Norm(h + α · FFN(h))` (post) |
+| `post_sdpa` | `h = x + α · Norm(Attn(Norm(x)))` (Norm only on attn output, FFN unchanged) | `y = h + α · FFN(Norm(h))` |
 
-QK-norm (a separate RMSNorm applied to Q and K inside the attention module) is
+QK-norm (a separate Norm applied to Q and K inside the attention module) is
 **always on** by default, orthogonal to `norm_strategy`. It can be turned off
 with `qk_norm = false` for ablation.
 
-The final post-stack RMSNorm is applied regardless of `norm_strategy`.
+The final post-stack norm is applied regardless of `norm_strategy`.
 
 ### 5.4 Toggle composition
 
+- `norm_type` is **global** (LayerNorm or RMSNorm for the whole model).
 - `norm_strategy` is **global** (uniform across all layers).
+- `residual_scaling` is **global**.
 - `canon_kernel_sizes` is **per-layer** (a list of length `num_hidden_layers`,
   or a scalar broadcast across layers).
 - `canon_positions` is **global** (same set of positions for every layer).
@@ -464,14 +489,17 @@ The final post-stack RMSNorm is applied regardless of `norm_strategy`.
 
 | Knob | Scope | Notes |
 | --- | --- | --- |
+| `norm_type` | global | `layernorm` (default) or `rmsnorm`. |
 | `norm_strategy` | global | Single enum value applied uniformly. |
-| `qk_norm` | global | Per-head RMSNorm inside attention. |
+| `qk_norm` | global | Per-head Norm inside attention. |
+| `residual_scaling` | global | `sqrt_num_layers` (default) or `none`. |
 | `rope_dim` / `nope_dim` | global | Same split across all heads of all layers. |
 | `canon_enabled` | global | Master switch. |
 | `canon_positions` | global | List of insertion points. |
 | `canon_kernel_sizes` | per-layer | Scalar broadcasts; list must match `num_hidden_layers`. |
 | `ffn_activation` | global | `swiglu` default; future variants added here. |
-| `tie_word_embeddings` | global | |
+| `tie_word_embeddings` | global | Off by default. |
+| `mlm_head_activation` | global | Default `gelu`. |
 | `classifier_pool` | global (per-head model) | Only meaningful for sequence-classification head. |
 
 ---
@@ -500,15 +528,17 @@ Standard multi-head attention with `num_attention_heads == num_kv_heads`
 
 ### 6.2 QK-norm
 
-Q and K are passed through **independent per-head RMSNorms** (each operating on
-the `d_head` channels) before scoring. V is not normed. Gains are learnable
-scalars per head channel.
+Q and K are each passed through a **separate Norm** (one for Q, one for K) that
+operates over the `d_head` channel dimension. The gain (and bias, under
+LayerNorm) is shape `(d_head,)`, shared across heads — i.e., the same channel
+gain is broadcast across the `H` heads. V is not normed.
 
 ```
-Q_norm = RMSNorm_q(Q)     # shape unchanged
-K_norm = RMSNorm_k(K)
+Q_norm = Norm_q(Q)     # shape unchanged
+K_norm = Norm_k(K)
 ```
 
+The norm type (LayerNorm vs. RMSNorm) follows the model-wide `norm_type`.
 QK-norm is computed in fp32 regardless of autocast.
 
 ### 6.3 RoPE application
@@ -617,10 +647,13 @@ Let `D = hidden_size`, `H = num_attention_heads`, `d = head_dim = D / H`.
 
 ```
 params = 4 · D · D                  (Q, K, V, O projections, no bias)
-       + 2 · H · d                  (QK-norm gains: H heads × d channels × 2)
+       + n_norm · 2 · d             (QK-norm: one Norm each for Q and K,
+                                     gain shape (d,) shared across heads,
+                                     plus bias under LayerNorm)
 ```
 
-RoPE caches are buffers, not parameters.
+where `n_norm = 2` under LayerNorm (gain + bias) and `n_norm = 1` under
+RMSNorm (gain only). RoPE caches are buffers, not parameters.
 
 ---
 
@@ -735,34 +768,61 @@ params = 3 · D · F     (W_g, W_u, W_d, no bias)
 
 ## 9. Normalization
 
-### 9.1 RMSNorm
+The `norm_type` config field selects the normalization operator used everywhere
+in the model (block pre-norm, any post-norms required by `norm_strategy`,
+QK-norm, post-embedding norm, final stack norm, optional pre-head norm). The
+same operator type is used at every site; mixing LayerNorm and RMSNorm within a
+single model is not supported.
+
+### 9.1 LayerNorm (default)
+
+```
+LayerNorm(x) = γ · (x − mean(x)) / sqrt(var(x) + eps) + β
+```
+
+- `γ` and `β` are learnable vectors of shape `(D,)` (or `(d_head,)` for
+  QK-norm), initialized to 1 and 0 respectively.
+- `eps = norm_eps`, default `1e-6`.
+- mean and variance are taken over the last dimension (the feature dimension).
+- Computed in **fp32** regardless of autocast: the input is up-cast to fp32
+  for the mean/var, normalized, multiplied by `γ` plus `β`, and cast back to
+  the input dtype.
+
+### 9.2 RMSNorm (`norm_type = "rmsnorm"`)
 
 ```
 RMSNorm(x) = γ · x / sqrt(mean(x²) + eps)
 ```
 
-- `γ` is a learnable vector of shape `(D,)`, initialized to 1.
+- `γ` is a learnable vector of shape `(D,)` (or `(d_head,)`), initialized to 1.
 - `eps = norm_eps`, default `1e-6`.
 - No bias term.
-- Computed in **fp32** regardless of autocast: the input is up-cast to fp32 for
-  the mean/sqrt, normalized, then multiplied by `γ` and cast back to the input
-  dtype.
+- fp32 internal compute, same as LayerNorm.
 
-### 9.2 All norm sites in the model
+LayerNorm has both centering and scaling; RMSNorm drops the centering step. In
+return, RMSNorm has half the parameters at each site and is slightly cheaper
+per token. Empirically the two are close at modest scale; we default to
+LayerNorm because (a) it matches ESM-C and (b) the centering step is mildly
+helpful for some training stabilities.
 
-| Site | Module | Shape of γ |
-| --- | --- | --- |
-| Token-embedding output (optional `post_embed_norm`) | `RMSNorm` | `(D,)` |
-| Attention pre-norm | `RMSNorm` | `(D,)` |
-| Attention QK-norm (Q) | `RMSNorm` per head | `(d_head,)` |
-| Attention QK-norm (K) | `RMSNorm` per head | `(d_head,)` |
-| FFN pre-norm | `RMSNorm` | `(D,)` |
-| Optional sandwich/post-SDPA/hybrid post-norms | `RMSNorm` | `(D,)` |
-| Final stack RMSNorm | `RMSNorm` | `(D,)` |
-| Optional pre-head norm (classification/token heads) | `RMSNorm` | `(D,)` |
+### 9.3 All norm sites in the model
 
-The QK-norm sites use one `γ` per attention layer per Q-or-K — i.e., 2L of them
-total, each shape `(d_head,)` (broadcast across heads).
+| Site | Shape of γ (and β under LayerNorm) |
+| --- | --- |
+| Token-embedding output (optional `post_embed_norm`) | `(D,)` |
+| Attention pre-norm | `(D,)` |
+| Attention QK-norm (Q) | `(d_head,)` |
+| Attention QK-norm (K) | `(d_head,)` |
+| FFN pre-norm | `(D,)` |
+| Optional sandwich / post-SDPA / hybrid post-norms | `(D,)` |
+| Final stack norm | `(D,)` |
+| MLM head intermediate norm | `(D,)` |
+| Optional pre-head norm (classification / token heads) | `(D,)` |
+
+Each `norm_type = "layernorm"` site doubles the parameter count of its
+RMSNorm equivalent (γ and β instead of just γ). The QK-norm sites use one
+parameter set per attention layer per Q-or-K — i.e., 2L of them total — each
+gain shape `(d_head,)` and shared across the `H` heads.
 
 ---
 
@@ -775,22 +835,40 @@ self.embed_tokens = nn.Embedding(vocab_size=33, embedding_dim=D)
 ```
 
 - No positional embedding (RoPE handles position).
-- `post_embed_norm` (RMSNorm after the embedding lookup) is `False` by default.
+- `post_embed_norm` (Norm after the embedding lookup) is `False` by default.
 - Init: truncated normal `std = initializer_range` (default `0.02`); `<pad>`
   row not zeroed (consistent with HF convention).
 
 ### 10.2 MLM head
 
+OPLM uses the BERT / RoBERTa-style two-layer MLP MLM head:
+
 ```python
-self.lm_head = nn.Linear(D, vocab_size=33, bias=False)
+class OplmMLMHead(nn.Module):
+    def __init__(self, config):
+        self.dense   = nn.Linear(D, D)                     # bias=True
+        self.act     = activation_fn(config.mlm_head_activation)  # default GELU
+        self.norm    = Norm(D, eps=config.norm_eps)        # LayerNorm by default
+        self.decoder = nn.Linear(D, vocab_size, bias=True)  # vocab projection
+
+    def forward(self, x):
+        x = self.dense(x)
+        x = self.act(x)
+        x = self.norm(x)
+        return self.decoder(x)
 ```
 
-Weights are **tied** with `embed_tokens` by default (`tie_word_embeddings =
-True`). Untying is supported as an ablation.
+Order: Dense → activation → Norm → decoder projection. The intermediate Norm
+follows the model-wide `norm_type` (LayerNorm by default; RMSNorm under
+`norm_type = "rmsnorm"`).
 
-The MLM head is a single linear projection. No bottleneck, no GELU, no
-intermediate norm — the final stack RMSNorm already handles activation
-shaping.
+`tie_word_embeddings` is **off by default**. The decoder projection is its own
+`Linear(D, V)`. When set to `True`, `decoder.weight` is tied to
+`embed_tokens.weight` (the decoder bias remains an independent parameter).
+Untied is the default because OPLM's vocabulary is tiny (33 tokens × D ≈ 25K
+parameters at D=768), so the parameter savings from tying are trivial, and
+keeping the projection independent gives the head a small extra degree of
+freedom that historically helps slightly on MLM.
 
 Loss:
 
@@ -819,7 +897,8 @@ Pooling:
 | `mean` (default) | Mean over the last hidden state at positions where `attention_mask == 1`. Pad and special tokens are excluded if their mask is zero; users can pass a mask that includes or excludes `<cls>`/`<eos>` as they see fit. |
 | `cls` | Take the hidden state at position 0 (`<cls>`). |
 
-An optional `pre_head_norm` (RMSNorm) is available; off by default.
+An optional `pre_head_norm` (using the model's configured `norm_type`) is
+available; off by default.
 
 ### 10.4 Token-classification head
 
@@ -922,9 +1001,9 @@ Total Canon cost across the stack: `sum over layers, positions of k · D`.
 ### 11.7 Block-with-canon diagram
 
 ```
-x ─► [Conv_A(k_l)] ─► RMSNorm ─► Attn ─► [Conv_C(k_l)] ─► (+) ─► h
-                                                                  │
-h ─► RMSNorm ─► [Conv_D(k_l)] ─► SwiGLU FFN ───────────► (+) ─► y
+x ─► [Conv_A(k_l)] ─► Norm ─► Attn ─► [Conv_C(k_l)] ─► (+) ─► h
+                                                               │
+h ─► Norm ─► [Conv_D(k_l)] ─► SwiGLU FFN ──────────────► (+) ─► y
 ```
 
 `k_l` is layer `l`'s kernel size from the schedule.
@@ -951,15 +1030,19 @@ maps 1:1 to `OplmConfig` constructor kwargs.
 | `rope_theta` | `float` | `10000.0` | RoPE base. |
 | `rope_dim` | `int` | `head_dim` | Channels per head that receive RoPE. |
 | `nope_dim` | `int` | `0` | Channels per head left position-invariant. `rope_dim + nope_dim == head_dim`. |
-| `norm_eps` | `float` | `1e-6` | RMSNorm epsilon. |
+| `norm_type` | `str` | `"layernorm"` | One of `layernorm`, `rmsnorm`. Applies to every norm site in the model. |
+| `norm_eps` | `float` | `1e-6` | Epsilon for whichever norm is selected. |
 | `norm_strategy` | `str` | `"pre"` | One of `pre`, `sandwich`, `hybrid`, `post_sdpa`. |
-| `qk_norm` | `bool` | `True` | Per-head RMSNorm on Q and K. |
-| `post_embed_norm` | `bool` | `False` | RMSNorm immediately after token embedding. |
+| `qk_norm` | `bool` | `True` | Per-head Norm on Q and K. |
+| `post_embed_norm` | `bool` | `False` | Norm immediately after token embedding. |
+| `residual_scaling` | `str` | `"sqrt_num_layers"` | One of `sqrt_num_layers`, `none`. Scales each sublayer output by `1/sqrt(L)` before adding to the residual stream. |
+| `init_scale_output_projections` | `bool` | `True` | When `True`, init `std` of attention `W_o` and FFN `W_d` is divided by `sqrt(2L)` (GPT-2 style). Redundant with `residual_scaling = "sqrt_num_layers"`; disable as an ablation. |
 | `ffn_activation` | `str` | `"swiglu"` | FFN variant. |
 | `ffn_bias` | `bool` | `False` | Bias on FFN linears. |
 | `attention_dropout` | `float` | `0.0` | Dropout on attention weights (fallback path; fast path inherits when supported). |
 | `hidden_dropout` | `float` | `0.0` | Dropout after attention/FFN output projections. |
-| `tie_word_embeddings` | `bool` | `True` | Tie MLM head to input embedding. |
+| `tie_word_embeddings` | `bool` | `False` | Tie MLM head decoder weight to `embed_tokens.weight`. |
+| `mlm_head_activation` | `str` | `"gelu"` | Activation in the BERT-style MLM head MLP. One of `gelu`, `silu`, `relu`. |
 | `canon_enabled` | `bool` | `False` | Master switch for Canon conv sublayers. |
 | `canon_positions` | `list[str]` | `[]` | Subset of `["A", "B", "C", "D"]`. |
 | `canon_kernel_sizes` | `int \| list[int] \| dict` | `4` | Kernel size or schedule. |
@@ -968,7 +1051,7 @@ maps 1:1 to `OplmConfig` constructor kwargs.
 | `classifier_pool` | `str` | `"mean"` | Sequence-classification pooler: `mean` or `cls`. |
 | `classifier_dropout` | `float` | `0.0` | Dropout in classification heads. |
 | `num_labels` | `int` | `2` | Number of output classes for classification heads. |
-| `pre_head_norm` | `bool` | `False` | RMSNorm immediately before any task head. |
+| `pre_head_norm` | `bool` | `False` | Norm (using `norm_type`) immediately before any task head. |
 | `use_flex_attention` | `bool` | `True` | Debug override. Setting to `False` forces the fallback path always — useful for debugging but slow. |
 | `gradient_checkpointing` | `bool` | `False` | Activation checkpointing on `OplmBlock`. |
 | `pad_token_id` | `int` | `1` | Matches ESM vocabulary. |
@@ -988,8 +1071,11 @@ Enforced in `OplmConfig.__init__` (with explicit `ValueError` on violation):
 - `rope_dim + nope_dim == head_dim`.
 - `rope_dim >= 0`, `nope_dim >= 0`, and `rope_dim` even (each RoPE rotation
   consumes a channel pair).
+- `norm_type in {"layernorm", "rmsnorm"}`.
 - `norm_strategy in {"pre", "sandwich", "hybrid", "post_sdpa"}`.
+- `residual_scaling in {"sqrt_num_layers", "none"}`.
 - `ffn_activation in {"swiglu", "geglu"}` (`geglu` reserved for future use).
+- `mlm_head_activation in {"gelu", "silu", "relu"}`.
 - If `canon_enabled`: `canon_positions` non-empty and ⊆ `{"A", "B", "C", "D"}`;
   resolved `canon_kernel_sizes` is a list of length `num_hidden_layers` with
   each element `≥ 2`.
@@ -1206,21 +1292,30 @@ output of each `OplmBlock` (post-residual). All shape `(B, T, D)`.
 | `nn.Linear.weight` (general) | Truncated normal, mean `0`, std `initializer_range` (`0.02`). |
 | `nn.Linear.bias` | Zero. |
 | `nn.Embedding.weight` | Truncated normal, mean `0`, std `initializer_range`. |
-| `RMSNorm.weight` | One. |
-| Attention output projection `W_o.weight` | Truncated normal, mean `0`, std `initializer_range / sqrt(2 · num_hidden_layers)`. |
-| FFN down-projection `W_d.weight` | Truncated normal, mean `0`, std `initializer_range / sqrt(2 · num_hidden_layers)`. |
+| Norm gain (`γ`) — both LayerNorm and RMSNorm | One. |
+| Norm bias (`β`, LayerNorm only) | Zero. |
+| QK-norm gain `γ` | One. (Bias zero under LayerNorm.) |
+| Attention output projection `W_o.weight` | Truncated normal, mean `0`, std `initializer_range / sqrt(2 · num_hidden_layers)` when `init_scale_output_projections = True` (default); std `initializer_range` otherwise. |
+| FFN down-projection `W_d.weight` | Same rule as `W_o` above. |
 | `nn.Conv1d.weight` (Canon) | Truncated normal, mean `0`, std `initializer_range`. |
-| QK-norm `γ` | One. |
+| MLM head `dense.weight`, `decoder.weight` (when untied) | Truncated normal, mean `0`, std `initializer_range`. (Decoder is not residual-stream-writing, so no `1/sqrt(2L)` factor.) |
+| MLM head `dense.bias`, `decoder.bias` | Zero. |
+| Classifier `weight` | Truncated normal, mean `0`, std `initializer_range`. |
+| Classifier `bias` | Zero. |
 
 The `1 / sqrt(2L)` scaling on residual-stream-writing projections follows the
-GPT-2 / NanoGPT convention. Without it, residual variance grows with depth at
-init and the early-training loss curve is worse.
+GPT-2 / NanoGPT convention. With `residual_scaling = "sqrt_num_layers"` active
+(default), it is partially redundant — the runtime division by `sqrt(L)`
+already controls residual-stream variance growth. The init scaling stays on by
+default as a belt-and-braces choice for the 80-layer target depth; users may
+ablate it via `init_scale_output_projections = False`.
 
 ### 15.2 Tying
 
 After init, `tie_weights()` is called. When `tie_word_embeddings == True`,
-`lm_head.weight` is set to `embed_tokens.weight` (the same `nn.Parameter`,
-not a copy).
+`lm_head.decoder.weight` is set to `embed_tokens.weight` (the same
+`nn.Parameter`, not a copy). The decoder bias remains an independent learnable
+parameter regardless of tying. The default is `False`.
 
 ### 15.3 Meta-device init
 
@@ -1236,8 +1331,8 @@ meta tensors: the materialization happens later via `load_state_dict`.
 
 - Mixed precision: **bf16** autocast on CUDA. fp32 master weights are managed
   by `Accelerator` (out of scope for this doc).
-- Norms (RMSNorm, QK-norm): always compute in **fp32** internally, output cast
-  back to the autocast dtype.
+- Norms (LayerNorm / RMSNorm, including QK-norm): always compute in **fp32**
+  internally, output cast back to the autocast dtype.
 - Attention softmax: **fp32** internal (both paths).
 - RoPE rotations: computed in fp32, then cast.
 - Logits: returned in **fp32**.
@@ -1252,8 +1347,9 @@ meta tensors: the materialization happens later via `load_state_dict`.
 ### 16.3 Why fp32 inside norms
 
 bf16's reduced mantissa precision causes meaningful drift in
-sum-of-squares reductions. Running RMS in fp32 costs negligible time and
-removes a known source of numerical instability seen in long-context training.
+sum-of-squares (and mean) reductions. Running both LayerNorm and RMSNorm in
+fp32 internally costs negligible time and removes a known source of numerical
+instability seen in long-context training.
 
 ---
 
@@ -1279,23 +1375,30 @@ Let `D = hidden_size`, `H = num_attention_heads`, `d = head_dim`,
 
 ### 18.1 Components
 
+Let `n_norm = 2` under LayerNorm (gain + bias) and `n_norm = 1` under RMSNorm
+(gain only). Residual scaling is parameter-free.
+
 ```
-embedding:               V · D
-final RMSNorm:           D
-MLM head (tied):         0           (untied: V · D)
+embedding:                       V · D
+final norm:                      n_norm · D
+
+MLM head:                        D · D + D            (dense)
+                               + n_norm · D           (intermediate norm)
+                               + (D · V + V if untied; else V)
+                                                      (decoder weight + bias)
 
 per attention block:
-    Q/K/V/O projections: 4 · D · D
-    QK-norm gains:       2 · d
-    pre-norm gain:       D
-    [if sandwich:        + D]
-    [if post_sdpa:       + D]
-    [if hybrid:          + 0  (norm reused on output, see §5.3)]
+    Q/K/V/O projections:         4 · D · D
+    QK-norm gains/biases:        2 · n_norm · d       (one Norm each for Q, K)
+    pre-norm:                    n_norm · D
+    [if sandwich:                + n_norm · D]
+    [if post_sdpa:               + n_norm · D]
+    [if hybrid:                  + 0   (norm reused on output, see §5.3)]
 
 per FFN block:
-    W_g, W_u, W_d:       3 · D · F
-    pre-norm gain:       D
-    [if sandwich:        + D]
+    W_g, W_u, W_d:               3 · D · F
+    pre-norm:                    n_norm · D
+    [if sandwich:                + n_norm · D]
 
 per Canon conv (one per enabled position per layer):
     k_l · D
@@ -1305,25 +1408,35 @@ per Canon conv (one per enabled position per layer):
 
 Parameters:
 
-- `D = 768, L = 12, H = 12, d = 64, F = 2048, V = 33, tie_word_embeddings = True`.
+- `D = 768, L = 12, H = 12, d = 64, F = 2048, V = 33`.
+- `norm_type = "layernorm"` (so `n_norm = 2`).
+- `tie_word_embeddings = False` (default).
 - `canon_enabled = False`.
 - `norm_strategy = "pre"`.
 
 ```
-embedding:          33 · 768                             = 25,344
-final RMSNorm:                                              768
+embedding:                33 · 768                                =     25,344
+final LayerNorm:          2 · 768                                 =      1,536
+
+MLM head:
+    dense weight:         768 · 768                               =    589,824
+    dense bias:           768                                     =        768
+    intermediate LN:      2 · 768                                 =      1,536
+    decoder weight:       768 · 33                                =     25,344
+    decoder bias:         33                                      =         33
+    subtotal:                                                          617,505
 
 per block (× 12):
-    attn projections:   4 · 768 · 768 = 2,359,296
-    QK-norm:            2 · 64                              128
-    pre-norm:                                               768
-    FFN:                3 · 768 · 2048 = 4,718,592
-    FFN pre-norm:                                           768
-    subtotal:                              7,080,320
+    attn projections:     4 · 768 · 768 = 2,359,296
+    QK-norm (LN, 2 norms × (γ + β) of 64):  2 · 2 · 64 =      256
+    attn pre-norm (LN):                     2 · 768   =    1,536
+    FFN:                  3 · 768 · 2048 = 4,718,592
+    FFN pre-norm (LN):                      2 · 768   =    1,536
+    subtotal:                                              7,081,216
 
-stack total:        12 · 7,080,320                  = 84,963,840
+stack total:              12 · 7,081,216                          = 84,974,592
 
-grand total:        25,344 + 768 + 84,963,840       ≈ 85.0 M
+grand total:              25,344 + 1,536 + 617,505 + 84,974,592   ≈ 85.6 M
 ```
 
 The actual repo preset numbers live in `src/oplm/configs/model/presets/`.
@@ -1344,7 +1457,7 @@ src/oplm/
     │                            strategy + canon insertions.
     ├── attention.py             OplmAttention with dual-path forward.
     ├── rope.py                  RoPE + partial RoPE.
-    ├── norm.py                  RMSNorm and placement helpers.
+    ├── norm.py                  LayerNorm + RMSNorm classes + placement helpers.
     ├── ffn.py                   SwiGLU FFN (and future activation variants).
     ├── conv.py                  Bidirectional depthwise conv for Canon.
     ├── embedding.py             Token embeddings; pooling helpers.
@@ -1418,8 +1531,8 @@ Not addressed in this document:
   channel pairs by position-dependent angles.
 - **NoPE** — "No positional encoding." Channels in a partial-RoPE scheme that
   receive no rotation.
-- **QK-norm** — RMSNorm applied per head to Q and K before scoring. Stabilizes
-  attention logits, especially at scale.
+- **QK-norm** — Norm applied (per head, gain shared across heads) to Q and K
+  before scoring. Stabilizes attention logits, especially at scale.
 - **SwiGLU** — Gated FFN: `down(silu(gate(x)) * up(x))`. Standard in modern
   PLMs.
 - **RMSNorm** — Root-mean-square norm. Cheaper than LayerNorm; no centering.
