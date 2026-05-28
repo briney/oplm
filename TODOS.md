@@ -1096,7 +1096,7 @@ imports them.
 These tests exercise the public surface and would catch wiring bugs that
 component tests miss.
 
-- [ ] **14.1 `tests/model/test_e2e_forward.py`**:
+- [x] **14.1 `tests/model/test_e2e_forward.py`**:
   - Build a tiny `OplmConfig` (e.g., `hidden_size=64, num_hidden_layers=2,
     num_attention_heads=4`) and instantiate each of the four task classes.
   - Forward a `(2, 16)` input through each; assert output shapes match §14.2.
@@ -1105,7 +1105,7 @@ component tests miss.
     sums to 1 along the last dim on real positions.
   - Loss is finite when `labels` are provided.
 
-- [ ] **14.2 `tests/model/test_save_load.py`**:
+- [x] **14.2 `tests/model/test_save_load.py`**:
   - `save_pretrained(tmpdir)` + `from_pretrained(tmpdir)` round-trip for each
     task class. Assert state-dict equality and identical forward outputs on the
     same input.
@@ -1113,12 +1113,12 @@ component tests miss.
     `AutoTokenizer.from_pretrained(tmpdir)` resolves back to
     `OplmTokenizerFast`.
 
-- [ ] **14.3 `tests/model/test_auto_classes.py`**:
+- [x] **14.3 `tests/model/test_auto_classes.py`**:
   - After `import oplm`, `AutoConfig.from_pretrained(tmpdir)`,
     `AutoModelForMaskedLM.from_pretrained(tmpdir)`, etc. all return the
     expected concrete `Oplm*` classes (no `trust_remote_code`).
 
-- [ ] **14.4 `tests/model/test_toggles.py`**:
+- [x] **14.4 `tests/model/test_toggles.py`**:
   - Parametrize over the Cartesian product of:
     - `norm_type ∈ {"layernorm", "rmsnorm"}`
     - `norm_strategy ∈ {"pre", "sandwich", "hybrid", "post_sdpa"}`
@@ -1134,7 +1134,7 @@ component tests miss.
     a non-None grad.
   - Keep `num_hidden_layers=2`, `hidden_size=64` so the matrix runs fast.
 
-- [ ] **14.5 `tests/model/test_esmc_api.py`**:
+- [x] **14.5 `tests/model/test_esmc_api.py`**:
   - Build `OplmForMaskedLM`. Construct an `OplmTokenizerFast` and assign it:
     `model.tokenizer = tokenizer` (the auto-attach branch of
     `from_pretrained` is exercised separately in `test_save_load.py`).
@@ -1154,12 +1154,12 @@ component tests miss.
     `model(**model.tokenize([...]))` forward pass and require bit-identical
     logits — proves `logits()` carries the attention mask through correctly.
 
-- [ ] **14.6 `tests/model/test_pilot_train.py`** (mark `@pytest.mark.slow`):
+- [x] **14.6 `tests/model/test_pilot_train.py`** (mark `@pytest.mark.slow`):
   - Build a 4-layer / 128-hidden / 4-head MLM, run 5 train steps on synthetic
     MLM data with an `AdamW` optimizer, assert loss decreases (or at least
     doesn't NaN). Validates that the full graph trains end-to-end.
 
-- [ ] **14.7 `tests/model/test_gradient_checkpointing.py`**:
+- [x] **14.7 `tests/model/test_gradient_checkpointing.py`**:
   - Same forward, with and without `config.gradient_checkpointing`, produces
     matching outputs (within float tolerance) and matching grads on a fixed
     seed.
