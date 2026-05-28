@@ -149,18 +149,29 @@ out = model(**inputs, output_hidden_states=True, output_attentions=False)
 
 ### 2.2 ESM-C-style convenience layer
 
-`OplmModel` and `OplmForMaskedLM` expose two convenience methods that mirror
-ESM-C so switching from ESM-C to OPLM is mechanical:
+All four `Oplm*ForX` classes expose three convenience methods. The first two
+mirror ESM-C so switching from ESM-C to OPLM is mechanical at the call site;
+the third (`tokenize`) is OPLM-specific and is the recommended way to feed the
+model when you do not want to manage tokenizer state yourself.
 
 ```python
 from oplm import OplmForMaskedLM, LogitsConfig
 
 model = OplmForMaskedLM.from_pretrained("brineylab/oplm-base")
+# from_pretrained auto-attaches the saved tokenizer if files are present; you
+# can also assign your own: model.tokenizer = AutoTokenizer.from_pretrained(...)
 
-# Tokenize a list of sequences -> (B, T) tensor of token IDs.
+# Full BatchEncoding — preferred. Contains input_ids AND attention_mask.
+batch = model.tokenize(["MEEPQSDPSVEPPLSQ", "GAGTRWPVQ"])
+out = model(**batch)
+
+# ESM-C-compatible: padded input_ids only. WARNING — using `ids` without also
+# passing the corresponding attention_mask will silently treat pad as real
+# input. Prefer model.tokenize(...) above; see §2.3.
 ids = model.encode(["MEEPQSDPSVEPPLSQ", "GAGTRWPVQ"])
 
-# Run forward and return a structured result.
+# Run forward and return a structured result. Internally calls tokenize(), so
+# the attention mask is always carried through correctly.
 out = model.logits(
     ["MEEPQSDPSVEPPLSQ", "GAGTRWPVQ"],
     LogitsConfig(
@@ -175,6 +186,13 @@ out = model.logits(
 # out.hidden_states    : tuple[Tensor]  | None
 # out.attentions       : tuple[Tensor]  | None  (forces fallback path)
 ```
+
+If `tokenize` / `encode` / `logits` is called before a tokenizer has been
+attached, the model raises with a message pointing to `from_pretrained` or
+manual assignment of `model.tokenizer`. There is no lazy
+`AutoTokenizer.from_pretrained(self.config._name_or_path)` fallback — that
+silently breaks scratch models, offline use, and test cases where the saved
+tokenizer files do not exist alongside the config.
 
 `LogitsConfig` (defined in `src/oplm/model/outputs.py`):
 
@@ -200,13 +218,21 @@ class LogitsOutput:
 
 ### 2.3 Method-to-HF mapping
 
-| ESM-C-style method | Delegates to |
-| --- | --- |
-| `model.encode(seqs)` | `tokenizer(seqs, return_tensors="pt", padding=True).input_ids` |
-| `model.logits(seqs, cfg)` | `model.forward(..., output_hidden_states=cfg.return_hidden_states or cfg.return_embeddings, output_attentions=cfg.return_attentions)` followed by repackaging into `LogitsOutput` |
+| Method | Returns | Delegates to |
+| --- | --- | --- |
+| `model.tokenize(seqs, **kwargs)` | `BatchEncoding` with `input_ids` + `attention_mask` (and any extras the tokenizer adds) | `self.tokenizer(seqs, return_tensors="pt", padding=True, **kwargs).to(device)` |
+| `model.encode(seqs, **kwargs)` | `Tensor` of `input_ids` only — for ESM-C parity | `self.tokenize(seqs, **kwargs).input_ids` |
+| `model.logits(seqs, cfg)` | `LogitsOutput` | `self.tokenize(seqs)` → `self.forward(input_ids, attention_mask, output_hidden_states=..., output_attentions=...)` → repackage |
 
-The convenience layer adds no new model state; it is a tokenize-then-forward
-wrapper. Users who want full control should call `forward()` directly.
+The convenience layer adds **one** piece of model-attached state — a
+`self.tokenizer` reference (defaults to `None`). Everything else is a
+tokenize-then-forward wrapper. Users who want full control should call
+`forward()` directly.
+
+`encode()` is kept for ESM-C call-site parity but is a known footgun in
+isolation: it returns the padded `input_ids` tensor with no attention mask. The
+recommended call pattern is `model.tokenize(...)` (full BatchEncoding) or
+`model.logits(...)` (built-in mask plumbing).
 
 ### 2.4 Token-classification example
 
@@ -461,12 +487,23 @@ scaling (`α = 1/sqrt(L)` by default) composes orthogonally with placement.
 | --- | --- | --- |
 | `pre` (default) | `h = x + α · Attn(Norm(x))` | `y = h + α · FFN(Norm(h))` |
 | `sandwich` | `h = x + α · Norm₂(Attn(Norm₁(x)))` | `y = h + α · Norm₄(FFN(Norm₃(h)))` |
-| `hybrid` (arXiv 2503.04598) | `h = x + α · Attn(Norm(x))` (pre) | `y = Norm(h + α · FFN(h))` (post) |
+| `hybrid` (arXiv 2503.04598) | `h = x + α · Attn_QKVNorm(x)` — **no outer pre-norm**; Q, K, V are each normed inside the attention module (see §6.2) | `y = Norm(h) + α · FFN(Norm(h))` — a single `Norm(h)` is reused as both the FFN input and the FFN-side residual stream |
 | `post_sdpa` | `h = x + α · Norm(Attn(Norm(x)))` (Norm only on attn output, FFN unchanged) | `y = h + α · FFN(Norm(h))` |
 
-QK-norm (a separate Norm applied to Q and K inside the attention module) is
-**always on** by default, orthogonal to `norm_strategy`. It can be turned off
-with `qk_norm = false` for ablation.
+The hybrid row reproduces the paper's "QKV-Post" main method literally:
+`Y_l = MHA_QKV(X_l) + X_l` followed by `X_{l+1} = FFN(Norm(Y_l)) + Norm(Y_l)`.
+Two things are different from the other strategies:
+
+1. The block-level attention pre-norm is **suppressed** — raw `x` is fed to the
+   attention module rather than `Norm(x)`.
+2. Inside the attention module, V is normed in addition to Q and K
+   ("QKV-norm" — see §6.2). This V-norm is automatic under `hybrid`; it is not
+   a separate config knob.
+
+For the other strategies (`pre`, `sandwich`, `post_sdpa`), QK-norm (a separate
+Norm applied to Q and K only — V is *not* normed) is **always on** by default
+and orthogonal to `norm_strategy`. It can be turned off with `qk_norm = false`
+for ablation.
 
 The final post-stack norm is applied regardless of `norm_strategy`.
 
@@ -526,12 +563,12 @@ Standard multi-head attention with `num_attention_heads == num_kv_heads`
 | Reshape back | `(B, T, D)` |
 | Output projection | `(B, T, D)` |
 
-### 6.2 QK-norm
+### 6.2 QK-norm / QKV-norm
 
 Q and K are each passed through a **separate Norm** (one for Q, one for K) that
 operates over the `d_head` channel dimension. The gain (and bias, under
 LayerNorm) is shape `(d_head,)`, shared across heads — i.e., the same channel
-gain is broadcast across the `H` heads. V is not normed.
+gain is broadcast across the `H` heads. By default, V is **not** normed.
 
 ```
 Q_norm = Norm_q(Q)     # shape unchanged
@@ -540,6 +577,25 @@ K_norm = Norm_k(K)
 
 The norm type (LayerNorm vs. RMSNorm) follows the model-wide `norm_type`.
 QK-norm is computed in fp32 regardless of autocast.
+
+When `norm_strategy == "hybrid"`, V is **also** normed by an independent
+`v_norm` of shape `(d_head,)` (same `norm_type`, same `norm_eps`), giving the
+"QKV-norm" formulation from arXiv 2503.04598:
+
+```
+Q_norm = Norm_q(Q)
+K_norm = Norm_k(K)
+V_norm = Norm_v(V)     # only under norm_strategy == "hybrid"
+```
+
+The block-level attention pre-norm is also suppressed under `hybrid` — raw `x`
+is fed into the attention module so that the only norms in the attention path
+are these per-projection norms. Under all other `norm_strategy` values,
+`v_norm` is `nn.Identity()`.
+
+If a user sets `qk_norm = False` together with `norm_strategy = "hybrid"`, the
+attention has no normalization at all — this is an exotic combination, but it
+is allowed; the validator emits a warning, not an error.
 
 ### 6.3 RoPE application
 
@@ -566,25 +622,37 @@ def forward(
 
 ### 6.5 Path selection
 
-A single `if output_attentions:` branch selects the kernel:
+A single helper `_use_fast_path(...)` selects the kernel. The fast path is used
+only when **all** of the following hold:
+
+| Condition | Why |
+| --- | --- |
+| `output_attentions` is `False` | `flex_attention` does not return attention weights. |
+| `config.use_flex_attention` is `True` | Debug override. |
+| `config.attention_dropout == 0.0` | `flex_attention` has no `dropout_p` argument; honouring the configured dropout exactly requires the fallback. |
+| `q.device.type == "cuda"` | `flex_attention` requires a CUDA device. |
+| (`flex_attention` import is available — torch ≥ 2.11) | Soft fallback if the kernel symbol is missing. |
+
+If any condition fails, the fallback `_manual_attention` runs instead. The
+fallback honours `attention_dropout`, supports CPU/MPS, and can return weights.
 
 ```python
 q, k, v = self._project_qkv(x)         # (B, H, T, d_head) each
 q, k = self._qk_norm(q, k)
+v = self._v_norm(v)                    # nn.Identity unless hybrid
 q, k = self._apply_rope(q, k)
-v_packed = v
 
-if output_attentions:
-    out, attn = self._manual_attention(q, k, v_packed, attention_mask)
-else:
-    out = self._flex_attention(q, k, v_packed, attention_mask)
+if self._use_fast_path(output_attentions, q.device):
+    out = self._flex_attention(q, k, v, attention_mask)
     attn = None
+else:
+    out, attn = self._manual_attention(q, k, v, attention_mask)
 
 out = self._output_projection(out)
 return out, attn
 ```
 
-QKV projection, QK-norm, RoPE, output projection — all shared between paths.
+QKV projection, QK/V-norm, RoPE, output projection — all shared between paths.
 Only the score → softmax → value combination differs.
 
 ### 6.6 Fast path: `torch.nn.attention.flex_attention`
@@ -596,7 +664,14 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 def mask_mod(b, h, q_idx, kv_idx):
     return attention_mask[b, kv_idx] == 1
 
-block_mask = create_block_mask(mask_mod, B=B, H=None, Q_LEN=T, KV_LEN=T)
+block_mask = create_block_mask(
+    mask_mod,
+    B=B,
+    H=num_attention_heads,
+    Q_LEN=T,
+    KV_LEN=T,
+    device=q.device,
+)
 out = flex_attention(q, k, v, block_mask=block_mask)  # (B, H, T, d_head)
 ```
 
@@ -609,6 +684,12 @@ Notes:
 - The encoder is **bidirectional**; no causal mask. The only mask is the
   per-token padding mask.
 - `flex_attention` returns no attention weights.
+- `H` is passed as an explicit integer rather than `None`. Recent PyTorch
+  builds tolerate `H=None` for head-broadcasting masks, but the documented
+  signature is `H: int`; the explicit form is version-stable.
+- `flex_attention` has no `dropout_p` argument. When
+  `config.attention_dropout > 0`, the path selector (§6.5) forces fallback so
+  the configured dropout is applied exactly.
 
 ### 6.7 Fallback path: pure manual matmul
 
@@ -810,11 +891,12 @@ helpful for some training stabilities.
 | Site | Shape of γ (and β under LayerNorm) |
 | --- | --- |
 | Token-embedding output (optional `post_embed_norm`) | `(D,)` |
-| Attention pre-norm | `(D,)` |
+| Attention pre-norm — omitted under `hybrid` | `(D,)` |
 | Attention QK-norm (Q) | `(d_head,)` |
 | Attention QK-norm (K) | `(d_head,)` |
+| Attention V-norm (only under `hybrid`) | `(d_head,)` |
 | FFN pre-norm | `(D,)` |
-| Optional sandwich / post-SDPA / hybrid post-norms | `(D,)` |
+| Optional sandwich / post-SDPA post-norms | `(D,)` |
 | Final stack norm | `(D,)` |
 | MLM head intermediate norm | `(D,)` |
 | Optional pre-head norm (classification / token heads) | `(D,)` |
@@ -1039,7 +1121,7 @@ maps 1:1 to `OplmConfig` constructor kwargs.
 | `init_scale_output_projections` | `bool` | `True` | When `True`, init `std` of attention `W_o` and FFN `W_d` is divided by `sqrt(2L)` (GPT-2 style). Redundant with `residual_scaling = "sqrt_num_layers"`; disable as an ablation. |
 | `ffn_activation` | `str` | `"swiglu"` | FFN variant. |
 | `ffn_bias` | `bool` | `False` | Bias on FFN linears. |
-| `attention_dropout` | `float` | `0.0` | Dropout on attention weights (fallback path; fast path inherits when supported). |
+| `attention_dropout` | `float` | `0.0` | Dropout on attention weights. Any non-zero value forces the fallback path (`flex_attention` has no `dropout_p` argument; see §6.5). |
 | `hidden_dropout` | `float` | `0.0` | Dropout after attention/FFN output projections. |
 | `tie_word_embeddings` | `bool` | `False` | Tie MLM head decoder weight to `embed_tokens.weight`. |
 | `mlm_head_activation` | `str` | `"gelu"` | Activation in the BERT-style MLM head MLP. One of `gelu`, `silu`, `relu`. |
@@ -1146,15 +1228,62 @@ AutoModelForMaskedLM.register(OplmConfig, OplmForMaskedLM)
 AutoModelForSequenceClassification.register(OplmConfig, OplmForSequenceClassification)
 AutoModelForTokenClassification.register(OplmConfig, OplmForTokenClassification)
 AutoTokenizer.register(OplmConfig, fast_tokenizer_class=OplmTokenizerFast)
+
+# Also tell HF to copy these classes' source files on push_to_hub /
+# save_pretrained and to populate `auto_map` automatically. This is the
+# documented hook — setting `auto_map` by hand does not copy code (see §13.3).
+OplmConfig.register_for_auto_class("AutoConfig")
+OplmModel.register_for_auto_class("AutoModel")
+OplmForMaskedLM.register_for_auto_class("AutoModelForMaskedLM")
+OplmForSequenceClassification.register_for_auto_class("AutoModelForSequenceClassification")
+OplmForTokenClassification.register_for_auto_class("AutoModelForTokenClassification")
+OplmTokenizerFast.register_for_auto_class("AutoTokenizer")
 ```
 
 After `import oplm`, calls like `AutoModelForMaskedLM.from_pretrained(
 "brineylab/oplm-base")` resolve without `trust_remote_code`.
 
-### 13.3 `auto_map` for remote loading
+### 13.3 `register_for_auto_class()` and `auto_map`
 
-`save_pretrained` (overridden on `OplmConfig`) writes the following into
-`config.json`:
+`auto_map` (a dict written into `config.json` / `tokenizer_config.json`) is
+what `trust_remote_code=True` loaders read to find the Python class to
+instantiate. But populating `auto_map` by hand is **not** sufficient to make
+`push_to_hub` upload the modeling code — HF only copies custom code for classes
+that have called `register_for_auto_class(...)`. The two mechanisms work
+together:
+
+| Mechanism | What it does | Who calls it |
+| --- | --- | --- |
+| `OplmConfig.register_for_auto_class("AutoConfig")` etc. | Marks the class so `save_pretrained` / `push_to_hub` (a) write the right `auto_map` entries into the JSON, and (b) copy the source file into the model repo. | The package, at import time. |
+| `auto_map` in `config.json` | Tells a downstream `trust_remote_code=True` loader which class to instantiate. | Written automatically by `save_pretrained` once the class is registered. |
+
+OPLM calls `register_for_auto_class` at import time, in
+`src/oplm/__init__.py`, after the in-process `AutoConfig.register(...)` /
+`AutoModel.register(...)` calls:
+
+```python
+OplmConfig.register_for_auto_class("AutoConfig")
+OplmModel.register_for_auto_class("AutoModel")
+OplmForMaskedLM.register_for_auto_class("AutoModelForMaskedLM")
+OplmForSequenceClassification.register_for_auto_class("AutoModelForSequenceClassification")
+OplmForTokenClassification.register_for_auto_class("AutoModelForTokenClassification")
+OplmTokenizerFast.register_for_auto_class("AutoTokenizer")
+```
+
+After this, `model.save_pretrained(dir)` writes both the weights and the
+modeling / configuration / tokenization `.py` files into `dir`, and
+`push_to_hub` uploads all of them — without any further manual `auto_map`
+construction.
+
+Verifying the round-trip is mandatory: the `test_save_load.py` /
+`test_auto_classes.py` integration tests (§14 of TODOS) must include a case
+that calls `save_pretrained(tmpdir)`, then opens `tmpdir` in a *subprocess*
+with `transformers` only (no `import oplm`) and runs
+`AutoModelForMaskedLM.from_pretrained(tmpdir, trust_remote_code=True)`. Without
+that, regressions in the file-copy step go undetected until someone uses the
+checkpoint from a clean env.
+
+The resulting `config.json` looks like this (HF writes it automatically):
 
 ```json
 {
@@ -1170,9 +1299,7 @@ After `import oplm`, calls like `AutoModelForMaskedLM.from_pretrained(
 }
 ```
 
-When `push_to_hub` is used, the repo also receives copies of
-`modeling_oplm.py`, `configuration_oplm.py`, and the small helper files they
-import. End users can then run:
+End users then run:
 
 ```python
 model = AutoModelForMaskedLM.from_pretrained(
@@ -1390,14 +1517,17 @@ MLM head:                        D · D + D            (dense)
 per attention block:
     Q/K/V/O projections:         4 · D · D
     QK-norm gains/biases:        2 · n_norm · d       (one Norm each for Q, K)
-    pre-norm:                    n_norm · D
+    pre-norm:                    n_norm · D           (omitted under hybrid)
     [if sandwich:                + n_norm · D]
     [if post_sdpa:               + n_norm · D]
-    [if hybrid:                  + 0   (norm reused on output, see §5.3)]
+    [if hybrid:                  + n_norm · d         (V-norm)
+                                 − n_norm · D         (no outer pre-norm)]
 
 per FFN block:
     W_g, W_u, W_d:               3 · D · F
-    pre-norm:                    n_norm · D
+    pre-norm:                    n_norm · D           (under hybrid, same gain is
+                                                      reused as the post-add Norm;
+                                                      no separate norm parameters)
     [if sandwich:                + n_norm · D]
 
 per Canon conv (one per enabled position per layer):
