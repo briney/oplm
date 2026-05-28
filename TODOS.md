@@ -726,7 +726,7 @@ for `sandwich`, `hybrid`, `post_sdpa`, plus Canon insertions at A/B/C/D.
 
 ## Phase 11 — `tokenization_oplm.py`: `OplmTokenizerFast`
 
-- [ ] **11.1 Build the underlying `tokenizers.Tokenizer` JSON**:
+- [x] **11.1 Build the underlying `tokenizers.Tokenizer` JSON**:
   - WordLevel model with the 33-token vocab from §3.1 of the architecture doc
     (IDs 0..32 in the exact order listed). The IDs and ordering must be
     bit-identical to ESM-C — a batch tokenized by ESM-C and by OPLM must
@@ -744,7 +744,7 @@ for `sandwich`, `hybrid`, `post_sdpa`, plus Canon insertions at A/B/C/D.
     - Special tokens: `<cls>` (0), `<eos>` (2).
   - Padding token: `<pad>` (id 1).
 
-- [ ] **11.2 Implement `OplmTokenizerFast(PreTrainedTokenizerFast)`**:
+- [x] **11.2 Implement `OplmTokenizerFast(PreTrainedTokenizerFast)`**:
   - Constructor accepts the standard HF kwargs, plus `vocab_file=None`
     (unused), and constructs the backing `tokenizers.Tokenizer` programmatically
     when no file path is provided. Persisted form goes through `tokenizer.json`.
@@ -760,7 +760,7 @@ for `sandwich`, `hybrid`, `post_sdpa`, plus Canon insertions at A/B/C/D.
     remote-loading via `trust_remote_code` works:
     `"auto_map": {"AutoTokenizer": ["tokenization_oplm.OplmTokenizerFast", null]}`.
 
-- [ ] **11.3 Tests** (`tests/model/test_tokenizer.py`):
+- [x] **11.3 Tests** (`tests/model/test_tokenizer.py`):
   - `tokenizer("MEEPQ").input_ids == [0, 20, 9, 9, 14, 16, 2]` — the canonical
     sanity check from §3.4.
   - Batch with padding produces equal-length sequences with `<pad>` at the end.
