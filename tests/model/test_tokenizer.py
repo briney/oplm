@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 
@@ -11,7 +10,12 @@ import pytest
 from oplm.model import OplmTokenizerFast
 from oplm.model.tokenization_oplm import VOCAB
 
-_have_esm = importlib.util.find_spec("esm") is not None
+# The public ESM-2 tokenizer shares OPLM's exact vocabulary and ordering for
+# every id except 31 (ESM-2 has `<null_1>` there; ESM-C — which OPLM follows —
+# has the chain-break `|`). It loads through plain AutoTokenizer, so we can
+# check parity without the heavy `esm` package. The true ESM-C tokenizer ships
+# only inside `esm` and is not loadable from the hub via AutoTokenizer.
+_ESM2_REPO = "facebook/esm2_t33_650M_UR50D"
 
 
 @pytest.fixture(scope="module")
@@ -99,15 +103,32 @@ def test_save_pretrained_round_trip(tokenizer: OplmTokenizerFast, tmp_path: Path
 
 
 # ---------------------------------------------------------------------------
-# ESM-C parity (skipped when esm is unavailable)
+# ESM parity (skipped when the hub tokenizer can't be downloaded, e.g. offline)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _have_esm, reason="esm package not installed")
-def test_esm_c_parity(tokenizer: OplmTokenizerFast):
-    from esm.tokenization import EsmSequenceTokenizer
+@pytest.fixture(scope="module")
+def esm2_tokenizer():
+    from transformers import AutoTokenizer
 
-    esm_tok = EsmSequenceTokenizer()
-    seqs = ["MEEPQSDPSVEPPLSQ", "GAGTRWPVQ"]
+    try:
+        return AutoTokenizer.from_pretrained(_ESM2_REPO)
+    except Exception as exc:  # network/hub unavailable -> skip, don't fail
+        pytest.skip(f"could not load {_ESM2_REPO}: {exc}")
+
+
+def test_input_ids_parity_with_esm(tokenizer: OplmTokenizerFast, esm2_tokenizer):
+    # On real protein sequences (no `|`/`<null_1>`), OPLM is byte-identical to ESM.
+    seqs = ["MEEPQ", "MEEPQSDPSVEPPLSQ", "GAGTRWPVQ"]
     for seq in seqs:
-        assert tokenizer(seq).input_ids == esm_tok(seq)["input_ids"]
+        assert tokenizer(seq).input_ids == esm2_tokenizer(seq)["input_ids"]
+
+
+def test_vocab_parity_with_esm_except_chain_break(tokenizer: OplmTokenizerFast, esm2_tokenizer):
+    esm_vocab = esm2_tokenizer.get_vocab()
+    assert len(esm_vocab) == len(VOCAB) == 33
+    differing = {i for tok, i in VOCAB.items() if esm_vocab.get(tok) != i}
+    # The only intended divergence is id 31: ESM-C `|` vs ESM-2 `<null_1>`.
+    assert differing == {31}
+    assert VOCAB["|"] == 31
+    assert esm_vocab["<null_1>"] == 31
