@@ -781,7 +781,7 @@ file so `auto_map` + `trust_remote_code` loading works without chasing imports
 across files. Internal helpers live in their own modules; `modeling_oplm.py`
 imports them.
 
-- [ ] **12.1 `OplmPreTrainedModel(PreTrainedModel)` (abstract base)**:
+- [x] **12.1 `OplmPreTrainedModel(PreTrainedModel)` (abstract base)**:
   - Class attributes:
     ```python
     config_class = OplmConfig
@@ -807,7 +807,7 @@ imports them.
       doesn't know its role. Cleanest implementation: mark them in `__init__`
       (e.g., `module._is_residual_writer = True`) and check that flag here.
 
-- [ ] **12.2 `OplmModel(OplmPreTrainedModel)`** — the backbone:
+- [x] **12.2 `OplmModel(OplmPreTrainedModel)`** — the backbone:
   - Holds `embed_tokens`, `nn.ModuleList[L]` of `OplmBlock`, and `final_norm =
     make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)`.
   - Forward signature matches HF convention:
@@ -832,7 +832,7 @@ imports them.
   - Apply `final_norm` to the last hidden state.
   - Return `BaseModelOutput(last_hidden_state, hidden_states, attentions)`.
 
-- [ ] **12.3 `OplmMLMHead(nn.Module)`** (defined in this file):
+- [x] **12.3 `OplmMLMHead(nn.Module)`** (defined in this file):
   - `dense: Linear(D, D, bias=True)`.
   - `act`: `F.gelu` / `F.silu` / `F.relu` per `config.mlm_head_activation`.
   - `norm = make_norm(config.norm_type, D, eps=config.norm_eps)`.
@@ -841,7 +841,7 @@ imports them.
     `1/sqrt(2L)` scaling here — see §15.1).
   - Forward: `decoder(norm(act(dense(x))))`.
 
-- [ ] **12.4 `EsmcCompatMixin`** (defined in this file):
+- [x] **12.4 `EsmcCompatMixin`** (defined in this file):
 
   Tokenizer attachment policy:
   - The mixin holds an optional `self.tokenizer: PreTrainedTokenizerFast | None
@@ -920,7 +920,7 @@ imports them.
     `sequence_logits=None` because `OplmModel` has no head — `getattr(out,
     "logits", None)` handles that case automatically.
 
-- [ ] **12.4b `OplmPreTrainedModel.from_pretrained` override** (auto-attach tokenizer):
+- [x] **12.4b `OplmPreTrainedModel.from_pretrained` override** (auto-attach tokenizer):
 
   ```python
   @classmethod
@@ -940,7 +940,7 @@ imports them.
       return model
   ```
 
-- [ ] **12.5 `OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin)`**:
+- [x] **12.5 `OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin)`**:
   - `__init__`: instantiates `self.oplm = OplmModel(config)` and
     `self.lm_head = OplmMLMHead(config)`.
   - Calls `self.post_init()` to fire `_init_weights` and `tie_weights`.
@@ -959,7 +959,7 @@ imports them.
       ignore_index=-100)` when `labels is not None`.
     - Return `MaskedLMOutput`.
 
-- [ ] **12.6 `OplmForSequenceClassification(OplmPreTrainedModel, EsmcCompatMixin)`**:
+- [x] **12.6 `OplmForSequenceClassification(OplmPreTrainedModel, EsmcCompatMixin)`**:
   - `__init__`: `self.oplm = OplmModel(config)`; optional `self.pre_head_norm`
     (only if `config.pre_head_norm`); `self.dropout = nn.Dropout(
     config.classifier_dropout)`; `self.classifier = nn.Linear(D,
@@ -976,7 +976,7 @@ imports them.
       HF idioms, otherwise leave a single `cross_entropy` path and document.
     - Return `SequenceClassifierOutput`.
 
-- [ ] **12.7 `OplmForTokenClassification(OplmPreTrainedModel, EsmcCompatMixin)`**:
+- [x] **12.7 `OplmForTokenClassification(OplmPreTrainedModel, EsmcCompatMixin)`**:
   - `__init__`: `self.oplm = OplmModel(config)`; optional `self.pre_head_norm`;
     `self.dropout = nn.Dropout(config.classifier_dropout)`;
     `self.classifier = nn.Linear(D, config.num_labels, bias=True)`.
@@ -988,7 +988,7 @@ imports them.
       ignore_index=-100)`.
     - Return `TokenClassifierOutput`.
 
-- [ ] **12.8 Module re-exports**: at top of `modeling_oplm.py`, export every
+- [x] **12.8 Module re-exports**: at top of `modeling_oplm.py`, export every
   public class: `__all__ = ["OplmPreTrainedModel", "OplmModel",
   "OplmForMaskedLM", "OplmForSequenceClassification",
   "OplmForTokenClassification", "OplmMLMHead", "EsmcCompatMixin"]`.

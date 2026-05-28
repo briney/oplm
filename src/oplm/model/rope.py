@@ -66,41 +66,60 @@ class RotaryEmbedding(nn.Module):
                 torch.empty(max_position_embeddings, 0, dtype=torch.float32),
                 persistent=False,
             )
+            # No rotation -> nothing to (re)build.
+            self._cache_initialized = True
             return
 
-        inv_freq = self.base ** (
-            -torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim
-        )  # (rope_dim/2,)
+        inv_freq = self._compute_inv_freq(device=None)  # (rope_dim/2,)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         cos, sin = self._compute_cos_sin(max_position_embeddings, device=inv_freq.device)
         self.register_buffer("cos_cached", cos, persistent=False)
         self.register_buffer("sin_cached", sin, persistent=False)
+        # Under HF's meta-device fast init these buffers are computed on `meta`
+        # and re-materialized later as uninitialized memory (not in the
+        # checkpoint, since they're non-persistent). Flag that so the first real
+        # forward rebuilds them; a normal CPU/GPU construction is already valid.
+        self._cache_initialized = not self.cos_cached.is_meta
+
+    def _compute_inv_freq(self, device: torch.device | None) -> torch.Tensor:
+        """Derive `inv_freq` from `base`/`rope_dim` (stored as plain attributes).
+
+        Recomputed rather than read from the buffer so a meta-device-corrupted
+        buffer can never leak into the rotation tables.
+        """
+        return self.base ** (
+            -torch.arange(0, self.rope_dim, 2, dtype=torch.float32, device=device) / self.rope_dim
+        )
 
     def _compute_cos_sin(
-        self, seq_len: int, device: torch.device
+        self, seq_len: int, device: torch.device | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute fp32 cos/sin tables of shape `(seq_len, rope_dim/2)`."""
+        inv_freq = self._compute_inv_freq(device=device)
         positions = torch.arange(seq_len, dtype=torch.float32, device=device)  # (T,)
-        freqs = positions[:, None] * self.inv_freq.to(device)[None, :]  # (T, rope_dim/2)
+        freqs = positions[:, None] * inv_freq[None, :]  # (T, rope_dim/2)
         return freqs.cos(), freqs.sin()
 
     def _maybe_extend_cache(self, seq_len: int, device: torch.device) -> None:
         """Rebuild the cos/sin tables if `seq_len` exceeds the cached length.
 
         Also rebuilds when the cached buffers live on a different device than
-        the incoming tensors (e.g., first call after `.to(cuda)`).
+        the incoming tensors (e.g., first call after `.to(cuda)`) or when the
+        cache has not yet been built on a real device (post meta-init load).
         """
         if self.rope_dim == 0:
             return
         cached_len = self.cos_cached.shape[0]
         same_device = self.cos_cached.device == device
-        if seq_len <= cached_len and same_device:
+        if self._cache_initialized and seq_len <= cached_len and same_device:
             return
         new_len = max(seq_len, cached_len)
         cos, sin = self._compute_cos_sin(new_len, device=device)
+        self.inv_freq = self._compute_inv_freq(device=device)
         self.cos_cached = cos
         self.sin_cached = sin
         self.max_position_embeddings = new_len
+        self._cache_initialized = True
 
     def apply_rotary(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Rotate the first `rope_dim` channels of `q` and `k` in fp32.

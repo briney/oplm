@@ -217,21 +217,28 @@ class OplmStack(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         tuple[torch.Tensor, ...] | None,
         tuple[torch.Tensor | None, ...] | None,
     ]:
-        batch_size, seq_len = input_ids.shape
-        attention_mask = prepare_attention_mask(
-            attention_mask, batch_size, seq_len, input_ids.device
-        )
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Provide exactly one of `input_ids` or `inputs_embeds`.")
 
-        x = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            x = inputs_embeds
+            batch_size, seq_len, _ = x.shape
+        else:
+            batch_size, seq_len = input_ids.shape
+            x = self.embed_tokens(input_ids)
+
+        device = x.device
+        attention_mask = prepare_attention_mask(attention_mask, batch_size, seq_len, device)
 
         hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
         attentions: tuple[torch.Tensor | None, ...] | None = () if output_attentions else None
