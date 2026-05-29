@@ -205,6 +205,19 @@ class MLMCollator:
         self._mask_batch(input_ids, labels, eligible, weights, generator)
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
+    def reset_batch_index(self) -> None:
+        """Reset the per-batch counter so the next call is batch index 0 again.
+
+        Only meaningful under ``deterministic=True``, where the per-batch RNG is
+        seeded by ``seed + batch_index`` (§4.6): resetting before a fresh pass
+        makes that pass reproduce the previous one exactly (identical masks),
+        which is what makes MLM-eval metrics comparable across training steps. The
+        sequence-eval dataloader calls this at the start of each iteration. The
+        one-time missing-weights warning flag is intentionally left untouched so
+        the warning does not re-fire every pass.
+        """
+        self._batch_idx = 0
+
     def _next_generator(self) -> torch.Generator | None:
         """Return this call's RNG and advance the batch counter.
 

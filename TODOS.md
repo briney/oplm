@@ -336,7 +336,7 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
 
 ## Phase 5 — Sequence builders (`data/sequence/loaders.py`)
 
-- [ ] **5.1 `build_train_dataloader(cfg: OplmConfig) -> DataLoader`:**
+- [x] **5.1 `build_train_dataloader(cfg: OplmConfig) -> DataLoader`:**
   1. `entries = parse_train_configs(cfg.data.train)`.
   2. one `ShardedProteinDataset(entry.path, shuffle_shards=cfg.data.shuffle_shards,
      shuffle_rows=cfg.data.shuffle_rows, seed=cfg.train.seed,
@@ -352,12 +352,12 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
      num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
      prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers>0 else
      None)`.
-- [ ] **5.2 `build_sequence_eval_dataloader(path: str, cfg: OplmConfig) ->
+- [x] **5.2 `build_sequence_eval_dataloader(path: str, cfg: OplmConfig) ->
   DataLoader`:** same machinery, **eval policy** — `ShardedProteinDataset(path,
   shuffle_shards=False, shuffle_rows=False, seed=<fixed eval seed, e.g. 42>,
   load_masking_weights=cfg.data.weighted_masking)`; `MLMCollator(...,
   deterministic=True, seed=<fixed eval seed>)`; same batch/worker settings.
-- [ ] **5.3 Tests** (`tests/data/sequence/test_loaders.py`): a real fixture
+- [x] **5.3 Tests** (`tests/data/sequence/test_loaders.py`): a real fixture
   config yields the documented batch contract; eval builder is deterministic
   across two passes (identical batches); train builder differs across epochs;
   `num_workers=0` path returns `prefetch_factor=None`.
