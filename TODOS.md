@@ -437,20 +437,29 @@ embeddings + supervised head are the eval harness's job.
 
 ## Phase 9 — Public API & trainer integration
 
-- [ ] **9.1 `data/__init__.py`** re-exports the public surface (no logic):
+- [x] **9.1 `data/__init__.py`** re-exports the public surface (no logic):
   `get_tokenizer`, `build_train_dataloader`, `build_sequence_eval_dataloader`,
   `ShardedProteinDataset`, `InterleavedDataset`, `MLMCollator`,
   `tokenize_and_pad`, `load_structures`, `StructureData`,
   `load_variant_assays`, `VariantAssay`, `parse_train_configs`,
   `parse_eval_configs`. Must not import `oplm.eval`.
-- [ ] **9.2 Trainer wiring:** confirm
+- [x] **9.2 Trainer wiring:** confirm
   [`src/oplm/training/trainer.py`](src/oplm/training/trainer.py) builds the loader
   via `from oplm.data.loader import build_train_dataloader` **→ update the import
   to `from oplm.data import build_train_dataloader`** (the old module path is
   gone). Verify the epoch handling calls `set_epoch(epoch)` on the dataset on
   `StopIteration`, and that batches pass `input_ids/attention_mask/labels`
   straight into `model(...)`. Make no behavioral changes beyond the import path.
-- [ ] **9.3 Eval-harness boundary (note only):** `oplm.eval` will not import until
+  - Done as written: only the dataloader import was changed. Epoch handling
+    (`_set_dataset_epoch` → `dataset.set_epoch`) and the `input_ids/attention_mask/
+    labels` forward call already match the new `oplm.data` API. **Known deferred
+    break (out of scope):** the trainer still imports `OplmForMLM` from
+    `oplm.model.transformer`, which the model rewrite renamed to `OplmForMaskedLM`
+    (now in `oplm.model`); so `Trainer(cfg)` is not yet instantiable. This is a
+    model-migration issue left for the trainer rewrite (also dangling in
+    `eval/*`, `cli.py`, `inference.py`). Phase 10.2 proves the data path
+    end-to-end against `OplmForMaskedLM` directly, without the trainer.
+- [x] **9.3 Eval-harness boundary (note only):** `oplm.eval` will not import until
   its own rewrite consumes `oplm.data.*` (structure/variant/downstream loaders +
   `build_sequence_eval_dataloader`). That is tracked separately; do not stub it
   here. Ensure nothing in `oplm.data` imports `oplm.eval`.

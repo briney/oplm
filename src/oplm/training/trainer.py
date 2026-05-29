@@ -36,7 +36,7 @@ class Trainer:
         from accelerate.utils import DataLoaderConfiguration, set_seed
         from rich.console import Console
 
-        from oplm.data.loader import build_train_dataloader
+        from oplm.data import build_train_dataloader
         from oplm.model.transformer import OplmForMLM
         from oplm.training.flops import estimate_flops_per_token
         from oplm.training.optim import build_optimizers, build_schedulers
