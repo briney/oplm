@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from oplm.model import OplmTokenizerFast
 from oplm.model.tokenization_oplm import VOCAB
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # The public ESM-2 tokenizer shares OPLM's exact vocabulary and ordering for
 # every id except 31 (ESM-2 has `<null_1>` there; ESM-C — which OPLM follows —

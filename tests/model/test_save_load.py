@@ -44,7 +44,9 @@ def _tiny_config(**overrides) -> OplmConfig:
 
 def _last_hidden_or_logits(out) -> torch.Tensor:
     """Pull the single forward tensor each task class exposes."""
-    return out.logits if hasattr(out, "logits") and out.logits is not None else out.last_hidden_state
+    if hasattr(out, "logits") and out.logits is not None:
+        return out.logits
+    return out.last_hidden_state
 
 
 @pytest.mark.parametrize("cls", _TASK_CLASSES, ids=[c.__name__ for c in _TASK_CLASSES])

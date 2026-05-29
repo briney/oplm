@@ -64,7 +64,5 @@ def structure_logreg_fixtures_dir() -> Path:
         pytest.skip(f"Logreg structure fixtures not found: {path}")
     pdb_files = list(path.glob("*.pdb")) + list(path.glob("*.cif"))
     if len(pdb_files) < 15:
-        pytest.skip(
-            f"Logreg fixtures need >= 15 structures, found {len(pdb_files)} in {path}"
-        )
+        pytest.skip(f"Logreg fixtures need >= 15 structures, found {len(pdb_files)} in {path}")
     return path

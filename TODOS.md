@@ -492,10 +492,14 @@ embeddings + supervised head are the eval harness's job.
   - Data-tooling scope is clean: `ruff format`/`ruff check` pass on
     `src/oplm/data` + `tests/data`, `mypy src/oplm/data` → no issues,
     `pytest tests/data` → 177 passed, 1 skipped (optional ProteinGym variant
-    fixture absent; see `tests/data/fixtures/README.md`). **Pre-existing,
-    out-of-scope:** `ruff check tests/` still reports a few `TC003`/line-length
-    findings in `tests/model/*` (model-package tests, untouched by this effort) —
-    left for a separate model-test cleanup.
+    fixture absent; see `tests/data/fixtures/README.md`). Both `ruff format
+    --check src/ tests/` and `ruff check src/ tests/` are now fully clean (the
+    stray `I001`/`TC003`/line-length findings in `tests/model/*` were fixed, and
+    the residual whitespace drift in `tests/conftest.py` /
+    `tests/model/test_gradient_checkpointing.py` was reformatted).
+    **Deferred (out of scope):** the `OplmForMLM` → `OplmForMaskedLM`
+    model-migration in `trainer.py` (and `cli.py`/`inference.py`/`eval/*`) is a
+    config-system bridge, not a rename — left for the planned trainer rewrite.
 
 ---
 

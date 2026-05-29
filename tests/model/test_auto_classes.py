@@ -10,6 +10,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForMaskedLM,
+    AutoModelForSequenceClassification,
+    AutoModelForTokenClassification,
+)
 
 import oplm  # noqa: F401  (import triggers auto-class registration)
 from oplm import (
@@ -18,13 +25,6 @@ from oplm import (
     OplmForSequenceClassification,
     OplmForTokenClassification,
     OplmModel,
-)
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForMaskedLM,
-    AutoModelForSequenceClassification,
-    AutoModelForTokenClassification,
 )
 
 if TYPE_CHECKING:
