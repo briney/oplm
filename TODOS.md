@@ -445,7 +445,7 @@ on it.
 
 ### 3.1 Update `src/oplm/eval/tasks/base.py`
 
-- [ ] `EvalTask.__init__` builds a `Schedule` from the entry instead of holding
+- [x] `EvalTask.__init__` builds a `Schedule` from the entry instead of holding
   `eval_every`. Add the import and rewrite the constructor:
 
   ```python
@@ -467,7 +467,7 @@ on it.
 
 ### 3.2 Rewrite `src/oplm/eval/evaluator.py`
 
-- [ ] Replace the class body. Construction resolves the global default schedule, parses
+- [x] Replace the class body. Construction resolves the global default schedule, parses
   entries, builds tasks, and warns on a provably-unreachable step schedule. `run_due`
   takes an `EvalContext`, returns `{}` cheaply when nothing is due, and unwraps the
   model only when at least one task runs:
