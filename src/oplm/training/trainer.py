@@ -37,7 +37,7 @@ class Trainer:
         from rich.console import Console
 
         from oplm.data import build_train_dataloader
-        from oplm.model.transformer import OplmForMLM
+        from oplm.model import OplmForMaskedLM
         from oplm.training.flops import estimate_flops_per_token
         from oplm.training.optim import build_optimizers, build_schedulers
 
@@ -87,7 +87,7 @@ class Trainer:
 
         # Model
         _status("[dim]Building model...[/dim]")
-        model = OplmForMLM(cfg.model)
+        model = OplmForMaskedLM(cfg.model)
         if cfg.model.gradient_checkpointing:
             model.encoder.gradient_checkpointing = True
 

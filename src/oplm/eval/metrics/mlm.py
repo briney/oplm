@@ -12,13 +12,13 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch.utils.data import DataLoader
 
-    from oplm.model.transformer import OplmForMLM
+    from oplm.model import OplmForMaskedLM
 
 _PERPLEXITY_CAP = 1000.0
 
 
 def compute_mlm_metrics(
-    model: OplmForMLM,
+    model: OplmForMaskedLM,
     dataloader: DataLoader[dict[str, Tensor]],
     accelerator: Accelerator,
 ) -> dict[str, float]:

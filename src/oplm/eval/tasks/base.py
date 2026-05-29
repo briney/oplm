@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from accelerate import Accelerator
 
     from oplm.config import EvalDatasetEntry, OplmConfig
-    from oplm.model.transformer import OplmForMLM
+    from oplm.model import OplmForMaskedLM
 
 
 class EvalTask(ABC):
@@ -32,7 +32,7 @@ class EvalTask(ABC):
     @abstractmethod
     def evaluate(
         self,
-        model: OplmForMLM,
+        model: OplmForMaskedLM,
         accelerator: Accelerator,
     ) -> dict[str, float]:
         """Run evaluation and return metrics.

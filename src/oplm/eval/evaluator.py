@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
     from oplm.config import OplmConfig
     from oplm.eval.tasks.base import EvalTask
-    from oplm.model.transformer import OplmForMLM
+    from oplm.model import OplmForMaskedLM
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class Evaluator:
 
     def __call__(
         self,
-        model: OplmForMLM,
+        model: OplmForMaskedLM,
         accelerator: Accelerator,
         global_step: int,
     ) -> dict[str, float]:

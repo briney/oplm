@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
     from oplm.config import EvalDatasetEntry, OplmConfig
-    from oplm.model.transformer import OplmForMLM
+    from oplm.model import OplmForMaskedLM
 
 
 @register_eval_task("sequence")
@@ -48,7 +48,7 @@ class SequenceEvalTask(EvalTask):
 
     def evaluate(
         self,
-        model: OplmForMLM,
+        model: OplmForMaskedLM,
         accelerator: Accelerator,
     ) -> dict[str, float]:
         """Run MLM evaluation on held-out sequences.

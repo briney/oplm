@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from oplm.config import DataConfig
+from oplm.config import DataConfig, ScheduleSpec
 from oplm.data.config import parse_eval_configs, parse_train_configs
+
+# Fallback cadence used by the parse_eval_configs tests below (was an int
+# ``default_eval_every``; the cadence is now a structured ScheduleSpec).
+_DEFAULT_SCHEDULE = ScheduleSpec("steps", 1000)
 
 # --------------------------------------------------------------------------- #
 # parse_train_configs
@@ -130,41 +134,65 @@ def test_parse_train_invalid_type_raises(raw: object) -> None:
 @pytest.mark.parametrize("raw", [None, {}])
 def test_parse_eval_empty_inputs(raw: object) -> None:
     """``None`` and an empty mapping yield no eval entries."""
-    assert parse_eval_configs(raw, default_eval_every=1000) == []
+    assert parse_eval_configs(raw, _DEFAULT_SCHEDULE) == []
 
 
-def test_parse_eval_minimal_entry_uses_default_eval_every() -> None:
-    """A minimal entry resolves ``eval_every`` to the supplied default."""
+def test_parse_eval_minimal_entry_uses_default_schedule() -> None:
+    """A minimal entry (no ``every``) falls back to the supplied default schedule."""
     entries = parse_eval_configs(
         {"heldout": {"path": "/data/heldout/", "type": "sequence"}},
-        default_eval_every=1000,
+        _DEFAULT_SCHEDULE,
     )
     assert len(entries) == 1
     entry = entries[0]
     assert entry.name == "heldout"
     assert entry.path == "/data/heldout/"
     assert entry.type == "sequence"
-    assert entry.eval_every == 1000
+    assert entry.schedule is _DEFAULT_SCHEDULE
     assert entry.metrics is None
     assert entry.extra == {}
 
 
-def test_parse_eval_per_entry_eval_every_override() -> None:
-    """A per-entry ``eval_every`` overrides the default cadence."""
+def test_parse_eval_per_entry_every_override() -> None:
+    """A per-entry ``every`` block overrides the default cadence."""
     entries = parse_eval_configs(
-        {"pg": {"path": "/pg", "type": "proteingym", "eval_every": 50_000}},
-        default_eval_every=1000,
+        {"pg": {"path": "/pg", "type": "proteingym", "every": {"steps": 50_000}}},
+        _DEFAULT_SCHEDULE,
     )
-    assert entries[0].eval_every == 50_000
+    assert entries[0].schedule == ScheduleSpec("steps", 50_000, at_start=False, at_end=True)
+
+
+def test_parse_eval_every_tokens_with_flags() -> None:
+    """A ``tokens`` cadence with explicit ``at_start``/``at_end`` flags parses."""
+    entries = parse_eval_configs(
+        {
+            "hd": {
+                "path": "/hd",
+                "type": "sequence",
+                "every": {"tokens": 1_000_000, "at_start": True, "at_end": False},
+            }
+        },
+        _DEFAULT_SCHEDULE,
+    )
+    assert entries[0].schedule == ScheduleSpec("tokens", 1_000_000, at_start=True, at_end=False)
 
 
 def test_parse_eval_metrics_parsed() -> None:
     """A ``metrics`` list is carried through as a list of strings."""
     entries = parse_eval_configs(
         {"h": {"path": "/h", "type": "sequence", "metrics": ["perplexity", "accuracy"]}},
-        default_eval_every=1000,
+        _DEFAULT_SCHEDULE,
     )
     assert entries[0].metrics == ["perplexity", "accuracy"]
+
+
+def test_parse_eval_metrics_bare_string_raises() -> None:
+    """A bare ``metrics`` string is rejected (must not split into characters)."""
+    with pytest.raises(ValueError, match="must be a list"):
+        parse_eval_configs(
+            {"h": {"path": "/h", "type": "sequence", "metrics": "loss"}},
+            _DEFAULT_SCHEDULE,
+        )
 
 
 def test_parse_eval_extras_routed_into_extra() -> None:
@@ -178,21 +206,30 @@ def test_parse_eval_extras_routed_into_extra() -> None:
                 "min_seq_sep": 6,
             }
         },
-        default_eval_every=1000,
+        _DEFAULT_SCHEDULE,
     )
     assert entries[0].extra == {"contact_threshold": 8.0, "min_seq_sep": 6}
+
+
+def test_parse_eval_removed_eval_every_key_raises() -> None:
+    """The removed per-entry ``eval_every`` key is rejected, pointing at ``every``."""
+    with pytest.raises(ValueError, match="every"):
+        parse_eval_configs(
+            {"x": {"path": "/x", "type": "sequence", "eval_every": 500}},
+            _DEFAULT_SCHEDULE,
+        )
 
 
 def test_parse_eval_missing_path_raises() -> None:
     """``path`` is required."""
     with pytest.raises(ValueError, match="missing required 'path'"):
-        parse_eval_configs({"x": {"type": "sequence"}}, default_eval_every=1000)
+        parse_eval_configs({"x": {"type": "sequence"}}, _DEFAULT_SCHEDULE)
 
 
 def test_parse_eval_missing_type_raises() -> None:
     """``type`` is required."""
     with pytest.raises(ValueError, match="missing required 'type'"):
-        parse_eval_configs({"x": {"path": "/x"}}, default_eval_every=1000)
+        parse_eval_configs({"x": {"path": "/x"}}, _DEFAULT_SCHEDULE)
 
 
 def test_parse_eval_nested_extra_block_raises() -> None:
@@ -200,7 +237,7 @@ def test_parse_eval_nested_extra_block_raises() -> None:
     with pytest.raises(ValueError, match="nested 'extra' block"):
         parse_eval_configs(
             {"x": {"path": "/x", "type": "sequence", "extra": {"a": 1}}},
-            default_eval_every=1000,
+            _DEFAULT_SCHEDULE,
         )
 
 
@@ -208,13 +245,13 @@ def test_parse_eval_nested_extra_block_raises() -> None:
 def test_parse_eval_invalid_type_raises(raw: object) -> None:
     """A non-mapping eval config is rejected."""
     with pytest.raises(ValueError, match="must be a"):
-        parse_eval_configs(raw, default_eval_every=1000)
+        parse_eval_configs(raw, _DEFAULT_SCHEDULE)
 
 
 def test_parse_eval_entry_value_not_mapping_raises() -> None:
     """An eval entry whose value is not a mapping is rejected."""
     with pytest.raises(ValueError, match="must be a mapping"):
-        parse_eval_configs({"x": "/x"}, default_eval_every=1000)
+        parse_eval_configs({"x": "/x"}, _DEFAULT_SCHEDULE)
 
 
 # --------------------------------------------------------------------------- #

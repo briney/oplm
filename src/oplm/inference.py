@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from oplm.config import OplmConfig, load_config
-from oplm.model.transformer import OplmForMLM
+from oplm.model import OplmForMaskedLM
 
 _MODEL_STATE_FILENAMES = (
     "model.safetensors",
@@ -59,10 +59,10 @@ def load_model_for_inference(
     cfg: OplmConfig,
     *,
     device: torch.device | str = "cpu",
-) -> OplmForMLM:
+) -> OplmForMaskedLM:
     """Load an inference-ready model from a checkpoint directory or state-dict file."""
     state_dict = load_model_state_dict(model_path)
-    model = OplmForMLM(cfg.model)
+    model = OplmForMaskedLM(cfg.model)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()

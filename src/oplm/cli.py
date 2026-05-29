@@ -110,13 +110,13 @@ def info(
     """Print model config and parameter count."""
     import torch
 
-    from oplm.model import OplmForMLM
+    from oplm.model import OplmForMaskedLM
 
     cfg = load_config(_build_argv(config, preset, overrides))
 
     # Build model on meta device to avoid memory allocation
     with torch.device("meta"):
-        model = OplmForMLM(cfg.model)
+        model = OplmForMaskedLM(cfg.model)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

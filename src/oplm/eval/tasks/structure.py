@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from accelerate import Accelerator
 
     from oplm.config import EvalDatasetEntry, OplmConfig
-    from oplm.model.transformer import OplmForMLM
+    from oplm.model import OplmForMaskedLM
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -126,7 +126,7 @@ class StructureEvalTask(EvalTask):
 
     def evaluate(
         self,
-        model: OplmForMLM,
+        model: OplmForMaskedLM,
         accelerator: Accelerator,
     ) -> dict[str, float]:
         """Run contact prediction evaluation.
@@ -243,7 +243,7 @@ class StructureEvalTask(EvalTask):
     def _process_single_structure(
         self,
         struct: StructureData,
-        model: OplmForMLM,
+        model: OplmForMaskedLM,
         device: torch.device,
         need_attention: bool,
         need_categorical_jacobian: bool,

@@ -10,7 +10,7 @@ from oplm.eval.tasks.base import EvalTask
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
-    from oplm.model.transformer import OplmForMLM
+    from oplm.model import OplmForMaskedLM
 
 
 @register_eval_task("tape")
@@ -39,7 +39,7 @@ class TapeEvalTask(EvalTask):
 
     def evaluate(
         self,
-        model: OplmForMLM,
+        model: OplmForMaskedLM,
         accelerator: Accelerator,
     ) -> dict[str, float]:
         raise NotImplementedError(

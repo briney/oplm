@@ -67,7 +67,7 @@ dead import and every `OplmForMLM` annotation is an undefined name — under `my
 (this repo's setting) both fail, so `mypy src/` cannot pass until they are renamed. Do this
 first; later phases assume the new name.
 
-- [ ] Replace the import everywhere it appears. The class is **not** in
+- [x] Replace the import everywhere it appears. The class is **not** in
   `oplm.model.transformer` anymore (that module now holds only `OplmBlock` / `OplmStack`);
   import it from the package root:
 
@@ -76,7 +76,7 @@ first; later phases assume the new name.
   from oplm.model import OplmForMaskedLM
   ```
 
-- [ ] Rename every `OplmForMLM` reference (imports **and** type hints) to `OplmForMaskedLM`
+- [x] Rename every `OplmForMLM` reference (imports **and** type hints) to `OplmForMaskedLM`
   across all of these files (all currently carry the stale name):
 
   ```
@@ -98,9 +98,9 @@ first; later phases assume the new name.
   those phases don't otherwise rewrite (the stub tasks, `metrics/mlm.py`, `inference.py`,
   `cli.py`).
 
-- [ ] Confirm none remain: `grep -rn "OplmForMLM" src/` → empty.
+- [x] Confirm none remain: `grep -rn "OplmForMLM" src/` → empty.
 
-- [ ] **Scope caveat — model construction is owned by the trainer refactor, not this plan.**
+- [x] **Scope caveat — model construction is owned by the trainer refactor, not this plan.**
   The *constructor call sites* `OplmForMLM(cfg.model)` (`trainer.py:90`, `inference.py:65`,
   `cli.py:119`) pass `cfg.model`, which is an `oplm.config.ModelConfig` dataclass — **not**
   the `oplm.model.OplmConfig` (`PretrainedConfig`) that `OplmForMaskedLM.__init__` requires.
@@ -124,7 +124,7 @@ on it.
 
 ### 1.1 Add `ScheduleSpec` and `parse_schedule_block` to `src/oplm/config.py`
 
-- [ ] Add a module-level constant and the spec dataclass (place near the other
+- [x] Add a module-level constant and the spec dataclass (place near the other
   `_VALID_*` tuples, before `EvalDatasetEntry`):
 
   ```python
@@ -147,7 +147,7 @@ on it.
       at_end: bool = True
   ```
 
-- [ ] Add the parser (used by both the per-entry `every` and the global default). The
+- [x] Add the parser (used by both the per-entry `every` and the global default). The
   `epochs` check must precede the generic unknown-key check so its message wins:
 
   ```python
@@ -201,7 +201,7 @@ on it.
 
 ### 1.2 Change `EvalDatasetEntry` (in `src/oplm/config.py`)
 
-- [ ] Replace the `eval_every: int | None = None` field with `schedule: ScheduleSpec`.
+- [x] Replace the `eval_every: int | None = None` field with `schedule: ScheduleSpec`.
   Field order must keep non-default fields before defaulted ones:
 
   ```python
@@ -222,8 +222,8 @@ on it.
 
 ### 1.3 Change `TrainConfig` (in `src/oplm/config.py`)
 
-- [ ] Remove `eval_every: int = 10_000`.
-- [ ] Add a structured default mirroring the per-entry grammar (place where
+- [x] Remove `eval_every: int = 10_000`.
+- [x] Add a structured default mirroring the per-entry grammar (place where
   `eval_every` was, in the logging block):
 
   ```python
@@ -238,7 +238,7 @@ on it.
 
 ### 1.4 Reject the removed `train.eval_every` (in `src/oplm/config.py`)
 
-- [ ] Add a rejector next to the existing `_reject_removed_sequence_length_alias`,
+- [x] Add a rejector next to the existing `_reject_removed_sequence_length_alias`,
   reusing `_lookup_nested_mapping_value` / `_NESTED_VALUE_MISSING`:
 
   ```python
@@ -256,7 +256,7 @@ on it.
           )
   ```
 
-- [ ] In `load_config`, call it right after the existing sequence-length rejection:
+- [x] In `load_config`, call it right after the existing sequence-length rejection:
 
   ```python
   _reject_removed_sequence_length_alias(override_dicts)
@@ -265,19 +265,19 @@ on it.
 
 ### 1.5 Update `parse_eval_configs` (in `src/oplm/data/config.py`)
 
-- [ ] Update the import to pull the spec and parser from `oplm.config`:
+- [x] Update the import to pull the spec and parser from `oplm.config`:
 
   ```python
   from oplm.config import EvalDatasetEntry, ScheduleSpec, TrainDatasetEntry, parse_schedule_block
   ```
 
-- [ ] Replace `eval_every` with `every` in the known-keys set:
+- [x] Replace `eval_every` with `every` in the known-keys set:
 
   ```python
   _KNOWN_EVAL_KEYS = frozenset({"path", "type", "every", "metrics"})
   ```
 
-- [ ] Change the signature and the per-entry body. New signature:
+- [x] Change the signature and the per-entry body. New signature:
 
   ```python
   def parse_eval_configs(raw: Any, default_schedule: ScheduleSpec) -> list[EvalDatasetEntry]:
@@ -336,7 +336,7 @@ on it.
 
 ### 2.1 Create `src/oplm/eval/context.py`
 
-- [ ] New file:
+- [x] New file:
 
   ```python
   """Immutable training-state snapshot handed across the trainer↔eval boundary."""
@@ -367,7 +367,7 @@ on it.
 
 ### 2.2 Create `src/oplm/eval/schedule.py`
 
-- [ ] New file. The crossing test reduces to `step % n == 0` for steps (delta 1) and
+- [x] New file. The crossing test reduces to `step % n == 0` for steps (delta 1) and
   fires once when a counter passes a multiple for tokens:
 
   ```python

@@ -211,7 +211,10 @@ class TrainConfig:
 
     # Logging
     log_every: int = 10
-    eval_every: int = 10_000
+    # Default eval cadence for datasets that omit `every`. Same grammar as a
+    # data.eval.<name>.every block: exactly one of {steps, tokens}. Parsed into a
+    # ScheduleSpec by the Evaluator via oplm.config.parse_schedule_block.
+    eval_default_every: Any = field(default_factory=lambda: {"steps": 10_000})
     wandb_project: str = "oplm"
     wandb_run_name: str | None = None
     wandb_enabled: bool = True
@@ -278,6 +281,73 @@ class TrainDatasetEntry:
     fraction: float
 
 
+_VALID_SCHEDULE_UNITS = ("steps", "tokens")  # "epochs" deferred — EVAL_HARNESS.md §4.6
+_SCHEDULE_KEYS = frozenset({*_VALID_SCHEDULE_UNITS, "at_start", "at_end"})
+
+
+@dataclass(frozen=True)
+class ScheduleSpec:
+    """Parsed, behavior-free eval cadence built from an ``every: {unit: N}`` block.
+
+    Carries no behavior so it can live in ``oplm.config`` without importing
+    ``oplm.eval``. The eval harness turns it into a concrete ``Schedule`` via
+    ``oplm.eval.schedule.build_schedule``.
+    """
+
+    unit: str  # one of _VALID_SCHEDULE_UNITS
+    n: int  # positive
+    at_start: bool = False
+    at_end: bool = True
+
+
+def parse_schedule_block(raw: Any, label: str) -> ScheduleSpec:
+    """Parse an ``every: {unit: N, at_start?, at_end?}`` mapping into a ScheduleSpec.
+
+    Args:
+        raw: The cadence mapping (a dataset's ``every`` or ``train.eval_default_every``).
+        label: Human-readable source used in error messages.
+
+    Raises:
+        ValueError: If ``raw`` is not a mapping, names ``epochs`` (deferred), does not
+            name exactly one valid unit, has unknown keys, the unit value is not a
+            positive int, or ``at_start`` / ``at_end`` are not actual bools.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{label}: cadence must be a mapping like {{steps: N}} or {{tokens: N}}, "
+            f"got {type(raw).__name__}"
+        )
+    if "epochs" in raw:
+        raise ValueError(
+            f"{label}: epoch cadence is not yet supported (see docs/EVAL_HARNESS.md "
+            f"§4.6); use {{steps: N}} or {{tokens: N}}"
+        )
+    unknown = [k for k in raw if k not in _SCHEDULE_KEYS]
+    if unknown:
+        raise ValueError(f"{label}: unknown keys in cadence block: {sorted(unknown)}")
+    unit_keys = [k for k in raw if k in _VALID_SCHEDULE_UNITS]
+    if len(unit_keys) != 1:
+        raise ValueError(
+            f"{label}: cadence must name exactly one of {list(_VALID_SCHEDULE_UNITS)}, "
+            f"got {sorted(unit_keys)}"
+        )
+    unit = unit_keys[0]
+    n = raw[unit]
+    if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+        raise ValueError(f"{label}: cadence {unit!r} must be a positive int, got {n!r}")
+    # The schema says bools; parse them strictly. bool(raw.get(...)) would coerce the
+    # YAML string "false" to True, silently inverting the flag — validate the type.
+    at_start = raw.get("at_start", False)
+    at_end = raw.get("at_end", True)
+    for flag_name, flag_value in (("at_start", at_start), ("at_end", at_end)):
+        if not isinstance(flag_value, bool):
+            raise ValueError(
+                f"{label}: {flag_name!r} must be a bool, got {flag_value!r} "
+                f"({type(flag_value).__name__})"
+            )
+    return ScheduleSpec(unit=unit, n=n, at_start=at_start, at_end=at_end)
+
+
 @dataclass
 class EvalDatasetEntry:
     """Parsed configuration for a single evaluation dataset.
@@ -287,10 +357,10 @@ class EvalDatasetEntry:
 
     name: str
     path: str
-    type: str  # "sequence", "structure", "proteingym", ...
-    eval_every: int | None = None  # Per-dataset override; None → use train.eval_every
-    metrics: list[str] | None = None  # Override default metrics; None → use type defaults
-    extra: dict[str, Any] = field(default_factory=dict)  # Task-specific config
+    type: str  # registry key: "sequence", "structure", ...
+    schedule: ScheduleSpec  # was: eval_every: int | None
+    metrics: list[str] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -398,6 +468,20 @@ def _reject_removed_sequence_length_alias(override_dicts: list[Any]) -> None:
         )
 
 
+def _reject_removed_eval_every_alias(override_dicts: list[Any]) -> None:
+    """Reject the removed steps-only ``train.eval_every`` override."""
+    present = any(
+        _lookup_nested_mapping_value(ov, ("train", "eval_every")) is not _NESTED_VALUE_MISSING
+        for ov in override_dicts
+    )
+    if present:
+        raise ValueError(
+            "`train.eval_every` has been removed. Use "
+            "`train.eval_default_every: {steps: N}` (or {tokens: N}) for the global "
+            "default eval cadence."
+        )
+
+
 def load_config(argv: list[str]) -> OplmConfig:
     """Load config from defaults, optional preset, optional YAML file, and CLI overrides.
 
@@ -445,6 +529,7 @@ def load_config(argv: list[str]) -> OplmConfig:
 
     override_dicts = [OmegaConf.to_container(ov, resolve=True) for ov in overrides]
     _reject_removed_sequence_length_alias(override_dicts)
+    _reject_removed_eval_every_alias(override_dicts)
 
     # Merge all overrides into base
     for ov in overrides:

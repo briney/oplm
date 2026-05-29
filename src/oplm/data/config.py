@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from oplm.config import EvalDatasetEntry, TrainDatasetEntry
+from oplm.config import EvalDatasetEntry, ScheduleSpec, TrainDatasetEntry, parse_schedule_block
 
 # Eval-entry keys with dedicated handling; everything else is folded into
 # ``EvalDatasetEntry.extra`` so task-specific config travels with the entry.
-_KNOWN_EVAL_KEYS = frozenset({"path", "type", "eval_every", "metrics"})
+_KNOWN_EVAL_KEYS = frozenset({"path", "type", "every", "metrics"})
 
 
 def parse_train_configs(raw: Any) -> list[TrainDatasetEntry]:
@@ -121,28 +121,30 @@ def _parse_train_mapping(raw: dict[Any, Any]) -> list[TrainDatasetEntry]:
     ]
 
 
-def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEntry]:
+def parse_eval_configs(raw: Any, default_schedule: ScheduleSpec) -> list[EvalDatasetEntry]:
     """Normalize a raw ``data.eval`` config value into structured eval entries.
 
     Accepts ``None`` / empty mapping (→ empty list) or a mapping
-    ``{name: {path, type, eval_every?, metrics?, **extra}}``. ``path`` and
-    ``type`` are required; ``eval_every`` falls back to ``default_eval_every``
-    when omitted; any keys outside the known set are folded into
-    :attr:`~oplm.config.EvalDatasetEntry.extra` so task-specific config travels
-    with the entry.
+    ``{name: {path, type, every?, metrics?, **extra}}``. ``path`` and ``type``
+    are required; ``every`` is an ``{steps: N}`` / ``{tokens: N}`` cadence block
+    (see :func:`oplm.config.parse_schedule_block`) that falls back to
+    ``default_schedule`` when omitted; any keys outside the known set are folded
+    into :attr:`~oplm.config.EvalDatasetEntry.extra` so task-specific config
+    travels with the entry.
 
     Args:
         raw: The ``data.eval`` value from config — a mapping or ``None``.
-        default_eval_every: Fallback cadence (``train.eval_every``) applied when an
-            entry omits ``eval_every``.
+        default_schedule: Fallback cadence (``train.eval_default_every``) applied
+            when an entry omits ``every``.
 
     Returns:
         List of :class:`~oplm.config.EvalDatasetEntry`.
 
     Raises:
         ValueError: If ``raw`` is not a mapping, an entry is not a mapping, an
-            entry is missing ``path`` or ``type``, or an entry uses a nested
-            ``extra`` block (task-specific keys go directly on the entry).
+            entry is missing ``path`` or ``type``, an entry uses a nested
+            ``extra`` block, an entry uses the removed ``eval_every`` key, an
+            entry's ``every`` block is malformed, or ``metrics`` is not a list.
     """
     if raw is None:
         return []
@@ -176,12 +178,33 @@ def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEnt
                 "task-specific keys directly on the dataset entry instead."
             )
 
-        raw_every = value.get("eval_every")
-        eval_every = int(raw_every) if raw_every is not None else default_eval_every
+        if "eval_every" in value:
+            raise ValueError(
+                f"Eval dataset {name!r} uses the removed `eval_every` key. "
+                f"Use `every: {{steps: N}}` (or {{tokens: N}})."
+            )
+
+        raw_every = value.get("every")
+        schedule = (
+            parse_schedule_block(raw_every, f"data.eval.{name}.every")
+            if raw_every is not None
+            else default_schedule
+        )
 
         raw_metrics = value.get("metrics")
-        metrics = [str(m) for m in raw_metrics] if raw_metrics is not None else None
-
+        if raw_metrics is None:
+            metrics = None
+        elif isinstance(raw_metrics, (list, tuple)):
+            metrics = [str(m) for m in raw_metrics]
+        else:
+            # A bare string is iterable, so the naive `[str(m) for m in "loss"]` yields
+            # ["l", "o", "s", "s"]. Require an actual list/tuple of metric names; reject
+            # strings (and anything else) explicitly. (OmegaConf is already resolved to
+            # plain containers here — see the isinstance(value, dict) checks above.)
+            raise ValueError(
+                f"Eval dataset {name!r}: `metrics` must be a list of names "
+                f"(e.g. [loss, accuracy]), got {raw_metrics!r}"
+            )
         extra = {k: v for k, v in value.items() if k not in _KNOWN_EVAL_KEYS}
 
         entries.append(
@@ -189,7 +212,7 @@ def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEnt
                 name=str(name),
                 path=str(path),
                 type=str(eval_type),
-                eval_every=eval_every,
+                schedule=schedule,
                 metrics=metrics,
                 extra=extra,
             )
