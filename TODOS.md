@@ -1166,32 +1166,32 @@ the environment supports spawning, a small ragged distributed smoke test.
 
 ## Phase 9 — Verification & quality gates
 
-- [ ] No references to the deleted module remain:
+- [x] No references to the deleted module remain:
   `grep -rn "oplm.eval.data" src/ tests/` → empty.
-- [ ] No `OplmForMLM` references remain (Phase 0):
+- [x] No `OplmForMLM` references remain (Phase 0):
   `grep -rn "OplmForMLM" src/ tests/` → empty (all renamed to `OplmForMaskedLM`).
-- [ ] Structure task is off the old forward API:
+- [x] Structure task is off the old forward API:
   `grep -rn "need_weights\|attention_weights" src/oplm/eval/` → empty.
-- [ ] No stray `eval_every` remains except the two rejection messages:
+- [x] No stray `eval_every` remains except the two rejection messages:
   `grep -rn "eval_every" src/` → only `_reject_removed_eval_every_alias`, the
   `parse_eval_configs` rejection, and `eval_default_every`.
-- [ ] `python -c "import oplm.eval; print(oplm.eval.__all__)"` lists the new exports.
-- [ ] `python -c "from oplm.config import load_config; load_config([])"` works (default
+- [x] `python -c "import oplm.eval; print(oplm.eval.__all__)"` lists the new exports.
+- [x] `python -c "from oplm.config import load_config; load_config([])"` works (default
   `eval_default_every` parses), and `load_config(['train.eval_every=1'])` raises.
-- [ ] Lint/format: `ruff check src/ tests/`, `ruff format src/ tests/`.
-- [ ] Type — **firm gate for this plan:** `mypy src/oplm/eval` clean. **Broader gate, partial:**
+- [x] Lint/format: `ruff check src/ tests/`, `ruff format src/ tests/`.
+- [x] Type — **firm gate for this plan:** `mypy src/oplm/eval` clean. **Broader gate, partial:**
   `mypy src/` will still report the `OplmForMaskedLM(cfg.model)` argument-type mismatch in
   `trainer.py` / `inference.py` / `cli.py` (`ModelConfig` vs HF `OplmConfig`) — that is the
   **trainer-refactor's** responsibility (Phase 0 caveat), not this plan's. After Phase 0 the
   only remaining `mypy src/` errors should be those construction-site mismatches; confirm there
   are no *new* eval-introduced errors and no surviving stale-import errors.
-- [ ] Fast tests: `pytest -m "not slow"` green (this includes the new pure tests: schedule,
+- [x] Fast tests: `pytest -m "not slow"` green (this includes the new pure tests: schedule,
   config, evaluator, registry, and the single-process token-accounting/rank-sync checks).
-- [ ] Full tests (needs the structure/sequence fixtures present):
+- [x] Full tests (needs the structure/sequence fixtures present):
   `pytest tests/eval` green; the structure test confirms **both** the tokenizer migration and
   the new `output_attentions` forward API. The live-`Trainer` test (8.6) stays skipped until
   the trainer refactor lands.
-- [ ] Sanity-check the design alignment: steps + tokens cadence only (epochs rejected);
+- [x] Sanity-check the design alignment: steps + tokens cadence only (epochs rejected);
   `at_end` defaults true; `at_start`/`at_end` parsed as strict bools; `metrics` rejects bare
   strings; `_warn_unreachable` honors `at_start`; `run_due` unwraps only when due;
   `tokens_seen` reduced **unconditionally** (rank-identical); model class is `OplmForMaskedLM`;
