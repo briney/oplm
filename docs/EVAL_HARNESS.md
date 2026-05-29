@@ -28,8 +28,8 @@
 - The `data.eval:` block of `OplmConfig` — the contract between YAML and the
   harness — and the `every: {…}` cadence grammar.
 - Concise definitions of the metrics the harness computes (MLM perplexity, contact
-  precision@L, the categorical-Jacobian coupling score, and the ranking metrics for
-  variant tasks).
+  precision@L via the categorical Jacobian, and the ranking metrics for variant
+  tasks).
 - The implemented task types (sequence, structure) and the registered stubs
   (ProteinGym, TAPE, ProteinGlue, EVEREST).
 
@@ -38,8 +38,9 @@
 - The data loaders, on-disk formats, tokenizer, and masking strategy. →
   [`DATA_TOOLING.md`](DATA_TOOLING.md) (the harness *consumes* `oplm.data`; it does
   not define loaders).
-- The model, its forward signature, and how attention weights are exposed for
-  contact prediction. → [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md).
+- The model, its forward signature, and how logits are exposed (the categorical
+  Jacobian probes them for contact prediction). →
+  [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md).
 - The trainer loop, optimizer, schedules, FLOPs accounting, and checkpoint format.
   → future `docs/TRAINER.md`. This document specifies only the *interface* the
   trainer must satisfy to drive eval (§6).
@@ -159,7 +160,7 @@ src/oplm/eval/
   metrics/
     __init__.py
     mlm.py                  # MLM loss / accuracy / perplexity
-    contact.py              # contact map, APC, attention-logreg precision@L
+    contact.py              # contact map, APC, precision@L primitives
     categorical_jacobian.py # categorical-Jacobian coupling → precision@L
 ```
 
@@ -532,13 +533,14 @@ sequences.
   max_structures)` → `list[StructureData]`. Tokenization uses
   `oplm.data.get_tokenizer()` (the canonical tokenizer; the legacy `ProteinTokenizer`
   is gone).
-- Metrics: `precision_at_L` from attention maps via the ESM-1b logistic-regression
-  protocol (§8.2), and optionally `categorical_jacobian_precision_at_L` (§8.3).
+- Metrics: `precision_at_L`, `precision_at_L_2`, `precision_at_L_5` computed from the
+  categorical Jacobian (§8.3); `precision_at_L` is the default.
 - Distributed: structures are sharded across ranks
   (`structures[rank::world_size]`), each rank processes its shard one structure at a
-  time (attention offloaded to CPU after each forward for memory), and per-structure
-  results are gathered with `dist.all_gather_object`. Token cadence affects only
-  *when* this task runs; the sharding is internal and independent of scheduling.
+  time (the Jacobian and intermediates offloaded to CPU after each forward for
+  memory), and per-structure results are gathered with `dist.all_gather_object`. Token
+  cadence affects only *when* this task runs; the sharding is internal and independent
+  of scheduling.
 
 ### 7.4 Stub tasks
 
@@ -567,11 +569,6 @@ class StructureTaskConfig:
     min_seq_sep: int = 6
     l_divisor: int = 1
     use_cbeta: bool = True
-    use_logistic_regression: bool = True
-    logreg_n_train: int = 20
-    logreg_n_iterations: int = 5
-    logreg_c: float = 0.15
-    use_categorical_jacobian: bool = False
     categorical_jacobian_sample_size: int | None = None
     categorical_jacobian_sample_seed: int = 42
     categorical_jacobian_mutation_batch_size: int = 20
@@ -605,31 +602,29 @@ Over masked positions only:
 `compute_mlm_metrics(model, dataloader, accelerator) -> {loss, accuracy,
 perplexity}`.
 
-### 8.2 Contact prediction (`metrics/contact.py`)
+### 8.2 Contact-map and precision@L primitives (`metrics/contact.py`)
+
+Shared scoring math used by the categorical-Jacobian metric:
 
 - **Contact map** — binary `(L, L)`; residues `i, j` are in contact iff their Cβ–Cβ
   distance (virtual Cβ inferred from N, CA, C when absent) is below
   `contact_threshold` (8.0 Å) and `|i − j| ≥ min_seq_sep` (6).
 - **APC (Average Product Correction)** — removes per-position background from a
   coupling matrix `F`: `F_apc[i,j] = F[i,j] − (rowmean_i · colmean_j) / mean(F)`.
-- **Attention → contacts (ESM-1b protocol)** — symmetrize each head's attention map,
-  APC-correct it, stack all layers × heads as features, and fit an L1-regularized
-  logistic regression (cross-validated over a small set of training structures) to
-  predict contacts. A mean-attention score is the fallback when too few structures
-  are available.
 - **Precision@L** — rank candidate long-range pairs (`|i − j| ≥ min_seq_sep`) by
   score, take the top `L / l_divisor`, and report the fraction that are true
   contacts.
 
 ### 8.3 Categorical-Jacobian coupling (`metrics/categorical_jacobian.py`)
 
-An attention-free contact signal. The categorical Jacobian
+The single contact-prediction signal. The categorical Jacobian
 `J[i,a,j,b] = ∂ logit(x_j = b) / ∂(x_i = a)` is estimated by finite differences
 (mutating each position to each canonical amino acid and measuring the logit shift).
 Center over all four axes, symmetrize (`(J + Jᵀ)/2`), APC-correct, and reduce to an
-`(L, L)` coupling map → precision@L as in §8.2. `categorical_jacobian_sample_size`
-optionally restricts the (expensive) computation to a deterministic subset of
-structures.
+`(L, L)` coupling map → precision@L using the §8.2 primitives. The result is reported
+as `precision_at_L{,_2,_5}`. `categorical_jacobian_sample_size` optionally restricts
+the (expensive, `L × 20` forwards per structure) computation to a deterministic subset
+of structures.
 
 ### 8.4 Variant-task ranking metrics
 
@@ -731,8 +726,6 @@ data:
       every: { steps: 20_000 }
       # task-specific knobs → EvalDatasetEntry.extra → StructureTaskConfig.from_extra
       contact_threshold: 8.0
-      use_logistic_regression: true
-      use_categorical_jacobian: true
       categorical_jacobian_sample_size: 12
 ```
 
@@ -789,7 +782,8 @@ scheduling possible. Epoch cadence is designed (§4.6) but ships in a later cut.
 ## See also
 
 - [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md) — the model, its forward
-  signature, and how attention weights are exposed for contact prediction.
+  signature, and how logits are exposed (probed by the categorical Jacobian for
+  contact prediction).
 - [`DATA_TOOLING.md`](DATA_TOOLING.md) — the eval data loaders the harness consumes
   (`build_sequence_eval_dataloader`, `load_structures`, `load_variant_assays`) and
   the train/eval data boundary.

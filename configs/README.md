@@ -168,7 +168,7 @@ data:
       path: /data/pdb
       type: structure
       every: { steps: 20_000 }
-      use_categorical_jacobian: true
+      categorical_jacobian_sample_size: 12
 ```
 
 Task-specific keys go at the same level as `path` and `type`, not under `extra:`.
@@ -182,7 +182,9 @@ task-specific keys beyond the shared ones above.
 
 ### Structure
 
-Structure eval loads PDB/CIF files and supports these task-specific keys:
+Structure eval loads PDB/CIF files and computes `precision_at_L{,_2,_5}` from the
+model's categorical Jacobian (an unsupervised contact signal). Supported task-specific
+keys:
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -190,13 +192,8 @@ Structure eval loads PDB/CIF files and supports these task-specific keys:
 | `min_seq_sep` | `int` | `6` | Minimum sequence separation for scoring. |
 | `l_divisor` | `int` | `1` | Evaluate top `L / l_divisor` contacts. |
 | `use_cbeta` | `bool` | `true` | Use virtual C-beta distances. |
-| `use_logistic_regression` | `bool` | `true` | Fit the ESM-style L1 logistic regression probe when enough structures exist. |
-| `logreg_n_train` | `int` | `20` | Structures reserved for probe training. |
-| `logreg_n_iterations` | `int` | `5` | Cross-validation iterations for the probe. |
-| `logreg_c` | `float` | `0.15` | Inverse regularization strength for the probe. |
-| `use_categorical_jacobian` | `bool` | `false` | Enable unsupervised categorical-Jacobian P@L alongside the attention/logreg metrics. |
-| `categorical_jacobian_sample_size` | `int \| null` | `null` | Optional deterministic subset size used only for the Jacobian path. |
-| `categorical_jacobian_sample_seed` | `int` | `42` | Seed for Jacobian subset sampling. |
+| `categorical_jacobian_sample_size` | `int \| null` | `null` | Optional deterministic subset of structures to score (the Jacobian is expensive: `L × 20` forwards each). |
+| `categorical_jacobian_sample_seed` | `int` | `42` | Seed for subset sampling. |
 | `categorical_jacobian_mutation_batch_size` | `int` | `20` | Number of mutant sequences per Jacobian forward pass. |
 | `max_structures` | `int \| null` | `null` | Optional cap on structures loaded from disk. |
 
@@ -264,8 +261,6 @@ data:
       type: structure
       every: { steps: 2000 }
       contact_threshold: 8.0
-      use_logistic_regression: true
-      use_categorical_jacobian: true
       categorical_jacobian_sample_size: 12
 ```
 

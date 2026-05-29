@@ -39,7 +39,7 @@ train: null
 #       path: /data/pdb
 #       type: structure
 #       every: { steps: 20_000 }
-#       use_categorical_jacobian: true
+#       categorical_jacobian_sample_size: 12
 eval: null
 
 # Sequence masking

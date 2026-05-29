@@ -1,9 +1,8 @@
-"""Structure-eval task tests: a slow end-to-end run plus a pure config-parse test.
+"""Structure-eval task tests: a slow end-to-end run plus pure config-parse tests.
 
-The slow test exercises BOTH migration gates at once — the canonical-tokenizer
-swap (TODOS.md §4.2) and the new ``output_attentions`` / ``.attentions`` forward
-API. If the forward call were still on the old ``need_weights`` /
-``"attention_weights"`` contract, the task would raise here.
+The slow test exercises the canonical-tokenizer swap (TODOS.md §4.2) and the
+full categorical-Jacobian P@L path — wildtype + per-mutation forward passes,
+the ``(L, A, L, A)`` reduction, and precision@L scoring — over real structures.
 """
 
 from __future__ import annotations
@@ -37,17 +36,14 @@ _MAX_SEQ_LEN = 128
 
 def test_structure_config_rejects_string_bool() -> None:
     """A YAML string like ``"false"`` must not coerce to ``True`` (issue #5)."""
-    with pytest.raises(ValueError, match="use_logistic_regression"):
-        StructureTaskConfig.from_extra({"use_logistic_regression": "false"})
+    with pytest.raises(ValueError, match="use_cbeta"):
+        StructureTaskConfig.from_extra({"use_cbeta": "false"})
 
 
 def test_structure_config_real_bools_parse() -> None:
     """Actual bools are accepted verbatim."""
-    cfg = StructureTaskConfig.from_extra(
-        {"use_logistic_regression": False, "use_categorical_jacobian": True}
-    )
-    assert cfg.use_logistic_regression is False
-    assert cfg.use_categorical_jacobian is True
+    cfg = StructureTaskConfig.from_extra({"use_cbeta": False})
+    assert cfg.use_cbeta is False
 
 
 def test_structure_config_jacobian_sample_size_floor() -> None:
@@ -70,7 +66,7 @@ def test_structure_config_jacobian_mutation_batch_size_range(bad_batch: int) -> 
 def test_structure_eval_precision_in_unit_interval(
     structure_fixtures_dir: Path, make_model: Callable[..., OplmForMaskedLM]
 ) -> None:
-    """Mean-attention P@L runs over a few real structures and lands in ``[0, 1]``."""
+    """Categorical-Jacobian P@L runs over a few real structures and lands in ``[0, 1]``."""
     from accelerate import Accelerator
 
     cfg = OplmConfig(
@@ -84,9 +80,9 @@ def test_structure_eval_precision_in_unit_interval(
         path=str(structure_fixtures_dir),
         type="structure",
         schedule=ScheduleSpec("steps", 1),
-        # Real Python bools — from_extra rejects the string "false". The
-        # mean-attention path keeps the run cheap with only a couple structures.
-        extra={"max_structures": 2, "use_logistic_regression": False},
+        # Cap to a couple of small structures to keep the Jacobian's L×20
+        # forward passes cheap on CPU.
+        extra={"max_structures": 2},
     )
     task = StructureEvalTask(entry, cfg)
     accelerator = Accelerator(cpu=True)

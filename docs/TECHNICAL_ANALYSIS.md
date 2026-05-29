@@ -71,11 +71,15 @@ The current tests validate:
 
 But there is no regression test for repeated `SequenceEvalTask.evaluate()` calls returning stable metrics.
 
-#### 1.4 Structure-task integration does not exercise the intended logreg path
+#### 1.4 Structure-task integration (resolved)
 
-`StructureEvalTask` defaults to `logreg_n_train=20` in [src/oplm/eval/tasks/structure.py:63](/home/briney/git/oplm/src/oplm/eval/tasks/structure.py#L63). The test fixture directory contains only three structures. That means the structure integration tests run the fallback path, not the main logistic-regression evaluation protocol.
-
-This is acceptable for a small CI smoke test, but it means the advertised "real" structure evaluation is only unit-tested in pieces, not end-to-end.
+The structure task previously offered an ESM-1b attention + logistic-regression probe
+that needed ≥21 structures, so the 3-structure CI fixture only exercised the
+mean-attention fallback. That probe has since been removed: `StructureEvalTask` now
+computes `precision_at_L` solely from the categorical Jacobian, which has no
+multi-structure training requirement. The slow integration test
+([tests/eval/test_structure_task.py](/home/briney/git/oplm/tests/eval/test_structure_task.py))
+runs the full Jacobian path end-to-end over the fixture structures.
 
 #### 1.5 CI cost is higher than necessary
 

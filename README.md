@@ -293,7 +293,7 @@ OPLM supports single parquet files, directories of shards, or interleaved multi-
 OPLM includes a built-in evaluation harness with support for:
 
 - **Sequence evaluation** -- masked language modeling metrics (loss, accuracy, perplexity)
-- **Structure evaluation** -- contact prediction precision@L from attention maps, optional logistic regression fitting, and categorical-Jacobian contact extraction
+- **Structure evaluation** -- contact prediction precision@L via categorical-Jacobian coupling
 
 Configure evaluation datasets in your YAML config:
 
@@ -306,10 +306,8 @@ data:
     structures:
       path: /path/to/pdb_directory
       type: structure
-      eval_every: 10_000
+      every: { steps: 10_000 }
       contact_threshold: 8.0
-      use_logistic_regression: true
-      use_categorical_jacobian: true
       categorical_jacobian_sample_size: 12
 ```
 

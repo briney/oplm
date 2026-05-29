@@ -38,7 +38,6 @@ train = [
     "wandb>=0.16",
     "datasets>=2.18",
     "biopython>=1.83",
-    "scikit-learn>=1.4",
 ]
 flash = [
     "flash-attn>=2.5",
@@ -109,7 +108,5 @@ module = [
     "wandb.*",
     "Bio",
     "Bio.*",
-    "sklearn",
-    "sklearn.*",
 ]
 ignore_missing_imports = true
