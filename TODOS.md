@@ -396,18 +396,20 @@ Eval-only modality. **Lazy-import biopython** inside functions; raise a clear
 
 Zero-shot variant-effect data. Tokenize+pad at scoring time (no MLM masking).
 
-- [ ] **7.1 `VariantAssay` dataclass:** `name: str`, `wildtype: str`,
+- [x] **7.1 `VariantAssay` dataclass:** `name: str`, `wildtype: str`,
   `mutations: list[str]`, `labels: list[float]`.
-- [ ] **7.2 CSV parsing** (`load_variant_assays(directory) -> list[VariantAssay]`):
+- [x] **7.2 CSV parsing** (`load_variant_assays(directory) -> list[VariantAssay]`):
   one assay per CSV. Required columns `mutant` (e.g. `"A42T"`, `:`-joined for
   multi-mutants) and `DMS_score` (float). The wild-type sequence is supplied per
   assay (sidecar/metadata/`EvalDatasetEntry.extra["wildtype"]` or a `wildtype`
-  column) — document the accepted source(s).
-- [ ] **7.3 Mutation parsing/validation:** `parse_mutation("A42T") -> (wt="A",
+  column) — document the accepted source(s). *(Accepted sources: a `wildtypes`
+  mapping keyed by assay name — the route for `EvalDatasetEntry.extra["wildtype"]`
+  / a sidecar, which takes precedence — or a constant `wildtype` column.)*
+- [x] **7.3 Mutation parsing/validation:** `parse_mutation("A42T") -> (wt="A",
   pos=42, mut="T")` (1-based). Validate `wildtype[pos-1] == wt`; raise on
   mismatch. (Scoring itself — masked-marginal log-prob ratios — belongs to the
   eval harness; this module only loads + validates.)
-- [ ] **7.4 Tests** (`tests/data/variant/test_loader.py`): tiny real ProteinGym
+- [x] **7.4 Tests** (`tests/data/variant/test_loader.py`): tiny real ProteinGym
   CSV fixture at `tests/data/fixtures/variant/<assay>.csv`; parse → correct
   counts; mutation parse + WT-consistency validation; multi-mutant split on `:`;
   mismatch raises.
