@@ -369,20 +369,20 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
 Eval-only modality. **Lazy-import biopython** inside functions; raise a clear
 `ImportError` pointing at `pip install oplm[train]` when missing.
 
-- [ ] **6.1 `StructureData` dataclass:** `name: str`, `sequence: str`,
+- [x] **6.1 `StructureData` dataclass:** `name: str`, `sequence: str`,
   `coords: Tensor  # (L,3,3) backbone N,CA,C; NaN for missing`, `chain_id: str|None`.
-- [ ] **6.2 Modified-residue map** (three-letter → one-letter), at least:
+- [x] **6.2 Modified-residue map** (three-letter → one-letter), at least:
   `MSE→M, SEC→C, CSE→C, SEP→S, TPO→T, PTR→Y`. `_residue_to_one_letter` uses the
   map first, then `Bio.Data.IUPACData.protein_letters_3to1`, else `"X"`.
-- [ ] **6.3 `_parse_single_structure(path) -> StructureData | None`:** pick parser
+- [x] **6.3 `_parse_single_structure(path) -> StructureData | None`:** pick parser
   by suffix (`.cif/.mmcif` → `MMCIFParser`, else `PDBParser`, both `QUIET=True`);
   use **first model, first chain**; skip heteroatoms unless in the modified map;
   per residue, extract `N,CA,C` coords (NaN row if an atom is missing); return
   `None` (warn) on parse failure or empty chain.
-- [ ] **6.4 `load_structures(directory, max_structures=None) ->
+- [x] **6.4 `load_structures(directory, max_structures=None) ->
   list[StructureData]`:** glob `*.pdb,*.cif,*.ent,*.mmcif`, sort by filename for
   determinism, parse each, skip `None`, optional cap.
-- [ ] **6.5 Tests** (`tests/data/structure/test_loader.py`, `@pytest.mark.slow`):
+- [x] **6.5 Tests** (`tests/data/structure/test_loader.py`, `@pytest.mark.slow`):
   parse one real PDB fixture → `coords` shape `(L,3,3)`, `len(sequence)==L`,
   modified-residue mapping works, missing atoms → NaN. Add a non-biopython
   import-error test via monkeypatch if feasible.
