@@ -450,8 +450,12 @@ This yields the *true* global token count and makes `tokens_seen`/`tokens_delta`
 rank-identical by construction. Under gradient accumulation, sum micro-batch tokens
 locally across the accumulation window and reduce once at the optimizer step, so
 `tokens_delta` is "global tokens in this optimizer step." The reduction is one small
-all-reduce per step (negligible beside the backward pass); it may be gated on
-`evaluator.needs_token_count` to skip it entirely when no token-cadence task exists.
+all-reduce per step (negligible beside the backward pass) and is performed
+**unconditionally** — not gated on `evaluator.needs_token_count`. Gating it off would
+leave the per-rank estimate (`local_tokens × num_processes`), which diverges across ranks
+on ragged batches and violates the §3.2 rank-identical invariant; the cost is too small to
+justify that risk. (`needs_token_count` remains a useful introspection property, but the
+trainer does not use it to skip the reduction.)
 
 ### 6.3 `is_final` and termination
 

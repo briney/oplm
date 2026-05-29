@@ -15,7 +15,11 @@ a task when `global_step % task.eval_every == 0`. We replace this with: a frozen
 that unwraps the model only when something is due; a `every: {unit: N}` config grammar
 replacing `eval_every`; deletion of the duplicated `src/oplm/eval/data/` loaders in
 favor of `oplm.data`; and a trainer-side change so `tokens_seen` is the rank-reduced
-global token count (required for token cadence not to deadlock).
+global token count (required for token cadence not to deadlock). As a prerequisite, we
+also rename the rewritten model class everywhere (`OplmForMLM` → `OplmForMaskedLM`,
+imported from `oplm.model`) and bring the structure task onto the new forward API
+(`output_attentions` / `.attentions`), since the old model and its `eval/` references no
+longer exist (Phase 0).
 
 ## Ground rules (respect throughout)
 
@@ -40,15 +44,76 @@ global token count (required for token cadence not to deadlock).
 | modify | `src/oplm/data/config.py` (`parse_eval_configs` → `every:` grammar) |
 | create | `src/oplm/eval/context.py` (`EvalContext`) |
 | create | `src/oplm/eval/schedule.py` (`Schedule`, `_crossed`, `EveryNSteps`, `EveryNTokens`, `build_schedule`) |
-| modify | `src/oplm/eval/tasks/base.py` (`EvalTask` holds a `Schedule`) |
-| modify | `src/oplm/eval/evaluator.py` (`run_due`, unwrap-behind-due-check, `needs_token_count`) |
-| modify | `src/oplm/eval/tasks/sequence.py` (import loader from `oplm.data`) |
-| modify | `src/oplm/eval/tasks/structure.py` (import from `oplm.data`; canonical tokenizer; `StructureTaskConfig`) |
+| modify | `src/oplm/eval/tasks/base.py` (`EvalTask` holds a `Schedule`; rename `OplmForMLM`) |
+| modify | `src/oplm/eval/evaluator.py` (`run_due`, unwrap-behind-due-check, `needs_token_count`; rename `OplmForMLM`) |
+| modify | `src/oplm/eval/tasks/sequence.py` (import loader from `oplm.data`; rename `OplmForMLM`) |
+| modify | `src/oplm/eval/tasks/structure.py` (import from `oplm.data`; canonical tokenizer; `StructureTaskConfig`; new forward API; rename `OplmForMLM`) |
+| modify | `src/oplm/eval/tasks/{proteingym,tape,everest,proteinglue}.py`, `src/oplm/eval/metrics/mlm.py` (rename `OplmForMLM` → `OplmForMaskedLM`, fix import path — Phase 0) |
 | delete | `src/oplm/eval/data/` (`__init__.py`, `sequence_loader.py`, `structure_loader.py`) |
 | modify | `src/oplm/eval/__init__.py` (public API) |
-| modify | `src/oplm/training/trainer.py` (build `EvalContext`; rank-reduce tokens; call `run_due`) |
+| modify | `src/oplm/training/trainer.py` (build `EvalContext`; rank-reduce tokens; call `run_due`; rename `OplmForMLM` import/hint — Phase 0) |
+| modify | `src/oplm/inference.py`, `src/oplm/cli.py` (rename `OplmForMLM` import/hint — Phase 0) |
 | modify | `configs/README.md` (document `every:` + `eval_default_every`) |
 | create | `tests/eval/test_*.py` (the harness is currently untested) |
+
+---
+
+## Phase 0 — Rename the model class: `OplmForMLM` → `OplmForMaskedLM`
+
+The model was rewritten: `oplm.model.transformer.OplmForMLM` **no longer exists**. The
+masked-LM class is now `OplmForMaskedLM`, exported from `oplm.model` (defined in
+`oplm.model.modeling_oplm`). Every `from oplm.model.transformer import OplmForMLM` is a
+dead import and every `OplmForMLM` annotation is an undefined name — under `mypy --strict`
+(this repo's setting) both fail, so `mypy src/` cannot pass until they are renamed. Do this
+first; later phases assume the new name.
+
+- [ ] Replace the import everywhere it appears. The class is **not** in
+  `oplm.model.transformer` anymore (that module now holds only `OplmBlock` / `OplmStack`);
+  import it from the package root:
+
+  ```python
+  # was: from oplm.model.transformer import OplmForMLM
+  from oplm.model import OplmForMaskedLM
+  ```
+
+- [ ] Rename every `OplmForMLM` reference (imports **and** type hints) to `OplmForMaskedLM`
+  across all of these files (all currently carry the stale name):
+
+  ```
+  src/oplm/eval/evaluator.py            (TYPE_CHECKING import + run_due hint)
+  src/oplm/eval/tasks/base.py           (TYPE_CHECKING import + evaluate hint)
+  src/oplm/eval/tasks/sequence.py       (TYPE_CHECKING import + evaluate hint)
+  src/oplm/eval/tasks/structure.py      (TYPE_CHECKING import + two evaluate/_eval hints)
+  src/oplm/eval/tasks/proteingym.py     (TYPE_CHECKING import + evaluate hint)
+  src/oplm/eval/tasks/tape.py           (TYPE_CHECKING import + evaluate hint)
+  src/oplm/eval/tasks/everest.py        (TYPE_CHECKING import + evaluate hint)
+  src/oplm/eval/tasks/proteinglue.py    (TYPE_CHECKING import + evaluate hint)
+  src/oplm/eval/metrics/mlm.py          (TYPE_CHECKING import + compute_mlm_metrics hint)
+  src/oplm/training/trainer.py:40       (local import in __init__)
+  src/oplm/inference.py:11              (module-level import + return-type hint at :62)
+  src/oplm/cli.py:113                   (local import in inspect command)
+  ```
+
+  The code blocks in the phases below already use the new name; this step covers the files
+  those phases don't otherwise rewrite (the stub tasks, `metrics/mlm.py`, `inference.py`,
+  `cli.py`).
+
+- [ ] Confirm none remain: `grep -rn "OplmForMLM" src/` → empty.
+
+- [ ] **Scope caveat — model construction is owned by the trainer refactor, not this plan.**
+  The *constructor call sites* `OplmForMLM(cfg.model)` (`trainer.py:90`, `inference.py:65`,
+  `cli.py:119`) pass `cfg.model`, which is an `oplm.config.ModelConfig` dataclass — **not**
+  the `oplm.model.OplmConfig` (`PretrainedConfig`) that `OplmForMaskedLM.__init__` requires.
+  The two schemas diverge substantially (e.g. `hidden_dim`/`num_layers`/`num_kv_heads`/
+  `conv_*`/`value_residual` vs. `hidden_size`/`num_hidden_layers`/`norm_strategy`/`canon_*`),
+  so there is no clean rename and **no conversion helper is to be built** (it would be
+  obsoleted the moment the trainer is updated). Renaming the class on these three lines is
+  still correct and unbreaks the import, but the `ModelConfig → OplmConfig` mismatch on the
+  construction argument is resolved by the **separate trainer-refactor effort**, which will
+  converge the trainer/inference/cli onto the HF `OplmConfig`. Consequently:
+  - `mypy src/oplm/eval` is a firm gate for **this** plan and must be clean.
+  - Full `mypy src/` green (and the live-`Trainer` test, Phase 8.6) is **gated on the
+    trainer refactor** updating those construction sites; see Phase 9.
 
 ---
 
@@ -95,8 +160,8 @@ on it.
 
       Raises:
           ValueError: If ``raw`` is not a mapping, names ``epochs`` (deferred), does not
-              name exactly one valid unit, has unknown keys, or the unit value is not a
-              positive int.
+              name exactly one valid unit, has unknown keys, the unit value is not a
+              positive int, or ``at_start`` / ``at_end`` are not actual bools.
       """
       if not isinstance(raw, dict):
           raise ValueError(
@@ -121,12 +186,17 @@ on it.
       n = raw[unit]
       if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
           raise ValueError(f"{label}: cadence {unit!r} must be a positive int, got {n!r}")
-      return ScheduleSpec(
-          unit=unit,
-          n=n,
-          at_start=bool(raw.get("at_start", False)),
-          at_end=bool(raw.get("at_end", True)),
-      )
+      # The schema says bools; parse them strictly. bool(raw.get(...)) would coerce the
+      # YAML string "false" to True, silently inverting the flag — validate the type.
+      at_start = raw.get("at_start", False)
+      at_end = raw.get("at_end", True)
+      for flag_name, flag_value in (("at_start", at_start), ("at_end", at_end)):
+          if not isinstance(flag_value, bool):
+              raise ValueError(
+                  f"{label}: {flag_name!r} must be a bool, got {flag_value!r} "
+                  f"({type(flag_value).__name__})"
+              )
+      return ScheduleSpec(unit=unit, n=n, at_start=at_start, at_end=at_end)
   ```
 
 ### 1.2 Change `EvalDatasetEntry` (in `src/oplm/config.py`)
@@ -231,7 +301,19 @@ on it.
   )
 
   raw_metrics = value.get("metrics")
-  metrics = [str(m) for m in raw_metrics] if raw_metrics is not None else None
+  if raw_metrics is None:
+      metrics = None
+  elif isinstance(raw_metrics, (list, tuple)):
+      metrics = [str(m) for m in raw_metrics]
+  else:
+      # A bare string is iterable, so the naive `[str(m) for m in "loss"]` yields
+      # ["l", "o", "s", "s"]. Require an actual list/tuple of metric names; reject
+      # strings (and anything else) explicitly. (OmegaConf is already resolved to
+      # plain containers here — see the isinstance(value, dict) checks above.)
+      raise ValueError(
+          f"Eval dataset {name!r}: `metrics` must be a list of names "
+          f"(e.g. [loss, accuracy]), got {raw_metrics!r}"
+      )
   extra = {k: v for k, v in value.items() if k not in _KNOWN_EVAL_KEYS}
 
   entries.append(
@@ -409,7 +491,7 @@ on it.
       from oplm.config import OplmConfig
       from oplm.eval.context import EvalContext
       from oplm.eval.tasks.base import EvalTask
-      from oplm.model.transformer import OplmForMLM
+      from oplm.model import OplmForMaskedLM
 
   logger = logging.getLogger(__name__)
 
@@ -443,17 +525,25 @@ on it.
           total_steps = cfg.train.max_steps
           for task in self.tasks:
               sched = task.schedule
-              if isinstance(sched, EveryNSteps) and not sched.at_end and sched.n > total_steps:
+              # A schedule with at_start=True fires on the first eval call regardless of
+              # cadence, and at_end=True fires on the final step — so it is only provably
+              # unreachable when BOTH are off and the cadence exceeds the run length.
+              if (
+                  isinstance(sched, EveryNSteps)
+                  and not sched.at_start
+                  and not sched.at_end
+                  and sched.n > total_steps
+              ):
                   logger.warning(
-                      "Eval task %r: step cadence n=%d exceeds max_steps=%d and at_end is "
-                      "false; it will never run.",
+                      "Eval task %r: step cadence n=%d exceeds max_steps=%d with at_start "
+                      "and at_end both false; it will never run.",
                       task.name,
                       sched.n,
                       total_steps,
                   )
 
       def run_due(
-          self, ctx: EvalContext, model: OplmForMLM, accelerator: Accelerator
+          self, ctx: EvalContext, model: OplmForMaskedLM, accelerator: Accelerator
       ) -> dict[str, float]:
           """Run every task due at ``ctx`` and return merged ``eval/<name>/<metric>`` metrics.
 
@@ -503,7 +593,7 @@ on it.
   `evaluate` becomes:
 
   ```python
-  def evaluate(self, model: OplmForMLM, accelerator: Accelerator) -> dict[str, float]:
+  def evaluate(self, model: OplmForMaskedLM, accelerator: Accelerator) -> dict[str, float]:
       if self._dataloader is None:
           self._dataloader = build_sequence_eval_dataloader(self.path, self.cfg)
       all_metrics = compute_mlm_metrics(model, self._dataloader, accelerator)
@@ -555,16 +645,27 @@ on it.
           def _opt_int(key: str) -> int | None:
               return int(extra[key]) if key in extra else None
 
+          def _strict_bool(key: str, default: bool) -> bool:
+              # Same rationale as parse_schedule_block: bool("false") is True, so a YAML
+              # string would silently invert the flag. Require an actual bool.
+              value = extra.get(key, default)
+              if not isinstance(value, bool):
+                  raise ValueError(
+                      f"structure-eval {key!r} must be a bool, got {value!r} "
+                      f"({type(value).__name__})"
+                  )
+              return value
+
           cfg = cls(
               contact_threshold=float(extra.get("contact_threshold", 8.0)),
               min_seq_sep=int(extra.get("min_seq_sep", 6)),
               l_divisor=int(extra.get("l_divisor", 1)),
-              use_cbeta=bool(extra.get("use_cbeta", True)),
-              use_logistic_regression=bool(extra.get("use_logistic_regression", True)),
+              use_cbeta=_strict_bool("use_cbeta", True),
+              use_logistic_regression=_strict_bool("use_logistic_regression", True),
               logreg_n_train=int(extra.get("logreg_n_train", 20)),
               logreg_n_iterations=int(extra.get("logreg_n_iterations", 5)),
               logreg_c=float(extra.get("logreg_c", 0.15)),
-              use_categorical_jacobian=bool(extra.get("use_categorical_jacobian", False)),
+              use_categorical_jacobian=_strict_bool("use_categorical_jacobian", False),
               categorical_jacobian_sample_size=_opt_int("categorical_jacobian_sample_size"),
               categorical_jacobian_sample_seed=int(
                   extra.get("categorical_jacobian_sample_seed", 42)
@@ -622,6 +723,38 @@ on it.
   `OplmTokenizerFast.encode(seq)` differs from the legacy tokenizer — pass
   `add_special_tokens=True` explicitly and confirm the contact extraction still strips
   the `<cls>`/`<eos>` positions.
+
+- [ ] **Update the forward call to the rewritten model's API.** The old model took
+  `need_weights=` and returned attention under the `"attention_weights"` key; the rewritten
+  `OplmForMaskedLM` takes `output_attentions=` and returns a HuggingFace `MaskedLMOutput`
+  whose attention tuple is `.attentions` (key `"attentions"`). Phase 4.2 otherwise only
+  swaps the loader/tokenizer/config, so without this the structure task still crashes at the
+  forward call. Change both sites:
+
+  ```python
+  # in the per-structure forward (was: need_weights=need_attention):
+  with torch.no_grad():
+      outputs = model(
+          input_ids=input_ids,
+          attention_mask=attention_mask,
+          output_attentions=need_attention,
+      )
+
+  # in the attention branch (was: raw_attn = outputs["attention_weights"]):
+  if need_attention:
+      raw_attn = outputs.attentions
+      if raw_attn is None:
+          raise ValueError("Model did not return attention weights for structure evaluation")
+      ...
+  ```
+
+  The `outputs["logits"]` accesses elsewhere in the file stay as-is — `MaskedLMOutput` is a
+  `ModelOutput`, so both `outputs["logits"]` and `outputs.logits` work. Confirm no
+  `need_weights` / `attention_weights` references remain:
+  `grep -n "need_weights\|attention_weights" src/oplm/eval/tasks/structure.py` → empty.
+  Note the rewritten model emits attentions only via its manual fallback kernel
+  (`output_attentions=True` forces it; see docs/MODEL_ARCHITECTURE.md §6.5), so no extra
+  config flag is needed at the call site.
 
 - [ ] Optionally update `get_canonical_amino_acid_token_ids`'s parameter annotation in
   `src/oplm/eval/metrics/categorical_jacobian.py` from `ProteinTokenizer` to
@@ -721,10 +854,16 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
   self._step_local_tokens = 0
   ```
 
-  (This also makes the logged `train/tokens` the true global count. To skip the
-  collective when no token-cadence task exists, gate it on
-  `self.evaluator is not None and self.evaluator.needs_token_count` and otherwise fall
-  back to `tokens_delta = self._step_local_tokens * self.accelerator.num_processes`.)
+  **Reduce unconditionally — do not gate on `needs_token_count`.** It is tempting to skip the
+  all-reduce when no token-cadence task is configured and fall back to
+  `self._step_local_tokens * num_processes`, but that per-rank estimate diverges across ranks
+  under variable-length / ragged batches and would make `tokens_seen` / `tokens_delta`
+  rank-dependent — violating the load-bearing "every `EvalContext` field is rank-identical"
+  invariant (design §3.2) on whichever fields the context carries. The reduction is a single
+  tiny all-reduce per optimizer step (negligible beside the backward pass), so always perform
+  it: `tokens_seen` is then the true global count and rank-identical by construction, and the
+  logged `train/tokens` is correct too. (`Evaluator.needs_token_count` is still exported and
+  exercised by tests, but the trainer does **not** use it to gate this reduction.)
 
 ### 6.3 Build the context and call `run_due`
 
@@ -829,6 +968,33 @@ the suite below. Reuse the existing session-scoped fixtures from `tests/conftest
 or GPU; task/trainer tests build a tiny model on CPU — mark the model-building ones
 `@pytest.mark.slow`.
 
+**Building a model in a test (issue #3 — config types).** `OplmForMaskedLM.__init__`
+takes the HuggingFace `oplm.model.OplmConfig` (a `PretrainedConfig`), **not** the
+`oplm.config.ModelConfig` dataclass that lives at `cfg.model`. The two schemas diverge
+(`hidden_dim`/`num_layers`/`num_kv_heads` vs. `hidden_size`/`num_hidden_layers`/…) and
+there is **no conversion helper** (it would be obsoleted by the pending trainer refactor —
+Phase 0 caveat). So construct the HF config **directly** with its native field names, as the
+existing model tests already do (e.g. `tests/data/test_e2e.py`, `tests/model/test_pilot_train.py`).
+Alias the two `OplmConfig` names to avoid the clash:
+
+```python
+from oplm.config import OplmConfig          # root run config (data.eval, train, …)
+from oplm.model import OplmConfig as OplmModelConfig, OplmForMaskedLM
+
+model = OplmForMaskedLM(
+    OplmModelConfig(
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        max_position_embeddings=64,
+    )
+).eval()
+```
+
+The eval task / metrics code only *annotates* `model: OplmForMaskedLM` and calls
+`model(...)`; it never constructs the model, so it stays mypy-clean. Only the tests (and the
+trainer, owned by the separate refactor) construct one.
+
 ### 8.1 `tests/eval/test_schedule.py` (pure, no model)
 
 - [ ] Add a small `ctx(...)` helper that builds an `EvalContext` with sensible defaults
@@ -857,6 +1023,11 @@ or GPU; task/trainer tests build a tiny model on CPU — mark the model-building
   - two unit keys (`{steps: 1, tokens: 2}`) → `ValueError`.
   - `every: {epochs: 1}` → `ValueError` mentioning "not yet supported".
   - non-positive / bool `n` → `ValueError`.
+  - non-bool `at_start` / `at_end` (e.g. `{steps: 10, at_start: "false"}`) → `ValueError`
+    mentioning the flag name (issue #5: the string `"false"` must not coerce to `True`).
+  - `metrics` as a bare string (e.g. `metrics: "loss"`) → `ValueError` (issue #8: must be a
+    list, not split into `["l", "o", "s", "s"]`); a real list `[loss, accuracy]` parses to
+    `["loss", "accuracy"]`.
   - removed per-entry `eval_every: 500` → `ValueError` mentioning `every`.
   - unknown task key (`contact_threshold: 8.0`) folds into `EvalDatasetEntry.extra`.
 - [ ] Test `load_config(["train.eval_every=500"])` raises `ValueError` mentioning
@@ -883,24 +1054,59 @@ or GPU; task/trainer tests build a tiny model on CPU — mark the model-building
 
 ### 8.4 `tests/eval/test_sequence_task.py`
 
-- [ ] `@pytest.mark.slow`. Build a tiny `OplmConfig` (e.g. `hidden_dim=32, num_layers=2,
-  num_heads=2, num_kv_heads=1, max_seq_len=64`) and `OplmForMLM(cfg.model)` on CPU.
+- [ ] `@pytest.mark.slow`. Build **two** configs (see the Phase 8 intro): a root
+  `oplm.config.OplmConfig` for the task (`cfg`, providing `data`/`train` so
+  `build_sequence_eval_dataloader(self.path, cfg)` can tokenize/mask), and the model from the
+  HF `OplmModelConfig` directly — **not** `OplmForMaskedLM(cfg.model)`:
+
+  ```python
+  model = OplmForMaskedLM(
+      OplmModelConfig(
+          hidden_size=32, num_hidden_layers=2, num_attention_heads=2,
+          max_position_embeddings=64,  # >= the data cfg's max_seq_len
+          # vocab_size defaults to the tokenizer's 33 — keep it consistent with the data cfg
+      )
+  ).eval()
+  ```
+
   Construct a `SequenceEvalTask` from an `EvalDatasetEntry(name="hd",
-  path=str(training_parquet), type="sequence", schedule=ScheduleSpec("steps", 1))`.
-  Build a single-process `Accelerator` (use the `_reset_accelerator_state` autouse
+  path=str(training_parquet), type="sequence", schedule=ScheduleSpec("steps", 1))` with the
+  root `cfg`. Build a single-process `Accelerator` (use the `_reset_accelerator_state` autouse
   fixture already in `tests/conftest.py`). Assert `evaluate` returns `loss`, `accuracy`,
-  `perplexity`, all finite, with `0 <= accuracy <= 1`.
+  `perplexity`, all finite, with `0 <= accuracy <= 1`. Keep `max_position_embeddings` and
+  `vocab_size` consistent with the data cfg's `max_seq_len` / tokenizer so the dataloader's
+  token ids index the model embedding correctly.
 
 ### 8.5 `tests/eval/test_structure_task.py`
 
-- [ ] `@pytest.mark.slow`. Use `structure_fixtures_dir` (skips if absent). Tiny model as
-  in 8.4 but `max_seq_len` large enough for the fixtures. Construct a `StructureEvalTask`
-  with `type="structure"`, `schedule=ScheduleSpec("steps", 1)`, and
-  `extra={"max_structures": 2, "use_logistic_regression": false}` (use the
-  mean-attention path so it runs with few structures). Assert `precision_at_L` is present
-  and in `[0, 1]`. This is the verification gate for the tokenizer migration (§4.2).
+- [ ] `@pytest.mark.slow`. Use `structure_fixtures_dir` (skips if absent). Build the model
+  from `OplmModelConfig` directly as in 8.4, but with `max_position_embeddings` large enough
+  for the fixtures. Construct a `StructureEvalTask` with `type="structure"`,
+  `schedule=ScheduleSpec("steps", 1)`, and `extra={"max_structures": 2,
+  "use_logistic_regression": False}` (a real Python bool — `from_extra` now rejects the
+  string `"false"`; use the mean-attention path so it runs with few structures). Assert
+  `precision_at_L` is present and in `[0, 1]`. This exercises **both** migration gates: the
+  tokenizer swap (§4.2) **and** the new `output_attentions` / `.attentions` forward API — if
+  the forward call were left on the old `need_weights` / `"attention_weights"` API the task
+  would raise here.
+- [ ] Add a **non-slow** unit test (no model/fixtures) for `StructureTaskConfig.from_extra`
+  (issue #5): a string boolean such as `{"use_logistic_regression": "false"}` raises
+  `ValueError` naming the key (must not coerce to `True`), real bools parse, and the existing
+  numeric validations (`categorical_jacobian_sample_size >= 1`,
+  `categorical_jacobian_mutation_batch_size` in `[1, 20]`) still raise on bad values.
 
 ### 8.6 `tests/eval/test_trainer_integration.py`
+
+> **Dependency — gated on the trainer refactor (Phase 0 caveat).** This is the only test
+> that runs the live `Trainer`, which builds the model via `OplmForMaskedLM(cfg.model)` at
+> `trainer.py:90`. That call is broken until the **separate trainer-refactor effort** converges
+> the trainer onto the HF `OplmConfig` (this plan deliberately does not build a
+> `ModelConfig → OplmConfig` converter). So write this test now, but mark it
+> `@pytest.mark.skip(reason="enable once the trainer constructs OplmForMaskedLM from the HF
+> OplmConfig — see Phase 0")` (or `xfail`), and flip it on when the trainer refactor lands.
+> The eval-integration code in Phase 6 (`_build_eval_context`, rank-reduced tokens,
+> `run_due`) is still exercised in isolation by 8.3 (evaluator) and 8.8 (token accounting),
+> so this gating does not leave Phase 6 untested — it only defers the full end-to-end run.
 
 - [ ] `@pytest.mark.slow`. End-to-end: tiny `OplmConfig` with `train.max_steps=4`,
   `train.wandb_enabled=False`, `train.batch_size` small, `data.train=str(training_parquet)`,
@@ -915,26 +1121,81 @@ or GPU; task/trainer tests build a tiny model on CPU — mark the model-building
   fired on the step cadence). Add a second case with `every: {tokens: 1}` and assert eval
   fires every step (token cadence path + the rank-reduction code runs).
 
+### 8.7 `tests/eval/test_registry.py` (pure, no model)
+
+The design (§10) calls for explicit registry coverage; add it (the current plan only used the
+registry implicitly via the dummy task in 8.3).
+
+- [ ] Duplicate registration raises: calling `@register_eval_task("sequence")` a second time
+  (e.g. on a throwaway subclass) raises `ValueError`/`KeyError` naming the duplicate type.
+- [ ] Unknown type raises with the known list: `get_eval_task_class("does_not_exist")` raises
+  and the message includes the registered type names (so the error is actionable).
+- [ ] Sanity: each real registered type (`sequence`, `structure`, `proteingym`, `tape`,
+  `proteinglue`, `everest`) resolves via `get_eval_task_class` to an `EvalTask` subclass after
+  `import oplm.eval.tasks`.
+- [ ] Use an isolated registry where possible (or register/clean up a uniquely-named dummy in a
+  fixture) so the test does not mutate the shared `EVAL_TASK_REGISTRY` for other tests.
+
+### 8.8 `tests/eval/test_token_accounting.py`
+
+The design (§10) calls for token-accounting and rank-sync coverage; this is the source-of-truth
+guarantee behind token cadence (no deadlock). Add both a focused single-process check and, if
+the environment supports spawning, a small ragged distributed smoke test.
+
+- [ ] **Focused token accounting (single process, no GPU).** Drive the trainer's token
+  reduction (or a small extracted helper mirroring Phase 6.2) over a few synthetic batches with
+  *known, varying* `attention_mask` sums; assert the accumulated `tokens_seen` equals the exact
+  sum of all `attention_mask` ones (the true global count) — i.e. **not** a
+  `local_tokens × num_processes` estimate. With `num_processes == 1` the reduction is identity,
+  so this nails the per-step accumulation + reset logic and that `_step_local_tokens` zeroes
+  each optimizer step.
+- [ ] **Rank-sync purity (no model).** Given one `EvalContext`, every task's `is_due` is a pure
+  function of it, so all ranks agree by construction. Assert this directly: build a context and
+  check `task.schedule.is_due(ctx)` is deterministic and that two independently-built contexts
+  with identical fields yield identical `is_due` for an `EveryNTokens` schedule.
+- [ ] **Ragged distributed smoke (mark `@pytest.mark.slow`; skip if multi-proc launch is
+  unavailable).** Launch ≥2 ranks (e.g. `accelerate`/`torch.distributed` with `gloo`) feeding
+  **ragged** per-rank token counts, run several optimizer steps with a token-cadence eval
+  configured, and assert (a) every rank computes the *same* `tokens_seen`/`tokens_delta` after
+  the reduction, and (b) the token-cadence eval does **not** hang (all ranks reach the same
+  `is_due` and the collective inside `evaluate` completes). This is the direct regression test
+  for the §3.2 invariant and the reason the reduction is unconditional (issue #6). If the CI
+  environment cannot spawn workers, document the skip clearly (do not silently drop coverage).
+
 ---
 
 ## Phase 9 — Verification & quality gates
 
 - [ ] No references to the deleted module remain:
   `grep -rn "oplm.eval.data" src/ tests/` → empty.
+- [ ] No `OplmForMLM` references remain (Phase 0):
+  `grep -rn "OplmForMLM" src/ tests/` → empty (all renamed to `OplmForMaskedLM`).
+- [ ] Structure task is off the old forward API:
+  `grep -rn "need_weights\|attention_weights" src/oplm/eval/` → empty.
 - [ ] No stray `eval_every` remains except the two rejection messages:
   `grep -rn "eval_every" src/` → only `_reject_removed_eval_every_alias`, the
   `parse_eval_configs` rejection, and `eval_default_every`.
 - [ ] `python -c "import oplm.eval; print(oplm.eval.__all__)"` lists the new exports.
 - [ ] `python -c "from oplm.config import load_config; load_config([])"` works (default
   `eval_default_every` parses), and `load_config(['train.eval_every=1'])` raises.
-- [ ] Lint/format/type: `ruff check src/ tests/`, `ruff format src/ tests/`,
-  `mypy src/`.
-- [ ] Fast tests: `pytest -m "not slow"` green.
+- [ ] Lint/format: `ruff check src/ tests/`, `ruff format src/ tests/`.
+- [ ] Type — **firm gate for this plan:** `mypy src/oplm/eval` clean. **Broader gate, partial:**
+  `mypy src/` will still report the `OplmForMaskedLM(cfg.model)` argument-type mismatch in
+  `trainer.py` / `inference.py` / `cli.py` (`ModelConfig` vs HF `OplmConfig`) — that is the
+  **trainer-refactor's** responsibility (Phase 0 caveat), not this plan's. After Phase 0 the
+  only remaining `mypy src/` errors should be those construction-site mismatches; confirm there
+  are no *new* eval-introduced errors and no surviving stale-import errors.
+- [ ] Fast tests: `pytest -m "not slow"` green (this includes the new pure tests: schedule,
+  config, evaluator, registry, and the single-process token-accounting/rank-sync checks).
 - [ ] Full tests (needs the structure/sequence fixtures present):
-  `pytest tests/eval` green; the structure test confirms the tokenizer migration.
+  `pytest tests/eval` green; the structure test confirms **both** the tokenizer migration and
+  the new `output_attentions` forward API. The live-`Trainer` test (8.6) stays skipped until
+  the trainer refactor lands.
 - [ ] Sanity-check the design alignment: steps + tokens cadence only (epochs rejected);
-  `at_end` defaults true; `run_due` unwraps only when due; `tokens_seen` rank-reduced;
-  `eval/data/` gone.
+  `at_end` defaults true; `at_start`/`at_end` parsed as strict bools; `metrics` rejects bare
+  strings; `_warn_unreachable` honors `at_start`; `run_due` unwraps only when due;
+  `tokens_seen` reduced **unconditionally** (rank-identical); model class is `OplmForMaskedLM`;
+  structure task uses `output_attentions` / `.attentions`; `eval/data/` gone.
 
 ---
 
@@ -949,4 +1210,7 @@ or GPU; task/trainer tests build a tiny model on CPU — mark the model-building
   `default_schedule: ScheduleSpec`. The only caller is the `Evaluator`; update it (done
   in Phase 3.2). `parse_eval_configs` is re-exported from `oplm.data` — keep the export.
 - **Stub tasks** (`proteingym`, `tape`, `proteinglue`, `everest`) inherit the new
-  `EvalTask.__init__`, so they need no changes; they still raise `NotImplementedError`.
+  `EvalTask.__init__`, so they need no *behavioral* changes and still raise
+  `NotImplementedError` — but they **do** need the Phase 0 rename (each has a stale
+  `from oplm.model.transformer import OplmForMLM` import and an `OplmForMLM` hint on its
+  `evaluate` stub), or `mypy src/oplm/eval` fails on the undefined name.
