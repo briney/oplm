@@ -782,7 +782,7 @@ on it.
 
 ### 5.1 `src/oplm/eval/__init__.py`
 
-- [ ] Export the new types:
+- [x] Export the new types:
 
   ```python
   """OPLM evaluation harness. See docs/EVAL_HARNESS.md for the design."""
