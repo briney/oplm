@@ -720,7 +720,9 @@ data:
     casp_contacts:
       path: /data/casp_structures/
       type: structure
-      extra: { contact_threshold: 8.0, min_seq_sep: 6 }
+      # task-specific keys go directly on the entry; they are folded into `extra`
+      contact_threshold: 8.0
+      min_seq_sep: 6
     proteingym:
       path: /data/proteingym/
       type: proteingym

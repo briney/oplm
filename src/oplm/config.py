@@ -270,7 +270,7 @@ class TrainConfig:
 class TrainDatasetEntry:
     """Parsed configuration for a single training dataset.
 
-    Populated by :func:`parse_train_configs`, not directly from YAML.
+    Populated by :func:`oplm.data.config.parse_train_configs`, not directly from YAML.
     """
 
     name: str
@@ -282,7 +282,7 @@ class TrainDatasetEntry:
 class EvalDatasetEntry:
     """Parsed configuration for a single evaluation dataset.
 
-    Populated by :func:`parse_eval_configs`, not directly from YAML.
+    Populated by :func:`oplm.data.config.parse_eval_configs`, not directly from YAML.
     """
 
     name: str
@@ -299,15 +299,18 @@ class DataConfig:
 
     # Training dataset(s). Accepts a str path (single dataset) or a dict of
     # {name: {path, fraction}} (multiple datasets). Parsed at runtime via
-    # parse_train_configs(). See configs/data/base.yaml for syntax examples.
+    # oplm.data.config.parse_train_configs(). See configs/data/base.yaml for syntax.
     train: Any = None
 
     # Evaluation dataset(s). Accepts a dict of {name: {path, type, ...}}.
-    # Parsed at runtime via parse_eval_configs().
+    # Parsed at runtime via oplm.data.config.parse_eval_configs().
     eval: Any = None
 
-    # Sequence masking
-    mask_prob: float = 0.15
+    # Sequence masking (see docs/DATA_TOOLING.md §4.5)
+    mask_prob: float = 0.15  # fraction of eligible positions selected for masking
+    mask_token_prob: float = 0.8  # of masked positions -> <mask>
+    random_token_prob: float = 0.1  # of masked positions -> random canonical AA
+    weighted_masking: bool = False  # honor the masking_weights column when True (§4.5.1)
 
     # DataLoader settings
     num_workers: int = 4
@@ -317,6 +320,21 @@ class DataConfig:
     # Shard iteration behavior (only affects sharded parquet directories)
     shuffle_shards: bool = True
     shuffle_rows: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate the masking-split probabilities."""
+        if not 0.0 <= self.mask_token_prob <= 1.0:
+            raise ValueError(f"mask_token_prob must be in [0, 1], got {self.mask_token_prob}")
+        if not 0.0 <= self.random_token_prob <= 1.0:
+            raise ValueError(f"random_token_prob must be in [0, 1], got {self.random_token_prob}")
+        # The remainder (1 - mask_token_prob - random_token_prob) keeps the
+        # original token, so the two probabilities must not exceed 1 together.
+        if self.mask_token_prob + self.random_token_prob > 1.0 + 1e-9:
+            raise ValueError(
+                "mask_token_prob + random_token_prob must be <= 1, got "
+                f"{self.mask_token_prob} + {self.random_token_prob} = "
+                f"{self.mask_token_prob + self.random_token_prob}"
+            )
 
 
 @dataclass
@@ -378,176 +396,6 @@ def _reject_removed_sequence_length_alias(override_dicts: list[Any]) -> None:
             "`data.max_length` has been removed. Use `model.max_seq_len` as the "
             "sequence-length setting."
         )
-
-
-def parse_train_configs(raw: Any) -> list[TrainDatasetEntry]:
-    """Normalize a raw ``data.train`` config value into structured dataset entries.
-
-    Supports three forms:
-
-    * ``None`` or empty dict → empty list (no training data)
-    * String path → single dataset at 100% sampling
-    * Dict of ``{name: {path, fraction}}`` → multiple datasets with fractions
-
-    Fractions are normalized to sum to 1.0. Omitted fractions share the
-    remaining mass equally among unspecified entries.
-
-    Args:
-        raw: The ``data.train`` value from config — a string, dict, or None.
-
-    Returns:
-        List of :class:`TrainDatasetEntry` with normalized fractions.
-
-    Raises:
-        ValueError: If the config structure is invalid or fractions are negative.
-    """
-    if raw is None:
-        return []
-
-    if isinstance(raw, str):
-        if not raw:
-            return []
-        return [TrainDatasetEntry(name="default", path=raw, fraction=1.0)]
-
-    if isinstance(raw, dict):
-        if len(raw) == 0:
-            return []
-
-        entries: list[TrainDatasetEntry] = []
-        for name, value in raw.items():
-            if value is None:
-                continue
-            if isinstance(value, str):
-                entries.append(TrainDatasetEntry(name=str(name), path=value, fraction=-1.0))
-            elif isinstance(value, dict):
-                path = value.get("path")
-                if path is None:
-                    continue
-                frac = value.get("fraction")
-                entries.append(
-                    TrainDatasetEntry(
-                        name=str(name),
-                        path=str(path),
-                        fraction=float(frac) if frac is not None else -1.0,
-                    )
-                )
-            else:
-                raise ValueError(
-                    f"Invalid train config for {name!r}: expected str or dict, "
-                    f"got {type(value).__name__}"
-                )
-
-        if len(entries) == 0:
-            return []
-        if len(entries) == 1:
-            entries[0].fraction = 1.0
-            return entries
-
-        # Validate specified fractions
-        for e in entries:
-            if e.fraction != -1.0 and e.fraction < 0:
-                raise ValueError(f"data.train.{e.name}.fraction must be >= 0")
-
-        # Fill unspecified fractions: share remaining mass equally
-        specified_total = sum(e.fraction for e in entries if e.fraction >= 0)
-        unspecified = [e for e in entries if e.fraction < 0]
-        if unspecified:
-            remaining = max(0.0, 1.0 - specified_total)
-            default_frac = remaining / len(unspecified) if remaining > 0 else 0.0
-            for e in unspecified:
-                e.fraction = default_frac
-
-        # Normalize to sum to 1.0
-        total = sum(e.fraction for e in entries)
-        if total <= 0:
-            eq = 1.0 / len(entries)
-            for e in entries:
-                e.fraction = eq
-        else:
-            for e in entries:
-                e.fraction = e.fraction / total
-
-        return entries
-
-    raise ValueError(f"Invalid data.train config type: {type(raw).__name__}")
-
-
-def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEntry]:
-    """Normalize a raw ``data.eval`` config value into structured eval dataset entries.
-
-    Supports two forms:
-
-    * ``None`` or empty dict → empty list (no eval data)
-    * Dict of ``{name: {path, type, eval_every?, metrics?}}`` → multiple eval datasets
-
-    Args:
-        raw: The ``data.eval`` value from config — a dict or None.
-        default_eval_every: Fallback ``eval_every`` from ``train.eval_every``.
-
-    Returns:
-        List of :class:`EvalDatasetEntry` with resolved eval_every values.
-
-    Raises:
-        ValueError: If the config structure is invalid or required fields are missing.
-    """
-    if raw is None:
-        return []
-
-    if isinstance(raw, dict):
-        if len(raw) == 0:
-            return []
-
-        entries: list[EvalDatasetEntry] = []
-        for name, value in raw.items():
-            if value is None:
-                continue
-            if not isinstance(value, dict):
-                raise ValueError(
-                    f"Invalid eval config for {name!r}: expected dict with 'path' and 'type', "
-                    f"got {type(value).__name__}"
-                )
-
-            path = value.get("path")
-            if path is None:
-                raise ValueError(f"Eval dataset {name!r} is missing required 'path' field")
-
-            eval_type = value.get("type")
-            if eval_type is None:
-                raise ValueError(f"Eval dataset {name!r} is missing required 'type' field")
-
-            eval_every = value.get("eval_every")
-            if eval_every is not None:
-                eval_every = int(eval_every)
-
-            raw_metrics = value.get("metrics")
-            metrics: list[str] | None = None
-            if raw_metrics is not None:
-                metrics = [str(m) for m in raw_metrics]
-
-            if "extra" in value:
-                raise ValueError(
-                    f"Eval dataset {name!r} uses deprecated nested 'extra' config. "
-                    "Put task-specific keys directly on the dataset entry instead."
-                )
-
-            # Collect task-specific config keys into extra dict
-            _KNOWN_EVAL_KEYS = {"path", "type", "eval_every", "metrics"}
-            extra = {k: v for k, v in value.items() if k not in _KNOWN_EVAL_KEYS}
-
-            entries.append(
-                EvalDatasetEntry(
-                    name=str(name),
-                    path=str(path),
-                    type=str(eval_type),
-                    eval_every=eval_every if eval_every is not None else default_eval_every,
-                    metrics=metrics,
-                    extra=extra,
-                )
-            )
-
-        return entries
-
-    raise ValueError(f"Invalid data.eval config type: {type(raw).__name__}")
 
 
 def load_config(argv: list[str]) -> OplmConfig:

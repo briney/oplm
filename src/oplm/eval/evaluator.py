@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from oplm.config import parse_eval_configs
+from oplm.data.config import parse_eval_configs
 from oplm.eval.registry import get_eval_task_class
 
 if TYPE_CHECKING:

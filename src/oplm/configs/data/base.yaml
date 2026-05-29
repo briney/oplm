@@ -23,6 +23,9 @@ train: null
 
 # Sequence masking
 mask_prob: 0.15
+mask_token_prob: 0.8
+random_token_prob: 0.1
+weighted_masking: false   # set true to honor the masking_weights column
 
 # DataLoader settings
 num_workers: 4

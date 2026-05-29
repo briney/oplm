@@ -99,7 +99,7 @@ box only when its code **and** its tests pass.
 
 ## Phase 1 — Configuration surface
 
-- [ ] **1.1 Extend `DataConfig`** in `src/oplm/config.py` with three fields
+- [x] **1.1 Extend `DataConfig`** in `src/oplm/config.py` with three fields
   (defaults shown):
   ```python
   mask_token_prob: float = 0.8       # of masked positions -> <mask>
@@ -111,13 +111,13 @@ box only when its code **and** its tests pass.
   Leave existing fields untouched: `train`, `eval`, `mask_prob=0.15`,
   `num_workers=4`, `pin_memory=True`, `prefetch_factor=4`, `shuffle_shards=True`,
   `shuffle_rows=True`.
-- [ ] **1.2 Update `src/oplm/configs/data/base.yaml`** — add:
+- [x] **1.2 Update `src/oplm/configs/data/base.yaml`** — add:
   ```yaml
   mask_token_prob: 0.8
   random_token_prob: 0.1
   weighted_masking: false   # set true to honor the masking_weights column
   ```
-- [ ] **1.3 Implement `data/config.py`** — parsing helpers (entry dataclasses are
+- [x] **1.3 Implement `data/config.py`** — parsing helpers (entry dataclasses are
   imported from `oplm.config`, not redefined). If equivalent functions still
   exist in `config.py`, remove them there so `data/config.py` is the single home.
   - `parse_train_configs(raw) -> list[TrainDatasetEntry]`:
@@ -130,7 +130,7 @@ box only when its code **and** its tests pass.
     - `raw` is a mapping `{name: {path, type, eval_every?, metrics?, **extra}}`.
     - Require `path` and `type`; fold unknown keys into `extra`. `eval_every`
       defaults to `None` (caller falls back to `default_eval_every`).
-- [ ] **1.4 Tests** (`tests/data/test_config.py`): single-path expands to one
+- [x] **1.4 Tests** (`tests/data/test_config.py`): single-path expands to one
   full-weight entry; multi-dataset fractions normalize; omitted fractions split
   remainder; missing `path` raises; eval parsing requires `path`+`type` and
   routes extras into `extra`.
