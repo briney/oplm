@@ -7,12 +7,15 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from torch.utils.data import DataLoader
 
     from oplm.config import OplmConfig
+    from oplm.eval.context import EvalContext
     from oplm.eval.evaluator import Evaluator
     from oplm.training.callbacks import TrainerCallback
 
@@ -118,6 +121,8 @@ class Trainer:
         self.tokens_seen = 0
         self._samples_seen = 0
         self._last_eval_loss: float | None = None
+        self._epoch_at_last_opt_step = 0
+        self._step_local_tokens = 0  # local tokens accumulated across the current opt step
 
         # FLOP estimation
         self.flops_per_token = estimate_flops_per_token(cfg.model)
@@ -197,9 +202,9 @@ class Trainer:
                     for optimizer in self.optimizers:
                         optimizer.zero_grad()
 
-                # Track tokens and samples
-                tokens_in_batch = batch["attention_mask"].sum().item()
-                self.tokens_seen += int(tokens_in_batch) * self.accelerator.num_processes
+                # Track tokens (local; reduced across ranks on the opt-step boundary
+                # below) and samples
+                self._step_local_tokens += int(batch["attention_mask"].sum().item())
                 self._samples_seen += len(batch["input_ids"]) * self.accelerator.num_processes
 
                 # Only act on optimizer steps (accumulation boundary)
@@ -211,12 +216,22 @@ class Trainer:
                 self.global_step += 1
                 current_loss = loss.item()
 
+                # Rank-reduce this step's tokens so tokens_seen / tokens_delta are
+                # rank-identical (the EvalContext rank-sync invariant; see design §3.2).
+                # Unconditional: a per-rank estimate would diverge on ragged batches.
+                tokens_tensor = torch.tensor(
+                    self._step_local_tokens, device=self.accelerator.device, dtype=torch.long
+                )
+                tokens_delta = int(self.accelerator.reduce(tokens_tensor, reduction="sum").item())
+                self.tokens_seen += tokens_delta
+                self._step_local_tokens = 0
+
                 # Logging
                 if self.global_step % cfg.log_every == 0:
                     self._log_step(current_loss)
 
                 # Evaluation
-                eval_metrics = self._run_eval()
+                eval_metrics = self._run_eval(tokens_delta)
                 if eval_metrics:
                     eval_loss = self._extract_eval_loss(eval_metrics)
                     if eval_loss is not None:
@@ -249,18 +264,34 @@ class Trainer:
             self._emit_train_end()
             self.accelerator.end_training()
 
-    def _run_eval(self) -> dict[str, float]:
-        """Run all due evaluations for the current step.
+    def _build_eval_context(self, tokens_delta: int) -> EvalContext:
+        """Build a rank-identical EvalContext for the current optimizer step."""
+        from oplm.eval.context import EvalContext
 
-        Delegates to the :class:`~oplm.eval.Evaluator`, which handles per-task
-        scheduling internally. Returns an empty dict (no-op) when no evals are
-        due or no evaluator is configured.
+        epoch_delta = self.epoch - self._epoch_at_last_opt_step
+        self._epoch_at_last_opt_step = self.epoch
+        return EvalContext(
+            global_step=self.global_step,
+            epoch=self.epoch,
+            tokens_seen=self.tokens_seen,
+            steps_delta=1,
+            tokens_delta=tokens_delta,
+            epoch_delta=epoch_delta,
+            is_final=(self.global_step >= self.total_steps),
+        )
+
+    def _run_eval(self, tokens_delta: int) -> dict[str, float]:
+        """Run all due evaluations for the current optimizer step.
+
+        Builds a rank-identical :class:`~oplm.eval.context.EvalContext` and delegates
+        to :meth:`~oplm.eval.Evaluator.run_due`, which handles per-task scheduling and
+        unwraps the (wrapped) model only when a task is due. Returns an empty dict when
+        no evaluator is configured or nothing is due.
         """
         if self.evaluator is None:
             return {}
-
-        unwrapped = self.accelerator.unwrap_model(self.model)
-        return self.evaluator(unwrapped, self.accelerator, self.global_step)
+        ctx = self._build_eval_context(tokens_delta)
+        return self.evaluator.run_due(ctx, self.model, self.accelerator)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -345,6 +376,12 @@ class Trainer:
             state.get("samples_seen", self.global_step * self._global_effective_batch_size())
         )
         self._set_dataset_epoch(self.epoch)
+
+        # Reset per-opt-step snapshot markers so the first post-resume step computes
+        # correct deltas. tokens_seen is already restored from trainer_state.json; the
+        # half-open crossing test neither re-fires at the resumed step nor skips a multiple.
+        self._epoch_at_last_opt_step = self.epoch
+        self._step_local_tokens = 0
 
         logger.info(
             "Resumed from checkpoint %s (step=%d, epoch=%d, samples=%d, tokens=%d)",

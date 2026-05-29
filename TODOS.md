@@ -815,8 +815,8 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
 
 ### 6.1 Imports and state
 
-- [ ] Add `import torch` to the module-level imports (needed for the token reduction).
-- [ ] In `__init__`, add two state fields next to the other training-state inits
+- [x] Add `import torch` to the module-level imports (needed for the token reduction).
+- [x] In `__init__`, add two state fields next to the other training-state inits
   (`self.global_step = 0`, etc.):
 
   ```python
@@ -826,7 +826,7 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
 
 ### 6.2 Rank-reduce tokens and build the context in the loop
 
-- [ ] In `train()`, find the per-micro-batch accounting:
+- [x] In `train()`, find the per-micro-batch accounting:
 
   ```python
   tokens_in_batch = batch["attention_mask"].sum().item()
@@ -842,7 +842,7 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
   self._samples_seen += len(batch["input_ids"]) * self.accelerator.num_processes
   ```
 
-- [ ] Immediately after `self.global_step += 1` (inside the `sync_gradients` branch),
+- [x] Immediately after `self.global_step += 1` (inside the `sync_gradients` branch),
   reduce the step's tokens across ranks so `tokens_seen` is rank-identical:
 
   ```python
@@ -867,7 +867,7 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
 
 ### 6.3 Build the context and call `run_due`
 
-- [ ] Add the builder method:
+- [x] Add the builder method:
 
   ```python
   def _build_eval_context(self, tokens_delta: int) -> EvalContext:
@@ -890,7 +890,7 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
   top-level eval import — `from oplm.eval.context import EvalContext` at the top of
   `_build_eval_context`).
 
-- [ ] Change `_run_eval` to take the step's `tokens_delta`, build the context, and pass
+- [x] Change `_run_eval` to take the step's `tokens_delta`, build the context, and pass
   the WRAPPED model (the evaluator unwraps behind the due-check):
 
   ```python
@@ -906,7 +906,7 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
 
 ### 6.4 Resume
 
-- [ ] In `_resume_from_checkpoint`, after `self.epoch` is restored, reset the snapshot
+- [x] In `_resume_from_checkpoint`, after `self.epoch` is restored, reset the snapshot
   markers so the first post-resume step computes correct deltas:
 
   ```python
