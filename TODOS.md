@@ -143,10 +143,10 @@ Single source of truth = `OplmTokenizerFast`. This module defines **no
 vocabulary**; it provides an accessor, derived id constants, and per-residue
 vector alignment.
 
-- [ ] **2.1 Accessor:** `get_tokenizer() -> OplmTokenizerFast` returning a fresh
+- [x] **2.1 Accessor:** `get_tokenizer() -> OplmTokenizerFast` returning a fresh
   `OplmTokenizerFast()` (imported from `oplm.model`). Optionally cache a
   module-level singleton; if so, never mutate it.
-- [ ] **2.2 Derived id constants** (compute from the tokenizer instance, never
+- [x] **2.2 Derived id constants** (compute from the tokenizer instance, never
   hardcode literals):
   - `special_ids(tok) -> set[int]` = `set(tok.all_special_ids)` → `{0,1,2,3,32}`.
   - `non_maskable_ids(tok) -> set[int]` = the special ids (cls/pad/eos/unk/mask).
@@ -157,7 +157,7 @@ vector alignment.
     vocab map (`tok.convert_tokens_to_ids`) → expect `range(4, 24)`. Return a
     `torch.long` tensor. This helper is the shared sampling pool reused by the
     collator and (later) eval metrics.
-- [ ] **2.3 Alignment helper:**
+- [x] **2.3 Alignment helper:**
   `align_per_residue(values: Sequence[Sequence[float] | None], *, lengths:
   Sequence[int], total_len: int, fill_special: float = 0.0, fill_pad: float =
   0.0) -> Tensor`:
@@ -170,7 +170,7 @@ vector alignment.
   - Mirror the **exact** truncation rule used for tokens (Phase 4.1): values are
     clipped to `max_length - 2` residues. Raise `ValueError` if a non-`None`
     `values` length disagrees with its sequence length before truncation.
-- [ ] **2.4 Tests** (`tests/data/test_tokenizer.py`):
+- [x] **2.4 Tests** (`tests/data/test_tokenizer.py`):
   - **Parity guard:** for a battery of sequences, ids equal
     `OplmTokenizerFast()(seq).input_ids`; `mask_token_id==32`,
     `pad_token_id==1`, `special_ids=={0,1,2,3,32}`,
