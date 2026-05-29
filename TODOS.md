@@ -1,520 +1,952 @@
-# OPLM Data Tooling — Implementation Plan
+# Eval Harness Implementation Plan
 
-This plan builds the OPLM **data tooling** from scratch per
-[`docs/DATA_TOOLING.md`](docs/DATA_TOOLING.md). It is fully standalone: every
-file path, signature, algorithm, constant, and test is specified here.
+Bring `src/oplm/eval/` (and the trainer's eval integration) into alignment with the
+design in [`docs/EVAL_HARNESS.md`](docs/EVAL_HARNESS.md). This file is **standalone**:
+every change below is specified with the exact file, the current state, and the target
+code. You do not need to read any other document to execute it.
 
-> **From-scratch.** Assume `src/oplm/data/` does **not exist** at implementation
-> time — the previous implementation is removed before you start. Do not edit or
-> port old files; write every module new. `src/oplm/eval/data/` is also gone; the
-> eval harness rewrite is a **separate** effort (future `docs/EVAL.md`) and is out
-> of scope here. This plan delivers the `oplm.data` package that the eval harness
-> will later import, plus the trainer integration.
+## What changes, in one paragraph
 
-Phases are dependency-ordered; each produces independently testable code. Check a
-box only when its code **and** its tests pass.
+Today the trainer passes a bare `global_step: int` to `Evaluator.__call__`, which runs
+a task when `global_step % task.eval_every == 0`. We replace this with: a frozen,
+**rank-synchronized** `EvalContext` carrying cumulative counters and per-step deltas; a
+`Schedule` strategy object per task that fires via a **crossing test** supporting
+**steps and tokens** (epochs deferred); an `Evaluator.run_due(ctx, model, accelerator)`
+that unwraps the model only when something is due; a `every: {unit: N}` config grammar
+replacing `eval_every`; deletion of the duplicated `src/oplm/eval/data/` loaders in
+favor of `oplm.data`; and a trainer-side change so `tokens_seen` is the rank-reduced
+global token count (required for token cadence not to deadlock).
 
-## Conventions
+## Ground rules (respect throughout)
 
-- Python ≥ 3.11; `from __future__ import annotations` at the top of every file.
-- Type hints on all signatures; Google-style docstrings on public APIs.
-- `ruff format` / `ruff check`; line length 100; absolute imports only.
-- No logic in `__init__.py`. No `os.path` — use `pathlib.Path`. No bare `except`.
-- Tensor shape comments on non-trivial ops, e.g. `# (B, T) -> (B, T, V)`.
-- Tests: `pytest`, mirror layout under `tests/data/`. Prefer **real** data
-  fixtures. Mark heavy/model tests `@pytest.mark.slow`; session-scope large
-  fixtures.
+- **`oplm.data` must never import `oplm.eval`.** The cadence *spec* type (`ScheduleSpec`)
+  and its parser (`parse_schedule_block`) live in `oplm.config` so both the data/config
+  layer and the eval layer can use them with no cycle. The cadence *behavior*
+  (`Schedule`, `build_schedule`) lives in `oplm.eval`.
+- **The rank-sync invariant is load-bearing.** Every `EvalContext` field must be
+  identical on every distributed rank. Tasks call collectives (`accelerator.reduce`,
+  `dist.all_gather_object`) inside `evaluate`; if ranks disagree on "is this task due,"
+  the run deadlocks at the collective. This is why token counts must be rank-reduced.
+- **Schedules hold no state** — they are pure functions of `EvalContext`, which makes
+  resume work with nothing to persist.
+- Style: `from __future__ import annotations` in every file; type hints on all
+  signatures; Google-style docstrings; line length 100; `ruff` + `mypy` clean.
 
-## Glossary
+## Files touched
 
-- `B` = batch size; `T` = padded sequence length (incl. `<cls>`/`<eos>`).
-- `L` = raw residue length of one sequence.
-- `n_eligible` = count of maskable positions in a sequence (excludes specials/pad).
-- `k` = `round(mask_prob * n_eligible)` = number of positions masked per sequence.
-- `V` = vocab size = **33** (canonical tokenizer).
-- `w_i` = per-residue masking weight at position `i`.
-
-## Canonical facts (depend on these; do not re-derive)
-
-- **Tokenizer:** `OplmTokenizerFast` from
-  [`src/oplm/model/tokenization_oplm.py`](src/oplm/model/tokenization_oplm.py),
-  exported by `oplm.model`. 33 tokens, ESM-C order:
-  - specials: `<cls>`=0, `<pad>`=1, `<eos>`=2, `<unk>`=3, `<mask>`=32.
-  - 20 standard amino acids occupy contiguous IDs **4–23**
-    (`L,A,G,V,S,E,R,T,I,D,P,K,Q,N,F,Y,M,H,W,C`).
-  - ambiguous/gap/structure tokens: `X`24,`B`25,`U`26,`Z`27,`O`28,`.`29,`-`30,`|`31.
-  - sanity: `OplmTokenizerFast()("MEEPQ").input_ids == [0, 20, 9, 9, 14, 16, 2]`.
-  - templating wraps every sequence with `<cls> … <eos>`; pad with id 1.
-- **Model (for integration tests):** `OplmForMaskedLM` from `oplm.model`.
-  `forward(input_ids, attention_mask, labels=None, output_attentions=None,
-  output_hidden_states=None)` → `MaskedLMOutput(loss, logits, hidden_states,
-  attentions)`. Loss is `cross_entropy(logits.view(-1,V), labels.view(-1),
-  ignore_index=-100)`. `output_attentions=True` exposes attention (structure
-  eval); `output_hidden_states=True` exposes hidden states (downstream eval).
-- **Pooling helpers:** `mean_pool(hidden, attention_mask)` and `cls_pool(hidden)`
-  in [`src/oplm/model/embedding.py`](src/oplm/model/embedding.py) (for downstream).
-- **Config:** `OplmConfig`/`ModelConfig`/`TrainConfig`/`DataConfig` plus
-  `TrainDatasetEntry`/`EvalDatasetEntry` in
-  [`src/oplm/config.py`](src/oplm/config.py).
-- **Deps:** `pyarrow` and `numpy` are core deps (parquet, math). `biopython` and
-  `scikit-learn` are under the `train` extra (structure parsing must lazy-import
-  biopython). Use `torch` for all tensor/RNG work.
-
-> **Note:** `ModelConfig.vocab_size` defaults to **33**, matching the 33-token
-> tokenizer (the legacy `32` default and the value in `configs/model/base.yaml`
-> were corrected). Integration tests can rely on the default; no override needed.
+| Action | Path |
+| --- | --- |
+| modify | `src/oplm/config.py` (add `ScheduleSpec`, `parse_schedule_block`; change `EvalDatasetEntry`, `TrainConfig`; reject removed `eval_every`) |
+| modify | `src/oplm/data/config.py` (`parse_eval_configs` → `every:` grammar) |
+| create | `src/oplm/eval/context.py` (`EvalContext`) |
+| create | `src/oplm/eval/schedule.py` (`Schedule`, `_crossed`, `EveryNSteps`, `EveryNTokens`, `build_schedule`) |
+| modify | `src/oplm/eval/tasks/base.py` (`EvalTask` holds a `Schedule`) |
+| modify | `src/oplm/eval/evaluator.py` (`run_due`, unwrap-behind-due-check, `needs_token_count`) |
+| modify | `src/oplm/eval/tasks/sequence.py` (import loader from `oplm.data`) |
+| modify | `src/oplm/eval/tasks/structure.py` (import from `oplm.data`; canonical tokenizer; `StructureTaskConfig`) |
+| delete | `src/oplm/eval/data/` (`__init__.py`, `sequence_loader.py`, `structure_loader.py`) |
+| modify | `src/oplm/eval/__init__.py` (public API) |
+| modify | `src/oplm/training/trainer.py` (build `EvalContext`; rank-reduce tokens; call `run_due`) |
+| modify | `configs/README.md` (document `every:` + `eval_default_every`) |
+| create | `tests/eval/test_*.py` (the harness is currently untested) |
 
 ---
 
-## Phase 0 — Scaffolding & dependencies
+## Phase 1 — Config foundation
 
-- [x] **0.1 Create the package tree** (empty modules, with module docstrings):
-  ```
-  src/oplm/data/__init__.py
-  src/oplm/data/tokenizer.py
-  src/oplm/data/config.py
-  src/oplm/data/sequence/__init__.py
-  src/oplm/data/sequence/dataset.py
-  src/oplm/data/sequence/collate.py
-  src/oplm/data/sequence/loaders.py
-  src/oplm/data/structure/__init__.py
-  src/oplm/data/structure/loader.py
-  src/oplm/data/variant/__init__.py
-  src/oplm/data/variant/loader.py
-  src/oplm/data/downstream/__init__.py
-  src/oplm/data/downstream/loader.py
-  ```
-- [x] **0.2 Test tree:** create `tests/data/__init__.py`,
-  `tests/data/sequence/__init__.py`, etc., and `tests/data/conftest.py` for
-  shared fixtures. Create `tests/data/fixtures/` for real data.
-- [x] **0.3 Import hygiene:** `import oplm.data` (and any submodule) must **not**
-  import `oplm.eval`. `oplm/__init__.py` already imports only `.model`; keep it
-  that way. Add a test asserting `import oplm.data` succeeds without the eval
-  package present.
-- [x] **0.4 Deps check:** confirm `pyarrow`/`numpy` in core deps and
-  `biopython`/`scikit-learn` in the `train` extra of `pyproject.toml` (already
-  present). No new deps required.
+The cadence spec and parser are the shared contract. Do this first; everything depends
+on it.
 
----
+### 1.1 Add `ScheduleSpec` and `parse_schedule_block` to `src/oplm/config.py`
 
-## Phase 1 — Configuration surface
+- [ ] Add a module-level constant and the spec dataclass (place near the other
+  `_VALID_*` tuples, before `EvalDatasetEntry`):
 
-- [x] **1.1 Extend `DataConfig`** in `src/oplm/config.py` with three fields
-  (defaults shown):
   ```python
-  mask_token_prob: float = 0.8       # of masked positions -> <mask>
-  random_token_prob: float = 0.1     # of masked positions -> random canonical AA
-  weighted_masking: bool = False     # honor masking_weights column when True
+  _VALID_SCHEDULE_UNITS = ("steps", "tokens")  # "epochs" deferred — EVAL_HARNESS.md §4.6
+  _SCHEDULE_KEYS = frozenset({*_VALID_SCHEDULE_UNITS, "at_start", "at_end"})
+
+
+  @dataclass(frozen=True)
+  class ScheduleSpec:
+      """Parsed, behavior-free eval cadence built from an ``every: {unit: N}`` block.
+
+      Carries no behavior so it can live in ``oplm.config`` without importing
+      ``oplm.eval``. The eval harness turns it into a concrete ``Schedule`` via
+      ``oplm.eval.schedule.build_schedule``.
+      """
+
+      unit: str  # one of _VALID_SCHEDULE_UNITS
+      n: int  # positive
+      at_start: bool = False
+      at_end: bool = True
   ```
-  Add validation (in `__post_init__`): `0 <= mask_token_prob <= 1`,
-  `0 <= random_token_prob <= 1`, and `mask_token_prob + random_token_prob <= 1`.
-  Leave existing fields untouched: `train`, `eval`, `mask_prob=0.15`,
-  `num_workers=4`, `pin_memory=True`, `prefetch_factor=4`, `shuffle_shards=True`,
-  `shuffle_rows=True`.
-- [x] **1.2 Update `src/oplm/configs/data/base.yaml`** — add:
-  ```yaml
-  mask_token_prob: 0.8
-  random_token_prob: 0.1
-  weighted_masking: false   # set true to honor the masking_weights column
-  ```
-- [x] **1.3 Implement `data/config.py`** — parsing helpers (entry dataclasses are
-  imported from `oplm.config`, not redefined). If equivalent functions still
-  exist in `config.py`, remove them there so `data/config.py` is the single home.
-  - `parse_train_configs(raw) -> list[TrainDatasetEntry]`:
-    - `raw` is a `str` (single path → one entry, `fraction=1.0`, `name="train"`)
-      **or** a mapping `{name: {path: str, fraction?: float}}`.
-    - Normalize fractions to sum 1.0. Omitted fractions split the remaining mass
-      equally among entries lacking one. Validate each `fraction >= 0` and the
-      total `> 0`. Raise `ValueError` on missing `path`.
-  - `parse_eval_configs(raw, default_eval_every) -> list[EvalDatasetEntry]`:
-    - `raw` is a mapping `{name: {path, type, eval_every?, metrics?, **extra}}`.
-    - Require `path` and `type`; fold unknown keys into `extra`. `eval_every`
-      defaults to `None` (caller falls back to `default_eval_every`).
-- [x] **1.4 Tests** (`tests/data/test_config.py`): single-path expands to one
-  full-weight entry; multi-dataset fractions normalize; omitted fractions split
-  remainder; missing `path` raises; eval parsing requires `path`+`type` and
-  routes extras into `extra`.
 
----
+- [ ] Add the parser (used by both the per-entry `every` and the global default). The
+  `epochs` check must precede the generic unknown-key check so its message wins:
 
-## Phase 2 — Tokenizer access layer (`data/tokenizer.py`)
-
-Single source of truth = `OplmTokenizerFast`. This module defines **no
-vocabulary**; it provides an accessor, derived id constants, and per-residue
-vector alignment.
-
-- [x] **2.1 Accessor:** `get_tokenizer() -> OplmTokenizerFast` returning a fresh
-  `OplmTokenizerFast()` (imported from `oplm.model`). Optionally cache a
-  module-level singleton; if so, never mutate it.
-- [x] **2.2 Derived id constants** (compute from the tokenizer instance, never
-  hardcode literals):
-  - `special_ids(tok) -> set[int]` = `set(tok.all_special_ids)` → `{0,1,2,3,32}`.
-  - `non_maskable_ids(tok) -> set[int]` = the special ids (cls/pad/eos/unk/mask).
-  - `mask_token_id(tok)` = `tok.mask_token_id` (32); `pad_token_id(tok)` =
-    `tok.pad_token_id` (1).
-  - `canonical_amino_acid_ids(tok) -> Tensor`: the 20 standard-AA token ids. Build
-    by converting each char of `"LAGVSERTIDPKQNFYMHWC"` through the tokenizer's
-    vocab map (`tok.convert_tokens_to_ids`) → expect `range(4, 24)`. Return a
-    `torch.long` tensor. This helper is the shared sampling pool reused by the
-    collator and (later) eval metrics.
-- [x] **2.3 Alignment helper:**
-  `align_per_residue(values: Sequence[Sequence[float] | None], *, lengths:
-  Sequence[int], total_len: int, fill_special: float = 0.0, fill_pad: float =
-  0.0) -> Tensor`:
-  - Produces a `(B, total_len)` float tensor aligned to tokenized `input_ids`:
-    for each row, position 0 (`<cls>`) and the `<eos>` position get
-    `fill_special`; residue positions `1..1+len_i` get the (already
-    truncation-clipped) values; trailing pad positions get `fill_pad`.
-  - Rows whose `values` is `None` → fill residue positions with `1.0` so a
-    missing-weight row is treated as uniform; document this choice.
-  - Mirror the **exact** truncation rule used for tokens (Phase 4.1): values are
-    clipped to `max_length - 2` residues. Raise `ValueError` if a non-`None`
-    `values` length disagrees with its sequence length before truncation.
-- [x] **2.4 Tests** (`tests/data/test_tokenizer.py`):
-  - **Parity guard:** for a battery of sequences, ids equal
-    `OplmTokenizerFast()(seq).input_ids`; `mask_token_id==32`,
-    `pad_token_id==1`, `special_ids=={0,1,2,3,32}`,
-    `canonical_amino_acid_ids().tolist()==list(range(4,24))`. (This is the test
-    that catches any vocab regression.)
-  - **Alignment:** weights line up with `input_ids` (specials/pad get fill);
-    truncation matches; length mismatch raises; `None` row → uniform.
-
----
-
-## Phase 3 — Sequence datasets (`data/sequence/dataset.py`)
-
-### On-disk format
-Parquet file (`.parquet`/`.parq`/`.pq`) or a directory of such shards. Required
-columns `sequence_id` (str), `sequence` (str, raw one-letter AAs). Optional
-`masking_weights` (`list[float]`, length == `len(sequence)`).
-
-### Seed mixing (use these exact constants for reproducibility)
-```python
-_PHI    = 0x9E3779B97F4A7C15   # golden-ratio mix
-_PRIME  = 0x0100_0003
-_MASK32 = 0xFFFF_FFFF
-def _epoch_seed(base, epoch):        return (( _PHI ^ base) + epoch * _PRIME) & _MASK32
-def _shard_row_seed(epoch_seed, s):  return (epoch_seed + 1009 + s)        & _MASK32
-```
-
-### Distributed/worker context
-Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
-- rank/world_size from `torch.distributed` if `is_available() and
-  is_initialized()`, else env `RANK`/`WORLD_SIZE`, else `(0, 1)`.
-- worker_id/num_workers from `torch.utils.data.get_worker_info()`, else `(0, 1)`.
-- joint index = `rank * num_workers + worker_id`; stride =
-  `world_size * num_workers`.
-
-- [x] **3.1 `ShardedProteinDataset(IterableDataset)`**:
   ```python
-  ShardedProteinDataset(
-      path: str | Path, *,
-      shuffle_shards: bool = True,
-      shuffle_rows: bool = True,
-      seed: int = 0,
-      load_masking_weights: bool = False,
+  def parse_schedule_block(raw: Any, label: str) -> ScheduleSpec:
+      """Parse an ``every: {unit: N, at_start?, at_end?}`` mapping into a ScheduleSpec.
+
+      Args:
+          raw: The cadence mapping (a dataset's ``every`` or ``train.eval_default_every``).
+          label: Human-readable source used in error messages.
+
+      Raises:
+          ValueError: If ``raw`` is not a mapping, names ``epochs`` (deferred), does not
+              name exactly one valid unit, has unknown keys, or the unit value is not a
+              positive int.
+      """
+      if not isinstance(raw, dict):
+          raise ValueError(
+              f"{label}: cadence must be a mapping like {{steps: N}} or {{tokens: N}}, "
+              f"got {type(raw).__name__}"
+          )
+      if "epochs" in raw:
+          raise ValueError(
+              f"{label}: epoch cadence is not yet supported (see docs/EVAL_HARNESS.md "
+              f"§4.6); use {{steps: N}} or {{tokens: N}}"
+          )
+      unknown = [k for k in raw if k not in _SCHEDULE_KEYS]
+      if unknown:
+          raise ValueError(f"{label}: unknown keys in cadence block: {sorted(unknown)}")
+      unit_keys = [k for k in raw if k in _VALID_SCHEDULE_UNITS]
+      if len(unit_keys) != 1:
+          raise ValueError(
+              f"{label}: cadence must name exactly one of {list(_VALID_SCHEDULE_UNITS)}, "
+              f"got {sorted(unit_keys)}"
+          )
+      unit = unit_keys[0]
+      n = raw[unit]
+      if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+          raise ValueError(f"{label}: cadence {unit!r} must be a positive int, got {n!r}")
+      return ScheduleSpec(
+          unit=unit,
+          n=n,
+          at_start=bool(raw.get("at_start", False)),
+          at_end=bool(raw.get("at_end", True)),
+      )
+  ```
+
+### 1.2 Change `EvalDatasetEntry` (in `src/oplm/config.py`)
+
+- [ ] Replace the `eval_every: int | None = None` field with `schedule: ScheduleSpec`.
+  Field order must keep non-default fields before defaulted ones:
+
+  ```python
+  @dataclass
+  class EvalDatasetEntry:
+      """Parsed configuration for a single evaluation dataset.
+
+      Populated by :func:`oplm.data.config.parse_eval_configs`, not directly from YAML.
+      """
+
+      name: str
+      path: str
+      type: str  # registry key: "sequence", "structure", ...
+      schedule: ScheduleSpec  # was: eval_every: int | None
+      metrics: list[str] | None = None
+      extra: dict[str, Any] = field(default_factory=dict)
+  ```
+
+### 1.3 Change `TrainConfig` (in `src/oplm/config.py`)
+
+- [ ] Remove `eval_every: int = 10_000`.
+- [ ] Add a structured default mirroring the per-entry grammar (place where
+  `eval_every` was, in the logging block):
+
+  ```python
+  # Default eval cadence for datasets that omit `every`. Same grammar as a
+  # data.eval.<name>.every block: exactly one of {steps, tokens}. Parsed into a
+  # ScheduleSpec by the Evaluator via oplm.config.parse_schedule_block.
+  eval_default_every: Any = field(default_factory=lambda: {"steps": 10_000})
+  ```
+
+  (`Any` + `default_factory` dict matches the existing `DataConfig.eval: Any = None`
+  pattern; OmegaConf merges it as a plain mapping.)
+
+### 1.4 Reject the removed `train.eval_every` (in `src/oplm/config.py`)
+
+- [ ] Add a rejector next to the existing `_reject_removed_sequence_length_alias`,
+  reusing `_lookup_nested_mapping_value` / `_NESTED_VALUE_MISSING`:
+
+  ```python
+  def _reject_removed_eval_every_alias(override_dicts: list[Any]) -> None:
+      """Reject the removed steps-only ``train.eval_every`` override."""
+      present = any(
+          _lookup_nested_mapping_value(ov, ("train", "eval_every")) is not _NESTED_VALUE_MISSING
+          for ov in override_dicts
+      )
+      if present:
+          raise ValueError(
+              "`train.eval_every` has been removed. Use "
+              "`train.eval_default_every: {steps: N}` (or {tokens: N}) for the global "
+              "default eval cadence."
+          )
+  ```
+
+- [ ] In `load_config`, call it right after the existing sequence-length rejection:
+
+  ```python
+  _reject_removed_sequence_length_alias(override_dicts)
+  _reject_removed_eval_every_alias(override_dicts)
+  ```
+
+### 1.5 Update `parse_eval_configs` (in `src/oplm/data/config.py`)
+
+- [ ] Update the import to pull the spec and parser from `oplm.config`:
+
+  ```python
+  from oplm.config import EvalDatasetEntry, ScheduleSpec, TrainDatasetEntry, parse_schedule_block
+  ```
+
+- [ ] Replace `eval_every` with `every` in the known-keys set:
+
+  ```python
+  _KNOWN_EVAL_KEYS = frozenset({"path", "type", "every", "metrics"})
+  ```
+
+- [ ] Change the signature and the per-entry body. New signature:
+
+  ```python
+  def parse_eval_configs(raw: Any, default_schedule: ScheduleSpec) -> list[EvalDatasetEntry]:
+  ```
+
+  Inside the per-entry loop, **after** the existing `path`/`type` checks and the
+  existing nested-`extra` rejection, replace the old `eval_every` handling with:
+
+  ```python
+  if "eval_every" in value:
+      raise ValueError(
+          f"Eval dataset {name!r} uses the removed `eval_every` key. "
+          f"Use `every: {{steps: N}}` (or {{tokens: N}})."
+      )
+
+  raw_every = value.get("every")
+  schedule = (
+      parse_schedule_block(raw_every, f"data.eval.{name}.every")
+      if raw_every is not None
+      else default_schedule
+  )
+
+  raw_metrics = value.get("metrics")
+  metrics = [str(m) for m in raw_metrics] if raw_metrics is not None else None
+  extra = {k: v for k, v in value.items() if k not in _KNOWN_EVAL_KEYS}
+
+  entries.append(
+      EvalDatasetEntry(
+          name=str(name),
+          path=str(path),
+          type=str(eval_type),
+          schedule=schedule,
+          metrics=metrics,
+          extra=extra,
+      )
   )
   ```
-  - `__init__`: resolve `path` to a sorted list of shard files (single file → one
-    shard). Read each shard's row count from parquet metadata without loading
-    rows (`pyarrow.parquet.ParquetFile(p).metadata.num_rows`). Store shards +
-    counts; cache `_total_rows`.
-  - `__len__` / `total_length` → `_total_rows`.
-  - `set_epoch(epoch)`: store epoch (the iterator uses it to seed shuffles).
-    Stable across runs/ranks for a given `(seed, epoch)`.
-  - `__iter__`:
-    1. compute `epoch_seed = _epoch_seed(seed, epoch)`.
-    2. shard order: if `shuffle_shards`, permute shard indices with a generator
-       seeded by `epoch_seed`; else natural order.
-    3. for each shard `s` (in order): read columns
-       `["sequence_id","sequence"] (+ ["masking_weights"] if
-       load_masking_weights)` via pyarrow; if `shuffle_rows`, permute row indices
-       with a generator seeded by `_shard_row_seed(epoch_seed, s)`.
-    4. **striping:** yield only rows whose running global row index satisfies
-       `idx % stride == joint_index` (stride/joint from the context helper), so
-       each `(rank, worker)` gets a disjoint, gap-free subset.
-    5. yield `dict(sequence_id=…, sequence=…)`, plus
-       `masking_weights=<list[float] | None>` when `load_masking_weights`.
-  - When `load_masking_weights=True` but a shard lacks the column → yield `None`
-    for that field (do not error here; collator handles fallback + one-time warn).
-- [x] **3.2 `InterleavedDataset(IterableDataset)`**:
-  ```python
-  InterleavedDataset(datasets, fractions, *, num_samples=None, seed=0)
-  ```
-  - Normalize `fractions` to sum 1.0 (validate `>=0`, sum `>0`).
-  - `set_epoch` propagates to all sub-datasets.
-  - `__iter__`: seed a generator per `(epoch, rank, worker)`. Maintain one live
-    iterator per source. For `num_samples` steps (default = Σ source lengths,
-    striped per worker): pick a source via `multinomial(fractions)`; pull its
-    next item; on `StopIteration`, re-`iter()` that source and continue. Yield
-    items unchanged (pass through the dict incl. any `masking_weights`).
-- [x] **3.3 Tests** (`tests/data/sequence/test_dataset.py`), using a tiny real
-  parquet fixture (write 2 shards in a fixture; see Phase 10 fixture helper):
-  - same `(seed, epoch)` → identical row order; different epochs → different.
-  - **striping coverage:** simulate `(world_size, num_workers)` ∈
-    {(1,1),(1,2),(2,2)}; union of yielded `sequence_id`s == full set, no dups.
-  - interleaving sampling ratio over many draws ≈ `fractions`; exhausted sources
-    refill.
-  - `load_masking_weights`: column surfaced when present; `None` when absent.
+
+  Update the function docstring to describe `every` instead of `eval_every`.
 
 ---
 
-## Phase 4 — Collation (`data/sequence/collate.py`)
+## Phase 2 — Scheduling primitives
 
-### 4.1 Pad/tokenize primitive
-- [x] `tokenize_and_pad(batch, tokenizer, max_length) -> dict[str, Tensor]`:
-  - Accept `list[dict]` (uses `"sequence"`) or `list[str]`.
-  - Truncate each raw sequence to `max_length - 2` chars (room for
-    `<cls>`/`<eos>`).
-  - Tokenize with the canonical tokenizer; pad to the batch-max length with
-    `pad_token_id`. Return `{"input_ids": (B,T) long, "attention_mask": (B,T)
-    long}`. **No masking, no labels.** (Used by variant/structure/downstream.)
-  - Provide an optional path to also return aligned `masking_weights` (B,T) via
-    `align_per_residue` (Phase 2.3) when weights are supplied — used internally by
-    the MLM collator; keep the public primitive's default output to the two keys.
+### 2.1 Create `src/oplm/eval/context.py`
 
-### 4.2 MLM-mask layer
-- [x] `MLMCollator`:
+- [ ] New file:
+
   ```python
-  MLMCollator(
-      tokenizer, max_length=1024,
-      mask_prob=0.15, mask_token_prob=0.8, random_token_prob=0.1, *,
-      weighted_masking=False, deterministic=False, seed=0,
+  """Immutable training-state snapshot handed across the trainer↔eval boundary."""
+
+  from __future__ import annotations
+
+  from dataclasses import dataclass
+
+
+  @dataclass(frozen=True)
+  class EvalContext:
+      """Synchronized training state for one optimizer step.
+
+      INVARIANT: every field MUST be identical across all distributed ranks, so each
+      rank independently computes the same ``Schedule.is_due`` without communicating.
+      Tasks run collectives inside ``evaluate``; a rank disagreement would deadlock.
+      See docs/EVAL_HARNESS.md §3.2.
+      """
+
+      global_step: int  # cumulative optimizer steps completed
+      epoch: int  # cumulative epochs (carried for future epoch cadence; unused now)
+      tokens_seen: int  # cumulative GLOBAL tokens — rank-reduced, not per-rank
+      steps_delta: int  # optimizer steps since the previous context (== 1)
+      tokens_delta: int  # GLOBAL tokens processed in this optimizer step (rank-reduced)
+      epoch_delta: int  # epochs crossed since the previous context (0/1; future use)
+      is_final: bool  # True on the last optimizer step (global_step >= total_steps)
+  ```
+
+### 2.2 Create `src/oplm/eval/schedule.py`
+
+- [ ] New file. The crossing test reduces to `step % n == 0` for steps (delta 1) and
+  fires once when a counter passes a multiple for tokens:
+
+  ```python
+  """Eval cadence strategies — pure functions of EvalContext. See EVAL_HARNESS.md §4."""
+
+  from __future__ import annotations
+
+  from dataclasses import dataclass
+  from typing import Protocol, runtime_checkable
+
+  from oplm.config import ScheduleSpec
+  from oplm.eval.context import EvalContext
+
+
+  def _crossed(curr: int, delta: int, n: int) -> bool:
+      """True iff the half-open interval ``(curr - delta, curr]`` contains a multiple of n."""
+      return curr // n > (curr - delta) // n
+
+
+  @runtime_checkable
+  class Schedule(Protocol):
+      """Decides, from a synchronized EvalContext, whether a task runs this step."""
+
+      def is_due(self, ctx: EvalContext) -> bool: ...
+
+
+  @dataclass(frozen=True)
+  class EveryNSteps:
+      """Fire every ``n`` optimizer steps."""
+
+      n: int
+      at_start: bool = False
+      at_end: bool = True
+
+      def is_due(self, ctx: EvalContext) -> bool:
+          return (
+              (self.at_start and ctx.global_step - ctx.steps_delta == 0)
+              or (self.at_end and ctx.is_final)
+              or _crossed(ctx.global_step, ctx.steps_delta, self.n)
+          )
+
+
+  @dataclass(frozen=True)
+  class EveryNTokens:
+      """Fire each time cumulative global tokens cross a multiple of ``n``."""
+
+      n: int
+      at_start: bool = False
+      at_end: bool = True
+
+      def is_due(self, ctx: EvalContext) -> bool:
+          return (
+              (self.at_start and ctx.tokens_seen - ctx.tokens_delta == 0)
+              or (self.at_end and ctx.is_final)
+              or _crossed(ctx.tokens_seen, ctx.tokens_delta, self.n)
+          )
+
+
+  _SCHEDULE_BY_UNIT: dict[str, type] = {"steps": EveryNSteps, "tokens": EveryNTokens}
+
+
+  def build_schedule(spec: ScheduleSpec) -> Schedule:
+      """Turn a parsed :class:`ScheduleSpec` into a concrete :class:`Schedule`."""
+      cls = _SCHEDULE_BY_UNIT.get(spec.unit)
+      if cls is None:
+          raise ValueError(
+              f"Unsupported schedule unit {spec.unit!r}; supported: {sorted(_SCHEDULE_BY_UNIT)}"
+          )
+      return cls(n=spec.n, at_start=spec.at_start, at_end=spec.at_end)
+  ```
+
+---
+
+## Phase 3 — Evaluator & EvalTask base
+
+### 3.1 Update `src/oplm/eval/tasks/base.py`
+
+- [ ] `EvalTask.__init__` builds a `Schedule` from the entry instead of holding
+  `eval_every`. Add the import and rewrite the constructor:
+
+  ```python
+  from oplm.eval.schedule import build_schedule
+  ```
+
+  ```python
+  def __init__(self, entry: EvalDatasetEntry, cfg: OplmConfig) -> None:
+      self.name = entry.name
+      self.path = entry.path
+      self.metrics = entry.metrics or self.default_metrics
+      self.schedule = build_schedule(entry.schedule)
+      self.cfg = cfg
+  ```
+
+  Remove the `self.eval_every` line. The abstract `evaluate(self, model, accelerator)`
+  signature is unchanged. (Add `Schedule` to the `TYPE_CHECKING` block if you annotate
+  `self.schedule`.)
+
+### 3.2 Rewrite `src/oplm/eval/evaluator.py`
+
+- [ ] Replace the class body. Construction resolves the global default schedule, parses
+  entries, builds tasks, and warns on a provably-unreachable step schedule. `run_due`
+  takes an `EvalContext`, returns `{}` cheaply when nothing is due, and unwraps the
+  model only when at least one task runs:
+
+  ```python
+  """Evaluator orchestrator — the single integration point between Trainer and tasks."""
+
+  from __future__ import annotations
+
+  import logging
+  from typing import TYPE_CHECKING
+
+  from oplm.config import parse_schedule_block
+  from oplm.data.config import parse_eval_configs
+  from oplm.eval.registry import get_eval_task_class
+  from oplm.eval.schedule import EveryNSteps, EveryNTokens
+
+  if TYPE_CHECKING:
+      from accelerate import Accelerator
+
+      from oplm.config import OplmConfig
+      from oplm.eval.context import EvalContext
+      from oplm.eval.tasks.base import EvalTask
+      from oplm.model.transformer import OplmForMLM
+
+  logger = logging.getLogger(__name__)
+
+
+  class Evaluator:
+      """Builds eval tasks from config and runs the ones due at the current step."""
+
+      def __init__(self, cfg: OplmConfig) -> None:
+          import oplm.eval.tasks  # noqa: F401  -- triggers task registration
+
+          default_schedule = parse_schedule_block(
+              cfg.train.eval_default_every, "train.eval_default_every"
+          )
+          entries = parse_eval_configs(cfg.data.eval, default_schedule)
+          self.tasks: list[EvalTask] = []
+          for entry in entries:
+              cls = get_eval_task_class(entry.type)
+              self.tasks.append(cls(entry, cfg))
+              logger.info(
+                  "Registered eval task %r (type=%s, schedule=%r)",
+                  entry.name,
+                  entry.type,
+                  entry.schedule,
+              )
+          self._warn_unreachable(cfg)
+
+      def _warn_unreachable(self, cfg: OplmConfig) -> None:
+          """Warn about step schedules that can provably never fire (step-bounded runs)."""
+          if cfg.train.max_epochs is not None:
+              return  # total steps not known here for epoch-bounded runs
+          total_steps = cfg.train.max_steps
+          for task in self.tasks:
+              sched = task.schedule
+              if isinstance(sched, EveryNSteps) and not sched.at_end and sched.n > total_steps:
+                  logger.warning(
+                      "Eval task %r: step cadence n=%d exceeds max_steps=%d and at_end is "
+                      "false; it will never run.",
+                      task.name,
+                      sched.n,
+                      total_steps,
+                  )
+
+      def run_due(
+          self, ctx: EvalContext, model: OplmForMLM, accelerator: Accelerator
+      ) -> dict[str, float]:
+          """Run every task due at ``ctx`` and return merged ``eval/<name>/<metric>`` metrics.
+
+          Returns an empty dict (and does no unwrap / no eval-mode toggle) when nothing
+          is due. ``model`` is the WRAPPED model; it is unwrapped here only when needed.
+          """
+          due = [t for t in self.tasks if t.schedule.is_due(ctx)]
+          if not due:
+              return {}
+          unwrapped = accelerator.unwrap_model(model)
+          unwrapped.eval()
+          metrics: dict[str, float] = {}
+          try:
+              for task in due:
+                  for key, value in task.evaluate(unwrapped, accelerator).items():
+                      metrics[f"eval/{task.name}/{key}"] = value
+          finally:
+              unwrapped.train()
+          return metrics
+
+      @property
+      def has_tasks(self) -> bool:
+          """Whether any eval tasks are configured."""
+          return len(self.tasks) > 0
+
+      @property
+      def needs_token_count(self) -> bool:
+          """Whether any task uses a token schedule (so the trainer must reduce tokens)."""
+          return any(isinstance(t.schedule, EveryNTokens) for t in self.tasks)
+  ```
+
+---
+
+## Phase 4 — Migrate tasks to `oplm.data`; delete `eval/data/`
+
+### 4.1 `src/oplm/eval/tasks/sequence.py`
+
+- [ ] Change the loader import from the (to-be-deleted) eval copy to `oplm.data`:
+
+  ```python
+  from oplm.data import build_sequence_eval_dataloader  # was: oplm.eval.data.sequence_loader
+  ```
+
+- [ ] Remove `_reset_dataloader_state` and its call. `oplm.data`'s
+  `build_sequence_eval_dataloader` returns a `_ResettingDataLoader` that rewinds the
+  deterministic collator on every `__iter__`, so the manual reset is redundant.
+  `evaluate` becomes:
+
+  ```python
+  def evaluate(self, model: OplmForMLM, accelerator: Accelerator) -> dict[str, float]:
+      if self._dataloader is None:
+          self._dataloader = build_sequence_eval_dataloader(self.path, self.cfg)
+      all_metrics = compute_mlm_metrics(model, self._dataloader, accelerator)
+      return {k: v for k, v in all_metrics.items() if k in self.metrics}
+  ```
+
+  Keep the `compute_mlm_metrics` import from `oplm.eval.metrics.mlm` (metrics stay in
+  eval). Keep `self._dataloader` lazy init.
+
+### 4.2 `src/oplm/eval/tasks/structure.py`
+
+- [ ] Replace the two top imports:
+
+  ```python
+  # remove:
+  #   from oplm.data.tokenizer import ProteinTokenizer
+  #   from oplm.eval.data.structure_loader import StructureData, load_structures
+  # add:
+  from oplm.data import StructureData, get_tokenizer, load_structures
+  ```
+
+  Keep the `metrics.contact` / `metrics.categorical_jacobian` imports (eval-owned).
+
+- [ ] Add a typed task config and parse `entry.extra` once. Add this dataclass near the
+  top of the module (it carries the exact current defaults and the two current
+  validations):
+
+  ```python
+  @dataclass(frozen=True)
+  class StructureTaskConfig:
+      """Typed structure-eval knobs, parsed from EvalDatasetEntry.extra."""
+
+      contact_threshold: float = 8.0
+      min_seq_sep: int = 6
+      l_divisor: int = 1
+      use_cbeta: bool = True
+      use_logistic_regression: bool = True
+      logreg_n_train: int = 20
+      logreg_n_iterations: int = 5
+      logreg_c: float = 0.15
+      use_categorical_jacobian: bool = False
+      categorical_jacobian_sample_size: int | None = None
+      categorical_jacobian_sample_seed: int = 42
+      categorical_jacobian_mutation_batch_size: int = 20
+      max_structures: int | None = None
+
+      @classmethod
+      def from_extra(cls, extra: dict[str, Any]) -> StructureTaskConfig:
+          def _opt_int(key: str) -> int | None:
+              return int(extra[key]) if key in extra else None
+
+          cfg = cls(
+              contact_threshold=float(extra.get("contact_threshold", 8.0)),
+              min_seq_sep=int(extra.get("min_seq_sep", 6)),
+              l_divisor=int(extra.get("l_divisor", 1)),
+              use_cbeta=bool(extra.get("use_cbeta", True)),
+              use_logistic_regression=bool(extra.get("use_logistic_regression", True)),
+              logreg_n_train=int(extra.get("logreg_n_train", 20)),
+              logreg_n_iterations=int(extra.get("logreg_n_iterations", 5)),
+              logreg_c=float(extra.get("logreg_c", 0.15)),
+              use_categorical_jacobian=bool(extra.get("use_categorical_jacobian", False)),
+              categorical_jacobian_sample_size=_opt_int("categorical_jacobian_sample_size"),
+              categorical_jacobian_sample_seed=int(
+                  extra.get("categorical_jacobian_sample_seed", 42)
+              ),
+              categorical_jacobian_mutation_batch_size=int(
+                  extra.get("categorical_jacobian_mutation_batch_size", 20)
+              ),
+              max_structures=_opt_int("max_structures"),
+          )
+          if cfg.categorical_jacobian_sample_size is not None and (
+              cfg.categorical_jacobian_sample_size < 1
+          ):
+              raise ValueError("categorical_jacobian_sample_size must be >= 1 when provided")
+          if not 1 <= cfg.categorical_jacobian_mutation_batch_size <= 20:
+              raise ValueError("categorical_jacobian_mutation_batch_size must be in [1, 20]")
+          return cfg
+  ```
+
+- [ ] In `__init__`, replace the block of `self.X = ... extra.get(...)` assignments
+  (and the two inline `if` validations) with one line, and update the tokenizer types:
+
+  ```python
+  def __init__(self, entry: EvalDatasetEntry, cfg: OplmConfig) -> None:
+      super().__init__(entry, cfg)
+      self.tcfg = StructureTaskConfig.from_extra(entry.extra)
+      if entry.metrics is None and self.tcfg.use_categorical_jacobian:
+          self.metrics = ["precision_at_L", "categorical_jacobian_precision_at_L"]
+      self._structures: list[StructureData] | None = None
+      self._tokenizer: OplmTokenizerFast | None = None
+      self._canonical_aa_token_ids: torch.Tensor | None = None
+  ```
+
+  Add `from oplm.model import OplmTokenizerFast` under `TYPE_CHECKING` (used only for the
+  annotation).
+
+- [ ] Replace every remaining `self.<knob>` reference in the file with `self.tcfg.<knob>`
+  (`self.contact_threshold` → `self.tcfg.contact_threshold`, `self.min_seq_sep`,
+  `self.l_divisor`, `self.use_cbeta`, `self.use_logistic_regression`,
+  `self.logreg_n_train`, `self.logreg_n_iterations`, `self.logreg_c`,
+  `self.use_categorical_jacobian`, `self.categorical_jacobian_*`, `self.max_structures`).
+  Grep to confirm none remain: `grep -n "self\.\(contact_threshold\|min_seq_sep\|l_divisor\|use_cbeta\|use_logistic_regression\|logreg_\|use_categorical_jacobian\|categorical_jacobian_\|max_structures\)" src/oplm/eval/tasks/structure.py`.
+
+- [ ] In the lazy-init inside `evaluate`, swap the tokenizer constructor:
+
+  ```python
+  if self._tokenizer is None:
+      self._tokenizer = get_tokenizer()  # was: ProteinTokenizer()
+  ```
+
+  Leave `get_canonical_amino_acid_token_ids(self._tokenizer)` and
+  `self._tokenizer.encode(struct.sequence)` as-is — `OplmTokenizerFast` supports both
+  (`.encode(aa, add_special_tokens=False)` and `.encode(seq)` with default special
+  tokens). **Verification (do in Phase 8):** the structure-task test must produce a
+  finite `precision_at_L` in `[0, 1]`; if it does not, the special-token handling of
+  `OplmTokenizerFast.encode(seq)` differs from the legacy tokenizer — pass
+  `add_special_tokens=True` explicitly and confirm the contact extraction still strips
+  the `<cls>`/`<eos>` positions.
+
+- [ ] Optionally update `get_canonical_amino_acid_token_ids`'s parameter annotation in
+  `src/oplm/eval/metrics/categorical_jacobian.py` from `ProteinTokenizer` to
+  `OplmTokenizerFast` (it only calls `.encode`, so behavior is unchanged).
+
+### 4.3 Delete the duplicated loaders
+
+- [ ] Remove the directory and its three files:
+
+  ```bash
+  git rm src/oplm/eval/data/__init__.py \
+         src/oplm/eval/data/sequence_loader.py \
+         src/oplm/eval/data/structure_loader.py
+  ```
+
+- [ ] Confirm nothing else imports them:
+
+  ```bash
+  grep -rn "oplm.eval.data" src/ tests/   # expect no results
+  ```
+
+---
+
+## Phase 5 — Public API
+
+### 5.1 `src/oplm/eval/__init__.py`
+
+- [ ] Export the new types:
+
+  ```python
+  """OPLM evaluation harness. See docs/EVAL_HARNESS.md for the design."""
+
+  from __future__ import annotations
+
+  from oplm.eval.context import EvalContext
+  from oplm.eval.evaluator import Evaluator
+  from oplm.eval.registry import register_eval_task
+  from oplm.eval.schedule import EveryNSteps, EveryNTokens, Schedule
+  from oplm.eval.tasks.base import EvalTask
+
+  __all__ = [
+      "EvalContext",
+      "EvalTask",
+      "Evaluator",
+      "EveryNSteps",
+      "EveryNTokens",
+      "Schedule",
+      "register_eval_task",
+  ]
+  ```
+
+---
+
+## Phase 6 — Trainer integration
+
+All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-identical
+`EvalContext` per optimizer step and call `run_due` with the WRAPPED model.
+
+### 6.1 Imports and state
+
+- [ ] Add `import torch` to the module-level imports (needed for the token reduction).
+- [ ] In `__init__`, add two state fields next to the other training-state inits
+  (`self.global_step = 0`, etc.):
+
+  ```python
+  self._epoch_at_last_opt_step = 0
+  self._step_local_tokens = 0  # local tokens accumulated across the current opt step
+  ```
+
+### 6.2 Rank-reduce tokens and build the context in the loop
+
+- [ ] In `train()`, find the per-micro-batch accounting:
+
+  ```python
+  tokens_in_batch = batch["attention_mask"].sum().item()
+  self.tokens_seen += int(tokens_in_batch) * self.accelerator.num_processes
+  self._samples_seen += len(batch["input_ids"]) * self.accelerator.num_processes
+  ```
+
+  Replace the first two lines (per-rank token estimate) with a local accumulation; leave
+  the samples line:
+
+  ```python
+  self._step_local_tokens += int(batch["attention_mask"].sum().item())
+  self._samples_seen += len(batch["input_ids"]) * self.accelerator.num_processes
+  ```
+
+- [ ] Immediately after `self.global_step += 1` (inside the `sync_gradients` branch),
+  reduce the step's tokens across ranks so `tokens_seen` is rank-identical:
+
+  ```python
+  tokens_tensor = torch.tensor(
+      self._step_local_tokens, device=self.accelerator.device, dtype=torch.long
   )
-  __call__(self, batch: list[dict]) -> dict[str, Tensor]
+  tokens_delta = int(self.accelerator.reduce(tokens_tensor, reduction="sum").item())
+  self.tokens_seen += tokens_delta
+  self._step_local_tokens = 0
   ```
-  Steps inside `__call__` (track a `_batch_idx` counter, increment each call):
-  1. Build a `torch.Generator`. If `deterministic`, `manual_seed(seed +
-     _batch_idx)` (do **not** disturb global RNG — pass this generator to all
-     sampling ops below). Else use a generator seeded from ambient entropy (or
-     the default RNG) so masks are fresh each draw (RoBERTa dynamic).
-  2. `tokenize_and_pad(...)` → `input_ids`, `attention_mask`. Initialize
-     `labels = full_like(input_ids, -100)`.
-  3. **Eligibility** mask `(B,T)`: `attention_mask==1` AND id ∉ `non_maskable_ids`.
-  4. **Weights** `(B,T)`: if `weighted_masking`, align each row's
-     `masking_weights` (from the batch dicts) with `align_per_residue`
-     (`fill=0.0` at specials/pad; missing/`None` row → all `1.0`); if the column
-     is entirely absent across the batch, **warn once** and fall back to uniform.
-     If `weighted_masking=False`, weights are all `1.0` (ignore any column).
-     Set weight `0.0` at non-eligible positions.
-  5. **Selection — Gumbel-top-k per row** (fixed count, sampling without
-     replacement):
-     ```
-     n_eligible_b = eligibility[b].sum()
-     k_b          = round(mask_prob * n_eligible_b)
-     key          = log(weight) + gumbel_noise       # gumbel = -log(-log(U)), U~Uniform(0,1) via generator
-     key[~eligible or weight==0] = -inf
-     masked_idx   = topk(key[b], k_b).indices         # the k_b positions to mask
-     ```
-     Clamp `k_b` to the number of positive-weight eligible positions. Uniform
-     masking is the all-weights-equal special case (same code path).
-  6. **Targets:** `labels[b, masked_idx] = input_ids[b, masked_idx]`.
-  7. **Replacement (BERT 80/10/10)** over masked positions, drawn with the same
-     generator: `mask_token_prob` → `mask_token_id` (32); `random_token_prob` →
-     a uniform draw from `canonical_amino_acid_ids`; remainder → keep original.
-  8. Return `{"input_ids","attention_mask","labels"}` only — `masking_weights`
-     is **not** emitted.
-- [x] **4.3 Tests** (`tests/data/sequence/test_collate.py`):
-  - **Batch contract:** keys/shapes/dtypes per above; `T <= max_seq_len`;
-    `attention_mask` matches padding.
-  - **Fixed-k:** exactly `k=round(mask_prob*n_eligible)` positions per row, no
-    dups; specials/pad never masked; `labels==-100` exactly off-masked positions.
-  - **80/10/10** proportions within tolerance over many batches; random
-    replacements only from `canonical_amino_acid_ids`.
-  - **Dynamic (RoBERTa):** with `deterministic=False`, the same sequence in two
-    calls gets different masked-position sets (across many trials).
-  - **Determinism:** with `deterministic=True`, identical masks for the same
-    `_batch_idx`; global RNG unaffected (snapshot `torch.random.get_rng_state()`
-    before/after).
-  - **Weighted:** count stays `k`; empirical inclusion frequency monotone in
-    `w_i` and ≈ ∝ `w_i`; `w_i=0` never masked; scaling all weights leaves the
-    distribution unchanged; positive-weight `< k` → all positive ones masked;
-    `weighted_masking=False` ignores a present column; entirely-absent column
-    warns + uniform; length mismatch raises (from `align_per_residue`).
+
+  (This also makes the logged `train/tokens` the true global count. To skip the
+  collective when no token-cadence task exists, gate it on
+  `self.evaluator is not None and self.evaluator.needs_token_count` and otherwise fall
+  back to `tokens_delta = self._step_local_tokens * self.accelerator.num_processes`.)
+
+### 6.3 Build the context and call `run_due`
+
+- [ ] Add the builder method:
+
+  ```python
+  def _build_eval_context(self, tokens_delta: int) -> EvalContext:
+      """Build a rank-identical EvalContext for the current optimizer step."""
+      epoch_delta = self.epoch - self._epoch_at_last_opt_step
+      self._epoch_at_last_opt_step = self.epoch
+      return EvalContext(
+          global_step=self.global_step,
+          epoch=self.epoch,
+          tokens_seen=self.tokens_seen,
+          steps_delta=1,
+          tokens_delta=tokens_delta,
+          epoch_delta=epoch_delta,
+          is_final=(self.global_step >= self.total_steps),
+      )
+  ```
+
+  Add `from oplm.eval.context import EvalContext` under `TYPE_CHECKING` (the body uses it
+  only via the trainer; import it lazily inside the method if you prefer to avoid a
+  top-level eval import — `from oplm.eval.context import EvalContext` at the top of
+  `_build_eval_context`).
+
+- [ ] Change `_run_eval` to take the step's `tokens_delta`, build the context, and pass
+  the WRAPPED model (the evaluator unwraps behind the due-check):
+
+  ```python
+  def _run_eval(self, tokens_delta: int) -> dict[str, float]:
+      if self.evaluator is None:
+          return {}
+      ctx = self._build_eval_context(tokens_delta)
+      return self.evaluator.run_due(ctx, self.model, self.accelerator)
+  ```
+
+  Update its call site in `train()` from `self._run_eval()` to
+  `self._run_eval(tokens_delta)`. (Remove the old `unwrap_model` in `_run_eval`.)
+
+### 6.4 Resume
+
+- [ ] In `_resume_from_checkpoint`, after `self.epoch` is restored, reset the snapshot
+  markers so the first post-resume step computes correct deltas:
+
+  ```python
+  self._epoch_at_last_opt_step = self.epoch
+  self._step_local_tokens = 0
+  ```
+
+  `tokens_seen` is already restored from `trainer_state.json`; with the half-open
+  crossing test (§4.6 of the design) step/token schedules neither re-fire at the resumed
+  step nor skip the next multiple.
 
 ---
 
-## Phase 5 — Sequence builders (`data/sequence/loaders.py`)
+## Phase 7 — Config surface docs
 
-- [x] **5.1 `build_train_dataloader(cfg: OplmConfig) -> DataLoader`:**
-  1. `entries = parse_train_configs(cfg.data.train)`.
-  2. one `ShardedProteinDataset(entry.path, shuffle_shards=cfg.data.shuffle_shards,
-     shuffle_rows=cfg.data.shuffle_rows, seed=cfg.train.seed,
-     load_masking_weights=cfg.data.weighted_masking)` per entry.
-  3. if >1 entry → `InterleavedDataset(datasets, [e.fraction…],
-     seed=cfg.train.seed)`.
-  4. `MLMCollator(get_tokenizer(), max_length=cfg.model.max_seq_len,
-     mask_prob=cfg.data.mask_prob, mask_token_prob=cfg.data.mask_token_prob,
-     random_token_prob=cfg.data.random_token_prob,
-     weighted_masking=cfg.data.weighted_masking, deterministic=False,
-     seed=cfg.train.seed)`.
-  5. `DataLoader(dataset, batch_size=cfg.train.batch_size, collate_fn=collator,
-     num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
-     prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers>0 else
-     None)`.
-- [x] **5.2 `build_sequence_eval_dataloader(path: str, cfg: OplmConfig) ->
-  DataLoader`:** same machinery, **eval policy** — `ShardedProteinDataset(path,
-  shuffle_shards=False, shuffle_rows=False, seed=<fixed eval seed, e.g. 42>,
-  load_masking_weights=cfg.data.weighted_masking)`; `MLMCollator(...,
-  deterministic=True, seed=<fixed eval seed>)`; same batch/worker settings.
-- [x] **5.3 Tests** (`tests/data/sequence/test_loaders.py`): a real fixture
-  config yields the documented batch contract; eval builder is deterministic
-  across two passes (identical batches); train builder differs across epochs;
-  `num_workers=0` path returns `prefetch_factor=None`.
+### 7.1 `configs/README.md`
 
----
+- [ ] Replace the `train.eval_every` config-table row with:
 
-## Phase 6 — Structure modality (`data/structure/loader.py`)
+  ```
+  | `train.eval_default_every` | `dict` | `{steps: 10000}` | Default eval cadence (`{steps: N}` or `{tokens: N}`) for datasets that omit `every`. | active |
+  ```
 
-Eval-only modality. **Lazy-import biopython** inside functions; raise a clear
-`ImportError` pointing at `pip install oplm[train]` when missing.
+- [ ] In the Eval Datasets section, replace the per-entry `eval_every` documentation
+  with the `every:` grammar and refer to the design doc:
 
-- [x] **6.1 `StructureData` dataclass:** `name: str`, `sequence: str`,
-  `coords: Tensor  # (L,3,3) backbone N,CA,C; NaN for missing`, `chain_id: str|None`.
-- [x] **6.2 Modified-residue map** (three-letter → one-letter), at least:
-  `MSE→M, SEC→C, CSE→C, SEP→S, TPO→T, PTR→Y`. `_residue_to_one_letter` uses the
-  map first, then `Bio.Data.IUPACData.protein_letters_3to1`, else `"X"`.
-- [x] **6.3 `_parse_single_structure(path) -> StructureData | None`:** pick parser
-  by suffix (`.cif/.mmcif` → `MMCIFParser`, else `PDBParser`, both `QUIET=True`);
-  use **first model, first chain**; skip heteroatoms unless in the modified map;
-  per residue, extract `N,CA,C` coords (NaN row if an atom is missing); return
-  `None` (warn) on parse failure or empty chain.
-- [x] **6.4 `load_structures(directory, max_structures=None) ->
-  list[StructureData]`:** glob `*.pdb,*.cif,*.ent,*.mmcif`, sort by filename for
-  determinism, parse each, skip `None`, optional cap.
-- [x] **6.5 Tests** (`tests/data/structure/test_loader.py`, `@pytest.mark.slow`):
-  parse one real PDB fixture → `coords` shape `(L,3,3)`, `len(sequence)==L`,
-  modified-residue mapping works, missing atoms → NaN. Add a non-biopython
-  import-error test via monkeypatch if feasible.
-  - **Fixture:** place a small real structure at
-    `tests/data/fixtures/structures/<id>.pdb` (e.g. a short chain). If absent,
-    prompt the user to supply one.
+  ```
+  Per-dataset cadence (`every`): exactly one of `{steps: N}` or `{tokens: N}`, with
+  optional `at_start` (default false) and `at_end` (default true) keys. Datasets that
+  omit `every` use `train.eval_default_every`. See docs/EVAL_HARNESS.md §9.
+
+  data:
+    eval:
+      heldout:
+        path: /data/eval_sequences.parquet
+        type: sequence
+        every: { tokens: 20_000_000 }
+      structures:
+        path: /data/pdb
+        type: structure
+        every: { steps: 20_000 }
+        use_categorical_jacobian: true
+  ```
+
+  Update any other `eval_every` mentions in this file to the new grammar.
+
+- [ ] (Optional) Add a commented `eval:` example block to
+  `src/oplm/configs/data/base.yaml` (currently it has no `eval` key; `DataConfig.eval`
+  defaults to `null`). Not required for correctness.
 
 ---
 
-## Phase 7 — Variant modality (`data/variant/loader.py`)
+## Phase 8 — Tests
 
-Zero-shot variant-effect data. Tokenize+pad at scoring time (no MLM masking).
+The eval harness currently has **no tests** (`tests/eval/` holds only `__init__.py`). Add
+the suite below. Reuse the existing session-scoped fixtures from `tests/conftest.py`:
+`training_parquet` (small real sequences), `structure_fixtures_dir`,
+`structure_logreg_fixtures_dir` (skip when absent). Pure scheduling tests need no model
+or GPU; task/trainer tests build a tiny model on CPU — mark the model-building ones
+`@pytest.mark.slow`.
 
-- [x] **7.1 `VariantAssay` dataclass:** `name: str`, `wildtype: str`,
-  `mutations: list[str]`, `labels: list[float]`.
-- [x] **7.2 CSV parsing** (`load_variant_assays(directory) -> list[VariantAssay]`):
-  one assay per CSV. Required columns `mutant` (e.g. `"A42T"`, `:`-joined for
-  multi-mutants) and `DMS_score` (float). The wild-type sequence is supplied per
-  assay (sidecar/metadata/`EvalDatasetEntry.extra["wildtype"]` or a `wildtype`
-  column) — document the accepted source(s). *(Accepted sources: a `wildtypes`
-  mapping keyed by assay name — the route for `EvalDatasetEntry.extra["wildtype"]`
-  / a sidecar, which takes precedence — or a constant `wildtype` column.)*
-- [x] **7.3 Mutation parsing/validation:** `parse_mutation("A42T") -> (wt="A",
-  pos=42, mut="T")` (1-based). Validate `wildtype[pos-1] == wt`; raise on
-  mismatch. (Scoring itself — masked-marginal log-prob ratios — belongs to the
-  eval harness; this module only loads + validates.)
-- [x] **7.4 Tests** (`tests/data/variant/test_loader.py`): tiny real ProteinGym
-  CSV fixture at `tests/data/fixtures/variant/<assay>.csv`; parse → correct
-  counts; mutation parse + WT-consistency validation; multi-mutant split on `:`;
-  mismatch raises.
+### 8.1 `tests/eval/test_schedule.py` (pure, no model)
 
----
+- [ ] Add a small `ctx(...)` helper that builds an `EvalContext` with sensible defaults
+  (`steps_delta=1`, others 0/False) so cases read clearly. Cover, per design §4.5:
+  - `EveryNSteps(1000)`: due at step 1000 (`delta=1`); not at 999 or 1001.
+  - `at_start`: `EveryNSteps(1000, at_start=True)` due at `ctx(1, steps_delta=1)`
+    (because `global_step - steps_delta == 0`); the default `at_start=False` is not.
+  - `at_end`: `EveryNSteps(1000)` due at `ctx(1500, is_final=True)` though off-cadence.
+  - `EveryNTokens(1_000_000)`: due at `ctx(step=10, tokens_seen=1_000_030,
+    tokens_delta=80)`; not due the next step `tokens_seen=1_000_110, tokens_delta=80`.
+  - `delta > n`: `EveryNTokens(1_000_000)` due exactly once at
+    `tokens_seen=2_500_000, tokens_delta=2_500_000`.
+  - resume no-refire: a step schedule that fired at 1000 is not due at
+    `ctx(1001, steps_delta=1)`.
+  - `n > total`: `EveryNSteps(100_000, at_end=False)` never due across steps 1..50_000;
+    with `at_end=True` it is due only at `is_final`.
+  - `build_schedule(ScheduleSpec("steps", 5))` is `EveryNSteps(5)`; `"tokens"` →
+    `EveryNTokens`; an unsupported unit raises `ValueError`.
 
-## Phase 8 — Downstream modality (`data/downstream/loader.py`)
+### 8.2 `tests/eval/test_config.py` (pure, no model)
 
-Labeled-sequence benchmarks (TAPE/ProteinGLUE). Tokenize+pad (no masking);
-embeddings + supervised head are the eval harness's job.
+- [ ] Test `parse_eval_configs` / `parse_schedule_block`:
+  - `every: {steps: 2000}` → `ScheduleSpec("steps", 2000, at_start=False, at_end=True)`.
+  - `every: {tokens: 1_000_000, at_start: true, at_end: false}` parsed correctly.
+  - omitted `every` → the supplied `default_schedule`.
+  - two unit keys (`{steps: 1, tokens: 2}`) → `ValueError`.
+  - `every: {epochs: 1}` → `ValueError` mentioning "not yet supported".
+  - non-positive / bool `n` → `ValueError`.
+  - removed per-entry `eval_every: 500` → `ValueError` mentioning `every`.
+  - unknown task key (`contact_threshold: 8.0`) folds into `EvalDatasetEntry.extra`.
+- [ ] Test `load_config(["train.eval_every=500"])` raises `ValueError` mentioning
+  `eval_default_every`; and `load_config(["train.eval_default_every={steps: 7}"])`
+  resolves (no error).
 
-- [x] **8.1 Loaders** for parquet/CSV with a `sequence` column plus task labels:
-  per-residue label lists, or sequence-level scalar/categorical. Define a small
-  dataclass (e.g. `DownstreamExample(sequence, label)`) and a
-  `load_downstream_dataset(path, task_type)` returning a list (or iterable).
-- [x] **8.2 Label contract** (document + implement collation of labels):
-  - per-residue → `(B, T)` long, aligned to non-special positions, pad with `-100`
-    (reuse `align_per_residue` with `fill_special=-100`, `fill_pad=-100`).
-  - seq-level regression → `(B,)` float; seq-level classification → `(B,)` long.
-- [x] **8.3 Tests** (`tests/data/downstream/test_loader.py`): tiny fixtures for
-  one per-residue and one sequence-level task; assert label tensor shapes/dtypes
-  and `-100` alignment for per-residue padding.
+### 8.3 `tests/eval/test_evaluator.py` (no model — use a dummy task)
 
----
+- [ ] Register a dummy task type for the test (in the test module, via
+  `@register_eval_task("dummy")`) whose `evaluate` returns a fixed dict like
+  `{"score": 1.0}`. Build an `OplmConfig` (defaults are fine) with
+  `data.eval = {"d": {"path": "x", "type": "dummy", "every": {"steps": 10}}}` and a
+  dummy `train.eval_default_every`. Assert:
+  - `run_due(ctx(step=10, steps_delta=1), model=None, accelerator=None)` is **not**
+    reached for `model=None` only if due — so instead assert the not-due path returns
+    `{}` without touching the model: `run_due(ctx(step=9), None, None) == {}`.
+  - For the due path, pass a tiny stub object with `.eval()/.train()` and a fake
+    `accelerator` whose `unwrap_model(m)` returns `m`; assert the returned dict is
+    `{"eval/d/score": 1.0}` (namespacing works).
+  - `Evaluator(cfg).needs_token_count` is `True` when an entry uses `every: {tokens: N}`
+    and `False` otherwise.
+  - Construct with `every: {steps: 10**9, at_end: false}` and `max_steps` small; assert a
+    warning is logged (use `caplog`).
 
-## Phase 9 — Public API & trainer integration
+### 8.4 `tests/eval/test_sequence_task.py`
 
-- [x] **9.1 `data/__init__.py`** re-exports the public surface (no logic):
-  `get_tokenizer`, `build_train_dataloader`, `build_sequence_eval_dataloader`,
-  `ShardedProteinDataset`, `InterleavedDataset`, `MLMCollator`,
-  `tokenize_and_pad`, `load_structures`, `StructureData`,
-  `load_variant_assays`, `VariantAssay`, `parse_train_configs`,
-  `parse_eval_configs`. Must not import `oplm.eval`.
-- [x] **9.2 Trainer wiring:** confirm
-  [`src/oplm/training/trainer.py`](src/oplm/training/trainer.py) builds the loader
-  via `from oplm.data.loader import build_train_dataloader` **→ update the import
-  to `from oplm.data import build_train_dataloader`** (the old module path is
-  gone). Verify the epoch handling calls `set_epoch(epoch)` on the dataset on
-  `StopIteration`, and that batches pass `input_ids/attention_mask/labels`
-  straight into `model(...)`. Make no behavioral changes beyond the import path.
-  - Done as written: only the dataloader import was changed. Epoch handling
-    (`_set_dataset_epoch` → `dataset.set_epoch`) and the `input_ids/attention_mask/
-    labels` forward call already match the new `oplm.data` API. **Known deferred
-    break (out of scope):** the trainer still imports `OplmForMLM` from
-    `oplm.model.transformer`, which the model rewrite renamed to `OplmForMaskedLM`
-    (now in `oplm.model`); so `Trainer(cfg)` is not yet instantiable. This is a
-    model-migration issue left for the trainer rewrite (also dangling in
-    `eval/*`, `cli.py`, `inference.py`). Phase 10.2 proves the data path
-    end-to-end against `OplmForMaskedLM` directly, without the trainer.
-- [x] **9.3 Eval-harness boundary (note only):** `oplm.eval` will not import until
-  its own rewrite consumes `oplm.data.*` (structure/variant/downstream loaders +
-  `build_sequence_eval_dataloader`). That is tracked separately; do not stub it
-  here. Ensure nothing in `oplm.data` imports `oplm.eval`.
+- [ ] `@pytest.mark.slow`. Build a tiny `OplmConfig` (e.g. `hidden_dim=32, num_layers=2,
+  num_heads=2, num_kv_heads=1, max_seq_len=64`) and `OplmForMLM(cfg.model)` on CPU.
+  Construct a `SequenceEvalTask` from an `EvalDatasetEntry(name="hd",
+  path=str(training_parquet), type="sequence", schedule=ScheduleSpec("steps", 1))`.
+  Build a single-process `Accelerator` (use the `_reset_accelerator_state` autouse
+  fixture already in `tests/conftest.py`). Assert `evaluate` returns `loss`, `accuracy`,
+  `perplexity`, all finite, with `0 <= accuracy <= 1`.
 
----
+### 8.5 `tests/eval/test_structure_task.py`
 
-## Phase 10 — End-to-end, fixtures & QA
+- [ ] `@pytest.mark.slow`. Use `structure_fixtures_dir` (skips if absent). Tiny model as
+  in 8.4 but `max_seq_len` large enough for the fixtures. Construct a `StructureEvalTask`
+  with `type="structure"`, `schedule=ScheduleSpec("steps", 1)`, and
+  `extra={"max_structures": 2, "use_logistic_regression": false}` (use the
+  mean-attention path so it runs with few structures). Assert `precision_at_L` is present
+  and in `[0, 1]`. This is the verification gate for the tokenizer migration (§4.2).
 
-- [x] **10.1 Fixture helpers** (`tests/data/conftest.py`): a session-scoped
-  fixture that writes a tiny **real** sequence parquet (a handful of real protein
-  sequences, with a second shard, optionally a `masking_weights` column) to a
-  `tmp_path_factory` dir; return the path. Reuse across dataset/collate/loader
-  tests. Document where real structure/variant fixtures must be dropped
-  (`tests/data/fixtures/...`); prompt the user if missing.
-- [x] **10.2 Pilot end-to-end** (`tests/data/test_e2e.py`, `@pytest.mark.slow`):
-  - Build a tiny `OplmConfig`: keep `model.vocab_size` at its default `33`, small
-    `hidden_dim`/`num_layers`/`num_heads`, `max_seq_len≈64`; `train.batch_size`
-    small; `data.train=<fixture parquet>`, `data.mask_prob=0.15`.
-  - Instantiate `OplmForMaskedLM(model-config)`; run ~3 train steps over
-    `build_train_dataloader(cfg)` (forward+backward+step); assert finite loss and
-    no shape errors.
-  - Run `build_sequence_eval_dataloader(<fixture>, cfg)` once; forward with
-    `labels`; assert a finite `loss` and that two eval passes give **identical**
-    batches (determinism).
-  - Repeat the train-step check with `data.weighted_masking=True` and a fixture
-    that has a `masking_weights` column; assert it runs and masks respect weights.
-- [x] **10.3 Lint/type/test gates:** `ruff format src/ tests/`,
-  `ruff check src/ tests/`, `mypy src/oplm/data`, and `pytest tests/data`
-  (`-m "not slow"` for fast iteration; full run before done).
-  - Data-tooling scope is clean: `ruff format`/`ruff check` pass on
-    `src/oplm/data` + `tests/data`, `mypy src/oplm/data` → no issues,
-    `pytest tests/data` → 177 passed, 1 skipped (optional ProteinGym variant
-    fixture absent; see `tests/data/fixtures/README.md`). Both `ruff format
-    --check src/ tests/` and `ruff check src/ tests/` are now fully clean (the
-    stray `I001`/`TC003`/line-length findings in `tests/model/*` were fixed, and
-    the residual whitespace drift in `tests/conftest.py` /
-    `tests/model/test_gradient_checkpointing.py` was reformatted).
-    **Deferred (out of scope):** the `OplmForMLM` → `OplmForMaskedLM`
-    model-migration in `trainer.py` (and `cli.py`/`inference.py`/`eval/*`) is a
-    config-system bridge, not a rename — left for the planned trainer rewrite.
+### 8.6 `tests/eval/test_trainer_integration.py`
+
+- [ ] `@pytest.mark.slow`. End-to-end: tiny `OplmConfig` with `train.max_steps=4`,
+  `train.wandb_enabled=False`, `train.batch_size` small, `data.train=str(training_parquet)`,
+  and
+  ```python
+  data.eval = {"hd": {"path": str(training_parquet), "type": "sequence",
+                       "every": {"steps": 2}}}
+  ```
+  Attach a `TrainerCallback` subclass that records `on_eval_end(trainer, metrics, step)`
+  calls. Run `Trainer(cfg).train()`. Assert it completes without error and that at least
+  one recorded metrics dict contains a key starting with `eval/hd/` (i.e. eval actually
+  fired on the step cadence). Add a second case with `every: {tokens: 1}` and assert eval
+  fires every step (token cadence path + the rank-reduction code runs).
 
 ---
 
-## Done criteria
+## Phase 9 — Verification & quality gates
 
-- [x] Every phase box checked; `pytest tests/data` green (incl. slow).
-- [x] `import oplm.data` works with no `oplm.eval` dependency.
-- [x] Tokenizer parity test passes (ids match `OplmTokenizerFast`, `<mask>`=32,
-  canonical AAs = 4–23).
-- [x] Masking is fixed-`k` Gumbel-top-k; uniform == equal-weights special case;
-  dynamic across epochs; deterministic under the eval flag.
-- [x] Trainer imports `build_train_dataloader` from `oplm.data` and trains a pilot
-  model end-to-end. *(Import path wired in Phase 9.2; the pilot trains end-to-end
-  in `tests/data/test_e2e.py` against `OplmForMaskedLM` directly. The `Trainer`
-  class itself remains non-instantiable pending the deferred `OplmForMLM` →
-  `OplmForMaskedLM` rename — a separate trainer-rewrite concern, see Phase 9.2.)*
-- [x] `docs/DATA_TOOLING.md` and this plan agree; Phase 10 adds test-only fixtures
-  and an e2e check with no API/behavioral deviation from the doc.
+- [ ] No references to the deleted module remain:
+  `grep -rn "oplm.eval.data" src/ tests/` → empty.
+- [ ] No stray `eval_every` remains except the two rejection messages:
+  `grep -rn "eval_every" src/` → only `_reject_removed_eval_every_alias`, the
+  `parse_eval_configs` rejection, and `eval_default_every`.
+- [ ] `python -c "import oplm.eval; print(oplm.eval.__all__)"` lists the new exports.
+- [ ] `python -c "from oplm.config import load_config; load_config([])"` works (default
+  `eval_default_every` parses), and `load_config(['train.eval_every=1'])` raises.
+- [ ] Lint/format/type: `ruff check src/ tests/`, `ruff format src/ tests/`,
+  `mypy src/`.
+- [ ] Fast tests: `pytest -m "not slow"` green.
+- [ ] Full tests (needs the structure/sequence fixtures present):
+  `pytest tests/eval` green; the structure test confirms the tokenizer migration.
+- [ ] Sanity-check the design alignment: steps + tokens cadence only (epochs rejected);
+  `at_end` defaults true; `run_due` unwraps only when due; `tokens_seen` rank-reduced;
+  `eval/data/` gone.
+
+---
+
+## Notes / known follow-ups (not blocking)
+
+- **Epoch cadence is deferred** (design §4.6). `EvalContext` already carries `epoch` /
+  `epoch_delta`, and `parse_schedule_block` rejects `epochs` with a clear message. Adding
+  it later is: a new `EveryNEpochs` class
+  (`_crossed(ctx.epoch, ctx.epoch_delta, n)`), `"epochs"` in `_VALID_SCHEDULE_UNITS` and
+  `_SCHEDULE_BY_UNIT`, and removing the rejection — no interface change.
+- **`parse_eval_configs` second arg changed** from `default_eval_every: int` to
+  `default_schedule: ScheduleSpec`. The only caller is the `Evaluator`; update it (done
+  in Phase 3.2). `parse_eval_configs` is re-exported from `oplm.data` — keep the export.
+- **Stub tasks** (`proteingym`, `tape`, `proteinglue`, `everest`) inherit the new
+  `EvalTask.__init__`, so they need no changes; they still raise `NotImplementedError`.
