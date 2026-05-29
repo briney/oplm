@@ -43,6 +43,7 @@ The live sources of truth are:
 - [`src/oplm/eval/evaluator.py`](../src/oplm/eval/evaluator.py) parses `data.eval`, constructs task instances through the registry, and returns metrics as `eval/<dataset>/<metric>`.
 - Sequence and structure evaluation are implemented today.
 - ProteinGym, TAPE, ProteinGlue, and EVEREST remain registered stubs rather than full benchmark integrations.
+- The target eval-harness design — the trainer↔eval scheduling contract, per-task cadence, and the `data.eval` config schema — is specified in [`EVAL_HARNESS.md`](EVAL_HARNESS.md).
 
 ### Inference
 

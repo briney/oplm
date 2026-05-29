@@ -6,7 +6,8 @@
 > per-modality loaders, the configuration schema, and the train/eval boundary, in
 > enough detail to implement directly. The model itself is out of scope and lives
 > in [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md); the eval *harness* (tasks,
-> metrics, scheduling) is out of scope and will live in a future `docs/EVAL.md`.
+> metrics, scheduling) is out of scope and lives in
+> [`EVAL_HARNESS.md`](EVAL_HARNESS.md).
 
 ---
 
@@ -30,7 +31,7 @@
   [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md) (the tokenizer is *defined*
   there; this doc only specifies how the data layer *uses* it).
 - The eval harness: task registry, metric math (contact P@L, Spearman, APC,
-  categorical Jacobian), per-task scheduling. → future `docs/EVAL.md`.
+  categorical Jacobian), per-task scheduling. → [`EVAL_HARNESS.md`](EVAL_HARNESS.md).
 - The trainer loop, optimizer, schedules, checkpointing. → future `docs/TRAINER.md`.
 - The CLI. → future `docs/CLI.md`.
 

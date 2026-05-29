@@ -25,7 +25,7 @@ This document specifies the OPLM model itself. Concretely:
 - The trainer, optimizer, learning-rate schedules, FLOPs accounting,
   gradient-clipping, gradient-accumulation, checkpoint format. → future
   `docs/TRAINER.md`.
-- The eval harness and downstream benchmarks. → future `docs/EVAL.md`.
+- The eval harness and downstream benchmarks. → [`EVAL_HARNESS.md`](EVAL_HARNESS.md).
 - The data pipeline, dataset formats, masking strategy. → `docs/DATA_TOOLING.md`.
 - The CLI. → future `docs/CLI.md`.
 - The full YAML config schema beyond the `model:` block (i.e., the `train:`,
@@ -1640,7 +1640,7 @@ Not addressed in this document:
 - Trainer, optimizer, learning-rate schedules, FLOPs accounting,
   gradient-clipping, checkpoint policy → `docs/TRAINER.md`.
 - Eval harness and downstream benchmarks (ProteinGym, TAPE, ProteinGlue,
-  EVEREST, structure-prediction probes) → `docs/EVAL.md`.
+  EVEREST, structure-prediction probes) → [`EVAL_HARNESS.md`](EVAL_HARNESS.md).
 - Data pipeline, masking strategy, dataset formats, multi-dataset weighting →
   `docs/DATA_TOOLING.md`.
 - CLI surface and `accelerate launch` invocation patterns → `docs/CLI.md`.
