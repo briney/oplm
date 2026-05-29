@@ -262,7 +262,7 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
 ## Phase 4 — Collation (`data/sequence/collate.py`)
 
 ### 4.1 Pad/tokenize primitive
-- [ ] `tokenize_and_pad(batch, tokenizer, max_length) -> dict[str, Tensor]`:
+- [x] `tokenize_and_pad(batch, tokenizer, max_length) -> dict[str, Tensor]`:
   - Accept `list[dict]` (uses `"sequence"`) or `list[str]`.
   - Truncate each raw sequence to `max_length - 2` chars (room for
     `<cls>`/`<eos>`).
@@ -274,7 +274,7 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
     the MLM collator; keep the public primitive's default output to the two keys.
 
 ### 4.2 MLM-mask layer
-- [ ] `MLMCollator`:
+- [x] `MLMCollator`:
   ```python
   MLMCollator(
       tokenizer, max_length=1024,
@@ -314,7 +314,7 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
      a uniform draw from `canonical_amino_acid_ids`; remainder → keep original.
   8. Return `{"input_ids","attention_mask","labels"}` only — `masking_weights`
      is **not** emitted.
-- [ ] **4.3 Tests** (`tests/data/sequence/test_collate.py`):
+- [x] **4.3 Tests** (`tests/data/sequence/test_collate.py`):
   - **Batch contract:** keys/shapes/dtypes per above; `T <= max_seq_len`;
     `attention_mask` matches padding.
   - **Fixed-k:** exactly `k=round(mask_prob*n_eligible)` positions per row, no
