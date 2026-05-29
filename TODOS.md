@@ -68,7 +68,7 @@ box only when its code **and** its tests pass.
 
 ## Phase 0 — Scaffolding & dependencies
 
-- [ ] **0.1 Create the package tree** (empty modules, with module docstrings):
+- [x] **0.1 Create the package tree** (empty modules, with module docstrings):
   ```
   src/oplm/data/__init__.py
   src/oplm/data/tokenizer.py
@@ -84,14 +84,14 @@ box only when its code **and** its tests pass.
   src/oplm/data/downstream/__init__.py
   src/oplm/data/downstream/loader.py
   ```
-- [ ] **0.2 Test tree:** create `tests/data/__init__.py`,
+- [x] **0.2 Test tree:** create `tests/data/__init__.py`,
   `tests/data/sequence/__init__.py`, etc., and `tests/data/conftest.py` for
   shared fixtures. Create `tests/data/fixtures/` for real data.
-- [ ] **0.3 Import hygiene:** `import oplm.data` (and any submodule) must **not**
+- [x] **0.3 Import hygiene:** `import oplm.data` (and any submodule) must **not**
   import `oplm.eval`. `oplm/__init__.py` already imports only `.model`; keep it
   that way. Add a test asserting `import oplm.data` succeeds without the eval
   package present.
-- [ ] **0.4 Deps check:** confirm `pyarrow`/`numpy` in core deps and
+- [x] **0.4 Deps check:** confirm `pyarrow`/`numpy` in core deps and
   `biopython`/`scikit-learn` in the `train` extra of `pyproject.toml` (already
   present). No new deps required.
 
