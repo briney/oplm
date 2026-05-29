@@ -421,15 +421,15 @@ Zero-shot variant-effect data. Tokenize+pad at scoring time (no MLM masking).
 Labeled-sequence benchmarks (TAPE/ProteinGLUE). Tokenize+pad (no masking);
 embeddings + supervised head are the eval harness's job.
 
-- [ ] **8.1 Loaders** for parquet/CSV with a `sequence` column plus task labels:
+- [x] **8.1 Loaders** for parquet/CSV with a `sequence` column plus task labels:
   per-residue label lists, or sequence-level scalar/categorical. Define a small
   dataclass (e.g. `DownstreamExample(sequence, label)`) and a
   `load_downstream_dataset(path, task_type)` returning a list (or iterable).
-- [ ] **8.2 Label contract** (document + implement collation of labels):
+- [x] **8.2 Label contract** (document + implement collation of labels):
   - per-residue → `(B, T)` long, aligned to non-special positions, pad with `-100`
     (reuse `align_per_residue` with `fill_special=-100`, `fill_pad=-100`).
   - seq-level regression → `(B,)` float; seq-level classification → `(B,)` long.
-- [ ] **8.3 Tests** (`tests/data/downstream/test_loader.py`): tiny fixtures for
+- [x] **8.3 Tests** (`tests/data/downstream/test_loader.py`): tiny fixtures for
   one per-residue and one sequence-level task; assert label tensor shapes/dtypes
   and `-100` alignment for per-residue padding.
 
