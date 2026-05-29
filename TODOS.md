@@ -205,7 +205,7 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
 - joint index = `rank * num_workers + worker_id`; stride =
   `world_size * num_workers`.
 
-- [ ] **3.1 `ShardedProteinDataset(IterableDataset)`**:
+- [x] **3.1 `ShardedProteinDataset(IterableDataset)`**:
   ```python
   ShardedProteinDataset(
       path: str | Path, *,
@@ -237,7 +237,7 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
        `masking_weights=<list[float] | None>` when `load_masking_weights`.
   - When `load_masking_weights=True` but a shard lacks the column → yield `None`
     for that field (do not error here; collator handles fallback + one-time warn).
-- [ ] **3.2 `InterleavedDataset(IterableDataset)`**:
+- [x] **3.2 `InterleavedDataset(IterableDataset)`**:
   ```python
   InterleavedDataset(datasets, fractions, *, num_samples=None, seed=0)
   ```
@@ -248,7 +248,7 @@ Provide a helper resolving `(rank, world_size, worker_id, num_workers)`:
     striped per worker): pick a source via `multinomial(fractions)`; pull its
     next item; on `StopIteration`, re-`iter()` that source and continue. Yield
     items unchanged (pass through the dict incl. any `masking_weights`).
-- [ ] **3.3 Tests** (`tests/data/sequence/test_dataset.py`), using a tiny real
+- [x] **3.3 Tests** (`tests/data/sequence/test_dataset.py`), using a tiny real
   parquet fixture (write 2 shards in a fixture; see Phase 10 fixture helper):
   - same `(seed, epoch)` → identical row order; different epochs → different.
   - **striping coverage:** simulate `(world_size, num_workers)` ∈
