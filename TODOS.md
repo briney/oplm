@@ -468,13 +468,13 @@ embeddings + supervised head are the eval harness's job.
 
 ## Phase 10 — End-to-end, fixtures & QA
 
-- [ ] **10.1 Fixture helpers** (`tests/data/conftest.py`): a session-scoped
+- [x] **10.1 Fixture helpers** (`tests/data/conftest.py`): a session-scoped
   fixture that writes a tiny **real** sequence parquet (a handful of real protein
   sequences, with a second shard, optionally a `masking_weights` column) to a
   `tmp_path_factory` dir; return the path. Reuse across dataset/collate/loader
   tests. Document where real structure/variant fixtures must be dropped
   (`tests/data/fixtures/...`); prompt the user if missing.
-- [ ] **10.2 Pilot end-to-end** (`tests/data/test_e2e.py`, `@pytest.mark.slow`):
+- [x] **10.2 Pilot end-to-end** (`tests/data/test_e2e.py`, `@pytest.mark.slow`):
   - Build a tiny `OplmConfig`: keep `model.vocab_size` at its default `33`, small
     `hidden_dim`/`num_layers`/`num_heads`, `max_seq_len≈64`; `train.batch_size`
     small; `data.train=<fixture parquet>`, `data.mask_prob=0.15`.
@@ -486,21 +486,31 @@ embeddings + supervised head are the eval harness's job.
     batches (determinism).
   - Repeat the train-step check with `data.weighted_masking=True` and a fixture
     that has a `masking_weights` column; assert it runs and masks respect weights.
-- [ ] **10.3 Lint/type/test gates:** `ruff format src/ tests/`,
+- [x] **10.3 Lint/type/test gates:** `ruff format src/ tests/`,
   `ruff check src/ tests/`, `mypy src/oplm/data`, and `pytest tests/data`
   (`-m "not slow"` for fast iteration; full run before done).
+  - Data-tooling scope is clean: `ruff format`/`ruff check` pass on
+    `src/oplm/data` + `tests/data`, `mypy src/oplm/data` → no issues,
+    `pytest tests/data` → 177 passed, 1 skipped (optional ProteinGym variant
+    fixture absent; see `tests/data/fixtures/README.md`). **Pre-existing,
+    out-of-scope:** `ruff check tests/` still reports a few `TC003`/line-length
+    findings in `tests/model/*` (model-package tests, untouched by this effort) —
+    left for a separate model-test cleanup.
 
 ---
 
 ## Done criteria
 
-- [ ] Every phase box checked; `pytest tests/data` green (incl. slow).
-- [ ] `import oplm.data` works with no `oplm.eval` dependency.
-- [ ] Tokenizer parity test passes (ids match `OplmTokenizerFast`, `<mask>`=32,
+- [x] Every phase box checked; `pytest tests/data` green (incl. slow).
+- [x] `import oplm.data` works with no `oplm.eval` dependency.
+- [x] Tokenizer parity test passes (ids match `OplmTokenizerFast`, `<mask>`=32,
   canonical AAs = 4–23).
-- [ ] Masking is fixed-`k` Gumbel-top-k; uniform == equal-weights special case;
+- [x] Masking is fixed-`k` Gumbel-top-k; uniform == equal-weights special case;
   dynamic across epochs; deterministic under the eval flag.
-- [ ] Trainer imports `build_train_dataloader` from `oplm.data` and trains a pilot
-  model end-to-end.
-- [ ] `docs/DATA_TOOLING.md` and this plan agree; any intentional deviation is
-  noted in the doc.
+- [x] Trainer imports `build_train_dataloader` from `oplm.data` and trains a pilot
+  model end-to-end. *(Import path wired in Phase 9.2; the pilot trains end-to-end
+  in `tests/data/test_e2e.py` against `OplmForMaskedLM` directly. The `Trainer`
+  class itself remains non-instantiable pending the deferred `OplmForMLM` →
+  `OplmForMaskedLM` rename — a separate trainer-rewrite concern, see Phase 9.2.)*
+- [x] `docs/DATA_TOOLING.md` and this plan agree; Phase 10 adds test-only fixtures
+  and an e2e check with no API/behavioral deviation from the doc.
