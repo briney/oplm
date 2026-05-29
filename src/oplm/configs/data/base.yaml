@@ -21,6 +21,27 @@
 #   - Parquet files must have columns: sequence_id, sequence.
 train: null
 
+# Evaluation dataset(s). Named map; each entry needs `path` and `type`
+# (sequence, structure, proteingym, tape, proteinglue, everest).
+#
+# Per-dataset cadence (`every`): exactly one of {steps: N} or {tokens: N}, with
+# optional at_start (default false) / at_end (default true). Datasets that omit
+# `every` use train.eval_default_every. Task-specific keys sit at the same level
+# as `path`/`type` (not under `extra:`). See configs/README.md and
+# docs/EVAL_HARNESS.md §9.
+#
+#   eval:
+#     heldout:
+#       path: /data/eval_sequences.parquet
+#       type: sequence
+#       every: { tokens: 20_000_000 }
+#     structures:
+#       path: /data/pdb
+#       type: structure
+#       every: { steps: 20_000 }
+#       use_categorical_jacobian: true
+eval: null
+
 # Sequence masking
 mask_prob: 0.15
 mask_token_prob: 0.8

@@ -109,7 +109,7 @@ flags. The lower-level distributed entry point keeps raw dotlist passthrough bec
 | `train.warmup_steps` | `int` | `5000` | Must be `>= 0`. | active |
 | `train.stable_steps` | `int` | `0` | Must be `>= 0`. | active |
 | `train.log_every` | `int` | `10` | Train-metric logging cadence in optimizer steps. | active |
-| `train.eval_every` | `int` | `10000` | Default eval cadence for datasets without a per-dataset override. | active |
+| `train.eval_default_every` | `dict` | `{steps: 10000}` | Default eval cadence (`{steps: N}` or `{tokens: N}`) for datasets that omit `every`. | active |
 | `train.wandb_project` | `str` | `oplm` | W&B project name. | active |
 | `train.wandb_run_name` | `str \| null` | `null` | Optional W&B run name. | active |
 | `train.wandb_enabled` | `bool` | `true` | Enable W&B logging through `accelerate`. | active |
@@ -150,8 +150,26 @@ Shared keys on every eval dataset entry:
 
 - `path`: file or directory path consumed by the task
 - `type`: one of `sequence`, `structure`, `proteingym`, `tape`, `proteinglue`, `everest`
-- `eval_every`: optional per-dataset cadence override
+- `every`: optional per-dataset cadence override (see below)
 - `metrics`: optional list of metric names to keep
+
+Per-dataset cadence (`every`): exactly one of `{steps: N}` or `{tokens: N}`, with
+optional `at_start` (default false) and `at_end` (default true) keys. Datasets that
+omit `every` use `train.eval_default_every`. See docs/EVAL_HARNESS.md §9.
+
+```yaml
+data:
+  eval:
+    heldout:
+      path: /data/eval_sequences.parquet
+      type: sequence
+      every: { tokens: 20_000_000 }
+    structures:
+      path: /data/pdb
+      type: structure
+      every: { steps: 20_000 }
+      use_categorical_jacobian: true
+```
 
 Task-specific keys go at the same level as `path` and `type`, not under `extra:`.
 They are currently passed through to the task as `EvalDatasetEntry.extra`; typed
@@ -233,7 +251,7 @@ data:
 
 ```yaml
 train:
-  eval_every: 500
+  eval_default_every: { steps: 500 }
 
 data:
   train: /data/train_sequences.parquet
@@ -244,7 +262,7 @@ data:
     structures:
       path: /data/pdb
       type: structure
-      eval_every: 2000
+      every: { steps: 2000 }
       contact_threshold: 8.0
       use_logistic_regression: true
       use_categorical_jacobian: true

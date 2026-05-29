@@ -924,13 +924,13 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
 
 ### 7.1 `configs/README.md`
 
-- [ ] Replace the `train.eval_every` config-table row with:
+- [x] Replace the `train.eval_every` config-table row with:
 
   ```
   | `train.eval_default_every` | `dict` | `{steps: 10000}` | Default eval cadence (`{steps: N}` or `{tokens: N}`) for datasets that omit `every`. | active |
   ```
 
-- [ ] In the Eval Datasets section, replace the per-entry `eval_every` documentation
+- [x] In the Eval Datasets section, replace the per-entry `eval_every` documentation
   with the `every:` grammar and refer to the design doc:
 
   ```
@@ -953,7 +953,7 @@ All edits are in `src/oplm/training/trainer.py`. The contract: build one rank-id
 
   Update any other `eval_every` mentions in this file to the new grammar.
 
-- [ ] (Optional) Add a commented `eval:` example block to
+- [x] (Optional) Add a commented `eval:` example block to
   `src/oplm/configs/data/base.yaml` (currently it has no `eval` key; `DataConfig.eval`
   defaults to `null`). Not required for correctness.
 
