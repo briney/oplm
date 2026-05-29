@@ -997,7 +997,7 @@ trainer, owned by the separate refactor) construct one.
 
 ### 8.1 `tests/eval/test_schedule.py` (pure, no model)
 
-- [ ] Add a small `ctx(...)` helper that builds an `EvalContext` with sensible defaults
+- [x] Add a small `ctx(...)` helper that builds an `EvalContext` with sensible defaults
   (`steps_delta=1`, others 0/False) so cases read clearly. Cover, per design §4.5:
   - `EveryNSteps(1000)`: due at step 1000 (`delta=1`); not at 999 or 1001.
   - `at_start`: `EveryNSteps(1000, at_start=True)` due at `ctx(1, steps_delta=1)`
@@ -1016,7 +1016,7 @@ trainer, owned by the separate refactor) construct one.
 
 ### 8.2 `tests/eval/test_config.py` (pure, no model)
 
-- [ ] Test `parse_eval_configs` / `parse_schedule_block`:
+- [x] Test `parse_eval_configs` / `parse_schedule_block`:
   - `every: {steps: 2000}` → `ScheduleSpec("steps", 2000, at_start=False, at_end=True)`.
   - `every: {tokens: 1_000_000, at_start: true, at_end: false}` parsed correctly.
   - omitted `every` → the supplied `default_schedule`.
@@ -1030,13 +1030,13 @@ trainer, owned by the separate refactor) construct one.
     `["loss", "accuracy"]`.
   - removed per-entry `eval_every: 500` → `ValueError` mentioning `every`.
   - unknown task key (`contact_threshold: 8.0`) folds into `EvalDatasetEntry.extra`.
-- [ ] Test `load_config(["train.eval_every=500"])` raises `ValueError` mentioning
+- [x] Test `load_config(["train.eval_every=500"])` raises `ValueError` mentioning
   `eval_default_every`; and `load_config(["train.eval_default_every={steps: 7}"])`
   resolves (no error).
 
 ### 8.3 `tests/eval/test_evaluator.py` (no model — use a dummy task)
 
-- [ ] Register a dummy task type for the test (in the test module, via
+- [x] Register a dummy task type for the test (in the test module, via
   `@register_eval_task("dummy")`) whose `evaluate` returns a fixed dict like
   `{"score": 1.0}`. Build an `OplmConfig` (defaults are fine) with
   `data.eval = {"d": {"path": "x", "type": "dummy", "every": {"steps": 10}}}` and a
@@ -1054,7 +1054,7 @@ trainer, owned by the separate refactor) construct one.
 
 ### 8.4 `tests/eval/test_sequence_task.py`
 
-- [ ] `@pytest.mark.slow`. Build **two** configs (see the Phase 8 intro): a root
+- [x] `@pytest.mark.slow`. Build **two** configs (see the Phase 8 intro): a root
   `oplm.config.OplmConfig` for the task (`cfg`, providing `data`/`train` so
   `build_sequence_eval_dataloader(self.path, cfg)` can tokenize/mask), and the model from the
   HF `OplmModelConfig` directly — **not** `OplmForMaskedLM(cfg.model)`:
@@ -1079,7 +1079,7 @@ trainer, owned by the separate refactor) construct one.
 
 ### 8.5 `tests/eval/test_structure_task.py`
 
-- [ ] `@pytest.mark.slow`. Use `structure_fixtures_dir` (skips if absent). Build the model
+- [x] `@pytest.mark.slow`. Use `structure_fixtures_dir` (skips if absent). Build the model
   from `OplmModelConfig` directly as in 8.4, but with `max_position_embeddings` large enough
   for the fixtures. Construct a `StructureEvalTask` with `type="structure"`,
   `schedule=ScheduleSpec("steps", 1)`, and `extra={"max_structures": 2,
@@ -1089,7 +1089,7 @@ trainer, owned by the separate refactor) construct one.
   tokenizer swap (§4.2) **and** the new `output_attentions` / `.attentions` forward API — if
   the forward call were left on the old `need_weights` / `"attention_weights"` API the task
   would raise here.
-- [ ] Add a **non-slow** unit test (no model/fixtures) for `StructureTaskConfig.from_extra`
+- [x] Add a **non-slow** unit test (no model/fixtures) for `StructureTaskConfig.from_extra`
   (issue #5): a string boolean such as `{"use_logistic_regression": "false"}` raises
   `ValueError` naming the key (must not coerce to `True`), real bools parse, and the existing
   numeric validations (`categorical_jacobian_sample_size >= 1`,
@@ -1108,7 +1108,7 @@ trainer, owned by the separate refactor) construct one.
 > `run_due`) is still exercised in isolation by 8.3 (evaluator) and 8.8 (token accounting),
 > so this gating does not leave Phase 6 untested — it only defers the full end-to-end run.
 
-- [ ] `@pytest.mark.slow`. End-to-end: tiny `OplmConfig` with `train.max_steps=4`,
+- [x] `@pytest.mark.slow`. End-to-end: tiny `OplmConfig` with `train.max_steps=4`,
   `train.wandb_enabled=False`, `train.batch_size` small, `data.train=str(training_parquet)`,
   and
   ```python
@@ -1126,14 +1126,14 @@ trainer, owned by the separate refactor) construct one.
 The design (§10) calls for explicit registry coverage; add it (the current plan only used the
 registry implicitly via the dummy task in 8.3).
 
-- [ ] Duplicate registration raises: calling `@register_eval_task("sequence")` a second time
+- [x] Duplicate registration raises: calling `@register_eval_task("sequence")` a second time
   (e.g. on a throwaway subclass) raises `ValueError`/`KeyError` naming the duplicate type.
-- [ ] Unknown type raises with the known list: `get_eval_task_class("does_not_exist")` raises
+- [x] Unknown type raises with the known list: `get_eval_task_class("does_not_exist")` raises
   and the message includes the registered type names (so the error is actionable).
-- [ ] Sanity: each real registered type (`sequence`, `structure`, `proteingym`, `tape`,
+- [x] Sanity: each real registered type (`sequence`, `structure`, `proteingym`, `tape`,
   `proteinglue`, `everest`) resolves via `get_eval_task_class` to an `EvalTask` subclass after
   `import oplm.eval.tasks`.
-- [ ] Use an isolated registry where possible (or register/clean up a uniquely-named dummy in a
+- [x] Use an isolated registry where possible (or register/clean up a uniquely-named dummy in a
   fixture) so the test does not mutate the shared `EVAL_TASK_REGISTRY` for other tests.
 
 ### 8.8 `tests/eval/test_token_accounting.py`
@@ -1142,18 +1142,18 @@ The design (§10) calls for token-accounting and rank-sync coverage; this is the
 guarantee behind token cadence (no deadlock). Add both a focused single-process check and, if
 the environment supports spawning, a small ragged distributed smoke test.
 
-- [ ] **Focused token accounting (single process, no GPU).** Drive the trainer's token
+- [x] **Focused token accounting (single process, no GPU).** Drive the trainer's token
   reduction (or a small extracted helper mirroring Phase 6.2) over a few synthetic batches with
   *known, varying* `attention_mask` sums; assert the accumulated `tokens_seen` equals the exact
   sum of all `attention_mask` ones (the true global count) — i.e. **not** a
   `local_tokens × num_processes` estimate. With `num_processes == 1` the reduction is identity,
   so this nails the per-step accumulation + reset logic and that `_step_local_tokens` zeroes
   each optimizer step.
-- [ ] **Rank-sync purity (no model).** Given one `EvalContext`, every task's `is_due` is a pure
+- [x] **Rank-sync purity (no model).** Given one `EvalContext`, every task's `is_due` is a pure
   function of it, so all ranks agree by construction. Assert this directly: build a context and
   check `task.schedule.is_due(ctx)` is deterministic and that two independently-built contexts
   with identical fields yield identical `is_due` for an `EveryNTokens` schedule.
-- [ ] **Ragged distributed smoke (mark `@pytest.mark.slow`; skip if multi-proc launch is
+- [x] **Ragged distributed smoke (mark `@pytest.mark.slow`; skip if multi-proc launch is
   unavailable).** Launch ≥2 ranks (e.g. `accelerate`/`torch.distributed` with `gloo`) feeding
   **ragged** per-rank token counts, run several optimizer steps with a token-cadence eval
   configured, and assert (a) every rank computes the *same* `tokens_seen`/`tokens_delta` after
