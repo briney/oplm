@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, ClassVar, TypeVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import numpy as np
 import torch
 
-from oplm.data.tokenizer import ProteinTokenizer
-from oplm.eval.data.structure_loader import StructureData, load_structures
+from oplm.data import StructureData, get_tokenizer, load_structures
 from oplm.eval.metrics.categorical_jacobian import (
     StructurePairScoreData,
     build_structure_pair_score_data,
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from accelerate import Accelerator
 
     from oplm.config import EvalDatasetEntry, OplmConfig
-    from oplm.model import OplmForMaskedLM
+    from oplm.model import OplmForMaskedLM, OplmTokenizerFast
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -48,6 +48,67 @@ _CATEGORICAL_JACOBIAN_METRIC_DIVISORS: dict[str, int] = {
     "categorical_jacobian_precision_at_L_2": 2,
     "categorical_jacobian_precision_at_L_5": 5,
 }
+
+
+@dataclass(frozen=True)
+class StructureTaskConfig:
+    """Typed structure-eval knobs, parsed from EvalDatasetEntry.extra."""
+
+    contact_threshold: float = 8.0
+    min_seq_sep: int = 6
+    l_divisor: int = 1
+    use_cbeta: bool = True
+    use_logistic_regression: bool = True
+    logreg_n_train: int = 20
+    logreg_n_iterations: int = 5
+    logreg_c: float = 0.15
+    use_categorical_jacobian: bool = False
+    categorical_jacobian_sample_size: int | None = None
+    categorical_jacobian_sample_seed: int = 42
+    categorical_jacobian_mutation_batch_size: int = 20
+    max_structures: int | None = None
+
+    @classmethod
+    def from_extra(cls, extra: dict[str, Any]) -> StructureTaskConfig:
+        """Build a config from an eval entry's ``extra`` block, validating types."""
+
+        def _opt_int(key: str) -> int | None:
+            return int(extra[key]) if key in extra else None
+
+        def _strict_bool(key: str, default: bool) -> bool:
+            # Same rationale as parse_schedule_block: bool("false") is True, so a YAML
+            # string would silently invert the flag. Require an actual bool.
+            value = extra.get(key, default)
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"structure-eval {key!r} must be a bool, got {value!r} ({type(value).__name__})"
+                )
+            return value
+
+        cfg = cls(
+            contact_threshold=float(extra.get("contact_threshold", 8.0)),
+            min_seq_sep=int(extra.get("min_seq_sep", 6)),
+            l_divisor=int(extra.get("l_divisor", 1)),
+            use_cbeta=_strict_bool("use_cbeta", True),
+            use_logistic_regression=_strict_bool("use_logistic_regression", True),
+            logreg_n_train=int(extra.get("logreg_n_train", 20)),
+            logreg_n_iterations=int(extra.get("logreg_n_iterations", 5)),
+            logreg_c=float(extra.get("logreg_c", 0.15)),
+            use_categorical_jacobian=_strict_bool("use_categorical_jacobian", False),
+            categorical_jacobian_sample_size=_opt_int("categorical_jacobian_sample_size"),
+            categorical_jacobian_sample_seed=int(extra.get("categorical_jacobian_sample_seed", 42)),
+            categorical_jacobian_mutation_batch_size=int(
+                extra.get("categorical_jacobian_mutation_batch_size", 20)
+            ),
+            max_structures=_opt_int("max_structures"),
+        )
+        if cfg.categorical_jacobian_sample_size is not None and (
+            cfg.categorical_jacobian_sample_size < 1
+        ):
+            raise ValueError("categorical_jacobian_sample_size must be >= 1 when provided")
+        if not 1 <= cfg.categorical_jacobian_mutation_batch_size <= 20:
+            raise ValueError("categorical_jacobian_mutation_batch_size must be in [1, 20]")
+        return cfg
 
 
 @register_eval_task("structure")
@@ -85,43 +146,13 @@ class StructureEvalTask(EvalTask):
 
     def __init__(self, entry: EvalDatasetEntry, cfg: OplmConfig) -> None:
         super().__init__(entry, cfg)
-        extra = entry.extra
-
-        self.contact_threshold: float = float(extra.get("contact_threshold", 8.0))
-        self.min_seq_sep: int = int(extra.get("min_seq_sep", 6))
-        self.l_divisor: int = int(extra.get("l_divisor", 1))
-        self.use_cbeta: bool = bool(extra.get("use_cbeta", True))
-        self.use_logistic_regression: bool = bool(extra.get("use_logistic_regression", True))
-        self.logreg_n_train: int = int(extra.get("logreg_n_train", 20))
-        self.logreg_n_iterations: int = int(extra.get("logreg_n_iterations", 5))
-        self.logreg_c: float = float(extra.get("logreg_c", 0.15))
-        self.use_categorical_jacobian: bool = bool(extra.get("use_categorical_jacobian", False))
-        self.categorical_jacobian_sample_size: int | None = (
-            int(extra["categorical_jacobian_sample_size"])
-            if "categorical_jacobian_sample_size" in extra
-            else None
-        )
-        self.categorical_jacobian_sample_seed: int = int(
-            extra.get("categorical_jacobian_sample_seed", 42)
-        )
-        self.categorical_jacobian_mutation_batch_size: int = int(
-            extra.get("categorical_jacobian_mutation_batch_size", 20)
-        )
-        self.max_structures: int | None = (
-            int(extra["max_structures"]) if "max_structures" in extra else None
-        )
-        if self.categorical_jacobian_sample_size is not None and (
-            self.categorical_jacobian_sample_size < 1
-        ):
-            raise ValueError("categorical_jacobian_sample_size must be >= 1 when provided")
-        if not 1 <= self.categorical_jacobian_mutation_batch_size <= 20:
-            raise ValueError("categorical_jacobian_mutation_batch_size must be in [1, 20]")
-        if entry.metrics is None and self.use_categorical_jacobian:
+        self.tcfg = StructureTaskConfig.from_extra(entry.extra)
+        if entry.metrics is None and self.tcfg.use_categorical_jacobian:
             self.metrics = ["precision_at_L", "categorical_jacobian_precision_at_L"]
 
         # Cached data (lazily loaded)
         self._structures: list[StructureData] | None = None
-        self._tokenizer: ProteinTokenizer | None = None
+        self._tokenizer: OplmTokenizerFast | None = None
         self._canonical_aa_token_ids: torch.Tensor | None = None
 
     def evaluate(
@@ -144,9 +175,9 @@ class StructureEvalTask(EvalTask):
         """
         # Lazy initialization
         if self._structures is None:
-            self._structures = load_structures(self.path, self.max_structures)
+            self._structures = load_structures(self.path, self.tcfg.max_structures)
         if self._tokenizer is None:
-            self._tokenizer = ProteinTokenizer()
+            self._tokenizer = get_tokenizer()
         if self._canonical_aa_token_ids is None:
             self._canonical_aa_token_ids = get_canonical_amino_acid_token_ids(self._tokenizer)
 
@@ -208,20 +239,20 @@ class StructureEvalTask(EvalTask):
                     results[metric_name] = 0.0
             else:
                 for metric_name, divisor in attention_metrics.items():
-                    if self.use_logistic_regression:
+                    if self.tcfg.use_logistic_regression:
                         p = compute_logreg_precision_at_l(
                             all_contact_data,
-                            n_train=self.logreg_n_train,
-                            n_iterations=self.logreg_n_iterations,
-                            logreg_c=self.logreg_c,
+                            n_train=self.tcfg.logreg_n_train,
+                            n_iterations=self.tcfg.logreg_n_iterations,
+                            logreg_c=self.tcfg.logreg_c,
                             l_divisor=divisor,
-                            min_seq_sep=self.min_seq_sep,
+                            min_seq_sep=self.tcfg.min_seq_sep,
                         )
                     else:
                         p = _fallback_mean_attention_precision(
                             all_contact_data,
                             l_divisor=divisor,
-                            min_seq_sep=self.min_seq_sep,
+                            min_seq_sep=self.tcfg.min_seq_sep,
                         )
                     results[metric_name] = p
 
@@ -235,7 +266,7 @@ class StructureEvalTask(EvalTask):
                     results[metric_name] = compute_mean_pair_score_precision_at_l(
                         all_categorical_jacobian_data,
                         l_divisor=divisor,
-                        min_seq_sep=self.min_seq_sep,
+                        min_seq_sep=self.tcfg.min_seq_sep,
                     )
 
         return {k: v for k, v in results.items() if k in self.metrics}
@@ -274,18 +305,18 @@ class StructureEvalTask(EvalTask):
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                need_weights=need_attention,
+                output_attentions=need_attention,
             )
 
         true_contacts = compute_contact_map(
             struct.coords,
-            threshold=self.contact_threshold,
-            use_cbeta=self.use_cbeta,
+            threshold=self.tcfg.contact_threshold,
+            use_cbeta=self.tcfg.use_cbeta,
         )
 
         attention_data: StructureContactData | None = None
         if need_attention:
-            raw_attn = outputs["attention_weights"]
+            raw_attn = outputs.attentions
             if raw_attn is None:
                 raise ValueError("Model did not return attention weights for structure evaluation")
 
@@ -302,7 +333,7 @@ class StructureEvalTask(EvalTask):
                 attn_contacts,
                 true_contacts,
                 seq_len,
-                self.min_seq_sep,
+                self.tcfg.min_seq_sep,
             )
             del raw_attn, attn_weights_cpu, attn_contacts
 
@@ -341,7 +372,7 @@ class StructureEvalTask(EvalTask):
                 wildtype_logits=wildtype_canonical_logits,
                 canonical_token_ids=self._canonical_aa_token_ids,
                 logits_fn=logits_fn,
-                mutation_batch_size=self.categorical_jacobian_mutation_batch_size,
+                mutation_batch_size=self.tcfg.categorical_jacobian_mutation_batch_size,
             )
             jacobian_contacts = categorical_jacobian_to_contact_map(
                 categorical_jacobian,
@@ -351,7 +382,7 @@ class StructureEvalTask(EvalTask):
                 jacobian_contacts,
                 true_contacts,
                 seq_len,
-                self.min_seq_sep,
+                self.tcfg.min_seq_sep,
             )
             del wildtype_logits, wildtype_canonical_logits, categorical_jacobian, jacobian_contacts
 
@@ -408,11 +439,11 @@ class StructureEvalTask(EvalTask):
         if not eligible_structures:
             return set()
 
-        sample_size = self.categorical_jacobian_sample_size
+        sample_size = self.tcfg.categorical_jacobian_sample_size
         if sample_size is None or sample_size >= len(eligible_structures):
             return {struct.name for struct in eligible_structures}
 
-        rng = np.random.RandomState(self.categorical_jacobian_sample_seed)
+        rng = np.random.RandomState(self.tcfg.categorical_jacobian_sample_seed)
         sampled_indices = sorted(
             rng.choice(len(eligible_structures), size=sample_size, replace=False)
         )

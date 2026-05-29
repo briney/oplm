@@ -581,13 +581,13 @@ on it.
 
 ### 4.1 `src/oplm/eval/tasks/sequence.py`
 
-- [ ] Change the loader import from the (to-be-deleted) eval copy to `oplm.data`:
+- [x] Change the loader import from the (to-be-deleted) eval copy to `oplm.data`:
 
   ```python
   from oplm.data import build_sequence_eval_dataloader  # was: oplm.eval.data.sequence_loader
   ```
 
-- [ ] Remove `_reset_dataloader_state` and its call. `oplm.data`'s
+- [x] Remove `_reset_dataloader_state` and its call. `oplm.data`'s
   `build_sequence_eval_dataloader` returns a `_ResettingDataLoader` that rewinds the
   deterministic collator on every `__iter__`, so the manual reset is redundant.
   `evaluate` becomes:
@@ -605,7 +605,7 @@ on it.
 
 ### 4.2 `src/oplm/eval/tasks/structure.py`
 
-- [ ] Replace the two top imports:
+- [x] Replace the two top imports:
 
   ```python
   # remove:
@@ -617,7 +617,7 @@ on it.
 
   Keep the `metrics.contact` / `metrics.categorical_jacobian` imports (eval-owned).
 
-- [ ] Add a typed task config and parse `entry.extra` once. Add this dataclass near the
+- [x] Add a typed task config and parse `entry.extra` once. Add this dataclass near the
   top of the module (it carries the exact current defaults and the two current
   validations):
 
@@ -684,7 +684,7 @@ on it.
           return cfg
   ```
 
-- [ ] In `__init__`, replace the block of `self.X = ... extra.get(...)` assignments
+- [x] In `__init__`, replace the block of `self.X = ... extra.get(...)` assignments
   (and the two inline `if` validations) with one line, and update the tokenizer types:
 
   ```python
@@ -701,14 +701,14 @@ on it.
   Add `from oplm.model import OplmTokenizerFast` under `TYPE_CHECKING` (used only for the
   annotation).
 
-- [ ] Replace every remaining `self.<knob>` reference in the file with `self.tcfg.<knob>`
+- [x] Replace every remaining `self.<knob>` reference in the file with `self.tcfg.<knob>`
   (`self.contact_threshold` → `self.tcfg.contact_threshold`, `self.min_seq_sep`,
   `self.l_divisor`, `self.use_cbeta`, `self.use_logistic_regression`,
   `self.logreg_n_train`, `self.logreg_n_iterations`, `self.logreg_c`,
   `self.use_categorical_jacobian`, `self.categorical_jacobian_*`, `self.max_structures`).
   Grep to confirm none remain: `grep -n "self\.\(contact_threshold\|min_seq_sep\|l_divisor\|use_cbeta\|use_logistic_regression\|logreg_\|use_categorical_jacobian\|categorical_jacobian_\|max_structures\)" src/oplm/eval/tasks/structure.py`.
 
-- [ ] In the lazy-init inside `evaluate`, swap the tokenizer constructor:
+- [x] In the lazy-init inside `evaluate`, swap the tokenizer constructor:
 
   ```python
   if self._tokenizer is None:
@@ -724,7 +724,7 @@ on it.
   `add_special_tokens=True` explicitly and confirm the contact extraction still strips
   the `<cls>`/`<eos>` positions.
 
-- [ ] **Update the forward call to the rewritten model's API.** The old model took
+- [x] **Update the forward call to the rewritten model's API.** The old model took
   `need_weights=` and returned attention under the `"attention_weights"` key; the rewritten
   `OplmForMaskedLM` takes `output_attentions=` and returns a HuggingFace `MaskedLMOutput`
   whose attention tuple is `.attentions` (key `"attentions"`). Phase 4.2 otherwise only
@@ -756,13 +756,13 @@ on it.
   (`output_attentions=True` forces it; see docs/MODEL_ARCHITECTURE.md §6.5), so no extra
   config flag is needed at the call site.
 
-- [ ] Optionally update `get_canonical_amino_acid_token_ids`'s parameter annotation in
+- [x] Optionally update `get_canonical_amino_acid_token_ids`'s parameter annotation in
   `src/oplm/eval/metrics/categorical_jacobian.py` from `ProteinTokenizer` to
   `OplmTokenizerFast` (it only calls `.encode`, so behavior is unchanged).
 
 ### 4.3 Delete the duplicated loaders
 
-- [ ] Remove the directory and its three files:
+- [x] Remove the directory and its three files:
 
   ```bash
   git rm src/oplm/eval/data/__init__.py \
@@ -770,7 +770,7 @@ on it.
          src/oplm/eval/data/structure_loader.py
   ```
 
-- [ ] Confirm nothing else imports them:
+- [x] Confirm nothing else imports them:
 
   ```bash
   grep -rn "oplm.eval.data" src/ tests/   # expect no results

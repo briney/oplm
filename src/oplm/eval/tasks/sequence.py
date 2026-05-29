@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
-from oplm.eval.data.sequence_loader import build_sequence_eval_dataloader
+from oplm.data import build_sequence_eval_dataloader
 from oplm.eval.metrics.mlm import compute_mlm_metrics
 from oplm.eval.registry import register_eval_task
 from oplm.eval.tasks.base import EvalTask
@@ -37,15 +37,6 @@ class SequenceEvalTask(EvalTask):
         super().__init__(entry, cfg)
         self._dataloader: DataLoader[dict[str, Tensor]] | None = None
 
-    def _reset_dataloader_state(self) -> None:
-        """Reset deterministic loader state before each evaluation pass."""
-        if self._dataloader is None:
-            return
-
-        reset = getattr(self._dataloader.collate_fn, "reset", None)
-        if callable(reset):
-            reset()
-
     def evaluate(
         self,
         model: OplmForMaskedLM,
@@ -55,7 +46,9 @@ class SequenceEvalTask(EvalTask):
 
         The DataLoader is lazily initialized on the first call to avoid
         loading eval data before training starts and to ensure the
-        accelerator is fully set up.
+        accelerator is fully set up. ``build_sequence_eval_dataloader`` returns
+        a resetting loader that rewinds its deterministic collator on every
+        ``__iter__``, so no manual reset is needed between passes.
 
         Args:
             model: The unwrapped model (already in eval mode).
@@ -66,7 +59,6 @@ class SequenceEvalTask(EvalTask):
         """
         if self._dataloader is None:
             self._dataloader = build_sequence_eval_dataloader(self.path, self.cfg)
-        self._reset_dataloader_state()
 
         all_metrics = compute_mlm_metrics(model, self._dataloader, accelerator)
 
