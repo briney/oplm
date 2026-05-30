@@ -31,7 +31,10 @@ train:
 
   # Logging
   log_every: 10
-  eval_every: { steps: 10_000 }   # default cadence: {steps: N} | {tokens: N}
+  # Default eval cadence for datasets that omit `every`: {steps: N} | {tokens: N}.
+  # Left null so an override replaces it cleanly (a non-null dict would deep-merge
+  # and collide on the unit key); null resolves to {steps: 10_000} in the Evaluator.
+  eval_every: null
   wandb_project: oplm
   wandb_run_name: null
   wandb_enabled: true

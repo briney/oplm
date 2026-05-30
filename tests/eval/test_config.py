@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from oplm.config import ScheduleSpec, load_config, parse_schedule_block
+from oplm.config import DEFAULT_EVAL_CADENCE, ScheduleSpec, load_config, parse_schedule_block
 from oplm.data.config import parse_eval_configs
 
 # Sentinel default cadence applied when an entry omits ``every``.
@@ -135,3 +135,24 @@ def test_load_config_eval_every_int_form_caught_by_schedule_parser() -> None:
     cfg = load_config(["train.eval_every=500"])
     with pytest.raises(ValueError, match="mapping"):
         parse_schedule_block(cfg.train.eval_every, "train.eval_every")
+
+
+def test_load_config_eval_every_defaults_to_null() -> None:
+    """The base layer leaves ``train.eval_every`` null; it resolves to the constant."""
+    cfg = load_config([])
+    assert cfg.train.eval_every is None
+    assert parse_schedule_block(DEFAULT_EVAL_CADENCE, "default") == ScheduleSpec("steps", 10_000)
+
+
+def test_load_config_eval_every_unit_switch_replaces_default() -> None:
+    """Switching the cadence unit on override replaces the null default cleanly.
+
+    Regression: with a non-null ``{steps: N}`` default, OmegaConf's deep dict-merge
+    left the ``steps`` key behind, so a ``{tokens: M}`` override produced a
+    two-unit mapping that ``parse_schedule_block`` rejects.
+    """
+    cfg = load_config(["train.eval_every={tokens: 20_000_000}"])
+    assert cfg.train.eval_every == {"tokens": 20_000_000}
+    assert parse_schedule_block(cfg.train.eval_every, "train.eval_every") == (
+        ScheduleSpec("tokens", 20_000_000)
+    )

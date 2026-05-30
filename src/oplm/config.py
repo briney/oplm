@@ -20,6 +20,13 @@ _VALID_OPTIMIZERS = ("adamw", "muon")
 _VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
 _VALID_MUON_ADJUST_LR_FNS = ("match_rms_adamw", "original")
 
+# Effective default for ``train.eval_every`` when left null. The field itself
+# defaults to None (not this mapping) so an override replaces it cleanly:
+# OmegaConf deep-merges dicts, so a non-null ``{steps: N}`` default would linger
+# and collide with a ``{tokens: M}`` override (two units → parse error). The
+# Evaluator coalesces None → this constant. See parse_schedule_block.
+DEFAULT_EVAL_CADENCE = {"steps": 10_000}
+
 
 @dataclass
 class TrainConfig:
@@ -55,9 +62,11 @@ class TrainConfig:
     # Logging
     log_every: int = 10
     # Default eval cadence for datasets that omit `every`. Same grammar as a
-    # data.eval.<name>.every block: exactly one of {steps, tokens}. Parsed into a
-    # ScheduleSpec by the Evaluator via oplm.config.parse_schedule_block.
-    eval_every: Any = field(default_factory=lambda: {"steps": 10_000})
+    # data.eval.<name>.every block: exactly one of {steps, tokens}. Defaults to
+    # None so a CLI/config override replaces it cleanly (OmegaConf deep-merges
+    # dicts); the Evaluator coalesces None → DEFAULT_EVAL_CADENCE and parses it
+    # into a ScheduleSpec via oplm.config.parse_schedule_block.
+    eval_every: Any = None
     wandb_project: str = "oplm"
     wandb_run_name: str | None = None
     wandb_enabled: bool = True

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from oplm.config import parse_schedule_block
+from oplm.config import DEFAULT_EVAL_CADENCE, parse_schedule_block
 from oplm.data.config import parse_eval_configs
 from oplm.eval.registry import get_eval_task_class
 from oplm.eval.schedule import EveryNSteps, EveryNTokens
@@ -27,7 +27,11 @@ class Evaluator:
     def __init__(self, cfg: OplmConfig) -> None:
         import oplm.eval.tasks  # noqa: F401  -- triggers task registration
 
-        default_schedule = parse_schedule_block(cfg.train.eval_every, "train.eval_every")
+        # eval_every defaults to None (clean override merge); coalesce here.
+        raw_cadence = cfg.train.eval_every
+        if raw_cadence is None:
+            raw_cadence = DEFAULT_EVAL_CADENCE
+        default_schedule = parse_schedule_block(raw_cadence, "train.eval_every")
         entries = parse_eval_configs(cfg.data.eval, default_schedule)
         self.tasks: list[EvalTask] = []
         for entry in entries:
