@@ -581,9 +581,8 @@ Rename every `cfg.model.max_seq_len` read to `cfg.model.max_position_embeddings`
 
 ### Phase-4 acceptance
 
-- [~] `grep -rn "max_seq_len" src/` — clean in `loaders.py`/`structure.py`. Two
-      hits remain in `cli.py` (lines 106, 163); those are rewritten in Phase 7,
-      after which the grep is fully clean (re-verified in Phase 9).
+- [x] `grep -rn "max_seq_len" src/` — fully clean. The two `cli.py` hits were
+      rewritten in Phase 7; `grep -rn "max_seq_len" src/` now returns nothing.
 
 ---
 
@@ -808,7 +807,7 @@ Replace the broken `OmegaConf.structured(deepcopy(cfg))` serialization and add a
 
 ### 7.1 `cli.py` — `train` one-line summary (≈ line 57)
 
-- [ ] Replace old field names:
+- [x] Replace old field names:
 
   ```python
   console.print(
@@ -818,7 +817,7 @@ Replace the broken `OmegaConf.structured(deepcopy(cfg))` serialization and add a
 
 ### 7.2 `cli.py` — `info` tables (≈ lines 104–187)
 
-- [ ] Build the model on the meta device exactly as today
+- [x] Build the model on the meta device exactly as today
       (`OplmForMaskedLM(cfg.model)`), then rebuild both tables on HF fields and
       drop rows for removed features. Replace the Architecture and Features table
       bodies with:
@@ -862,7 +861,7 @@ Collapse to the ESM-C API. `model.logits(...).embeddings` returns the
 post-final-norm hidden states `(B, L, hidden_size)`. The state-dict load path
 does **not** attach a tokenizer, so attach the shared one when missing.
 
-- [ ] Replace the command body:
+- [x] Replace the command body:
 
   ```python
   @app.command()
@@ -900,11 +899,11 @@ does **not** attach a tokenizer, so attach the shared one when missing.
       console.print(f"[green]Saved embeddings[/green] {tuple(embeddings.shape)} → {out_path}")
   ```
 
-- [ ] Remove the stale `from oplm.data.tokenizer import ProteinTokenizer` import.
+- [x] Remove the stale `from oplm.data.tokenizer import ProteinTokenizer` import.
 
 ### 7.4 `inference.py` — prefer the HF export, fall back to state dict
 
-- [ ] `load_model_for_inference` now builds from the HF config (`cfg.model` is the
+- [x] `load_model_for_inference` now builds from the HF config (`cfg.model` is the
       HF `OplmConfig`) and prefers `from_pretrained(<checkpoint>/hf)` when an HF
       export is present:
 
@@ -943,16 +942,20 @@ does **not** attach a tokenizer, so attach the shared one when missing.
       return None
   ```
 
-- [ ] Leave `resolve_inference_config`, `load_model_state_dict`,
+- [x] Leave `resolve_inference_config`, `load_model_state_dict`,
       `_find_associated_config`, and `_resolve_state_path` unchanged. (The
       checkpoint `config.yaml` written in Phase 6 still resolves through
       `load_config`; unknown HF keys from `to_dict()` are absorbed.)
 
 ### Phase-7 acceptance
 
-- [ ] `oplm info --preset small` prints a table with HF fields and no traceback.
-- [ ] `oplm encode <SEQ> --model <checkpoint-dir/hf>` writes an embeddings tensor
-      of shape `(1, L, hidden_size)`.
+- [x] `oplm info --preset small` prints a table with HF fields and no traceback.
+- [x] `oplm encode <SEQ> --model <checkpoint-dir/hf>` writes an embeddings tensor
+      of shape `(1, L, hidden_size)`. (Verified: a tiny HF export → `(1, 12, 32)`;
+      the export's `config.json` correctly overrides a passed `--preset`. The full
+      Phase-6 round trip — passing the top-level `checkpoint-N/` dir so
+      `resolve_inference_config` auto-finds `config.yaml` and `_find_hf_export`
+      resolves `checkpoint-N/hf/` — also works.)
 
 ---
 

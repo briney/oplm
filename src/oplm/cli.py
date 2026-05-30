@@ -66,7 +66,7 @@ def train(
     For distributed training: accelerate launch -m oplm.train --config <path>
     """
     cfg = load_config(_build_argv(config, preset, overrides, name))
-    console.print(f"[bold]Model:[/bold] {cfg.model.num_layers}L / {cfg.model.hidden_dim}D")
+    console.print(f"[bold]Model:[/bold] {cfg.model.num_hidden_layers}L / {cfg.model.hidden_size}D")
     console.print(f"[bold]Output:[/bold] {cfg.train.output_dir}")
 
     from oplm.train import main as train_main
@@ -88,10 +88,11 @@ def encode(
     preset: PresetOpt = None,
     overrides: OverridesOpt = None,
 ) -> None:
-    """Encode protein sequences to embeddings."""
+    """Encode protein sequences to per-residue embeddings."""
     import torch
 
-    from oplm.data.tokenizer import ProteinTokenizer
+    from oplm.data import get_tokenizer
+    from oplm.model import LogitsConfig
 
     cfg = resolve_inference_config(
         model_path,
@@ -100,17 +101,17 @@ def encode(
         overrides=overrides,
     )
     model = load_model_for_inference(model_path, cfg)
-
-    # Tokenize and encode
-    tokenizer = ProteinTokenizer()
-    batch = tokenizer.batch_encode(sequences, max_length=cfg.model.max_seq_len)
+    if getattr(model, "tokenizer", None) is None:
+        # `tokenizer` is intentionally un-annotated on the model (see modeling_oplm.py).
+        model.tokenizer = get_tokenizer()  # type: ignore[assignment]
 
     with torch.no_grad():
-        hidden = model.encoder(batch["input_ids"], attention_mask=batch["attention_mask"])[0]
+        embeddings = model.logits(list(sequences), LogitsConfig(return_embeddings=True)).embeddings
+    assert embeddings is not None  # return_embeddings=True always populates this
 
     out_path = Path(output)
-    torch.save(hidden, out_path)
-    console.print(f"[green]Saved embeddings[/green] {tuple(hidden.shape)} → {out_path}")
+    torch.save(embeddings, out_path)
+    console.print(f"[green]Saved embeddings[/green] {tuple(embeddings.shape)} → {out_path}")
 
 
 @app.command()
@@ -153,14 +154,14 @@ def info(
     table.add_column("Value")
     table.add_row("Parameters", f"{_fmt(total_params)} ({total_params:,})")
     table.add_row("Trainable", f"{_fmt(trainable_params)} ({trainable_params:,})")
-    table.add_row("Hidden dim", str(cfg.model.hidden_dim))
-    table.add_row("Layers", str(cfg.model.num_layers))
-    table.add_row("Attention heads", f"{cfg.model.num_heads} (KV: {cfg.model.num_kv_heads})")
+    table.add_row("Hidden size", str(cfg.model.hidden_size))
+    table.add_row("Layers", str(cfg.model.num_hidden_layers))
+    table.add_row("Attention heads", str(cfg.model.num_attention_heads))
     table.add_row("Head dim", str(cfg.model.head_dim))
-    table.add_row("FFN dim", str(cfg.model.ffn_dim))
+    table.add_row("Intermediate size", str(cfg.model.intermediate_size))
     table.add_row("FFN activation", cfg.model.ffn_activation)
     table.add_row("Vocab size", str(cfg.model.vocab_size))
-    table.add_row("Max seq len", str(cfg.model.max_seq_len))
+    table.add_row("Max positions", str(cfg.model.max_position_embeddings))
     console.print(table)
 
     # Features table
@@ -171,28 +172,19 @@ def info(
     def _status(enabled: bool) -> str:
         return "[green]on[/green]" if enabled else "[dim]off[/dim]"
 
-    features.add_row("Shared K/V", _status(cfg.model.shared_kv))
+    features.add_row("Norm type", cfg.model.norm_type)
+    features.add_row("Norm strategy", cfg.model.norm_strategy)
     features.add_row("Q/K norm", _status(cfg.model.qk_norm))
-    features.add_row("Output gate", _status(cfg.model.output_gate))
-    features.add_row("Post-SDPA norm", _status(cfg.model.post_sdpa_norm))
-    features.add_row("Partial RoPE", _status(cfg.model.partial_rope))
-    features.add_row("Value residual", _status(cfg.model.value_residual))
-    ve_str = str(cfg.model.num_value_embeds) if cfg.model.num_value_embeds else "[dim]off[/dim]"
-    features.add_row("Value embeds", ve_str)
-    cv_str = cfg.model.conv_positions if cfg.model.conv_positions else "[dim]none[/dim]"
-    features.add_row("Conv positions", cv_str)
-    if cfg.model.conv_kernel_schedule == "static":
-        conv_kernel_str = str(cfg.model.conv_kernel_size)
-    else:
-        conv_kernel_str = (
-            f"{cfg.model.conv_kernel_size} +{cfg.model.conv_kernel_increment} "
-            f"every {cfg.model.conv_kernel_block_size} layer(s)"
-        )
-        if cfg.model.conv_kernel_max_size is not None:
-            conv_kernel_str += f", max {cfg.model.conv_kernel_max_size}"
-    features.add_row("Conv kernels", conv_kernel_str)
-    features.add_row("Attn residual", _status(cfg.model.attn_residual))
+    features.add_row("Post-embed norm", _status(cfg.model.post_embed_norm))
+    features.add_row("Residual scaling", cfg.model.residual_scaling)
+    features.add_row("MLM head act", cfg.model.mlm_head_activation)
+    features.add_row("Canon", _status(cfg.model.canon_enabled))
+    canon_str = (
+        ", ".join(cfg.model.canon_positions) if cfg.model.canon_positions else "[dim]none[/dim]"
+    )
+    features.add_row("Canon positions", canon_str)
+    features.add_row("Flex attention", _status(cfg.model.use_flex_attention))
     features.add_row("Gradient ckpt", _status(cfg.model.gradient_checkpointing))
-    features.add_row("Tied embeddings", _status(cfg.model.tie_embeddings))
+    features.add_row("Tied embeddings", _status(cfg.model.tie_word_embeddings))
     console.print(features)
     console.print()
