@@ -488,14 +488,14 @@ for each (all listed below satisfy it).
 The model has **no GQA** (Q/K/V/O each project `hidden_size → hidden_size`) and
 the FFN is always gated (3 projections).
 
-- [ ] Update the type import to the HF config:
+- [x] Update the type import to the HF config:
 
   ```python
   if TYPE_CHECKING:
       from oplm.model import OplmConfig as OplmModelConfig
   ```
 
-- [ ] Rewrite `estimate_flops_per_token` for HF field names and drop GQA / the
+- [x] Rewrite `estimate_flops_per_token` for HF field names and drop GQA / the
       `ffn_dim`-derivation fallback (`intermediate_size` is always resolved):
 
   ```python
@@ -527,7 +527,7 @@ the FFN is always gated (3 projections).
 
 ### Phase-2 acceptance
 
-- [ ] Estimate is positive and finite, and strictly increases when
+- [x] Estimate is positive and finite, and strictly increases when
       `num_hidden_layers` or `hidden_size` increase (covered by Phase 8 test).
 
 ---
