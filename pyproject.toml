@@ -29,8 +29,11 @@ dependencies = [
     "torch>=2.11.0,<2.12",  # flex_attention gained FlashAttention-4 support in 2.11
     "transformers>=4.45,<5.4",
     "omegaconf>=2.3",
-    "typer>=0.9",
-    "rich>=13.0",
+    # typer 0.25 / rich 14+ change the --help panel rendering so the CLI help text
+    # no longer contains the option names verbatim (breaks tests/test_cli.py). Cap
+    # to the verified-good line, same rationale as above.
+    "typer>=0.9,<0.25",
+    "rich>=13.0,<14",
     "numpy>=1.26",
     "pyarrow>=14.0",
 ]
