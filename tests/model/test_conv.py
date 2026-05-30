@@ -1,151 +1,229 @@
-"""Tests for the BidirectionalDepthwiseConv module."""
+"""Tests for `oplm.model.conv` — CanonConv, resolve_canon_kernel_sizes."""
 
 from __future__ import annotations
 
+import pytest
 import torch
 
-from oplm.model.conv import BidirectionalDepthwiseConv
-
-
-B, T, D = 2, 16, 64
-
+from oplm.model.conv import CanonConv, resolve_canon_kernel_sizes
 
 # ---------------------------------------------------------------------------
-# Output shape tests
+# CanonConv shape / construction
 # ---------------------------------------------------------------------------
 
 
-class TestConvOutputShape:
-    """Verify output shape equals input shape (same padding)."""
+@pytest.mark.parametrize("kernel_size", [2, 3, 4, 5, 8])
+def test_canon_conv_preserves_shape(kernel_size: int):
+    conv = CanonConv(hidden_size=16, kernel_size=kernel_size)
+    x = torch.randn(2, 7, 16)
+    mask = torch.ones(2, 7, dtype=torch.long)
+    out = conv(x, mask)
+    assert out.shape == x.shape
 
-    def test_default_kernel(self) -> None:
-        conv = BidirectionalDepthwiseConv(D)
-        x = torch.randn(B, T, D)
-        assert conv(x).shape == (B, T, D)
 
-    def test_kernel_3(self) -> None:
-        conv = BidirectionalDepthwiseConv(D, kernel_size=3)
-        x = torch.randn(B, T, D)
-        assert conv(x).shape == (B, T, D)
+def test_canon_conv_is_depthwise():
+    conv = CanonConv(hidden_size=12, kernel_size=3)
+    # Depthwise: groups == in_channels == out_channels; weight has shape (D, 1, k).
+    assert conv.conv.groups == 12
+    assert conv.conv.weight.shape == (12, 1, 3)
+    assert conv.conv.bias is None
 
-    def test_kernel_15(self) -> None:
-        conv = BidirectionalDepthwiseConv(D, kernel_size=15)
-        x = torch.randn(B, T, D)
-        assert conv(x).shape == (B, T, D)
 
-    def test_single_token_sequence(self) -> None:
-        conv = BidirectionalDepthwiseConv(D, kernel_size=7)
-        x = torch.randn(B, 1, D)
-        assert conv(x).shape == (B, 1, D)
+def test_canon_conv_rejects_kernel_one():
+    with pytest.raises(ValueError, match="kernel_size"):
+        CanonConv(hidden_size=4, kernel_size=1)
 
-    def test_various_seq_lengths(self) -> None:
-        conv = BidirectionalDepthwiseConv(D, kernel_size=7)
-        for seq_len in [1, 3, 7, 8, 32, 128]:
-            x = torch.randn(B, seq_len, D)
-            assert conv(x).shape == (B, seq_len, D)
+
+def test_canon_conv_rejects_unknown_activation():
+    with pytest.raises(ValueError, match="activation"):
+        CanonConv(hidden_size=4, kernel_size=3, activation="tanh")
 
 
 # ---------------------------------------------------------------------------
-# Depthwise property
+# CanonConv pad zeroing
 # ---------------------------------------------------------------------------
 
 
-class TestConvDepthwise:
-    """Verify depthwise (groups=dim) parameterization."""
+def test_canon_conv_zeros_pad_inputs_before_conv():
+    """A non-zero value at a pad position must not influence the conv output.
 
-    def test_groups_equals_dim(self) -> None:
-        conv = BidirectionalDepthwiseConv(D, kernel_size=7)
-        assert conv.conv.groups == D
+    Compared against a parallel run where the same input is pre-zeroed at the
+    pad rows; the two outputs should be bit-identical.
+    """
+    torch.manual_seed(0)
+    conv = CanonConv(hidden_size=8, kernel_size=3)
+    x = torch.randn(1, 6, 8)
+    mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.long)
 
-    def test_parameter_count(self) -> None:
-        """Depthwise conv should have dim * kernel_size + dim (bias) params."""
-        k = 7
-        conv = BidirectionalDepthwiseConv(D, kernel_size=k)
-        # weight: (D, 1, k), bias: (D,)
-        total = sum(p.numel() for p in conv.conv.parameters())
-        assert total == D * k + D
+    # Inject garbage into pad positions; the conv must ignore it.
+    x_with_garbage = x.clone()
+    x_with_garbage[:, 4:, :] = 9999.0
+
+    out_garbage = conv(x_with_garbage, mask)
+    out_clean = conv(x * mask.unsqueeze(-1), mask)
+    assert torch.allclose(out_garbage, out_clean, atol=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# Bidirectional (symmetric) padding
-# ---------------------------------------------------------------------------
+def test_canon_conv_even_kernel_runs_and_preserves_length():
+    conv = CanonConv(hidden_size=8, kernel_size=4)
+    x = torch.randn(2, 5, 8)
+    mask = torch.ones(2, 5, dtype=torch.long)
+    out = conv(x, mask)
+    assert out.shape == (2, 5, 8)
 
 
-class TestConvBidirectional:
-    """Verify symmetric padding produces bidirectional context."""
+def test_canon_conv_odd_kernel_uses_symmetric_padding():
+    conv = CanonConv(hidden_size=8, kernel_size=3)
+    # Symmetric padding: conv's own padding is k//2 == 1; we add no manual pad.
+    assert conv.conv.padding == (1,)
+    assert conv._even_kernel is False  # type: ignore[attr-defined]
 
-    def test_symmetric_padding_amount(self) -> None:
-        """Padding should be kernel_size // 2 on each side."""
-        k = 7
-        conv = BidirectionalDepthwiseConv(D, kernel_size=k)
-        assert conv.conv.padding == (k // 2,)
 
-    def test_center_token_sees_both_sides(self) -> None:
-        """The middle token's output should depend on tokens on both sides."""
-        conv = BidirectionalDepthwiseConv(D, kernel_size=7, activation=False)
-        x = torch.zeros(1, 16, D)
-
-        # Set left and right neighbors of center differently
-        x[:, 6, :] = 1.0  # left of center
-        x[:, 8, :] = 1.0  # right of center
-        out = conv(x)
-
-        # Center token (idx 7) should be nonzero due to neighbors
-        assert out[:, 7, :].abs().sum() > 0
-
-    def test_first_and_last_tokens_have_output(self) -> None:
-        """Edge tokens should produce valid (nonzero) output."""
-        conv = BidirectionalDepthwiseConv(D, kernel_size=7, activation=False)
-        x = torch.randn(B, T, D)
-        out = conv(x)
-        assert out[:, 0, :].abs().sum() > 0
-        assert out[:, -1, :].abs().sum() > 0
+def test_canon_conv_even_kernel_disables_builtin_padding():
+    conv = CanonConv(hidden_size=8, kernel_size=4)
+    # Even kernels: conv padding is 0; we pad manually before the conv runs.
+    assert conv.conv.padding == (0,)
+    assert conv._even_kernel is True  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
-# Activation toggle
+# CanonConv activations
 # ---------------------------------------------------------------------------
 
 
-class TestConvActivation:
-    """Verify the optional SiLU activation."""
+def test_canon_conv_no_activation_by_default():
+    """With activation='none', a linear conv equals the raw conv output."""
+    torch.manual_seed(1)
+    conv = CanonConv(hidden_size=8, kernel_size=3, activation="none")
+    x = torch.randn(2, 4, 8)
+    mask = torch.ones(2, 4, dtype=torch.long)
 
-    def test_activation_enabled_by_default(self) -> None:
-        conv = BidirectionalDepthwiseConv(D)
-        assert isinstance(conv.act, torch.nn.SiLU)
+    out = conv(x, mask)
+    # Equivalent manual path: zero pads -> transpose -> conv -> transpose.
+    expected = conv.conv((x * mask.unsqueeze(-1)).transpose(1, 2)).transpose(1, 2)
+    assert torch.allclose(out, expected, atol=1e-6)
 
-    def test_activation_disabled(self) -> None:
-        conv = BidirectionalDepthwiseConv(D, activation=False)
-        assert isinstance(conv.act, torch.nn.Identity)
 
-    def test_activation_changes_output(self) -> None:
-        """With vs without activation should differ."""
-        torch.manual_seed(42)
-        x = torch.randn(B, T, D)
+def test_canon_conv_silu_activation_applied():
+    torch.manual_seed(2)
+    conv = CanonConv(hidden_size=8, kernel_size=3, activation="silu")
+    x = torch.randn(1, 4, 8)
+    mask = torch.ones(1, 4, dtype=torch.long)
 
-        torch.manual_seed(0)
-        conv_act = BidirectionalDepthwiseConv(D, activation=True)
-        torch.manual_seed(0)
-        conv_no = BidirectionalDepthwiseConv(D, activation=False)
+    out = conv(x, mask)
+    pre_act = conv.conv((x * mask.unsqueeze(-1)).transpose(1, 2)).transpose(1, 2)
+    assert torch.allclose(out, torch.nn.functional.silu(pre_act), atol=1e-6)
 
-        out_act = conv_act(x)
-        out_no = conv_no(x)
-        assert not torch.allclose(out_act, out_no, atol=1e-6)
+
+def test_canon_conv_gelu_activation_applied():
+    torch.manual_seed(3)
+    conv = CanonConv(hidden_size=8, kernel_size=3, activation="gelu")
+    x = torch.randn(1, 4, 8)
+    mask = torch.ones(1, 4, dtype=torch.long)
+
+    out = conv(x, mask)
+    pre_act = conv.conv((x * mask.unsqueeze(-1)).transpose(1, 2)).transpose(1, 2)
+    assert torch.allclose(out, torch.nn.functional.gelu(pre_act), atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# Gradient flow
+# CanonConv gradient flow
 # ---------------------------------------------------------------------------
 
 
-class TestConvGradient:
-    """Verify gradients flow through the conv."""
+def test_canon_conv_grad_flows_to_weight_and_input():
+    conv = CanonConv(hidden_size=8, kernel_size=3)
+    x = torch.randn(2, 4, 8, requires_grad=True)
+    mask = torch.ones(2, 4, dtype=torch.long)
+    conv(x, mask).sum().backward()
+    assert conv.conv.weight.grad is not None
+    assert conv.conv.weight.grad.abs().sum() > 0
+    assert x.grad is not None
+    assert x.grad.abs().sum() > 0
 
-    def test_gradient_flow(self) -> None:
-        conv = BidirectionalDepthwiseConv(D, kernel_size=7)
-        x = torch.randn(B, T, D, requires_grad=True)
-        loss = conv(x).sum()
-        loss.backward()
-        for name, param in conv.named_parameters():
-            assert param.grad is not None, f"No gradient for {name}"
-            assert param.grad.abs().sum() > 0, f"Zero gradient for {name}"
+
+# ---------------------------------------------------------------------------
+# resolve_canon_kernel_sizes
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_scalar_broadcasts():
+    assert resolve_canon_kernel_sizes(4, num_hidden_layers=6) == [4, 4, 4, 4, 4, 4]
+
+
+def test_resolve_list_passthrough():
+    assert resolve_canon_kernel_sizes([2, 3, 4, 5], num_hidden_layers=4) == [2, 3, 4, 5]
+
+
+def test_resolve_list_wrong_length_raises():
+    with pytest.raises(ValueError, match="length"):
+        resolve_canon_kernel_sizes([3, 3, 3], num_hidden_layers=4)
+
+
+def test_resolve_constant_schedule():
+    out = resolve_canon_kernel_sizes({"schedule": "constant", "value": 5}, num_hidden_layers=4)
+    assert out == [5, 5, 5, 5]
+
+
+def test_resolve_linear_schedule_endpoints_and_length():
+    out = resolve_canon_kernel_sizes(
+        {"schedule": "linear", "min": 2, "max": 8}, num_hidden_layers=4
+    )
+    assert len(out) == 4
+    assert out[0] == 2
+    assert out[-1] == 8
+    # Linear interpolation rounded to ints: monotonic non-decreasing.
+    assert all(b >= a for a, b in zip(out, out[1:], strict=False))
+
+
+def test_resolve_linear_schedule_single_layer():
+    out = resolve_canon_kernel_sizes(
+        {"schedule": "linear", "min": 3, "max": 9}, num_hidden_layers=1
+    )
+    # Endpoint of a single-element linspace is `min` (np.linspace convention).
+    assert out == [3]
+
+
+def test_resolve_linear_schedule_decreasing():
+    out = resolve_canon_kernel_sizes(
+        {"schedule": "linear", "min": 8, "max": 2}, num_hidden_layers=4
+    )
+    assert out[0] == 8
+    assert out[-1] == 2
+    assert all(b <= a for a, b in zip(out, out[1:], strict=False))
+
+
+def test_resolve_rejects_kernel_below_two():
+    with pytest.raises(ValueError, match=">= 2"):
+        resolve_canon_kernel_sizes([2, 1, 3, 4], num_hidden_layers=4)
+    with pytest.raises(ValueError, match=">= 2"):
+        resolve_canon_kernel_sizes(1, num_hidden_layers=3)
+
+
+def test_resolve_unknown_schedule_raises():
+    with pytest.raises(ValueError, match="schedule"):
+        resolve_canon_kernel_sizes(
+            {"schedule": "exponential", "min": 2, "max": 8}, num_hidden_layers=4
+        )
+
+
+def test_resolve_linear_missing_keys_raises():
+    with pytest.raises(ValueError, match="min"):
+        resolve_canon_kernel_sizes({"schedule": "linear", "max": 8}, num_hidden_layers=4)
+
+
+def test_resolve_constant_missing_value_raises():
+    with pytest.raises(ValueError, match="value"):
+        resolve_canon_kernel_sizes({"schedule": "constant"}, num_hidden_layers=4)
+
+
+def test_resolve_rejects_unsupported_type():
+    with pytest.raises(ValueError, match="int"):
+        resolve_canon_kernel_sizes("4", num_hidden_layers=3)  # type: ignore[arg-type]
+
+
+def test_resolve_rejects_bool():
+    # bool is a subclass of int; we explicitly reject it so a stray True/False
+    # doesn't silently become an all-1s or all-0s kernel schedule.
+    with pytest.raises(ValueError, match="bool"):
+        resolve_canon_kernel_sizes(True, num_hidden_layers=3)  # type: ignore[arg-type]

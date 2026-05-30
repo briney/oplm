@@ -5,7 +5,6 @@ Uses OmegaConf for YAML serialization, CLI overrides, and type-safe merging.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
@@ -14,168 +13,19 @@ from typing import Any, cast
 from omegaconf import DictConfig, OmegaConf
 
 AVAILABLE_PRESETS = ("small", "medium", "base", "large", "xlarge")
-_VALID_CONV_KERNEL_SCHEDULES = ("static", "block_step")
-
-
-def round_multiple(x: float, multiple: int) -> int:
-    """Round x up to the nearest multiple."""
-    return int(math.ceil(x / multiple) * multiple)
-
-
-@dataclass
-class ModelConfig:
-    """Model architecture configuration."""
-
-    # Core dimensions
-    hidden_dim: int = 768
-    num_layers: int = 12
-    num_heads: int = 12
-    num_kv_heads: int = 4
-    head_dim: int | None = None
-    ffn_dim: int | None = None
-    ffn_activation: str = "swiglu"
-    vocab_size: int = 32
-    max_seq_len: int = 512
-
-    # Attention features
-    shared_kv: bool = False
-    qk_norm: bool = True
-    output_gate: bool = False
-    query_dependent_gate: bool = False
-    post_sdpa_norm: bool = False
-
-    # Positional encoding
-    rope_theta: float = 10000.0
-    partial_rope: bool = False
-    nope_dim: int | None = None
-    rope_dim: int | None = None
-
-    # Cross-layer value residuals (Proust)
-    value_residual: bool = False
-    value_residual_lambda_init: float = 0.5
-
-    # Value embeddings (Proust)
-    num_value_embeds: int = 0
-    value_embed_gate_dim: int = 16
-
-    # Depthwise convolutions
-    conv_positions: str = ""
-    conv_kernel_size: int = 7
-    conv_kernel_schedule: str = "static"
-    conv_kernel_increment: int = 2
-    conv_kernel_block_size: int = 1
-    conv_kernel_max_size: int | None = None
-    conv_activation: bool = True
-
-    # Attention residuals (depth-wise, Kimi)
-    attn_residual: bool = False
-    attn_residual_block_size: int = 8
-
-    # Normalization
-    norm_eps: float = 1e-6
-    post_embed_norm: bool = False
-    pre_norm: bool = True
-    post_norm: bool = False
-    sandwich_norm: bool = False
-
-    # Training features
-    gradient_checkpointing: bool = False
-    tie_embeddings: bool = False
-    # Reserved for a future model-construction dtype surface. Runtime precision
-    # is currently controlled by ``train.mixed_precision``.
-    dtype: str = "bfloat16"
-
-    def __post_init__(self) -> None:
-        """Compute derived fields and validate configuration."""
-        # Derived fields
-        if self.head_dim is None:
-            self.head_dim = self.hidden_dim // self.num_heads
-        if self.ffn_dim is None:
-            if self.ffn_activation == "swiglu":
-                self.ffn_dim = round_multiple(8 / 3 * self.hidden_dim, 256)
-            else:
-                self.ffn_dim = 4 * self.hidden_dim
-        if self.rope_dim is None:
-            self.rope_dim = 32 if self.partial_rope else self.head_dim
-        if self.nope_dim is None:
-            self.nope_dim = self.head_dim - self.rope_dim
-
-        # Validation
-        if self.hidden_dim % self.num_heads != 0:
-            raise ValueError(
-                f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})"
-            )
-        if self.num_heads % self.num_kv_heads != 0:
-            raise ValueError(
-                f"num_heads ({self.num_heads}) must be divisible by "
-                f"num_kv_heads ({self.num_kv_heads})"
-            )
-        if self.partial_rope and self.nope_dim + self.rope_dim != self.head_dim:
-            raise ValueError(
-                f"nope_dim ({self.nope_dim}) + rope_dim ({self.rope_dim}) "
-                f"must equal head_dim ({self.head_dim})"
-            )
-        if self.conv_kernel_size % 2 == 0:
-            raise ValueError(f"conv_kernel_size ({self.conv_kernel_size}) must be odd")
-        if self.conv_kernel_schedule not in _VALID_CONV_KERNEL_SCHEDULES:
-            raise ValueError(
-                "conv_kernel_schedule must be one of "
-                f"{_VALID_CONV_KERNEL_SCHEDULES}, got {self.conv_kernel_schedule!r}"
-            )
-        if self.conv_kernel_schedule == "block_step":
-            if self.conv_kernel_increment < 0 or self.conv_kernel_increment % 2 != 0:
-                raise ValueError(
-                    "conv_kernel_increment "
-                    f"({self.conv_kernel_increment}) must be a non-negative even integer"
-                )
-            if self.conv_kernel_block_size < 1:
-                raise ValueError(
-                    f"conv_kernel_block_size ({self.conv_kernel_block_size}) must be >= 1"
-                )
-            if self.conv_kernel_max_size is not None:
-                if self.conv_kernel_max_size % 2 == 0:
-                    raise ValueError(
-                        f"conv_kernel_max_size ({self.conv_kernel_max_size}) must be odd"
-                    )
-                if self.conv_kernel_max_size < self.conv_kernel_size:
-                    raise ValueError(
-                        "conv_kernel_max_size "
-                        f"({self.conv_kernel_max_size}) must be >= conv_kernel_size "
-                        f"({self.conv_kernel_size})"
-                    )
-        if self.conv_positions and not all(c in "ACD" for c in self.conv_positions):
-            raise ValueError(
-                f"conv_positions ({self.conv_positions!r}) must only contain 'A', 'C', 'D'"
-            )
-        if self.attn_residual and self.num_layers % self.attn_residual_block_size != 0:
-            raise ValueError(
-                f"attn_residual_block_size ({self.attn_residual_block_size}) "
-                f"must divide num_layers ({self.num_layers})"
-            )
-        valid_activations = ("swiglu", "relu_squared", "gelu")
-        if self.ffn_activation not in valid_activations:
-            raise ValueError(
-                f"ffn_activation must be one of {valid_activations}, got {self.ffn_activation!r}"
-            )
-
-    def conv_kernel_size_for_layer(self, layer_idx: int) -> int:
-        """Return the effective convolution kernel size for a given layer."""
-        if self.conv_kernel_schedule == "static":
-            return self.conv_kernel_size
-
-        kernel_size = (
-            self.conv_kernel_size
-            + (layer_idx // self.conv_kernel_block_size) * self.conv_kernel_increment
-        )
-        if self.conv_kernel_max_size is not None:
-            kernel_size = min(kernel_size, self.conv_kernel_max_size)
-        return kernel_size
 
 
 _VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
 _VALID_OPTIMIZERS = ("adamw", "muon")
 _VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
 _VALID_MUON_ADJUST_LR_FNS = ("match_rms_adamw", "original")
+
+# Effective default for ``train.eval_every`` when left null. The field itself
+# defaults to None (not this mapping) so an override replaces it cleanly:
+# OmegaConf deep-merges dicts, so a non-null ``{steps: N}`` default would linger
+# and collide with a ``{tokens: M}`` override (two units → parse error). The
+# Evaluator coalesces None → this constant. See parse_schedule_block.
+DEFAULT_EVAL_CADENCE = {"steps": 10_000}
 
 
 @dataclass
@@ -211,7 +61,12 @@ class TrainConfig:
 
     # Logging
     log_every: int = 10
-    eval_every: int = 10_000
+    # Default eval cadence for datasets that omit `every`. Same grammar as a
+    # data.eval.<name>.every block: exactly one of {steps, tokens}. Defaults to
+    # None so a CLI/config override replaces it cleanly (OmegaConf deep-merges
+    # dicts); the Evaluator coalesces None → DEFAULT_EVAL_CADENCE and parses it
+    # into a ScheduleSpec via oplm.config.parse_schedule_block.
+    eval_every: Any = None
     wandb_project: str = "oplm"
     wandb_run_name: str | None = None
     wandb_enabled: bool = True
@@ -270,7 +125,7 @@ class TrainConfig:
 class TrainDatasetEntry:
     """Parsed configuration for a single training dataset.
 
-    Populated by :func:`parse_train_configs`, not directly from YAML.
+    Populated by :func:`oplm.data.config.parse_train_configs`, not directly from YAML.
     """
 
     name: str
@@ -278,19 +133,86 @@ class TrainDatasetEntry:
     fraction: float
 
 
+_VALID_SCHEDULE_UNITS = ("steps", "tokens")  # "epochs" deferred — EVAL_HARNESS.md §4.6
+_SCHEDULE_KEYS = frozenset({*_VALID_SCHEDULE_UNITS, "at_start", "at_end"})
+
+
+@dataclass(frozen=True)
+class ScheduleSpec:
+    """Parsed, behavior-free eval cadence built from an ``every: {unit: N}`` block.
+
+    Carries no behavior so it can live in ``oplm.config`` without importing
+    ``oplm.eval``. The eval harness turns it into a concrete ``Schedule`` via
+    ``oplm.eval.schedule.build_schedule``.
+    """
+
+    unit: str  # one of _VALID_SCHEDULE_UNITS
+    n: int  # positive
+    at_start: bool = False
+    at_end: bool = True
+
+
+def parse_schedule_block(raw: Any, label: str) -> ScheduleSpec:
+    """Parse an ``every: {unit: N, at_start?, at_end?}`` mapping into a ScheduleSpec.
+
+    Args:
+        raw: The cadence mapping (a dataset's ``every`` or ``train.eval_every``).
+        label: Human-readable source used in error messages.
+
+    Raises:
+        ValueError: If ``raw`` is not a mapping, names ``epochs`` (deferred), does not
+            name exactly one valid unit, has unknown keys, the unit value is not a
+            positive int, or ``at_start`` / ``at_end`` are not actual bools.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{label}: cadence must be a mapping like {{steps: N}} or {{tokens: N}}, "
+            f"got {type(raw).__name__}"
+        )
+    if "epochs" in raw:
+        raise ValueError(
+            f"{label}: epoch cadence is not yet supported (see docs/EVAL_HARNESS.md "
+            f"§4.6); use {{steps: N}} or {{tokens: N}}"
+        )
+    unknown = [k for k in raw if k not in _SCHEDULE_KEYS]
+    if unknown:
+        raise ValueError(f"{label}: unknown keys in cadence block: {sorted(unknown)}")
+    unit_keys = [k for k in raw if k in _VALID_SCHEDULE_UNITS]
+    if len(unit_keys) != 1:
+        raise ValueError(
+            f"{label}: cadence must name exactly one of {list(_VALID_SCHEDULE_UNITS)}, "
+            f"got {sorted(unit_keys)}"
+        )
+    unit = unit_keys[0]
+    n = raw[unit]
+    if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+        raise ValueError(f"{label}: cadence {unit!r} must be a positive int, got {n!r}")
+    # The schema says bools; parse them strictly. bool(raw.get(...)) would coerce the
+    # YAML string "false" to True, silently inverting the flag — validate the type.
+    at_start = raw.get("at_start", False)
+    at_end = raw.get("at_end", True)
+    for flag_name, flag_value in (("at_start", at_start), ("at_end", at_end)):
+        if not isinstance(flag_value, bool):
+            raise ValueError(
+                f"{label}: {flag_name!r} must be a bool, got {flag_value!r} "
+                f"({type(flag_value).__name__})"
+            )
+    return ScheduleSpec(unit=unit, n=n, at_start=at_start, at_end=at_end)
+
+
 @dataclass
 class EvalDatasetEntry:
     """Parsed configuration for a single evaluation dataset.
 
-    Populated by :func:`parse_eval_configs`, not directly from YAML.
+    Populated by :func:`oplm.data.config.parse_eval_configs`, not directly from YAML.
     """
 
     name: str
     path: str
-    type: str  # "sequence", "structure", "proteingym", ...
-    eval_every: int | None = None  # Per-dataset override; None → use train.eval_every
-    metrics: list[str] | None = None  # Override default metrics; None → use type defaults
-    extra: dict[str, Any] = field(default_factory=dict)  # Task-specific config
+    type: str  # registry key: "sequence", "structure", ...
+    schedule: ScheduleSpec  # was: eval_every: int | None
+    metrics: list[str] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -299,15 +221,18 @@ class DataConfig:
 
     # Training dataset(s). Accepts a str path (single dataset) or a dict of
     # {name: {path, fraction}} (multiple datasets). Parsed at runtime via
-    # parse_train_configs(). See configs/data/base.yaml for syntax examples.
+    # oplm.data.config.parse_train_configs(). See configs/data/base.yaml for syntax.
     train: Any = None
 
     # Evaluation dataset(s). Accepts a dict of {name: {path, type, ...}}.
-    # Parsed at runtime via parse_eval_configs().
+    # Parsed at runtime via oplm.data.config.parse_eval_configs().
     eval: Any = None
 
-    # Sequence masking
-    mask_prob: float = 0.15
+    # Sequence masking (see docs/DATA_TOOLING.md §4.5)
+    mask_prob: float = 0.15  # fraction of eligible positions selected for masking
+    mask_token_prob: float = 0.8  # of masked positions -> <mask>
+    random_token_prob: float = 0.1  # of masked positions -> random canonical AA
+    weighted_masking: bool = False  # honor the masking_weights column when True (§4.5.1)
 
     # DataLoader settings
     num_workers: int = 4
@@ -318,12 +243,30 @@ class DataConfig:
     shuffle_shards: bool = True
     shuffle_rows: bool = True
 
+    def __post_init__(self) -> None:
+        """Validate the masking-split probabilities."""
+        if not 0.0 <= self.mask_token_prob <= 1.0:
+            raise ValueError(f"mask_token_prob must be in [0, 1], got {self.mask_token_prob}")
+        if not 0.0 <= self.random_token_prob <= 1.0:
+            raise ValueError(f"random_token_prob must be in [0, 1], got {self.random_token_prob}")
+        # The remainder (1 - mask_token_prob - random_token_prob) keeps the
+        # original token, so the two probabilities must not exceed 1 together.
+        if self.mask_token_prob + self.random_token_prob > 1.0 + 1e-9:
+            raise ValueError(
+                "mask_token_prob + random_token_prob must be <= 1, got "
+                f"{self.mask_token_prob} + {self.random_token_prob} = "
+                f"{self.mask_token_prob + self.random_token_prob}"
+            )
+
 
 @dataclass
 class OplmConfig:
     """Root configuration composing model, training, and data configs."""
 
-    model: ModelConfig = field(default_factory=ModelConfig)
+    # Resolved into oplm.model.OplmConfig (the HF PretrainedConfig) by
+    # load_config. Untyped so OmegaConf can carry arbitrary HF field keys,
+    # mirroring how DataConfig.train/.eval are Any.
+    model: Any = field(default_factory=dict)
     train: TrainConfig = field(default_factory=TrainConfig)
     data: DataConfig = field(default_factory=DataConfig)
 
@@ -349,11 +292,21 @@ def get_preset_config(preset: str) -> DictConfig:
     return cast("DictConfig", OmegaConf.create(yaml_text))
 
 
-# Fields in ModelConfig that are derived from other fields in __post_init__.
-# These must be reset to None before OmegaConf.to_object() when they were not
-# explicitly set by the user, so that __post_init__ recomputes them from the
-# (potentially overridden) source dimensions.
-_DERIVED_MODEL_FIELDS = ("head_dim", "ffn_dim", "rope_dim", "nope_dim")
+# Per-concern default layers, merged at the config root in this order. Each
+# file is section-wrapped (top-level `model:` / `train:` / `data:`).
+_BASE_CONFIG_LAYERS = (
+    ("oplm.configs.model", "base.yaml"),
+    ("oplm.configs.train", "base.yaml"),
+    ("oplm.configs.data", "base.yaml"),
+)
+
+
+def _load_packaged_yaml(package: str, filename: str) -> DictConfig:
+    """Load a YAML resource shipped inside the package as a DictConfig."""
+    text = files(package).joinpath(filename).read_text()
+    return cast("DictConfig", OmegaConf.create(text))
+
+
 _NESTED_VALUE_MISSING = object()
 
 
@@ -375,179 +328,9 @@ def _reject_removed_sequence_length_alias(override_dicts: list[Any]) -> None:
     )
     if has_removed_alias:
         raise ValueError(
-            "`data.max_length` has been removed. Use `model.max_seq_len` as the "
-            "sequence-length setting."
+            "`data.max_length` has been removed. Use `model.max_position_embeddings` "
+            "as the sequence-length setting."
         )
-
-
-def parse_train_configs(raw: Any) -> list[TrainDatasetEntry]:
-    """Normalize a raw ``data.train`` config value into structured dataset entries.
-
-    Supports three forms:
-
-    * ``None`` or empty dict → empty list (no training data)
-    * String path → single dataset at 100% sampling
-    * Dict of ``{name: {path, fraction}}`` → multiple datasets with fractions
-
-    Fractions are normalized to sum to 1.0. Omitted fractions share the
-    remaining mass equally among unspecified entries.
-
-    Args:
-        raw: The ``data.train`` value from config — a string, dict, or None.
-
-    Returns:
-        List of :class:`TrainDatasetEntry` with normalized fractions.
-
-    Raises:
-        ValueError: If the config structure is invalid or fractions are negative.
-    """
-    if raw is None:
-        return []
-
-    if isinstance(raw, str):
-        if not raw:
-            return []
-        return [TrainDatasetEntry(name="default", path=raw, fraction=1.0)]
-
-    if isinstance(raw, dict):
-        if len(raw) == 0:
-            return []
-
-        entries: list[TrainDatasetEntry] = []
-        for name, value in raw.items():
-            if value is None:
-                continue
-            if isinstance(value, str):
-                entries.append(TrainDatasetEntry(name=str(name), path=value, fraction=-1.0))
-            elif isinstance(value, dict):
-                path = value.get("path")
-                if path is None:
-                    continue
-                frac = value.get("fraction")
-                entries.append(
-                    TrainDatasetEntry(
-                        name=str(name),
-                        path=str(path),
-                        fraction=float(frac) if frac is not None else -1.0,
-                    )
-                )
-            else:
-                raise ValueError(
-                    f"Invalid train config for {name!r}: expected str or dict, "
-                    f"got {type(value).__name__}"
-                )
-
-        if len(entries) == 0:
-            return []
-        if len(entries) == 1:
-            entries[0].fraction = 1.0
-            return entries
-
-        # Validate specified fractions
-        for e in entries:
-            if e.fraction != -1.0 and e.fraction < 0:
-                raise ValueError(f"data.train.{e.name}.fraction must be >= 0")
-
-        # Fill unspecified fractions: share remaining mass equally
-        specified_total = sum(e.fraction for e in entries if e.fraction >= 0)
-        unspecified = [e for e in entries if e.fraction < 0]
-        if unspecified:
-            remaining = max(0.0, 1.0 - specified_total)
-            default_frac = remaining / len(unspecified) if remaining > 0 else 0.0
-            for e in unspecified:
-                e.fraction = default_frac
-
-        # Normalize to sum to 1.0
-        total = sum(e.fraction for e in entries)
-        if total <= 0:
-            eq = 1.0 / len(entries)
-            for e in entries:
-                e.fraction = eq
-        else:
-            for e in entries:
-                e.fraction = e.fraction / total
-
-        return entries
-
-    raise ValueError(f"Invalid data.train config type: {type(raw).__name__}")
-
-
-def parse_eval_configs(raw: Any, default_eval_every: int) -> list[EvalDatasetEntry]:
-    """Normalize a raw ``data.eval`` config value into structured eval dataset entries.
-
-    Supports two forms:
-
-    * ``None`` or empty dict → empty list (no eval data)
-    * Dict of ``{name: {path, type, eval_every?, metrics?}}`` → multiple eval datasets
-
-    Args:
-        raw: The ``data.eval`` value from config — a dict or None.
-        default_eval_every: Fallback ``eval_every`` from ``train.eval_every``.
-
-    Returns:
-        List of :class:`EvalDatasetEntry` with resolved eval_every values.
-
-    Raises:
-        ValueError: If the config structure is invalid or required fields are missing.
-    """
-    if raw is None:
-        return []
-
-    if isinstance(raw, dict):
-        if len(raw) == 0:
-            return []
-
-        entries: list[EvalDatasetEntry] = []
-        for name, value in raw.items():
-            if value is None:
-                continue
-            if not isinstance(value, dict):
-                raise ValueError(
-                    f"Invalid eval config for {name!r}: expected dict with 'path' and 'type', "
-                    f"got {type(value).__name__}"
-                )
-
-            path = value.get("path")
-            if path is None:
-                raise ValueError(f"Eval dataset {name!r} is missing required 'path' field")
-
-            eval_type = value.get("type")
-            if eval_type is None:
-                raise ValueError(f"Eval dataset {name!r} is missing required 'type' field")
-
-            eval_every = value.get("eval_every")
-            if eval_every is not None:
-                eval_every = int(eval_every)
-
-            raw_metrics = value.get("metrics")
-            metrics: list[str] | None = None
-            if raw_metrics is not None:
-                metrics = [str(m) for m in raw_metrics]
-
-            if "extra" in value:
-                raise ValueError(
-                    f"Eval dataset {name!r} uses deprecated nested 'extra' config. "
-                    "Put task-specific keys directly on the dataset entry instead."
-                )
-
-            # Collect task-specific config keys into extra dict
-            _KNOWN_EVAL_KEYS = {"path", "type", "eval_every", "metrics"}
-            extra = {k: v for k, v in value.items() if k not in _KNOWN_EVAL_KEYS}
-
-            entries.append(
-                EvalDatasetEntry(
-                    name=str(name),
-                    path=str(path),
-                    type=str(eval_type),
-                    eval_every=eval_every if eval_every is not None else default_eval_every,
-                    metrics=metrics,
-                    extra=extra,
-                )
-            )
-
-        return entries
-
-    raise ValueError(f"Invalid data.eval config type: {type(raw).__name__}")
 
 
 def load_config(argv: list[str]) -> OplmConfig:
@@ -558,11 +341,15 @@ def load_config(argv: list[str]) -> OplmConfig:
     Args:
         argv: Command-line arguments (e.g. sys.argv[1:]).
             Supports ``--preset <name>`` for size presets, ``--config <path>``
-            for YAML files, and dotlist overrides like ``model.num_layers=32``.
+            for YAML files, ``--name <run>`` for the W&B run name, and dotlist
+            overrides like ``model.num_hidden_layers=32``.
 
     Returns:
         Fully resolved and validated OplmConfig. If a YAML file was used,
-        ``cfg.train.config_path`` is populated with its absolute path.
+        ``cfg.train.config_path`` is populated with its absolute path. ``--name``
+        sets ``cfg.train.wandb_run_name`` unless that field was explicitly set in
+        the YAML or via a CLI override (an explicit value always wins); when both
+        are unset it stays ``None`` (W&B assigns a random name).
     """
     base: DictConfig = OmegaConf.structured(OplmConfig)
 
@@ -570,9 +357,15 @@ def load_config(argv: list[str]) -> OplmConfig:
     # (data.train can be a string path or a nested dict of datasets).
     OmegaConf.set_struct(base, False)
 
-    # Extract --config and --preset flags
+    # Authoritative YAML defaults layer (model → train → data). These are the
+    # human-editable home for defaults and override the dataclass fallbacks.
+    for package, filename in _BASE_CONFIG_LAYERS:
+        base = cast("DictConfig", OmegaConf.merge(base, _load_packaged_yaml(package, filename)))
+
+    # Extract --config, --preset, and --name flags
     config_path: str | None = None
     preset: str | None = None
+    run_name: str | None = None
     remaining: list[str] = []
     i = 0
     while i < len(argv):
@@ -582,11 +375,15 @@ def load_config(argv: list[str]) -> OplmConfig:
         elif argv[i] == "--preset" and i + 1 < len(argv):
             preset = argv[i + 1]
             i += 2
+        elif argv[i] == "--name" and i + 1 < len(argv):
+            run_name = argv[i + 1]
+            i += 2
         else:
             remaining.append(argv[i])
             i += 1
 
-    # Collect explicit overrides to track which model fields the user set
+    # Collect user overrides (preset → --config → CLI dotlist), applied on top
+    # of the authoritative base layer.
     overrides: list[DictConfig] = []
     if preset is not None:
         overrides.append(get_preset_config(preset))
@@ -598,24 +395,35 @@ def load_config(argv: list[str]) -> OplmConfig:
     override_dicts = [OmegaConf.to_container(ov, resolve=True) for ov in overrides]
     _reject_removed_sequence_length_alias(override_dicts)
 
+    # Whether the user explicitly set the W&B run name (YAML or CLI override).
+    # An explicit value — even ``null`` — wins over the ``--name`` flag below.
+    user_set_run_name = any(
+        _lookup_nested_mapping_value(ov, ("train", "wandb_run_name")) is not _NESTED_VALUE_MISSING
+        for ov in override_dicts
+    )
+
     # Merge all overrides into base
     for ov in overrides:
         base = cast("DictConfig", OmegaConf.merge(base, ov))
 
-    # Find which model fields were explicitly provided by the user
-    explicit_model_keys: set[str] = set()
-    for ov_dict in override_dicts:
-        model_dict = ov_dict.get("model") if isinstance(ov_dict, dict) else None
-        if isinstance(model_dict, dict):
-            explicit_model_keys.update(model_dict.keys())
+    # Build train/data dataclasses (triggers their __post_init__ validation);
+    # `model` is an Any field so it round-trips as a plain dict here.
+    cfg: OplmConfig = OmegaConf.to_object(base)  # ty: ignore[invalid-assignment]  # OmegaConf union
 
-    # Reset derived fields not explicitly set so __post_init__ recomputes
-    # them from the (potentially overridden) source dimensions.
-    for fname in _DERIVED_MODEL_FIELDS:
-        if fname not in explicit_model_keys:
-            base.model[fname] = None
+    # Instantiate the HF model config from the merged `model` subtree. HF owns
+    # derivation (head_dim, intermediate_size, rope_dim/nope_dim) and validation.
+    # Derived fields are omitted unless set, resolving to None → derived inside
+    # OplmModelConfig.__init__. Unknown / old / mistyped `model.*` keys flow into
+    # **model_dict → PretrainedConfig **kwargs and are silently retained.
+    from oplm.model import OplmConfig as OplmModelConfig
 
-    # Convert to dataclass instances (triggers __post_init__ validation)
-    cfg: OplmConfig = OmegaConf.to_object(base)  # type: ignore[assignment]
+    model_dict = OmegaConf.to_container(base.model, resolve=True) or {}
+    cfg.model = OplmModelConfig(**model_dict)  # ty: ignore[invalid-argument-type]  # OmegaConf union
+
     cfg.train.config_path = config_path
+
+    # Propagate --name to the W&B run name unless explicitly set in YAML/CLI.
+    if run_name is not None and not user_set_run_name:
+        cfg.train.wandb_run_name = run_name
+
     return cfg

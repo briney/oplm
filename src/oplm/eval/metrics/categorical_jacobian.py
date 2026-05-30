@@ -13,7 +13,7 @@ from oplm.eval.metrics.contact import apply_apc, compute_precision_at_l
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from oplm.data.tokenizer import ProteinTokenizer
+    from oplm.model import OplmTokenizerFast
 
 # Matches the canonical amino-acid token ordering used by ESM-family models.
 CANONICAL_AMINO_ACIDS: tuple[str, ...] = (
@@ -58,7 +58,7 @@ class StructurePairScoreData:
     pair_indices: tuple[Tensor, Tensor]
 
 
-def get_canonical_amino_acid_token_ids(tokenizer: ProteinTokenizer) -> Tensor:
+def get_canonical_amino_acid_token_ids(tokenizer: OplmTokenizerFast) -> Tensor:
     """Return tokenizer IDs for the 20 canonical amino acids.
 
     Args:

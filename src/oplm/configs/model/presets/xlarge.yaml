@@ -1,7 +1,6 @@
 # ~15B parameters — production
 model:
-  hidden_dim: 5120
-  num_layers: 40
-  num_heads: 40
-  num_kv_heads: 8
+  hidden_size: 5120
+  num_hidden_layers: 40
+  num_attention_heads: 40
   gradient_checkpointing: true

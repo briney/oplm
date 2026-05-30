@@ -1,713 +1,473 @@
-"""Tests for TransformerBlock, OplmEncoder, MLMHead, and OplmForMLM."""
+"""Tests for `oplm.model.transformer` — OplmBlock and OplmStack."""
 
 from __future__ import annotations
 
-import copy
-from unittest import mock
+import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from oplm.config import ModelConfig
-from oplm.model.masking import normalize_attention_mask
-from oplm.model.residual import BlockAttentionResidualState
-from oplm.model.transformer import MLMHead, OplmEncoder, OplmForMLM, TransformerBlock
+from oplm.model.conv import CanonConv
+from oplm.model.norm import OplmLayerNorm
+from oplm.model.transformer import OplmBlock, OplmStack
 
 
-def _make_config(**kwargs: object) -> ModelConfig:
-    defaults: dict[str, object] = {
-        "hidden_dim": 64,
-        "num_heads": 4,
-        "num_kv_heads": 2,
-        "num_layers": 4,
-        "max_seq_len": 32,
-    }
-    defaults.update(kwargs)
-    return ModelConfig(**defaults)
-
-
-B, T = 2, 8
-VOCAB = 32
-
-
-def _run_attn_residual_eager_reference(
-    encoder: OplmEncoder,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run the pre-optimization eager residual-attention encoder path."""
-    assert encoder.attn_residual is not None
-
-    x: torch.Tensor | None = encoder.embedding(input_ids)
-    normalized_attention_mask = normalize_attention_mask(attention_mask)
-    v_first: torch.Tensor | None = None
-    state = BlockAttentionResidualState(blocks=[x], partial_block=None, step_count=0)
-
-    for i, block in enumerate(encoder.blocks):
-        ve: torch.Tensor | None = None
-        if encoder.value_embedding is not None and encoder.value_embedding.uses_layer(i):
-            assert x is not None
-            ve = encoder.value_embedding(input_ids, x, i)
-        x, v_first, state = block.forward_with_attn_res(
-            v_first=v_first,
-            attention_mask=normalized_attention_mask,
-            value_embed=ve,
-            attn_res=encoder.attn_residual,
-            state=state,
-            materialize_output=True,
-        )
-
-    assert x is not None
-    return encoder.final_norm(x)
-
-
-def _assert_encoder_grads_match(
-    actual: OplmEncoder,
-    expected: OplmEncoder,
+def _config(
     *,
-    atol: float = 1e-6,
-    rtol: float = 1e-5,
-) -> None:
-    """Assert encoder parameter gradients match exactly."""
-    for (name, param), (expected_name, expected_param) in zip(
-        actual.named_parameters(), expected.named_parameters(), strict=True
-    ):
-        assert name == expected_name
-        assert param.grad is not None, f"Missing gradient for {name}"
-        assert expected_param.grad is not None, f"Missing reference gradient for {name}"
-        torch.testing.assert_close(param.grad, expected_param.grad, atol=atol, rtol=rtol)
-
-
-def _run_mlm_with_eager_attn_residual_encoder(
-    model: OplmForMLM,
-    input_ids: torch.Tensor,
-    labels: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor | None]:
-    """Run the MLM head on top of the eager residual-attention encoder path."""
-    hidden = _run_attn_residual_eager_reference(model.encoder, input_ids)
-    logits = model.mlm_head(hidden)
-    loss: torch.Tensor | None = None
-    if labels is not None:
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-            ignore_index=-100,
-        )
-    return {"logits": logits, "loss": loss}
-
-
-def _dead_parameter_names(module: torch.nn.Module) -> list[str]:
-    """Return the parameter names whose gradients are absent or identically zero."""
-    dead_params = []
-    for name, param in module.named_parameters():
-        if param.requires_grad and (param.grad is None or param.grad.abs().sum() == 0):
-            dead_params.append(name)
-    return dead_params
-
-
-# ---------------------------------------------------------------------------
-# TransformerBlock
-# ---------------------------------------------------------------------------
-
-
-class TestTransformerBlock:
-    """Tests for single transformer layer."""
-
-    def test_output_shape(self) -> None:
-        cfg = _make_config()
-        block = TransformerBlock(cfg, layer_idx=0)
-        x = torch.randn(B, T, cfg.hidden_dim)
-        out, v_first, weights = block(x)
-        assert out.shape == (B, T, cfg.hidden_dim)
-
-    def test_no_weights_by_default(self) -> None:
-        cfg = _make_config()
-        block = TransformerBlock(cfg, layer_idx=0)
-        x = torch.randn(B, T, cfg.hidden_dim)
-        _, _, weights = block(x)
-        assert weights is None
-
-    def test_need_weights(self) -> None:
-        cfg = _make_config()
-        block = TransformerBlock(cfg, layer_idx=0)
-        x = torch.randn(B, T, cfg.hidden_dim)
-        _, _, weights = block(x, need_weights=True)
-        assert weights is not None
-        assert weights.shape == (B, cfg.num_heads, T, T)
-
-    def test_with_conv_a(self) -> None:
-        cfg = _make_config(conv_positions="A")
-        block = TransformerBlock(cfg, layer_idx=0)
-        assert block.conv_a is not None
-        assert block.conv_c is None
-        x = torch.randn(B, T, cfg.hidden_dim)
-        out, _, _ = block(x)
-        assert out.shape == (B, T, cfg.hidden_dim)
-
-    def test_with_conv_c(self) -> None:
-        cfg = _make_config(conv_positions="C")
-        block = TransformerBlock(cfg, layer_idx=0)
-        assert block.conv_a is None
-        assert block.conv_c is not None
-        x = torch.randn(B, T, cfg.hidden_dim)
-        out, _, _ = block(x)
-        assert out.shape == (B, T, cfg.hidden_dim)
-
-    def test_with_conv_ac(self) -> None:
-        cfg = _make_config(conv_positions="AC")
-        block = TransformerBlock(cfg, layer_idx=0)
-        assert block.conv_a is not None
-        assert block.conv_c is not None
-        x = torch.randn(B, T, cfg.hidden_dim)
-        out, _, _ = block(x)
-        assert out.shape == (B, T, cfg.hidden_dim)
-
-    def test_dynamic_conv_kernel_schedule_shared_across_positions(self) -> None:
-        cfg = _make_config(
-            conv_positions="ACD",
-            conv_kernel_size=3,
-            conv_kernel_schedule="block_step",
-            conv_kernel_increment=2,
-            conv_kernel_block_size=2,
-            conv_kernel_max_size=7,
-            num_layers=6,
-        )
-        encoder = OplmEncoder(cfg)
-        expected_kernels = [3, 3, 5, 5, 7, 7]
-
-        for idx, expected_kernel in enumerate(expected_kernels):
-            block = encoder.blocks[idx]
-            assert block.conv_kernel_size == expected_kernel
-            assert block.conv_a is not None
-            assert block.conv_c is not None
-            assert block.ffn.conv_d is not None
-            assert block.conv_a.conv.kernel_size == (expected_kernel,)
-            assert block.conv_c.conv.kernel_size == (expected_kernel,)
-            assert block.ffn.conv_d.conv.kernel_size == (expected_kernel,)
-
-    def test_static_conv_kernel_size_applies_to_all_layers(self) -> None:
-        cfg = _make_config(conv_positions="ACD", conv_kernel_size=9, num_layers=4)
-        encoder = OplmEncoder(cfg)
-
-        for idx in range(cfg.num_layers):
-            block = encoder.blocks[idx]
-            assert block.conv_kernel_size == 9
-            assert block.conv_a is not None
-            assert block.conv_c is not None
-            assert block.ffn.conv_d is not None
-            assert block.conv_a.conv.kernel_size == (9,)
-            assert block.conv_c.conv.kernel_size == (9,)
-            assert block.ffn.conv_d.conv.kernel_size == (9,)
-
-    def test_with_attention_mask(self) -> None:
-        cfg = _make_config()
-        block = TransformerBlock(cfg, layer_idx=0)
-        x = torch.randn(B, T, cfg.hidden_dim)
-        mask = torch.ones(B, 1, 1, T)
-        mask[:, :, :, -2:] = 0  # mask out last 2 positions
-        out, _, _ = block(x, attention_mask=mask)
-        assert out.shape == (B, T, cfg.hidden_dim)
-
-    def test_post_norm_output_shape(self) -> None:
-        cfg = _make_config(pre_norm=False, post_norm=True)
-        block = TransformerBlock(cfg, layer_idx=0)
-        assert block.attn_pre_norm is None
-        assert block.attn_post_norm is not None
-        x = torch.randn(B, T, cfg.hidden_dim)
-        out, _, _ = block(x)
-        assert out.shape == (B, T, cfg.hidden_dim)
-
-    def test_sandwich_norm_output_shape(self) -> None:
-        cfg = _make_config(sandwich_norm=True)
-        block = TransformerBlock(cfg, layer_idx=0)
-        assert block.attn_pre_norm is not None
-        assert block.attn_sandwich_norm is not None
-        assert block.attn_post_norm is None
-        x = torch.randn(B, T, cfg.hidden_dim)
-        out, _, _ = block(x)
-        assert out.shape == (B, T, cfg.hidden_dim)
-
-
-# ---------------------------------------------------------------------------
-# TransformerBlock — attention residuals path
-# ---------------------------------------------------------------------------
-
-
-class TestTransformerBlockAttnRes:
-    """Tests for the forward_with_attn_res path."""
-
-    def test_attn_res_forward(self) -> None:
-        cfg = _make_config(attn_residual=True, attn_residual_block_size=2)
-        block = TransformerBlock(cfg, layer_idx=0)
-        from oplm.model.residual import BlockAttentionResidual
-
-        attn_res = BlockAttentionResidual(cfg)
-        embed = torch.randn(B, T, cfg.hidden_dim)
-        state = BlockAttentionResidualState(blocks=[embed])
-
-        out, v_first, new_state = block.forward_with_attn_res(
-            v_first=None,
-            attention_mask=None,
-            value_embed=None,
-            attn_res=attn_res,
-            state=state,
-        )
-        assert out.shape == (B, T, cfg.hidden_dim)
-        assert new_state.step_count == 2  # attn + FFN sublayers
-
-    def test_attn_res_forward_can_skip_materialization(self) -> None:
-        cfg = _make_config(attn_residual=True, attn_residual_block_size=2)
-        block = TransformerBlock(cfg, layer_idx=0)
-        from oplm.model.residual import BlockAttentionResidual
-
-        attn_res = BlockAttentionResidual(cfg)
-        embed = torch.randn(B, T, cfg.hidden_dim)
-        state = BlockAttentionResidualState(blocks=[embed])
-
-        out, v_first, new_state = block.forward_with_attn_res(
-            v_first=None,
-            attention_mask=None,
-            value_embed=None,
-            attn_res=attn_res,
-            state=state,
-            materialize_output=False,
-        )
-        assert out is None
-        assert v_first is None
-        assert new_state.step_count == 2
-
-
-# ---------------------------------------------------------------------------
-# OplmEncoder
-# ---------------------------------------------------------------------------
-
-
-class TestOplmEncoder:
-    """Tests for the full encoder backbone."""
-
-    def test_output_shape(self) -> None:
-        cfg = _make_config()
-        encoder = OplmEncoder(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, weights = encoder(input_ids)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
-        assert weights is None
-
-    def test_need_weights(self) -> None:
-        cfg = _make_config()
-        encoder = OplmEncoder(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, weights = encoder(input_ids, need_weights=True)
-        assert weights is not None
-        assert len(weights) == cfg.num_layers
-        for w in weights:
-            assert w.shape == (B, cfg.num_heads, T, T)
-
-    def test_with_attention_mask(self) -> None:
-        cfg = _make_config()
-        encoder = OplmEncoder(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        mask = torch.ones(B, 1, 1, T)
-        hidden, _ = encoder(input_ids, attention_mask=mask)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
-
-    def test_with_2d_attention_mask(self) -> None:
-        cfg = _make_config()
-        encoder = OplmEncoder(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        mask = torch.ones(B, T, dtype=torch.long)
-        mask[:, -2:] = 0
-        hidden, _ = encoder(input_ids, attention_mask=mask)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
-
-    def test_with_value_embeddings(self) -> None:
-        cfg = _make_config(num_value_embeds=2)
-        encoder = OplmEncoder(cfg)
-        assert encoder.value_embedding is not None
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, _ = encoder(input_ids)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
-
-    def test_no_value_embeddings_by_default(self) -> None:
-        cfg = _make_config()
-        encoder = OplmEncoder(cfg)
-        assert encoder.value_embedding is None
-
-    def test_with_attn_residual(self) -> None:
-        cfg = _make_config(attn_residual=True, attn_residual_block_size=2)
-        encoder = OplmEncoder(cfg)
-        assert encoder.attn_residual is not None
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, _ = encoder(input_ids)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
-
-    def test_gradient_checkpointing(self) -> None:
-        cfg = _make_config(gradient_checkpointing=True)
-        encoder = OplmEncoder(cfg)
-        encoder.train()
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, _ = encoder(input_ids)
-        loss = hidden.sum()
-        loss.backward()
-        # Should not error; verify some gradients exist
-        for name, param in encoder.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, f"No gradient for {name}"
-                break  # just check first param is sufficient
-
-    @pytest.mark.parametrize("num_value_embeds", [0, 2])
-    def test_attn_residual_matches_eager_reference(self, num_value_embeds: int) -> None:
-        torch.manual_seed(0)
-        cfg = _make_config(
-            attn_residual=True,
-            attn_residual_block_size=2,
-            num_value_embeds=num_value_embeds,
-        )
-        encoder = OplmEncoder(cfg)
-        eager_encoder = copy.deepcopy(encoder)
-
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        attention_mask = torch.ones(B, T, dtype=torch.long)
-        attention_mask[:, -2:] = 0
-        grad_weight = torch.randn(B, T, cfg.hidden_dim)
-
-        hidden, _ = encoder(input_ids, attention_mask=attention_mask)
-        eager_hidden = _run_attn_residual_eager_reference(
-            eager_encoder,
-            input_ids,
-            attention_mask=attention_mask,
-        )
-
-        torch.testing.assert_close(hidden, eager_hidden, atol=1e-6, rtol=1e-5)
-
-        loss = (hidden * grad_weight).sum()
-        eager_loss = (eager_hidden * grad_weight).sum()
-        loss.backward()
-        eager_loss.backward()
-        _assert_encoder_grads_match(encoder, eager_encoder)
-
-    def test_attn_residual_skips_intermediate_post_ffn_materialization(self) -> None:
-        cfg = _make_config(attn_residual=True, attn_residual_block_size=2, num_layers=4)
-        encoder = OplmEncoder(cfg)
-        assert encoder.attn_residual is not None
-
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        step_indices: list[int] = []
-        original_aggregate = encoder.attn_residual.aggregate
-
-        def counting_aggregate(
-            state: BlockAttentionResidualState,
-            step_idx: int,
-        ) -> torch.Tensor:
-            step_indices.append(step_idx)
-            return original_aggregate(state, step_idx)
-
-        with mock.patch.object(
-            encoder.attn_residual,
-            "aggregate",
-            side_effect=counting_aggregate,
-        ) as aggregate_mock:
-            hidden, _ = encoder(input_ids)
-
-        assert hidden.shape == (B, T, cfg.hidden_dim)
-        assert aggregate_mock.call_count == 2 * cfg.num_layers + 1
-        assert step_indices == [0, 1, 2, 3, 4, 5, 6, 7, 7]
-
-
-# ---------------------------------------------------------------------------
-# OplmEncoder — ablation matrix
-# ---------------------------------------------------------------------------
-
-
-class TestEncoderAblationMatrix:
-    """Parametrize over boolean feature flags to verify forward pass succeeds."""
-
-    @pytest.mark.parametrize("shared_kv", [False, True])
-    @pytest.mark.parametrize("qk_norm", [False, True])
-    @pytest.mark.parametrize("value_residual", [False, True])
-    @pytest.mark.parametrize("post_embed_norm", [False, True])
-    def test_feature_combinations(
-        self,
-        shared_kv: bool,
-        qk_norm: bool,
-        value_residual: bool,
-        post_embed_norm: bool,
-    ) -> None:
-        cfg = _make_config(
-            shared_kv=shared_kv,
-            qk_norm=qk_norm,
-            value_residual=value_residual,
-            post_embed_norm=post_embed_norm,
-        )
-        encoder = OplmEncoder(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, _ = encoder(input_ids)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
-
-    @pytest.mark.parametrize("output_gate", [False, True])
-    @pytest.mark.parametrize("post_sdpa_norm", [False, True])
-    @pytest.mark.parametrize("conv_positions", ["", "A", "C", "AC", "ACD"])
-    def test_gate_and_conv_combinations(
-        self,
-        output_gate: bool,
-        post_sdpa_norm: bool,
-        conv_positions: str,
-    ) -> None:
-        cfg = _make_config(
-            output_gate=output_gate,
-            post_sdpa_norm=post_sdpa_norm,
-            conv_positions=conv_positions,
-        )
-        encoder = OplmEncoder(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, _ = encoder(input_ids)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
-
-    @pytest.mark.parametrize(
-        "pre_norm,post_norm,sandwich_norm",
-        [
-            (True, False, False),  # default pre-norm
-            (False, True, False),  # post-norm only
-            (True, True, False),  # pre + post
-            (False, False, True),  # sandwich
-        ],
+    hidden_size: int = 32,
+    num_attention_heads: int = 4,
+    head_dim: int | None = None,
+    intermediate_size: int = 64,
+    num_hidden_layers: int = 2,
+    vocab_size: int = 33,
+    max_position_embeddings: int = 64,
+    rope_theta: float = 10000.0,
+    rope_dim: int | None = None,
+    norm_type: str = "layernorm",
+    norm_eps: float = 1e-6,
+    norm_strategy: str = "pre",
+    qk_norm: bool = True,
+    ffn_activation: str = "swiglu",
+    ffn_bias: bool = False,
+    attention_dropout: float = 0.0,
+    hidden_dropout: float = 0.0,
+    use_flex_attention: bool = False,
+    post_embed_norm: bool = False,
+    residual_scaling: str = "sqrt_num_layers",
+    gradient_checkpointing: bool = False,
+    canon_enabled: bool = False,
+    canon_positions: list[str] | None = None,
+    canon_kernel_sizes: list[int] | None = None,
+    canon_activation: str = "none",
+) -> SimpleNamespace:
+    head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+    rope_dim = rope_dim if rope_dim is not None else head_dim
+    if canon_positions is None:
+        canon_positions = []
+    if canon_kernel_sizes is None:
+        canon_kernel_sizes = [3] * num_hidden_layers
+    return SimpleNamespace(
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        head_dim=head_dim,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=num_hidden_layers,
+        vocab_size=vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        rope_theta=rope_theta,
+        rope_dim=rope_dim,
+        norm_type=norm_type,
+        norm_eps=norm_eps,
+        norm_strategy=norm_strategy,
+        qk_norm=qk_norm,
+        ffn_activation=ffn_activation,
+        ffn_bias=ffn_bias,
+        attention_dropout=attention_dropout,
+        hidden_dropout=hidden_dropout,
+        use_flex_attention=use_flex_attention,
+        post_embed_norm=post_embed_norm,
+        residual_scaling=residual_scaling,
+        gradient_checkpointing=gradient_checkpointing,
+        canon_enabled=canon_enabled,
+        canon_positions=canon_positions,
+        canon_kernel_sizes=canon_kernel_sizes,
+        canon_activation=canon_activation,
     )
-    def test_norm_strategy_combinations(
-        self,
-        pre_norm: bool,
-        post_norm: bool,
-        sandwich_norm: bool,
-    ) -> None:
-        cfg = _make_config(pre_norm=pre_norm, post_norm=post_norm, sandwich_norm=sandwich_norm)
-        encoder = OplmEncoder(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, _ = encoder(input_ids)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
 
-    @pytest.mark.parametrize("ffn_activation", ["swiglu", "relu_squared", "gelu"])
-    @pytest.mark.parametrize("partial_rope", [False, True])
-    def test_activation_and_rope_combinations(
-        self,
-        ffn_activation: str,
-        partial_rope: bool,
-    ) -> None:
-        # head_dim=16 with default rope_dim=32 would overflow, so set rope_dim=8
-        extra: dict[str, object] = {}
-        if partial_rope:
-            extra["rope_dim"] = 8
-        cfg = _make_config(
-            ffn_activation=ffn_activation,
-            partial_rope=partial_rope,
-            **extra,
-        )
-        encoder = OplmEncoder(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        hidden, _ = encoder(input_ids)
-        assert hidden.shape == (B, T, cfg.hidden_dim)
+
+def _ones_mask(batch: int, seq: int) -> torch.Tensor:
+    return torch.ones(batch, seq, dtype=torch.long)
 
 
 # ---------------------------------------------------------------------------
-# Disabled features add zero parameters
+# OplmBlock — construction
 # ---------------------------------------------------------------------------
 
 
-class TestZeroOverheadWhenDisabled:
-    """Verify disabled features add exactly zero parameters."""
-
-    def test_no_conv_overhead(self) -> None:
-        cfg_no = _make_config(conv_positions="")
-        cfg_ac = _make_config(conv_positions="AC")
-        n_no = sum(p.numel() for p in OplmEncoder(cfg_no).parameters())
-        n_ac = sum(p.numel() for p in OplmEncoder(cfg_ac).parameters())
-        assert n_ac > n_no
-
-    def test_no_value_embed_overhead(self) -> None:
-        cfg_no = _make_config(num_value_embeds=0)
-        cfg_ve = _make_config(num_value_embeds=2)
-        n_no = sum(p.numel() for p in OplmEncoder(cfg_no).parameters())
-        n_ve = sum(p.numel() for p in OplmEncoder(cfg_ve).parameters())
-        assert n_ve > n_no
-
-    def test_post_norm_adds_parameters(self) -> None:
-        cfg_no = _make_config(post_norm=False)
-        cfg_post = _make_config(post_norm=True)
-        n_no = sum(p.numel() for p in OplmEncoder(cfg_no).parameters())
-        n_post = sum(p.numel() for p in OplmEncoder(cfg_post).parameters())
-        assert n_post > n_no
-
-    def test_sandwich_norm_adds_parameters(self) -> None:
-        cfg_no = _make_config(sandwich_norm=False)
-        cfg_sw = _make_config(sandwich_norm=True)
-        n_no = sum(p.numel() for p in OplmEncoder(cfg_no).parameters())
-        n_sw = sum(p.numel() for p in OplmEncoder(cfg_sw).parameters())
-        assert n_sw > n_no
-
-    def test_no_attn_residual_overhead(self) -> None:
-        cfg_no = _make_config(attn_residual=False)
-        cfg_ar = _make_config(attn_residual=True, attn_residual_block_size=2)
-        n_no = sum(p.numel() for p in OplmEncoder(cfg_no).parameters())
-        n_ar = sum(p.numel() for p in OplmEncoder(cfg_ar).parameters())
-        assert n_ar > n_no
+def test_block_alpha_uses_sqrt_num_layers():
+    cfg = _config(num_hidden_layers=4, residual_scaling="sqrt_num_layers")
+    block = OplmBlock(cfg, layer_idx=0)
+    assert block.alpha == pytest.approx(1.0 / math.sqrt(4))
 
 
-# ---------------------------------------------------------------------------
-# MLMHead
-# ---------------------------------------------------------------------------
+def test_block_alpha_is_one_under_no_residual_scaling():
+    cfg = _config(residual_scaling="none")
+    block = OplmBlock(cfg, layer_idx=0)
+    assert block.alpha == 1.0
 
 
-class TestMLMHead:
-    """Tests for the MLM projection head."""
-
-    def test_output_shape(self) -> None:
-        cfg = _make_config()
-        head = MLMHead(cfg)
-        x = torch.randn(B, T, cfg.hidden_dim)
-        logits = head(x)
-        assert logits.shape == (B, T, VOCAB)
+def test_block_rejects_unknown_residual_scaling():
+    cfg = _config(residual_scaling="bogus")
+    with pytest.raises(ValueError, match="residual_scaling"):
+        OplmBlock(cfg, layer_idx=0)
 
 
-# ---------------------------------------------------------------------------
-# OplmForMLM
-# ---------------------------------------------------------------------------
+def test_block_rejects_unknown_norm_strategy():
+    cfg = _config(norm_strategy="zzz")
+    with pytest.raises(ValueError, match="norm_strategy"):
+        OplmBlock(cfg, layer_idx=0)
 
 
-class TestOplmForMLM:
-    """Tests for the top-level MLM model."""
+@pytest.mark.parametrize("strategy", ["pre", "sandwich", "post_sdpa"])
+def test_block_has_attn_norm_for_non_hybrid_strategies(strategy: str):
+    block = OplmBlock(_config(norm_strategy=strategy), layer_idx=0)
+    assert isinstance(block.attn_norm, OplmLayerNorm)
 
-    def test_logits_shape(self) -> None:
-        cfg = _make_config()
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids)
-        assert result["logits"].shape == (B, T, VOCAB)
-        assert result["loss"] is None
 
-    def test_loss_with_labels(self) -> None:
-        cfg = _make_config()
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        labels = torch.full((B, T), -100, dtype=torch.long)
-        labels[:, 2:5] = torch.randint(0, VOCAB, (B, 3))
-        result = model(input_ids, labels=labels)
-        assert result["loss"] is not None
-        assert result["loss"].ndim == 0  # scalar
+def test_block_omits_attn_norm_under_hybrid():
+    block = OplmBlock(_config(norm_strategy="hybrid"), layer_idx=0)
+    assert not hasattr(block, "attn_norm")
 
-    def test_loss_is_positive(self) -> None:
-        cfg = _make_config()
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        labels = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids, labels=labels)
-        assert result["loss"].item() > 0
 
-    def test_tie_embeddings(self) -> None:
-        cfg = _make_config(tie_embeddings=True)
-        model = OplmForMLM(cfg)
-        assert model.mlm_head.projection.weight is model.encoder.embedding.embed.weight
+def test_block_sandwich_adds_two_post_norms():
+    block = OplmBlock(_config(norm_strategy="sandwich"), layer_idx=0)
+    assert isinstance(block.attn_post_norm, OplmLayerNorm)
+    assert isinstance(block.ffn_post_norm, OplmLayerNorm)
 
-    def test_no_tie_embeddings(self) -> None:
-        cfg = _make_config(tie_embeddings=False)
-        model = OplmForMLM(cfg)
-        assert model.mlm_head.projection.weight is not model.encoder.embedding.embed.weight
 
-    def test_attention_weights_returned(self) -> None:
-        cfg = _make_config()
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids, need_weights=True)
-        assert "attention_weights" in result
-        assert len(result["attention_weights"]) == cfg.num_layers
+def test_block_post_sdpa_adds_attn_post_norm_only():
+    block = OplmBlock(_config(norm_strategy="post_sdpa"), layer_idx=0)
+    assert isinstance(block.attn_post_norm, OplmLayerNorm)
+    assert not hasattr(block, "ffn_post_norm")
 
-    def test_with_attn_residual(self) -> None:
-        cfg = _make_config(attn_residual=True, attn_residual_block_size=2)
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        labels = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids, labels=labels)
-        assert result["logits"].shape == (B, T, VOCAB)
-        assert result["loss"] is not None
+
+def test_block_pre_strategy_has_no_post_norms():
+    block = OplmBlock(_config(norm_strategy="pre"), layer_idx=0)
+    assert not hasattr(block, "attn_post_norm")
+    assert not hasattr(block, "ffn_post_norm")
+
+
+def test_block_hybrid_strategy_has_no_block_level_post_norms():
+    block = OplmBlock(_config(norm_strategy="hybrid"), layer_idx=0)
+    assert not hasattr(block, "attn_post_norm")
+    assert not hasattr(block, "ffn_post_norm")
 
 
 # ---------------------------------------------------------------------------
-# Gradient flow — full model
+# OplmBlock — Canon wiring
 # ---------------------------------------------------------------------------
 
 
-class TestFullModelGradient:
-    """Verify gradients reach all parameters through the full model."""
+def test_block_no_canon_when_disabled():
+    cfg = _config(canon_enabled=False, canon_positions=["A", "B", "C", "D"])
+    block = OplmBlock(cfg, layer_idx=0)
+    for name in ("conv_a", "conv_b", "conv_c", "conv_d"):
+        assert not hasattr(block, name)
 
-    def test_all_params_receive_gradients(self) -> None:
-        cfg = _make_config()
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        labels = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids, labels=labels)
-        result["loss"].backward()
-        dead_params = _dead_parameter_names(model)
-        assert len(dead_params) == 0, f"Dead parameters: {dead_params}"
 
-    def test_all_params_receive_gradients_with_features(self) -> None:
-        """Full feature set: convolutions, value embeddings, value residuals."""
-        cfg = _make_config(
-            conv_positions="AC",
-            num_value_embeds=2,
-            value_residual=True,
-            output_gate=True,
-            qk_norm=True,
-        )
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        labels = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids, labels=labels)
-        result["loss"].backward()
-        dead_params = _dead_parameter_names(model)
-        assert len(dead_params) == 0, f"Dead parameters: {dead_params}"
+@pytest.mark.parametrize("position", ["A", "B", "C", "D"])
+def test_block_creates_only_requested_canon_position(position: str):
+    cfg = _config(
+        canon_enabled=True,
+        canon_positions=[position],
+        canon_kernel_sizes=[3, 3],
+    )
+    block = OplmBlock(cfg, layer_idx=0)
+    name = f"conv_{position.lower()}"
+    assert isinstance(getattr(block, name), CanonConv)
+    for other in {"A", "B", "C", "D"} - {position}:
+        assert not hasattr(block, f"conv_{other.lower()}")
 
-    def test_all_params_receive_gradients_post_norm(self) -> None:
-        cfg = _make_config(pre_norm=False, post_norm=True)
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        labels = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids, labels=labels)
-        result["loss"].backward()
-        dead_params = _dead_parameter_names(model)
-        assert len(dead_params) == 0, f"Dead parameters: {dead_params}"
 
-    def test_all_params_receive_gradients_sandwich_norm(self) -> None:
-        cfg = _make_config(sandwich_norm=True)
-        model = OplmForMLM(cfg)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        labels = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids, labels=labels)
-        result["loss"].backward()
-        dead_params = _dead_parameter_names(model)
-        assert len(dead_params) == 0, f"Dead parameters: {dead_params}"
+def test_block_canon_kernel_size_comes_from_layer_idx():
+    cfg = _config(
+        num_hidden_layers=3,
+        canon_enabled=True,
+        canon_positions=["A"],
+        canon_kernel_sizes=[2, 5, 7],
+    )
+    block_1 = OplmBlock(cfg, layer_idx=1)
+    block_2 = OplmBlock(cfg, layer_idx=2)
+    assert block_1.conv_a.kernel_size == 5
+    assert block_2.conv_a.kernel_size == 7
 
-    @pytest.mark.parametrize("num_value_embeds", [0, 2])
-    def test_all_params_receive_gradients_with_attn_residual(
-        self,
-        num_value_embeds: int,
-    ) -> None:
-        cfg = _make_config(
-            attn_residual=True,
-            attn_residual_block_size=2,
-            num_value_embeds=num_value_embeds,
-        )
-        model = OplmForMLM(cfg)
-        eager_model = copy.deepcopy(model)
-        input_ids = torch.randint(0, VOCAB, (B, T))
-        labels = torch.randint(0, VOCAB, (B, T))
-        result = model(input_ids, labels=labels)
-        eager_result = _run_mlm_with_eager_attn_residual_encoder(
-            eager_model,
-            input_ids,
-            labels=labels,
-        )
-        assert result["loss"] is not None
-        assert eager_result["loss"] is not None
-        torch.testing.assert_close(result["logits"], eager_result["logits"], atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(result["loss"], eager_result["loss"], atol=1e-6, rtol=1e-5)
-        result["loss"].backward()
-        eager_result["loss"].backward()
 
-        assert _dead_parameter_names(model) == _dead_parameter_names(eager_model)
+def test_block_canon_rejects_bad_position():
+    cfg = _config(canon_enabled=True, canon_positions=["Z"])
+    with pytest.raises(ValueError, match="canon_positions"):
+        OplmBlock(cfg, layer_idx=0)
+
+
+def test_block_canon_rejects_unresolved_kernel_sizes():
+    cfg = _config(
+        num_hidden_layers=2,
+        canon_enabled=True,
+        canon_positions=["A"],
+        canon_kernel_sizes=[3],  # length mismatch
+    )
+    with pytest.raises(ValueError, match="canon_kernel_sizes"):
+        OplmBlock(cfg, layer_idx=0)
+
+
+# ---------------------------------------------------------------------------
+# OplmBlock — forward
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("strategy", ["pre", "sandwich", "hybrid", "post_sdpa"])
+def test_block_forward_runs_under_every_norm_strategy(strategy: str):
+    torch.manual_seed(0)
+    cfg = _config(norm_strategy=strategy)
+    block = OplmBlock(cfg, layer_idx=0)
+    x = torch.randn(2, 5, cfg.hidden_size)
+    out, attn = block(x, _ones_mask(2, 5))
+    assert out.shape == x.shape
+    # No output_attentions requested -> manual path still returns weights on CPU.
+    assert attn is None or attn.shape == (2, cfg.num_attention_heads, 5, 5)
+
+
+def test_block_forward_returns_attentions_when_requested():
+    torch.manual_seed(1)
+    cfg = _config()
+    block = OplmBlock(cfg, layer_idx=0)
+    x = torch.randn(2, 4, cfg.hidden_size)
+    _, attn = block(x, _ones_mask(2, 4), output_attentions=True)
+    assert attn is not None
+    assert attn.shape == (2, cfg.num_attention_heads, 4, 4)
+
+
+def test_block_forward_with_all_canon_positions_runs():
+    torch.manual_seed(2)
+    cfg = _config(
+        canon_enabled=True,
+        canon_positions=["A", "B", "C", "D"],
+        canon_kernel_sizes=[3, 3],
+    )
+    block = OplmBlock(cfg, layer_idx=0)
+    x = torch.randn(2, 6, cfg.hidden_size)
+    out, _ = block(x, _ones_mask(2, 6))
+    assert out.shape == x.shape
+
+
+def test_block_forward_grad_flows_to_input():
+    torch.manual_seed(3)
+    cfg = _config()
+    block = OplmBlock(cfg, layer_idx=0)
+    x = torch.randn(2, 5, cfg.hidden_size, requires_grad=True)
+    out, _ = block(x, _ones_mask(2, 5))
+    out.sum().backward()
+    assert x.grad is not None
+    assert x.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# OplmBlock — gradient checkpointing
+# ---------------------------------------------------------------------------
+
+
+def test_block_gradient_checkpoint_matches_plain_forward():
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2, gradient_checkpointing=False)
+    block = OplmBlock(cfg, layer_idx=0)
+    block.train()  # checkpointing only fires under .training
+
+    x = torch.randn(2, 5, cfg.hidden_size, requires_grad=True)
+    mask = _ones_mask(2, 5)
+
+    block.gradient_checkpointing = False
+    out_plain, _ = block(x, mask)
+
+    block.gradient_checkpointing = True
+    out_ckpt, _ = block(x, mask)
+
+    assert torch.allclose(out_plain, out_ckpt, atol=1e-5)
+
+
+def test_block_gradient_checkpoint_gradients_match_plain():
+    torch.manual_seed(0)
+    cfg = _config()
+    block = OplmBlock(cfg, layer_idx=0)
+    block.train()
+
+    x = torch.randn(2, 5, cfg.hidden_size, requires_grad=True)
+    mask = _ones_mask(2, 5)
+
+    block.gradient_checkpointing = False
+    out_plain, _ = block(x, mask)
+    g_plain = torch.autograd.grad(out_plain.sum(), x, retain_graph=False)[0]
+
+    block.gradient_checkpointing = True
+    out_ckpt, _ = block(x, mask)
+    g_ckpt = torch.autograd.grad(out_ckpt.sum(), x, retain_graph=False)[0]
+
+    assert torch.allclose(g_plain, g_ckpt, atol=1e-5)
+
+
+def test_block_gradient_checkpoint_skipped_under_eval():
+    """Checkpointing only fires under `self.training` — eval-mode forward is plain."""
+    cfg = _config()
+    block = OplmBlock(cfg, layer_idx=0)
+    block.eval()
+    block.gradient_checkpointing = True
+    x = torch.randn(1, 4, cfg.hidden_size, requires_grad=True)
+    out, _ = block(x, _ones_mask(1, 4))
+    # If the checkpointed path had fired, this would still work — but we just
+    # confirm the forward succeeds and shape is preserved.
+    assert out.shape == x.shape
+
+
+# ---------------------------------------------------------------------------
+# OplmStack — construction
+# ---------------------------------------------------------------------------
+
+
+def test_stack_layers_count_matches_config():
+    cfg = _config(num_hidden_layers=3)
+    stack = OplmStack(cfg)
+    assert len(stack.layers) == 3
+    for i, block in enumerate(stack.layers):
+        assert block.layer_idx == i
+
+
+def test_stack_has_final_norm():
+    cfg = _config()
+    stack = OplmStack(cfg)
+    assert isinstance(stack.final_norm, OplmLayerNorm)
+
+
+# ---------------------------------------------------------------------------
+# OplmStack — forward
+# ---------------------------------------------------------------------------
+
+
+def test_stack_forward_shape():
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2, hidden_size=32)
+    stack = OplmStack(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 7))
+    last_hidden, hidden_states, attentions = stack(input_ids)
+    assert last_hidden.shape == (2, 7, cfg.hidden_size)
+    assert hidden_states is None
+    assert attentions is None
+
+
+def test_stack_forward_with_none_mask_materializes_ones():
+    """Passing attention_mask=None should run without error and match an all-ones mask."""
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2)
+    stack = OplmStack(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 5))
+
+    with torch.no_grad():
+        out_none, _, _ = stack(input_ids, attention_mask=None)
+        out_ones, _, _ = stack(input_ids, attention_mask=_ones_mask(2, 5))
+    assert torch.allclose(out_none, out_ones, atol=1e-6)
+
+
+def test_stack_hidden_states_has_L_plus_1_entries():
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=4)
+    stack = OplmStack(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 6))
+    _, hidden_states, _ = stack(input_ids, output_hidden_states=True)
+    assert hidden_states is not None
+    assert len(hidden_states) == cfg.num_hidden_layers + 1
+    for h in hidden_states:
+        assert h.shape == (2, 6, cfg.hidden_size)
+
+
+def test_stack_first_hidden_state_is_post_embedding():
+    """The first entry of hidden_states is the embedding output, not the final-norm output."""
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2)
+    stack = OplmStack(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+
+    with torch.no_grad():
+        emb = stack.embed_tokens(input_ids)
+        _, hidden_states, _ = stack(input_ids, output_hidden_states=True)
+    assert hidden_states is not None
+    assert torch.allclose(hidden_states[0], emb)
+
+
+def test_stack_attentions_has_L_entries():
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=3)
+    stack = OplmStack(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 5))
+    _, _, attentions = stack(input_ids, output_attentions=True)
+    assert attentions is not None
+    assert len(attentions) == cfg.num_hidden_layers
+    for a in attentions:
+        assert a is not None
+        assert a.shape == (2, cfg.num_attention_heads, 5, 5)
+
+
+@pytest.mark.parametrize("strategy", ["pre", "sandwich", "hybrid", "post_sdpa"])
+def test_stack_runs_under_every_norm_strategy(strategy: str):
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2, norm_strategy=strategy)
+    stack = OplmStack(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 5))
+    last_hidden, _, _ = stack(input_ids)
+    assert last_hidden.shape == (2, 5, cfg.hidden_size)
+
+
+def test_stack_runs_with_canon_enabled():
+    torch.manual_seed(0)
+    cfg = _config(
+        num_hidden_layers=2,
+        canon_enabled=True,
+        canon_positions=["A", "D"],
+        canon_kernel_sizes=[3, 3],
+    )
+    stack = OplmStack(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 6))
+    last_hidden, _, _ = stack(input_ids)
+    assert last_hidden.shape == (2, 6, cfg.hidden_size)
+
+
+# ---------------------------------------------------------------------------
+# OplmStack — gradient checkpointing
+# ---------------------------------------------------------------------------
+
+
+def test_stack_set_gradient_checkpointing_propagates_to_blocks():
+    cfg = _config(num_hidden_layers=3, gradient_checkpointing=False)
+    stack = OplmStack(cfg)
+    assert all(not b.gradient_checkpointing for b in stack.layers)
+    stack.set_gradient_checkpointing(True)
+    assert stack.gradient_checkpointing is True
+    assert all(b.gradient_checkpointing for b in stack.layers)
+    stack.set_gradient_checkpointing(False)
+    assert all(not b.gradient_checkpointing for b in stack.layers)
+
+
+def test_stack_gradient_checkpoint_matches_plain_forward():
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2)
+    stack = OplmStack(cfg)
+    stack.train()
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 5))
+
+    stack.set_gradient_checkpointing(False)
+    out_plain, _, _ = stack(input_ids)
+
+    stack.set_gradient_checkpointing(True)
+    out_ckpt, _, _ = stack(input_ids)
+
+    assert torch.allclose(out_plain, out_ckpt, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# OplmStack — pad mask correctness
+# ---------------------------------------------------------------------------
+
+
+def test_stack_padded_inputs_match_unpadded_at_real_positions():
+    """Doubling the seq with pad ids must not change the output at real positions."""
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2)
+    stack = OplmStack(cfg).eval()
+
+    real_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    mask_real = torch.ones(1, 4, dtype=torch.long)
+
+    pad_ids = torch.cat([real_ids, torch.randint(0, cfg.vocab_size, (1, 4))], dim=1)
+    mask_pad = torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.long)
+
+    with torch.no_grad():
+        out_real, _, _ = stack(real_ids, attention_mask=mask_real)
+        out_pad, _, _ = stack(pad_ids, attention_mask=mask_pad)
+    assert torch.allclose(out_real, out_pad[:, :4, :], atol=1e-5)

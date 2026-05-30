@@ -63,7 +63,7 @@ def partition_optimizer_params(model: nn.Module, cfg: TrainConfig) -> OptimizerP
             adamw_no_decay_params.append(param)
             continue
 
-        if cfg.optimizer == "muon" and param.ndim == 2 and not name.startswith("mlm_head."):
+        if cfg.optimizer == "muon" and param.ndim == 2 and not name.startswith("lm_head."):
             muon_params.append(param)
             continue
 

@@ -1,119 +1,179 @@
-"""Rotary Position Embeddings (RoPE)."""
+"""RoPE / partial RoPE applied to Q and K post-QK-norm."""
 
 from __future__ import annotations
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 
-
-def rotate_half(x: Tensor) -> Tensor:
-    """Rotate half of the hidden dimensions: ``[-x2, x1]``."""
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([-x2, x1], dim=-1)
+__all__ = ["RotaryEmbedding"]
 
 
 class RotaryEmbedding(nn.Module):
-    """Standard Rotary Position Embedding applied to Q and K.
+    """Rotary positional embedding with optional partial-RoPE / NoPE split.
 
-    Precomputes inverse frequencies and cos/sin cache up to ``max_seq_len``.
+    For each head and token position `p`, pair the first `rope_dim` channels
+    into `rope_dim / 2` 2-D pairs and rotate each pair by an angle `p · θ_i`,
+    where `θ_i = base^(-2i / rope_dim)`. The trailing `nope_dim = head_dim -
+    rope_dim` channels of each head are position-invariant and pass through
+    untouched.
+
+    `cos`/`sin` are precomputed buffers up to `max_position_embeddings`. If a
+    longer sequence arrives at inference, the buffers are extended on the fly
+    (no parameter update — `inv_freq`, `cos`, and `sin` are all non-persistent
+    buffers).
+
+    Rotations are computed in fp32 then cast back to the input dtype.
     """
 
-    inv_freq: Tensor
-    cos_cached: Tensor
-    sin_cached: Tensor
-
-    def __init__(self, dim: int, max_seq_len: int = 512, theta: float = 10000.0) -> None:
-        super().__init__()
-        self.dim = dim
-        self.max_seq_len = max_seq_len
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._build_cache(max_seq_len)
-
-    def _build_cache(self, seq_len: int) -> None:
-        t = torch.arange(seq_len, dtype=torch.float32, device=self.inv_freq.device)
-        freqs = torch.outer(t, self.inv_freq)  # (T, D/2)
-        emb = torch.cat([freqs, freqs], dim=-1)  # (T, D)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
-
-    def forward(
-        self,
-        q: Tensor,
-        k: Tensor,
-        position_ids: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Apply rotary embeddings to Q and K.
-
-        Args:
-            q: Query tensor of shape ``(B, T, H, D)``.
-            k: Key tensor of shape ``(B, T, KV_H, D)``.
-            position_ids: Optional position indices ``(B, T)`` or ``(total_tokens,)``.
-
-        Returns:
-            Rotated (q, k) with the same shapes.
-        """
-        if position_ids is None:
-            seq_len = q.shape[1]
-            # Extend cache if needed
-            if seq_len > self.max_seq_len:
-                self._build_cache(seq_len)
-                self.max_seq_len = seq_len
-            # (1, T, 1, D) for broadcasting over B and H
-            cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(2)
-            sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(2)
-        else:
-            cos = self.cos_cached[position_ids].unsqueeze(-2)  # (..., 1, D)
-            sin = self.sin_cached[position_ids].unsqueeze(-2)
-
-        q_rot = q * cos + rotate_half(q) * sin
-        k_rot = k * cos + rotate_half(k) * sin
-        return q_rot, k_rot
-
-
-class PartialRotaryEmbedding(nn.Module):
-    """Partial RoPE for GQA-S2 mode.
-
-    Splits head dimensions into position-invariant (NoPE) and position-dependent
-    (RoPE) portions. RoPE is applied only to the ``rope_dim`` portion of Q and K.
-    """
+    inv_freq: torch.Tensor
+    cos_cached: torch.Tensor
+    sin_cached: torch.Tensor
 
     def __init__(
         self,
+        head_dim: int,
         rope_dim: int,
-        nope_dim: int,
-        max_seq_len: int = 512,
-        theta: float = 10000.0,
+        max_position_embeddings: int,
+        base: float = 10000.0,
     ) -> None:
         super().__init__()
+        if rope_dim < 0 or rope_dim > head_dim:
+            raise ValueError(
+                f"rope_dim must satisfy 0 <= rope_dim <= head_dim; got rope_dim={rope_dim}, "
+                f"head_dim={head_dim}."
+            )
+        if rope_dim % 2 != 0:
+            raise ValueError(
+                f"rope_dim must be even (each rotation consumes a pair); got {rope_dim}."
+            )
+        self.head_dim = head_dim
         self.rope_dim = rope_dim
-        self.nope_dim = nope_dim
-        self.rotary = RotaryEmbedding(rope_dim, max_seq_len, theta)
+        self.nope_dim = head_dim - rope_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = float(base)
 
-    def forward(
-        self,
-        q: Tensor,
-        k: Tensor,
-        position_ids: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Apply partial rotary embeddings.
+        if rope_dim == 0:
+            # NoPE-only path: still register zero-size buffers so the module's
+            # state dict shape is stable across configurations.
+            self.register_buffer("inv_freq", torch.empty(0, dtype=torch.float32), persistent=False)
+            self.register_buffer(
+                "cos_cached",
+                torch.empty(max_position_embeddings, 0, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "sin_cached",
+                torch.empty(max_position_embeddings, 0, dtype=torch.float32),
+                persistent=False,
+            )
+            # No rotation -> nothing to (re)build.
+            self._cache_initialized = True
+            return
+
+        inv_freq = self._compute_inv_freq(device=None)  # (rope_dim/2,)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        cos, sin = self._compute_cos_sin(max_position_embeddings, device=inv_freq.device)
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
+        # Under HF's meta-device fast init these buffers are computed on `meta`
+        # and re-materialized later as uninitialized memory (not in the
+        # checkpoint, since they're non-persistent). Flag that so the first real
+        # forward rebuilds them; a normal CPU/GPU construction is already valid.
+        self._cache_initialized = not self.cos_cached.is_meta
+
+    def _compute_inv_freq(self, device: torch.device | None) -> torch.Tensor:
+        """Derive `inv_freq` from `base`/`rope_dim` (stored as plain attributes).
+
+        Recomputed rather than read from the buffer so a meta-device-corrupted
+        buffer can never leak into the rotation tables.
+        """
+        return self.base ** (
+            -torch.arange(0, self.rope_dim, 2, dtype=torch.float32, device=device) / self.rope_dim
+        )
+
+    def _compute_cos_sin(
+        self, seq_len: int, device: torch.device | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute fp32 cos/sin tables of shape `(seq_len, rope_dim/2)`."""
+        inv_freq = self._compute_inv_freq(device=device)
+        positions = torch.arange(seq_len, dtype=torch.float32, device=device)  # (T,)
+        freqs = positions[:, None] * inv_freq[None, :]  # (T, rope_dim/2)
+        return freqs.cos(), freqs.sin()
+
+    def _maybe_extend_cache(self, seq_len: int, device: torch.device) -> None:
+        """Rebuild the cos/sin tables if `seq_len` exceeds the cached length.
+
+        Also rebuilds when the cached buffers live on a different device than
+        the incoming tensors (e.g., first call after `.to(cuda)`) or when the
+        cache has not yet been built on a real device (post meta-init load).
+        """
+        if self.rope_dim == 0:
+            return
+        cached_len = self.cos_cached.shape[0]
+        same_device = self.cos_cached.device == device
+        if self._cache_initialized and seq_len <= cached_len and same_device:
+            return
+        new_len = max(seq_len, cached_len)
+        cos, sin = self._compute_cos_sin(new_len, device=device)
+        self.inv_freq = self._compute_inv_freq(device=device)
+        self.cos_cached = cos
+        self.sin_cached = sin
+        self.max_position_embeddings = new_len
+        self._cache_initialized = True
+
+    def apply_rotary(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate the first `rope_dim` channels of `q` and `k` in fp32.
 
         Args:
-            q: Query tensor ``(B, T, H, D)`` where ``D = nope_dim + rope_dim``.
-            k: Key tensor ``(B, T, KV_H, D)``.
-            position_ids: Optional position indices.
+            q: `(B, H, T, head_dim)` query tensor in any floating dtype.
+            k: `(B, H, T, head_dim)` key tensor in any floating dtype.
 
         Returns:
-            (q, k) with RoPE applied only to the rope_dim portion.
+            Rotated `(q, k)` with the same shape and dtype as the inputs. When
+            `rope_dim == 0`, inputs are returned unchanged.
         """
-        # Split into NoPE and RoPE portions
-        q_nope, q_rope = q[..., : self.nope_dim], q[..., self.nope_dim :]
-        k_nope, k_rope = k[..., : self.nope_dim], k[..., self.nope_dim :]
+        if self.rope_dim == 0:
+            return q, k
 
-        # Apply RoPE only to the rope portion
-        q_rope, k_rope = self.rotary(q_rope, k_rope, position_ids)
+        seq_len = q.shape[-2]
+        self._maybe_extend_cache(seq_len, device=q.device)
 
+        cos = self.cos_cached[:seq_len]  # (T, rope_dim/2)
+        sin = self.sin_cached[:seq_len]
+        # Broadcast against (B, H, T, rope_dim/2).
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+
+        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
+
+    def _rotate(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Apply paired-channel rotation to the first `rope_dim` channels.
+
+        `x: (B, H, T, head_dim)`, `cos`/`sin: (1, 1, T, rope_dim/2)`.
+        """
+        input_dtype = x.dtype
+        if self.nope_dim == 0:
+            x_rope, x_pass = x, None
+        else:
+            x_rope = x[..., : self.rope_dim]
+            x_pass = x[..., self.rope_dim :]
+
+        x_rope_fp32 = x_rope.to(torch.float32)
+        x_even = x_rope_fp32[..., 0::2]  # (B, H, T, rope_dim/2)
+        x_odd = x_rope_fp32[..., 1::2]
+        out_even = x_even * cos - x_odd * sin
+        out_odd = x_even * sin + x_odd * cos
+        # Re-interleave: (..., rope_dim/2, 2) -> (..., rope_dim).
+        rotated = torch.stack([out_even, out_odd], dim=-1).flatten(-2)
+        rotated = rotated.to(input_dtype)
+
+        if x_pass is None:
+            return rotated
+        return torch.cat([rotated, x_pass], dim=-1)
+
+    def extra_repr(self) -> str:
         return (
-            torch.cat([q_nope, q_rope], dim=-1),
-            torch.cat([k_nope, k_rope], dim=-1),
+            f"head_dim={self.head_dim}, rope_dim={self.rope_dim}, "
+            f"nope_dim={self.nope_dim}, max_position_embeddings={self.max_position_embeddings}, "
+            f"base={self.base}"
         )

@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from omegaconf import OmegaConf
 
 if TYPE_CHECKING:
+    import torch
     from accelerate import Accelerator
 
     from oplm.config import OplmConfig
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 def save_checkpoint(
     accelerator: Accelerator,
+    model: torch.nn.Module,
     cfg: OplmConfig,
     output_dir: str,
     global_step: int,
@@ -31,13 +32,17 @@ def save_checkpoint(
 ) -> None:
     """Save a training checkpoint.
 
-    Uses ``accelerator.save_state()`` for model, optimizer, scheduler, and RNG
-    states. Writes ``trainer_state.json`` and ``config.yaml`` alongside.
-    Rotates old checkpoints to respect ``save_total_limit``.
+    Uses ``accelerator.save_state()`` for the resumable model, optimizer,
+    scheduler, and RNG states. On the main process, also writes
+    ``trainer_state.json`` metadata, a re-loadable ``config.yaml``, and a
+    HuggingFace export under ``hf/`` (model weights + tokenizer) suitable for
+    ``OplmForMaskedLM.from_pretrained``. Rotates old checkpoints to respect
+    ``save_total_limit``.
 
     Args:
         accelerator: The HuggingFace Accelerator instance.
-        cfg: Full OPLM configuration (frozen copy saved for reproducibility).
+        model: The (possibly wrapped) model to export under ``hf/``.
+        cfg: Full OPLM configuration (serialized for reproducibility).
         output_dir: Base output directory (checkpoints saved under subdirs).
         global_step: Current global training step.
         epoch: Current epoch number.
@@ -45,6 +50,10 @@ def save_checkpoint(
         tokens_seen: Cumulative training tokens processed.
         save_total_limit: Maximum number of checkpoints to keep.
     """
+    from dataclasses import asdict
+
+    from oplm.data import get_tokenizer
+
     checkpoint_dir = Path(output_dir) / f"checkpoint-{global_step}"
     accelerator.save_state(str(checkpoint_dir))
 
@@ -59,10 +68,20 @@ def save_checkpoint(
         state_path = checkpoint_dir / "trainer_state.json"
         state_path.write_text(json.dumps(state, indent=2))
 
-        # Save frozen config
-        cfg_config = OmegaConf.to_container(OmegaConf.structured(deepcopy(cfg)), resolve=True)
+        # Save config (model is the HF OplmConfig; train/data are dataclasses)
+        config_dict = {
+            "model": cfg.model.to_dict(),
+            "train": asdict(cfg.train),
+            "data": asdict(cfg.data),
+        }
         config_path = checkpoint_dir / "config.yaml"
-        config_path.write_text(OmegaConf.to_yaml(OmegaConf.create(cfg_config)))
+        config_path.write_text(OmegaConf.to_yaml(OmegaConf.create(config_dict)))
+
+        # HuggingFace export for from_pretrained-style downstream loading
+        hf_dir = checkpoint_dir / "hf"
+        unwrapped = accelerator.unwrap_model(model)
+        unwrapped.save_pretrained(hf_dir)  # config.json + model.safetensors
+        get_tokenizer().save_pretrained(hf_dir)  # tokenizer files for round-trip
 
         # Rotate old checkpoints
         _rotate_checkpoints(Path(output_dir), save_total_limit)

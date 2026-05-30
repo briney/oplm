@@ -1,43 +1,44 @@
-"""Tests for the eval task registry."""
+"""Eval-task registry tests — pure, no model. See docs/EVAL_HARNESS.md §10."""
 
 from __future__ import annotations
 
 import pytest
 
-from oplm.eval.registry import EVAL_TASK_REGISTRY, get_eval_task_class, register_eval_task
-from oplm.eval.tasks.base import EvalTask
+import oplm.eval.tasks  # noqa: F401  -- import triggers @register_eval_task for shipped types
+from oplm.eval import EvalTask, register_eval_task
+from oplm.eval.registry import get_eval_task_class
+
+_REAL_TYPES = ("sequence", "structure", "proteingym", "tape", "proteinglue", "everest")
 
 
-class TestRegistry:
-    """Test register_eval_task decorator and get_eval_task_class lookup."""
+def test_duplicate_registration_raises() -> None:
+    """Re-registering an existing type fails and names the conflict."""
 
-    def test_register_and_lookup(self) -> None:
-        @register_eval_task("_test_reg")
-        class _TestTask(EvalTask):
-            def evaluate(self, model, accelerator):  # type: ignore[override]
-                return {}
+    class _Clash(EvalTask):
+        def evaluate(self, model: object, accelerator: object) -> dict[str, float]:
+            return {}
 
-        try:
-            assert get_eval_task_class("_test_reg") is _TestTask
-        finally:
-            EVAL_TASK_REGISTRY.pop("_test_reg", None)
+    with pytest.raises(ValueError, match="sequence"):
+        register_eval_task("sequence")(_Clash)  # type: ignore[arg-type]
 
-    def test_duplicate_registration_raises(self) -> None:
-        @register_eval_task("_test_dup")
-        class _Task1(EvalTask):
-            def evaluate(self, model, accelerator):  # type: ignore[override]
-                return {}
 
-        try:
-            with pytest.raises(ValueError, match="already registered"):
+def test_unknown_type_raises_with_known_list() -> None:
+    """An unknown type is rejected with an actionable list of registered types."""
+    with pytest.raises(ValueError, match="sequence") as exc_info:
+        get_eval_task_class("does_not_exist")
+    assert "does_not_exist" in str(exc_info.value)
 
-                @register_eval_task("_test_dup")
-                class _Task2(EvalTask):
-                    def evaluate(self, model, accelerator):  # type: ignore[override]
-                        return {}
-        finally:
-            EVAL_TASK_REGISTRY.pop("_test_dup", None)
 
-    def test_unknown_type_raises(self) -> None:
-        with pytest.raises(ValueError, match="Unknown eval type"):
-            get_eval_task_class("nonexistent_type_xyz")
+@pytest.mark.parametrize("type_name", _REAL_TYPES)
+def test_real_types_resolve_to_eval_task_subclasses(type_name: str) -> None:
+    """Every shipped type resolves to an ``EvalTask`` subclass after import."""
+    cls = get_eval_task_class(type_name)
+    assert issubclass(cls, EvalTask)
+
+
+def test_registration_via_fixture_is_isolated(dummy_task_type: str) -> None:
+    """The dummy fixture registers a resolvable type and cleans it up afterward."""
+    from oplm.eval.registry import EVAL_TASK_REGISTRY
+
+    assert issubclass(get_eval_task_class(dummy_task_type), EvalTask)
+    assert dummy_task_type in EVAL_TASK_REGISTRY

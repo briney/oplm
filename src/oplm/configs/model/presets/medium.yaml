@@ -1,6 +1,5 @@
 # ~150M parameters — standard ablation
 model:
-  hidden_dim: 768
-  num_layers: 12
-  num_heads: 12
-  num_kv_heads: 4
+  hidden_size: 768
+  num_hidden_layers: 12
+  num_attention_heads: 12

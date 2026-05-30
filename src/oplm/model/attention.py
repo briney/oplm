@@ -1,273 +1,228 @@
-"""Grouped-query attention with configurable sub-features."""
+"""Dual-path multi-head attention (flex_attention fast path + manual fallback)."""
 
 from __future__ import annotations
 
-import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import nn
+from torch.nn import functional as F
 
-from oplm.model.norm import RMSNorm
-from oplm.model.rope import PartialRotaryEmbedding, RotaryEmbedding
+from .masking import make_flex_block_mask
+from .norm import make_norm
+from .rope import RotaryEmbedding
 
 if TYPE_CHECKING:
-    from oplm.config import ModelConfig
+    from .configuration_oplm import OplmConfig
 
-logger = logging.getLogger(__name__)
+__all__ = ["OplmAttention"]
 
-# Select FlashAttention backend once at import time.
-# flash-attn v4 (Blackwell/Hopper) and flash-attn v2/v3 (Hopper/Ampere) install
-# into the same ``flash_attn`` namespace and are mutually exclusive. We prefer v4
-# when available, fall back to v2/v3, then to PyTorch SDPA.
-_flash_attn_func = None
-_flash_attn_version: str | None = None
+
+# `flex_attention` requires CUDA and a compatible torch build. Probe once at
+# import time so the per-forward fast-path guard is a cheap boolean check.
 try:
-    from flash_attn.cute import (  # type: ignore[no-redef]
-        flash_attn_func as _flash_attn_func,
-    )
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention
 
-    _flash_attn_version = "v4"
-    logger.info("Using flash_attn v4 (CUTE) backend for attention")
-except ImportError:
-    try:
-        from flash_attn import (  # type: ignore[no-redef]
-            flash_attn_func as _flash_attn_func,
-        )
-
-        _flash_attn_version = "v2"
-        logger.info("Using flash_attn v2/v3 backend for attention")
-    except ImportError:
-        logger.info("flash_attn not available, using PyTorch SDPA backend")
+    _FLEX_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only on torch builds without flex
+    _flex_attention = None  # ty: ignore[invalid-assignment]  # optional-import None sentinel
+    _FLEX_AVAILABLE = False
 
 
-class Attention(nn.Module):
-    """Grouped-query attention supporting all optional sub-features.
+class OplmAttention(nn.Module):
+    """Multi-head self-attention with a flex_attention fast path and SDPA fallback.
 
-    All optional features are resolved at ``__init__`` time — no dynamic
-    branching in ``forward()``. Disabled features create no parameters.
-    The ``need_weights`` flag is an exception: it is a per-call runtime choice
-    (typically False for training, True for eval) following the convention of
-    ``torch.nn.MultiheadAttention``.
+    The two compute paths share one set of parameters and one set of
+    pre-attention transformations (Q/K/V projections, optional QK/V norm, RoPE);
+    only the attention kernel itself differs. The fast path uses
+    `torch.nn.attention.flex_attention.flex_attention` with a closure-driven
+    `BlockMask`; the fallback is a manual scaled-dot-product softmax that also
+    returns the attention weights when `output_attentions=True`.
 
-    Features (all togglable via config):
-        - GQA (``num_kv_heads < num_heads``)
-        - Shared K/V projection (``shared_kv``)
-        - Q/K RMSNorm (``qk_norm``)
-        - Partial or full RoPE (``partial_rope``)
-        - Output gating — static or query-dependent (``output_gate``)
-        - Post-SDPA normalization (``post_sdpa_norm``)
-        - Cross-layer value residuals (``value_residual``)
+    Norm wiring (controlled by `config.norm_strategy`):
+
+    * `qk_norm=True` always installs `q_norm` and `k_norm` on the per-head
+      dimension (`d_head`).
+    * Under `norm_strategy == "hybrid"`, an additional `v_norm` is installed on
+      `d_head` — this realises the paper's "QKV-norm" main method.
+    * Under every other strategy, `v_norm` is `nn.Identity()`.
+
+    The output projection (`o_proj`) is marked `_is_residual_writer = True` so
+    the `OplmPreTrainedModel._init_weights` hook can apply the
+    `1/sqrt(2L)` residual-stream scaling defined in §15.1 of the architecture
+    doc.
     """
 
-    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
+    def __init__(self, config: OplmConfig) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
-        self.num_heads = config.num_heads
-        self.num_kv_heads = config.num_kv_heads
-        self.head_dim = config.head_dim or config.hidden_dim // config.num_heads
-        self.gqa_ratio = config.num_heads // config.num_kv_heads
-        self.hidden_dim = config.hidden_dim
 
-        q_dim = config.num_heads * self.head_dim
-        kv_dim = config.num_kv_heads * self.head_dim
-
-        # Projections
-        self.q_proj = nn.Linear(config.hidden_dim, q_dim, bias=False)
-        if config.shared_kv:
-            self.kv_proj = nn.Linear(config.hidden_dim, kv_dim, bias=False)
-        else:
-            self.k_proj = nn.Linear(config.hidden_dim, kv_dim, bias=False)
-            self.v_proj = nn.Linear(config.hidden_dim, kv_dim, bias=False)
-        self.shared_kv = config.shared_kv
-        self.o_proj = nn.Linear(q_dim, config.hidden_dim, bias=False)
-
-        # Q/K normalization
-        self.q_norm = RMSNorm(self.head_dim, config.norm_eps) if config.qk_norm else None
-        self.k_norm = RMSNorm(self.head_dim, config.norm_eps) if config.qk_norm else None
-
-        # Rotary embeddings
-        self.rope: RotaryEmbedding | PartialRotaryEmbedding
-        if config.partial_rope:
-            self.rope = PartialRotaryEmbedding(
-                rope_dim=config.rope_dim or 32,
-                nope_dim=config.nope_dim or (self.head_dim - 32),
-                max_seq_len=config.max_seq_len,
-                theta=config.rope_theta,
-            )
-        else:
-            self.rope = RotaryEmbedding(
-                dim=self.head_dim,
-                max_seq_len=config.max_seq_len,
-                theta=config.rope_theta,
+        hidden_size = config.hidden_size
+        num_heads = config.num_attention_heads
+        head_dim = config.head_dim
+        if head_dim * num_heads != hidden_size:
+            raise ValueError(
+                f"head_dim ({head_dim}) * num_attention_heads ({num_heads}) must equal "
+                f"hidden_size ({hidden_size})."
             )
 
-        # Output gating
-        self.output_gate = config.output_gate
-        if config.output_gate:
-            if config.query_dependent_gate:
-                self.gate_proj = nn.Linear(config.hidden_dim, config.num_heads, bias=False)
-            else:
-                self.gate_param = nn.Parameter(torch.zeros(config.num_heads))
-            self.query_dependent_gate = config.query_dependent_gate
-        else:
-            self.query_dependent_gate = False
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_heads
+        self.head_dim = head_dim
+        self.attention_dropout = float(config.attention_dropout)
+        self.hidden_dropout = float(config.hidden_dropout)
+        self.use_flex_attention = bool(config.use_flex_attention)
+        self.norm_strategy = config.norm_strategy
+        self.qk_norm_enabled = bool(config.qk_norm)
 
-        # Post-SDPA normalization
-        self.post_sdpa_norm = (
-            RMSNorm(self.head_dim, config.norm_eps) if config.post_sdpa_norm else None
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        # Picked up by OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling.
+        self.o_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+
+        if self.qk_norm_enabled:
+            self.q_norm: nn.Module = make_norm(config.norm_type, head_dim, eps=config.norm_eps)
+            self.k_norm: nn.Module = make_norm(config.norm_type, head_dim, eps=config.norm_eps)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
+        # Hybrid strategy ("QKV-norm") also norms V; every other strategy leaves V alone.
+        if config.norm_strategy == "hybrid":
+            self.v_norm: nn.Module = make_norm(config.norm_type, head_dim, eps=config.norm_eps)
+        else:
+            self.v_norm = nn.Identity()
+
+        self.rotary = RotaryEmbedding(
+            head_dim=head_dim,
+            rope_dim=config.rope_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
         )
 
-        # Cross-layer value residuals
-        self.value_residual = config.value_residual
-        if config.value_residual and layer_idx > 0:
-            init = config.value_residual_lambda_init
-            self.value_lambda = nn.Parameter(torch.tensor([init, -init], dtype=torch.float32))
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project to Q/K/V and reshape from `(B, T, D)` to `(B, H, T, d_head)`."""
+        batch, seq_len, _ = x.shape
+        h, d = self.num_attention_heads, self.head_dim
+
+        def split(t: torch.Tensor) -> torch.Tensor:
+            return t.view(batch, seq_len, h, d).transpose(1, 2)
+
+        return split(self.q_proj(x)), split(self.k_proj(x)), split(self.v_proj(x))
+
+    def _qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply per-head QK normalization (no-op when `qk_norm=False`).
+
+        Norm internals already cast to fp32; we forward the result in the same
+        dtype the norm returns (matches the input dtype).
+        """
+        return self.q_norm(q), self.k_norm(k)
+
+    def _apply_v_norm(self, v: torch.Tensor) -> torch.Tensor:
+        return self.v_norm(v)
+
+    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.rotary.apply_rotary(q, k)
+
+    def _output_projection(self, attn_out: torch.Tensor) -> torch.Tensor:
+        """Reshape `(B, H, T, d_head)` back to `(B, T, D)` and project."""
+        batch, _, seq_len, _ = attn_out.shape
+        merged = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, self.hidden_size)
+        return self.o_proj(merged)
+
+    # ------------------------------------------------------------------
+    # Fast-path guard / kernels
+    # ------------------------------------------------------------------
+
+    def _use_fast_path(self, output_attentions: bool, device: torch.device) -> bool:
+        """Decide whether to dispatch to `flex_attention`.
+
+        All conditions must hold; otherwise the manual fallback runs. The fast
+        path returns no attention weights and applies no dropout, so requesting
+        either forces the fallback. CUDA is required by the kernel itself.
+        """
+        if output_attentions:
+            return False
+        if not self.use_flex_attention:
+            return False
+        # flex_attention exposes no `dropout_p` argument; honouring the
+        # configured attention_dropout exactly requires the manual fallback.
+        if self.attention_dropout != 0.0:
+            return False
+        if device.type != "cuda":
+            return False
+        return _FLEX_AVAILABLE
+
+    def _flex_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run `flex_attention` with a closure-built `BlockMask`."""
+        block_mask = make_flex_block_mask(attention_mask, num_heads=self.num_attention_heads)
+        # torch's flex_attention return type is a union; this path returns a Tensor.
+        return _flex_attention(q, k, v, block_mask=block_mask)  # ty: ignore[invalid-return-type]
+
+    def _manual_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Manual scaled-dot-product attention. Returns `(out, attn_fp32)`."""
+        scale = 1.0 / math.sqrt(self.head_dim)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, T, T)
+        # Pad positions: mask is (B, T) with 1 for real tokens; broadcast as KV mask.
+        mask = (attention_mask == 0)[:, None, None, :]
+        scores = scores.masked_fill(mask, float("-inf"))
+        attn = F.softmax(scores, dim=-1, dtype=torch.float32)
+        attn_dropped = F.dropout(attn, p=self.attention_dropout, training=self.training)
+        out = torch.matmul(attn_dropped.to(v.dtype), v)  # (B, H, T, d_head)
+        return out, attn
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
-        x: Tensor,
-        v_first: Tensor | None = None,
-        attention_mask: Tensor | None = None,
-        value_embed: Tensor | None = None,
-        need_weights: bool = False,
-    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
-        """Compute attention.
+        x: torch.Tensor,
+        attention_mask: torch.Tensor,
+        output_attentions: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run dual-path multi-head attention.
 
         Args:
-            x: Hidden state ``(B, T, D)``.
-            v_first: First layer's V for cross-layer value residuals.
-            attention_mask: Normalized 4D attention mask. Boolean masks are
-                interpreted as keep-masks; floating masks are interpreted as
-                additive bias terms.
-            value_embed: Gated value embedding ``(B, T, KV_H, D_head)`` from ValueEmbedding.
-            need_weights: If True, compute and return per-head attention weights
-                using manual attention (bypasses FlashAttention/SDPA). Default False.
+            x: `(B, T, D)` residual-stream input.
+            attention_mask: `(B, T)` tensor with `1` at real tokens, `0` at pads.
+            output_attentions: When `True`, return the fp32 attention weights;
+                forces the manual fallback (the fast path returns none).
 
         Returns:
-            Tuple of (output ``(B, T, D)``, v_first_out, attn_weights).
-            ``v_first_out`` is non-None only at layer 0 when value_residual is enabled.
-            ``attn_weights`` is ``(B, H, T, T)`` when need_weights=True, else None.
+            A `(output, attn_weights_or_None)` tuple. `output` has shape
+            `(B, T, D)`; `attn_weights_or_None` has shape `(B, H, T, T)` in fp32
+            when requested, otherwise `None`.
         """
-        B, T, _ = x.shape
+        q, k, v = self._project_qkv(x)
+        q, k = self._qk_norm(q, k)
+        v = self._apply_v_norm(v)
+        q, k = self._apply_rope(q, k)
 
-        # 1. Project Q, K, V
-        q = self.q_proj(x)  # (B, T, num_heads * head_dim)
-        if self.shared_kv:
-            kv = self.kv_proj(x)  # (B, T, num_kv_heads * head_dim)
-            k = v = kv
+        if self._use_fast_path(output_attentions, q.device):
+            out = self._flex_attention(q, k, v, attention_mask)
+            attn = None
         else:
-            k = self.k_proj(x)  # (B, T, num_kv_heads * head_dim)
-            v = self.v_proj(x)
+            out, attn = self._manual_attention(q, k, v, attention_mask)
 
-        # 2. Reshape to (B, T, H, D_head)
-        q = q.view(B, T, self.num_heads, self.head_dim)
-        k = k.view(B, T, self.num_kv_heads, self.head_dim)
-        v = v.view(B, T, self.num_kv_heads, self.head_dim)
-
-        # 3. Q/K normalization
-        if self.q_norm is not None:
-            assert self.k_norm is not None
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-        # 4. Apply RoPE
-        q, k = self.rope(q, k)
-
-        # 5. GQA expansion
-        if self.gqa_ratio > 1:
-            k = k.repeat_interleave(self.gqa_ratio, dim=2)  # (B, T, H, D_head)
-            v = v.repeat_interleave(self.gqa_ratio, dim=2)
-
-        # 6. Value embeddings
-        if value_embed is not None:
-            if self.gqa_ratio > 1:
-                value_embed = value_embed.repeat_interleave(self.gqa_ratio, dim=2)
-            v = v + value_embed
-
-        # 7. Cross-layer value residuals
-        v_first_out: Tensor | None = None
-        if self.value_residual:
-            if self.layer_idx == 0:
-                v_first_out = v.detach().clone()
-            elif v_first is not None:
-                lambdas = torch.sigmoid(self.value_lambda)  # (2,)
-                lambda_v, lambda_first = lambdas[0], lambdas[1]
-                v = lambda_v * v + lambda_first * v_first
-
-        # 8. Compute attention
-        attn_out, attn_weights = self._attention(  # (B, T, H, D_head)
-            q, k, v, attention_mask, need_weights
-        )
-
-        # 9. Post-SDPA normalization
-        if self.post_sdpa_norm is not None:
-            attn_out = self.post_sdpa_norm(attn_out)
-
-        # 10. Output gating
-        if self.output_gate:
-            if self.query_dependent_gate:
-                gate = torch.sigmoid(self.gate_proj(x))  # (B, T, H)
-                gate = gate.unsqueeze(-1)  # (B, T, H, 1)
-            else:
-                gate = torch.sigmoid(self.gate_param)  # (H,)
-                gate = gate.view(1, 1, -1, 1)  # (1, 1, H, 1)
-            attn_out = gate * attn_out
-
-        # 11. Output projection
-        attn_out = attn_out.reshape(B, T, -1)  # (B, T, num_heads * head_dim)
-        output = self.o_proj(attn_out)  # (B, T, D)
-
-        return output, v_first_out, attn_weights
-
-    def _attention(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        attention_mask: Tensor | None,
-        need_weights: bool = False,
-    ) -> tuple[Tensor, Tensor | None]:
-        """Dispatch to manual attention, FlashAttention, or PyTorch SDPA.
-
-        Args:
-            q, k, v: Tensors of shape ``(B, T, H, D_head)``.
-            attention_mask: Optional normalized 4D mask.
-            need_weights: If True, compute attention manually and return
-                per-head weight matrix. Bypasses FlashAttention/SDPA.
-
-        Returns:
-            Tuple of (attention output ``(B, T, H, D_head)``, attn_weights).
-            ``attn_weights`` is ``(B, H, T, T)`` when need_weights=True, else None.
-        """
-        # Manual path: materialize attention weights for eval metrics
-        if need_weights:
-            q = q.transpose(1, 2)  # (B, H, T, D_head)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            scale = q.size(-1) ** -0.5
-            scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, T, T)
-            if attention_mask is not None:
-                if attention_mask.dtype == torch.bool:
-                    scores = scores.masked_fill(~attention_mask, torch.finfo(scores.dtype).min)
-                else:
-                    scores = scores + attention_mask.to(dtype=scores.dtype)
-            weights = scores.softmax(dim=-1)  # (B, H, T, T)
-            attn_out = torch.matmul(weights, v)  # (B, H, T, D_head)
-            return attn_out.transpose(1, 2), weights  # (B, T, H, D_head), (B, H, T, T)
-
-        # FlashAttention path
-        if _flash_attn_func is not None and attention_mask is None:
-            # flash_attn expects (B, T, H, D) layout and returns same
-            return _flash_attn_func(q, k, v, causal=False), None
-
-        # PyTorch SDPA path
-        q = q.transpose(1, 2)  # (B, H, T, D_head)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, is_causal=False
-        )
-        return attn_out.transpose(1, 2), None  # (B, T, H, D_head)
+        out = self._output_projection(out)
+        out = F.dropout(out, p=self.hidden_dropout, training=self.training)
+        return out, attn

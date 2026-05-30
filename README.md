@@ -1,39 +1,41 @@
 # OPLM
 
-**Open Protein Language Model** -- an encoder-only protein language model built for research, combining recent architectural innovations with a fully ablation-friendly design.
+**Open Protein Language Model** — an encoder-only protein language model with a
+HuggingFace-native, ESM-C-style API. Load a pretrained checkpoint, hand it a list
+of sequences, and get back per-residue logits and embeddings.
 
-OPLM integrates ideas from [Proust](https://arxiv.org/abs/2602.01845) (grouped-query attention with shared K/V projections, cross-layer value residuals, depthwise convolutions) and [Attention Residuals](https://arxiv.org/abs/2603.15031) (learned depth-wise residual connections). Every novel feature is independently togglable via config, enabling clean ablation studies with zero memory overhead when features are disabled.
-
-> **Status:** Pre-alpha (v0.0.1). The core architecture, training loop, and evaluation harness are functional. Benchmark dataset integrations are in progress.
+> **Status:** Pre-alpha (`v0.0.1`). The model, tokenizer, inference API, and
+> HuggingFace integration are stable; pretrained checkpoints and benchmark
+> results are still landing.
 
 ---
 
-## Features
+## Highlights
 
-- **Encoder-native architecture** -- fully bidirectional attention for masked language modeling on protein sequences
-- **Grouped-query attention** with optional shared K/V projections, Q/K normalization, output gating, and partial RoPE
-- **Cross-layer value residuals** and **learned attention residuals** for improved gradient flow
-- **Bidirectional depthwise convolutions** at configurable positions with static or scheduled kernel sizes
-- **SwiGLU, ReLU^2, or GELU** feed-forward activations
-- **Ablation-friendly** -- all architectural features are togglable with no overhead when off
-- **Distributed training** via HuggingFace Accelerate with FSDP, mixed precision (bf16/fp16), gradient checkpointing, and optional Muon optimization
-- **Optional FlashAttention** support (v2/v3 and v4) for efficient long-sequence training
-- **Built-in evaluation** for MLM metrics (loss, accuracy, perplexity) and structure-based contact prediction
-- **Five model presets** from 4.8M to 11.0B parameters
+- **ESM-C-style inference API** — `model.logits(sequences, LogitsConfig(...))`
+  returns a structured `LogitsOutput` with `sequence_logits`, `embeddings`,
+  `hidden_states`, and `attentions`. If you've used ESM-C, you already know it.
+- **HuggingFace-native** — every model is a `PreTrainedModel`. Use
+  `OplmForMaskedLM.from_pretrained(...)` or the `transformers` `Auto*` classes,
+  load from the Hub, and `save_pretrained` / `push_to_hub` like any other model.
+- **ESM-C-compatible tokenizer** — a 33-token `OplmTokenizerFast` with the same
+  vocabulary and special tokens as ESM-C.
+- **Fast attention** — built on `torch.nn.attention.flex_attention` (no separate
+  `flash-attn` dependency), with a manual fallback for returning attention
+  weights.
+- **Five sizes** — from a 5M-parameter ablation model up to 13B parameters.
 
 ---
 
 ## Installation
 
-**Requirements:** Python 3.11+ and PyTorch 2.10+
-
-### From PyPI
+**Requirements:** Python ≥ 3.11 and PyTorch ≥ 2.11.
 
 ```bash
 pip install oplm
 ```
 
-### From source
+Or from source:
 
 ```bash
 git clone https://github.com/briney/oplm.git
@@ -41,333 +43,226 @@ cd oplm
 pip install -e .
 ```
 
-### Optional extras
+Inference needs no extras. The optional groups are for contributors:
 
 ```bash
-# distributed training with Accelerate + Weights & Biases logging
-pip install oplm[train]
-
-# FlashAttention v2/v3 (Ampere/Hopper GPUs)
-pip install oplm[flash]
-
-# FlashAttention v4 (Blackwell/Hopper GPUs)
-pip install oplm[flash4]
-
-# everything (pick one flash variant)
-pip install oplm[train,flash]
-
-# development (pytest, ruff, mypy)
-pip install oplm[dev]
+pip install "oplm[train]"   # distributed training (Accelerate, W&B, datasets)
+pip install "oplm[dev]"     # tests, linting, type checking
 ```
 
 ---
 
 ## Quick start
 
-### Tokenize protein sequences
+### Per-residue logits and embeddings
 
-```python
-from oplm.data.tokenizer import ProteinTokenizer
-
-tokenizer = ProteinTokenizer()
-
-# single sequence
-token_ids = tokenizer.encode("MKWVTFISLLLLFSSAYS")
-
-# batch with padding
-batch = tokenizer.batch_encode(
-    ["MKWVTFISLLLLFSSAYS", "MLPGLALLLLAAWTARA"],
-    max_length=512,
-)
-print(batch["input_ids"].shape)       # (2, 512)
-print(batch["attention_mask"].shape)   # (2, 512)
-```
-
-### Build a model
-
-```python
-from oplm.config import ModelConfig
-from oplm.model import OplmForMLM
-
-cfg = ModelConfig(
-    hidden_dim=768,
-    num_layers=12,
-    num_heads=12,
-    num_kv_heads=4,
-)
-
-model = OplmForMLM(cfg)
-```
-
-Or use a built-in preset:
-
-```python
-from oplm.config import load_config
-
-cfg = load_config(["--preset", "medium"])
-model = OplmForMLM(cfg.model)
-```
-
-### Extract embeddings
+The primary entry point is `OplmForMaskedLM`. `from_pretrained` loads the weights
+and attaches the matching tokenizer, so `.logits()` takes raw sequences directly:
 
 ```python
 import torch
-from oplm.data.tokenizer import ProteinTokenizer
-from oplm.model import OplmForMLM
-from oplm.config import ModelConfig
+from oplm import OplmForMaskedLM, LogitsConfig
 
-tokenizer = ProteinTokenizer()
-cfg = ModelConfig(hidden_dim=768, num_layers=12, num_heads=12)
-model = OplmForMLM(cfg)
-model.eval()
+model = OplmForMaskedLM.from_pretrained("brineylab/oplm-base").eval()
 
-sequences = ["MKWVTFISLLLLFSSAYS", "MLPGLALLLLAAWTARA"]
-batch = tokenizer.batch_encode(sequences, max_length=512)
+sequences = [
+    "MSHHWGYGKHNGPEHWHKDFPIAKGERQSPVDIDTHTAKYDPSLKPLSVSYDQATSLRIL",
+    "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVK",
+]
 
 with torch.no_grad():
-    hidden = model.encoder(
-        batch["input_ids"],
+    out = model.logits(
+        sequences,
+        LogitsConfig(sequence=True, return_embeddings=True),
+    )
+
+out.sequence_logits   # (B, T, 33) per-residue amino-acid logits
+out.embeddings        # (B, T, hidden_size) per-residue embeddings
+```
+
+`B` is the batch size and `T` is the padded sequence length (each sequence is
+wrapped with `<cls> … <eos>`).
+
+### Per-protein embeddings
+
+For a single fixed-size vector per sequence, run the backbone (`OplmModel`) and
+mask-aware mean-pool over the residue dimension:
+
+```python
+import torch
+from oplm import OplmModel
+from oplm.model import mean_pool
+
+model = OplmModel.from_pretrained("brineylab/oplm-base").eval()
+
+batch = model.tokenize(sequences)            # BatchEncoding on the model's device
+with torch.no_grad():
+    out = model(
+        input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
-    )[0]
+    )
 
-print(hidden.shape)  # (2, 512, 768)
+per_residue = out.last_hidden_state          # (B, T, hidden_size)
+per_protein = mean_pool(per_residue, batch["attention_mask"])  # (B, hidden_size)
 ```
 
-For checkpoint-backed inference, use the shared loader so training-produced checkpoint
-directories work without manual state-dict handling:
+`oplm.model` also exports `cls_pool` if you prefer the `<cls>` representation.
+
+### Using the `transformers` Auto* API
+
+Importing `oplm` registers the config, models, and tokenizer with `transformers`,
+so the standard `Auto*` classes work too:
 
 ```python
-from oplm.inference import load_model_for_inference, resolve_inference_config
+import oplm  # registers OPLM with transformers' Auto* classes
+from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-checkpoint = "outputs/medium-run/checkpoint-10000"
-cfg = resolve_inference_config(checkpoint)
-model = load_model_for_inference(checkpoint, cfg)
+tokenizer = AutoTokenizer.from_pretrained("brineylab/oplm-base")
+model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-base").eval()
+
+batch = tokenizer(sequences, return_tensors="pt", padding=True)
+with torch.no_grad():
+    logits = model(**batch).logits   # (B, T, 33)
 ```
 
-### Masked language modeling
+`AutoModel` returns the bare encoder, and `AutoModelForSequenceClassification` /
+`AutoModelForTokenClassification` return the corresponding fine-tuning heads.
+
+Each model repo also bundles its modeling code, so consumers who don't have
+`oplm` installed can load it with `trust_remote_code=True`:
 
 ```python
-outputs = model(
-    batch["input_ids"],
-    attention_mask=batch["attention_mask"],
-    labels=labels,  # token IDs at masked positions, -100 elsewhere
-)
-loss = outputs["loss"]
-logits = outputs["logits"]
+model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-base", trust_remote_code=True)
 ```
+
+### Coming from ESM-C?
+
+OPLM mirrors the ESM-C inference surface so existing pipelines port with minimal
+changes:
+
+- `LogitsConfig(sequence=..., return_embeddings=...)` is the same knob object.
+- `model.logits(...)` returns a `LogitsOutput`; read `output.embeddings` exactly
+  as you would with ESM-C.
+- The tokenizer vocabulary (33 tokens, `<cls>`/`<pad>`/`<eos>`/`<mask>` specials)
+  matches ESM-C.
+
+The main difference: OPLM's `.logits()` and `.tokenize()` accept a `list[str]` of
+sequences directly, rather than pre-encoded protein tensors. Per-residue logits
+live in `output.sequence_logits`.
 
 ---
 
-## CLI
+## Pretrained models
 
-OPLM provides a command-line interface for training, embedding extraction, and model inspection.
+Checkpoints are published on the HuggingFace Hub under the `brineylab` org and
+selectable on the command line via `--preset`.
 
-### Training
+| Preset / Hub id          | Parameters | Layers | Hidden | Heads |
+|--------------------------|-----------:|-------:|-------:|------:|
+| `brineylab/oplm-small`   |       5.2M |      6 |    256 |     4 |
+| `brineylab/oplm-medium`  |      85.6M |     12 |    768 |    12 |
+| `brineylab/oplm-base`    |     309.5M |     24 |   1024 |    16 |
+| `brineylab/oplm-large`   |       2.5B |     32 |   2560 |    32 |
+| `brineylab/oplm-xlarge`  |      12.7B |     40 |   5120 |    40 |
 
-```bash
-# train with a YAML config
-oplm train --config configs/my_run.yaml
+All sizes share the 33-token tokenizer and a 1024-position context window.
 
-# use a size preset
-oplm train --preset medium
+---
 
-# preset + overrides (Hydra-style dot-notation)
-oplm train --preset large \
-  model.num_layers=16 \
-  train.lr=3e-4
+## Command line
 
-# distributed training with Accelerate
-accelerate launch -m oplm.train --config configs/my_run.yaml
-```
+`oplm` ships a small CLI; `oplm --help` lists every command.
 
-Set `train.optimizer=muon` to enable the built-in Muon optimizer for eligible
-hidden 2D weights while keeping AdamW on embeddings, norms, biases, and the MLM
-head.
-
-Standard one-node multi-GPU runs use plain Accelerate/DDP. If your shell or
-launcher environment enables DeepSpeed globally, `oplm.train` disables it by
-default to avoid DeepSpeed/Triton startup noise; set `OPLM_ENABLE_DEEPSPEED=1`
-to opt back in intentionally.
-
-### Encode sequences
+### Encode sequences to a file
 
 ```bash
 oplm encode MKWVTFISLLLLFSSAYS MLPGLALLLLAAWTARA \
-  --model /path/to/checkpoint-10000 \
+  --model brineylab/oplm-base \
   --output embeddings.pt
 ```
 
-### Inspect a model configuration
+`--model` accepts a Hub id, a local HuggingFace export directory, or a training
+checkpoint directory. The saved tensor holds the per-residue embeddings,
+`(num_sequences, T, hidden_size)`.
+
+### Inspect a model
 
 ```bash
-oplm info --preset medium
+oplm info --preset base
 ```
 
 ```
-──────────── OPLM Model Info ─────────────
-       Architecture
- Parameters   150.3M (150,341,409)
- Hidden dim   768
- Layers       12
- Attn heads   12 (KV: 4)
- FFN dim      2048
- Max seq len  2048
+──────────────── OPLM Model Info ────────────────
+                Architecture
+ Parameters        309.5M (309,507,105)
+ Hidden size       1024
+ Layers            24
+ Attention heads   16
+ Head dim          64
+ Intermediate size 2816
+ FFN activation    swiglu
  ...
 ```
 
 ---
 
-## Configuration
+## Training
 
-OPLM uses a layered config system: **defaults -> preset -> YAML file -> CLI overrides**, with later sources taking priority.
+OPLM trains with HuggingFace Accelerate (FSDP, mixed precision, gradient
+checkpointing, optional Muon optimizer) over parquet sequence datasets, with a
+built-in eval harness for MLM metrics and structure-based contact prediction.
 
-The canonical field-by-field reference lives in [configs/README.md](configs/README.md).
-Runtime precision is controlled by `train.mixed_precision`; `model.dtype` is currently a
-reserved placeholder.
-`model.max_seq_len` is the sequence-length setting for training, eval, and inference.
-Overrides use Hydra-style bare dot-notation: any positional token of the form
-`key.subkey=value` is treated as an override. This works the same way for
-`oplm train ...`, `oplm info ...`, `oplm encode ...`, and the distributed entrypoint
-`accelerate launch -m oplm.train ...`, all of which pass dotlist tokens through to
-`load_config()`.
-
-### Model presets
-
-| Preset   | Parameters | Layers | Hidden | Heads | KV Heads |
-|----------|-----------|--------|--------|-------|----------|
-| `small`  | ~4.8M     | 6      | 256    | 4     | 2        |
-| `medium` | ~76.2M    | 12     | 768    | 12    | 4        |
-| `base`   | ~271.7M   | 24     | 1024   | 16    | 4        |
-| `large`  | ~2.2B     | 32     | 2560   | 32    | 8        |
-| `xlarge` | ~11.0B    | 40     | 5120   | 40    | 8        |
-
-### YAML config example
-
-```yaml
-model:
-  hidden_dim: 768
-  num_layers: 12
-  num_heads: 12
-  num_kv_heads: 4
-  max_seq_len: 1024
-  ffn_activation: swiglu
-  shared_kv: false
-  qk_norm: true
-  partial_rope: true
-  value_residual: true
-  conv_positions: "AC"
-  conv_kernel_size: 3
-  conv_kernel_schedule: block_step
-  conv_kernel_increment: 2
-  conv_kernel_block_size: 2
-  conv_kernel_max_size: 9
-  attn_residual: true
-
-train:
-  max_steps: 100_000
-  batch_size: 128
-  lr: 1e-4
-  warmup_steps: 5_000
-  scheduler: warmup_cosine
-  mixed_precision: bf16
-  wandb_project: oplm
-
-data:
-  train: /path/to/sequences.parquet
-  mask_prob: 0.15
+```bash
+oplm train --preset base --config configs/my_run.yaml
 ```
 
-### Training data format
-
-Training data should be parquet files with two columns:
-
-| Column        | Type   | Description          |
-|---------------|--------|----------------------|
-| `sequence_id` | string | Unique identifier    |
-| `sequence`    | string | Amino acid sequence  |
-
-OPLM supports single parquet files, directories of shards, or interleaved multi-source datasets.
+See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide.
 
 ---
 
-## Evaluation
+## Configuration
 
-OPLM includes a built-in evaluation harness with support for:
+Models and runs are configured through a layered system
+(**defaults → preset → YAML → CLI overrides**) built on a HuggingFace
+`PretrainedConfig`. Architecture toggles, optimizer/scheduler settings, and the
+dataset schema are all set here.
 
-- **Sequence evaluation** -- masked language modeling metrics (loss, accuracy, perplexity)
-- **Structure evaluation** -- contact prediction precision@L from attention maps, optional logistic regression fitting, and categorical-Jacobian contact extraction
-
-Configure evaluation datasets in your YAML config:
-
-```yaml
-data:
-  eval:
-    validation:
-      path: /path/to/eval_sequences.parquet
-      type: sequence
-    structures:
-      path: /path/to/pdb_directory
-      type: structure
-      eval_every: 10_000
-      contact_threshold: 8.0
-      use_logistic_regression: true
-      use_categorical_jacobian: true
-      categorical_jacobian_sample_size: 12
-```
-
-Evaluation runs automatically during training at the configured interval, with results logged to Weights & Biases.
+See **[docs/CONFIG.md](docs/CONFIG.md)** for the field-by-field reference.
 
 ---
 
 ## Architecture
 
-The core architecture is an encoder-only transformer with the following optional components:
+OPLM is a pre-norm, bidirectional encoder transformer with RoPE and QK-norm:
+LayerNorm by default (RMSNorm available), SwiGLU feed-forward, untied
+input/output embeddings, standard multi-head attention, depth-stable residual
+scaling, and a BERT-style MLM head. A curated set of independently togglable
+research features (Canon depthwise convolutions, partial-RoPE/NoPE, sandwich /
+hybrid / post-SDPA norm) layers on top, each off by default.
 
-```
-Input tokens
-    -> TokenEmbedding (scaled by sqrt(D), optional post-norm)
-    -> [ValueEmbedding (first/last N layers)]
-    -> TransformerBlock x N:
-        -> [BidirectionalDepthwiseConv (position A)]
-        -> RMSNorm -> Attention (GQA, optional shared K/V, Q/K norm,
-           partial RoPE, output gating, value residuals)
-        -> [BlockAttentionResidual | standard residual]
-        -> [BidirectionalDepthwiseConv (position C)]
-        -> RMSNorm -> FFN (SwiGLU / ReLU^2 / GELU)
-            -> [BidirectionalDepthwiseConv (position D)]
-        -> [BlockAttentionResidual | standard residual]
-    -> MLMHead (Dense -> RMSNorm -> GELU -> projection)
-```
-
-For a complete architectural description, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+For the complete specification, see
+**[docs/MODEL_ARCHITECTURE.md](docs/MODEL_ARCHITECTURE.md)**.
 
 ---
 
 ## Development
 
 ```bash
-# install with dev dependencies
 pip install -e ".[dev]"
 
-# run tests
-pytest
+pytest                  # run tests
+pytest -m "not slow"    # skip slow tests
+pytest --cov=oplm       # with coverage
 
-# run tests with coverage
-pytest --cov=oplm
-
-# skip slow tests
-pytest -m "not slow"
-
-# lint and format
-ruff check src/
-ruff format src/
-
-# type check
-mypy src/
+ruff check src/         # lint
+ruff format src/        # format
+ty check src/           # type check (Astral's `ty`, not mypy)
 ```
+
+Contributor and agent instructions live in [AGENTS.md](AGENTS.md).
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

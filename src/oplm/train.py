@@ -1,7 +1,7 @@
 """Training entry point.
 
-Run directly:     python -m oplm.train --config configs/my_run.yaml
-Run distributed:  accelerate launch -m oplm.train --config configs/my_run.yaml model.num_layers=32
+Run directly:     python -m oplm.train --config configs/my_run.yaml model.num_hidden_layers=32
+Run distributed:  accelerate launch -m oplm.train --config configs/my_run.yaml
 """
 
 from __future__ import annotations

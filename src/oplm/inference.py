@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from oplm.config import OplmConfig, load_config
-from oplm.model.transformer import OplmForMLM
+from oplm.model import OplmForMaskedLM
 
 _MODEL_STATE_FILENAMES = (
     "model.safetensors",
@@ -59,14 +59,35 @@ def load_model_for_inference(
     cfg: OplmConfig,
     *,
     device: torch.device | str = "cpu",
-) -> OplmForMLM:
-    """Load an inference-ready model from a checkpoint directory or state-dict file."""
-    state_dict = load_model_state_dict(model_path)
-    model = OplmForMLM(cfg.model)
-    model.load_state_dict(state_dict)
+) -> OplmForMaskedLM:
+    """Load an inference-ready model.
+
+    Prefers a HuggingFace export (``<dir>/hf`` or a directory that already
+    contains ``config.json``); otherwise reconstructs from ``cfg.model`` and a
+    bare state-dict file.
+    """
+    model: OplmForMaskedLM
+    hf_dir = _find_hf_export(Path(model_path))
+    if hf_dir is not None:
+        # transformers' from_pretrained is untyped but returns an OplmForMaskedLM here.
+        model = OplmForMaskedLM.from_pretrained(str(hf_dir))
+    else:
+        state_dict = load_model_state_dict(model_path)
+        model = OplmForMaskedLM(cfg.model)
+        model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     return model
+
+
+def _find_hf_export(model_path: Path) -> Path | None:
+    """Return a directory loadable by ``from_pretrained`` if one exists."""
+    if model_path.is_dir():
+        if (model_path / "hf" / "config.json").exists():
+            return model_path / "hf"
+        if (model_path / "config.json").exists():
+            return model_path
+    return None
 
 
 def load_model_state_dict(model_path: str | Path) -> dict[str, Tensor]:

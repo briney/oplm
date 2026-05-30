@@ -1,7 +1,6 @@
 # ~3B parameters
 model:
-  hidden_dim: 2560
-  num_layers: 32
-  num_heads: 32
-  num_kv_heads: 8
+  hidden_size: 2560
+  num_hidden_layers: 32
+  num_attention_heads: 32
   gradient_checkpointing: true

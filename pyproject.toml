@@ -22,7 +22,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "torch>=2.10.0",
+    # Upper bounds keep CI on the verified-good toolchain: torch 2.12 is untested,
+    # and transformers >=5.4 shifts PretrainedConfig attribute typing so `ty`
+    # reports resolved-Optional config fields (head_dim, intermediate_size, ...) as
+    # errors. Bump deliberately after re-running `ty check src/` + the test suite.
+    "torch>=2.11.0,<2.12",  # flex_attention gained FlashAttention-4 support in 2.11
+    "transformers>=4.45,<5.4",
     "omegaconf>=2.3",
     "typer>=0.9",
     "rich>=13.0",
@@ -37,19 +42,16 @@ train = [
     "wandb>=0.16",
     "datasets>=2.18",
     "biopython>=1.83",
-    "scikit-learn>=1.4",
-]
-flash = [
-    "flash-attn>=2.5",
-]
-flash4 = [
-    "flash-attn-4>=4.0.0b1",
 ]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.8",
-    "mypy>=1.13",
+    # ty is Astral's type checker (pre-1.0/beta). Pin an EXACT version: its
+    # diagnostics shift between releases, so an unpinned range lets CI pull a newer
+    # ty that flags code an older ty accepts. Bump deliberately. See
+    # [tool.ty.environment] below.
+    "ty==0.0.40",
 ]
 
 [project.scripts]
@@ -86,29 +88,5 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
 
-[tool.mypy]
-python_version = "3.11"
-strict = true
-warn_return_any = true
-warn_unused_configs = true
-
-[[tool.mypy.overrides]]
-module = [
-    "numpy",
-    "numpy.*",
-    "pyarrow",
-    "pyarrow.*",
-    "flash_attn",
-    "flash_attn.*",
-    "accelerate",
-    "accelerate.*",
-    "deepspeed",
-    "deepspeed.*",
-    "wandb",
-    "wandb.*",
-    "Bio",
-    "Bio.*",
-    "sklearn",
-    "sklearn.*",
-]
-ignore_missing_imports = true
+[tool.ty.environment]
+python-version = "3.11"

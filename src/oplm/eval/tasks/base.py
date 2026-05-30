@@ -5,11 +5,14 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
+from oplm.eval.schedule import build_schedule
+
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
     from oplm.config import EvalDatasetEntry, OplmConfig
-    from oplm.model.transformer import OplmForMLM
+    from oplm.eval.schedule import Schedule
+    from oplm.model import OplmForMaskedLM
 
 
 class EvalTask(ABC):
@@ -25,14 +28,14 @@ class EvalTask(ABC):
     def __init__(self, entry: EvalDatasetEntry, cfg: OplmConfig) -> None:
         self.name = entry.name
         self.path = entry.path
-        self.eval_every: int = entry.eval_every or cfg.train.eval_every
         self.metrics = entry.metrics or self.default_metrics
+        self.schedule: Schedule = build_schedule(entry.schedule)
         self.cfg = cfg
 
     @abstractmethod
     def evaluate(
         self,
-        model: OplmForMLM,
+        model: OplmForMaskedLM,
         accelerator: Accelerator,
     ) -> dict[str, float]:
         """Run evaluation and return metrics.

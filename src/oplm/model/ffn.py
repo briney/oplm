@@ -1,77 +1,82 @@
-"""Feed-forward network with configurable activation."""
+"""SwiGLU feed-forward block and the make_ffn factory."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch.nn.functional as F
-from torch import Tensor, nn
-
-from oplm.model.conv import BidirectionalDepthwiseConv
+import torch
+from torch import nn
+from torch.nn import functional as F
 
 if TYPE_CHECKING:
-    from oplm.config import ModelConfig
+    from .configuration_oplm import OplmConfig
+
+__all__ = ["SwiGLU", "make_ffn", "round_up_to"]
 
 
-class FFN(nn.Module):
-    """Feed-forward network with configurable activation.
+class SwiGLU(nn.Module):
+    """SwiGLU feed-forward block: ``down(silu(gate(x)) * up(x))``.
 
-    Supports three activation variants:
-
-    - **SwiGLU** (default): ``down(silu(gate(x)) * up(x))`` with ``ffn_dim = round(8/3 * D, 256)``
-    - **ReLU squared**: ``down(relu(up(x))^2)`` with ``ffn_dim = 4 * D``
-    - **GELU**: ``down(gelu(up(x)))`` with ``ffn_dim = 4 * D``
-
-    Optionally applies a Canon-D depthwise convolution in the expanded space
-    when ``"D"`` appears in ``conv_positions``.
+    Three linear projections share no parameters and all use the same `bias`
+    setting. The gated branch is `silu(gate_proj(x))`; it modulates `up_proj(x)`
+    elementwise before being projected back to the model dim by `down_proj`.
     """
 
-    def __init__(self, config: ModelConfig, conv_kernel_size: int | None = None) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        bias: bool = False,
+    ) -> None:
         super().__init__()
-        hidden_dim = config.hidden_dim
-        ffn_dim = config.ffn_dim or 4 * hidden_dim
-        self.conv_kernel_size = (
-            config.conv_kernel_size if conv_kernel_size is None else conv_kernel_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
+        # Writes back into the residual stream: picked up by
+        # OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling (§15.1).
+        self.down_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, T, D) -> (B, T, F) -> (B, T, D)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+def round_up_to(value: int, multiple: int) -> int:
+    """Round `value` up to the nearest non-zero positive `multiple`.
+
+    Used to align `intermediate_size` to a tensor-core / memory-friendly
+    boundary when the config does not pin it explicitly.
+    """
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def make_ffn(config: OplmConfig) -> nn.Module:
+    """Construct the FFN operator selected by `config.ffn_activation`.
+
+    New gated-FFN variants should be added here; the rest of the model stays
+    agnostic to which activation is in use.
+
+    Args:
+        config: Carries `hidden_size`, `intermediate_size`, `ffn_activation`,
+            and `ffn_bias`.
+
+    Returns:
+        A `nn.Module` mapping `(B, T, D) -> (B, T, D)`.
+
+    Raises:
+        NotImplementedError: For activations that are accepted by config
+            validation but not yet implemented (currently `"geglu"`).
+        ValueError: For an unrecognized activation string.
+    """
+    activation = config.ffn_activation
+    if activation == "swiglu":
+        return SwiGLU(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=config.ffn_bias,
         )
-        self.activation = config.ffn_activation
-
-        if self.activation == "swiglu":
-            self.gate_proj = nn.Linear(hidden_dim, ffn_dim, bias=False)
-            self.up_proj = nn.Linear(hidden_dim, ffn_dim, bias=False)
-        else:
-            self.up_proj = nn.Linear(hidden_dim, ffn_dim, bias=False)
-
-        self.down_proj = nn.Linear(ffn_dim, hidden_dim, bias=False)
-
-        # Optional Canon-D convolution in expanded space
-        self.conv_d = (
-            BidirectionalDepthwiseConv(
-                ffn_dim,
-                kernel_size=self.conv_kernel_size,
-                activation=config.conv_activation,
-            )
-            if "D" in config.conv_positions
-            else None
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Apply feed-forward transformation.
-
-        Args:
-            x: Input tensor of shape ``(B, T, D)``.
-
-        Returns:
-            Output tensor of shape ``(B, T, D)``.
-        """
-        if self.activation == "swiglu":
-            h = F.silu(self.gate_proj(x)) * self.up_proj(x)  # (B, T, ffn_dim)
-        elif self.activation == "relu_squared":
-            h = F.relu(self.up_proj(x)).square()  # (B, T, ffn_dim)
-        else:  # gelu
-            h = F.gelu(self.up_proj(x))  # (B, T, ffn_dim)
-
-        if self.conv_d is not None:
-            h = self.conv_d(h)
-
-        out: Tensor = self.down_proj(h)  # (B, T, D)
-        return out
+    if activation == "geglu":
+        raise NotImplementedError("ffn_activation='geglu' is reserved but not yet implemented.")
+    raise ValueError(f"Unknown ffn_activation {activation!r}; expected 'swiglu' or 'geglu'.")
