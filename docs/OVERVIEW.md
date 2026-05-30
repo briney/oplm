@@ -29,7 +29,7 @@ evaluate it. Four subsystems compose cleanly along stable contracts:
        │ (also consumed by eval)                    ▼
        │                                     ┌──────────────┐
        │   load_structures / variant /       │ eval/        │
-       └───────────────────────────────────►│  Evaluator   │
+       └───────────────────────────────────► │  Evaluator   │
                                              │  + tasks     │
                                              └──────┬───────┘
                                                     │ forward()/logits()
