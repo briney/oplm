@@ -536,7 +536,7 @@ the FFN is always gated (3 projections).
 
 **File:** `src/oplm/training/optim.py`.
 
-- [ ] In `partition_optimizer_params`, change the Muon head-exclusion prefix
+- [x] In `partition_optimizer_params`, change the Muon head-exclusion prefix
       (≈ line 66) from the stale `mlm_head.` to the real head module name:
 
   ```python
@@ -553,11 +553,12 @@ the FFN is always gated (3 projections).
   `"embed"` name rule, since it appears under
   `oplm.backbone.embed_tokens.embed_tokens.weight`.)
 
-- [ ] Update any nearby comment that references `mlm_head` to `lm_head`.
+- [x] Update any nearby comment that references `mlm_head` to `lm_head`.
+      (None present — the changed line has no comment.)
 
 ### Phase-3 acceptance
 
-- [ ] With `optimizer="muon"`, `lm_head.dense.weight` (and untied
+- [x] With `optimizer="muon"`, `lm_head.dense.weight` (and untied
       `lm_head.decoder.weight`) land on AdamW-decay, not Muon (Phase 8 test).
 
 ---
