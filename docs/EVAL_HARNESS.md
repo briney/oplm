@@ -42,7 +42,7 @@
   Jacobian probes them for contact prediction). →
   [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md).
 - The trainer loop, optimizer, schedules, FLOPs accounting, and checkpoint format.
-  → future `docs/TRAINER.md`. This document specifies only the *interface* the
+  → `docs/TRAINER.md`. This document specifies only the *interface* the
   trainer must satisfy to drive eval (§6).
 - The CLI. → future `docs/CLI.md`.
 
@@ -423,7 +423,7 @@ the `eval/{name}/{metric}` namespace.
 ## 6. Trainer integration & distributed token accounting
 
 This section specifies only the interface the trainer must satisfy; the trainer
-loop itself is → future `docs/TRAINER.md`.
+loop itself is → `docs/TRAINER.md`.
 
 ### 6.1 Call site
 

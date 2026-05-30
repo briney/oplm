@@ -32,7 +32,7 @@
   there; this doc only specifies how the data layer *uses* it).
 - The eval harness: task registry, metric math (contact P@L, Spearman, APC,
   categorical Jacobian), per-task scheduling. → [`EVAL_HARNESS.md`](EVAL_HARNESS.md).
-- The trainer loop, optimizer, schedules, checkpointing. → future `docs/TRAINER.md`.
+- The trainer loop, optimizer, schedules, checkpointing. → `docs/TRAINER.md`.
 - The CLI. → future `docs/CLI.md`.
 
 ### 1.3 Design principles
