@@ -21,6 +21,14 @@ _PRESET_HELP = f"Model size preset ({', '.join(AVAILABLE_PRESETS)})"
 
 ConfigOpt = Annotated[str | None, typer.Option("--config", "-c", help="Path to YAML config")]
 PresetOpt = Annotated[str | None, typer.Option("--preset", "-p", help=_PRESET_HELP)]
+NameOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--name",
+        "-n",
+        help="W&B run name. Ignored if train.wandb_run_name is set in YAML/--override.",
+    ),
+]
 OverridesOpt = Annotated[
     list[str] | None,
     typer.Option("--override", help="Config override (key=value). Repeat as needed."),
@@ -31,6 +39,7 @@ def _build_argv(
     config: str | None,
     preset: str | None,
     overrides: list[str] | None,
+    name: str | None = None,
 ) -> list[str]:
     """Build an argv list for load_config from CLI options."""
     argv: list[str] = []
@@ -38,6 +47,8 @@ def _build_argv(
         argv.extend(["--preset", preset])
     if config:
         argv.extend(["--config", config])
+    if name:
+        argv.extend(["--name", name])
     if overrides:
         argv.extend(overrides)
     return argv
@@ -47,13 +58,14 @@ def _build_argv(
 def train(
     config: ConfigOpt = None,
     preset: PresetOpt = None,
+    name: NameOpt = None,
     overrides: OverridesOpt = None,
 ) -> None:
     """Launch training.
 
     For distributed training: accelerate launch -m oplm.train --config <path>
     """
-    cfg = load_config(_build_argv(config, preset, overrides))
+    cfg = load_config(_build_argv(config, preset, overrides, name))
     console.print(f"[bold]Model:[/bold] {cfg.model.num_layers}L / {cfg.model.hidden_dim}D")
     console.print(f"[bold]Output:[/bold] {cfg.train.output_dir}")
 

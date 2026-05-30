@@ -341,11 +341,15 @@ def load_config(argv: list[str]) -> OplmConfig:
     Args:
         argv: Command-line arguments (e.g. sys.argv[1:]).
             Supports ``--preset <name>`` for size presets, ``--config <path>``
-            for YAML files, and dotlist overrides like ``model.num_layers=32``.
+            for YAML files, ``--name <run>`` for the W&B run name, and dotlist
+            overrides like ``model.num_hidden_layers=32``.
 
     Returns:
         Fully resolved and validated OplmConfig. If a YAML file was used,
-        ``cfg.train.config_path`` is populated with its absolute path.
+        ``cfg.train.config_path`` is populated with its absolute path. ``--name``
+        sets ``cfg.train.wandb_run_name`` unless that field was explicitly set in
+        the YAML or via a CLI override (an explicit value always wins); when both
+        are unset it stays ``None`` (W&B assigns a random name).
     """
     base: DictConfig = OmegaConf.structured(OplmConfig)
 
@@ -358,9 +362,10 @@ def load_config(argv: list[str]) -> OplmConfig:
     for package, filename in _BASE_CONFIG_LAYERS:
         base = cast("DictConfig", OmegaConf.merge(base, _load_packaged_yaml(package, filename)))
 
-    # Extract --config and --preset flags
+    # Extract --config, --preset, and --name flags
     config_path: str | None = None
     preset: str | None = None
+    run_name: str | None = None
     remaining: list[str] = []
     i = 0
     while i < len(argv):
@@ -369,6 +374,9 @@ def load_config(argv: list[str]) -> OplmConfig:
             i += 2
         elif argv[i] == "--preset" and i + 1 < len(argv):
             preset = argv[i + 1]
+            i += 2
+        elif argv[i] == "--name" and i + 1 < len(argv):
+            run_name = argv[i + 1]
             i += 2
         else:
             remaining.append(argv[i])
@@ -386,6 +394,13 @@ def load_config(argv: list[str]) -> OplmConfig:
 
     override_dicts = [OmegaConf.to_container(ov, resolve=True) for ov in overrides]
     _reject_removed_sequence_length_alias(override_dicts)
+
+    # Whether the user explicitly set the W&B run name (YAML or CLI override).
+    # An explicit value — even ``null`` — wins over the ``--name`` flag below.
+    user_set_run_name = any(
+        _lookup_nested_mapping_value(ov, ("train", "wandb_run_name")) is not _NESTED_VALUE_MISSING
+        for ov in override_dicts
+    )
 
     # Merge all overrides into base
     for ov in overrides:
@@ -406,4 +421,9 @@ def load_config(argv: list[str]) -> OplmConfig:
     cfg.model = OplmModelConfig(**model_dict)  # type: ignore[arg-type]
 
     cfg.train.config_path = config_path
+
+    # Propagate --name to the W&B run name unless explicitly set in YAML/CLI.
+    if run_name is not None and not user_set_run_name:
+        cfg.train.wandb_run_name = run_name
+
     return cfg
