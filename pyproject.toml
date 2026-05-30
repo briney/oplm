@@ -39,12 +39,6 @@ train = [
     "datasets>=2.18",
     "biopython>=1.83",
 ]
-flash = [
-    "flash-attn>=2.5",
-]
-flash4 = [
-    "flash-attn-4>=4.0.0b1",
-]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
