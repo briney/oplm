@@ -57,7 +57,7 @@ class TrainConfig:
     # Default eval cadence for datasets that omit `every`. Same grammar as a
     # data.eval.<name>.every block: exactly one of {steps, tokens}. Parsed into a
     # ScheduleSpec by the Evaluator via oplm.config.parse_schedule_block.
-    eval_default_every: Any = field(default_factory=lambda: {"steps": 10_000})
+    eval_every: Any = field(default_factory=lambda: {"steps": 10_000})
     wandb_project: str = "oplm"
     wandb_run_name: str | None = None
     wandb_enabled: bool = True
@@ -147,7 +147,7 @@ def parse_schedule_block(raw: Any, label: str) -> ScheduleSpec:
     """Parse an ``every: {unit: N, at_start?, at_end?}`` mapping into a ScheduleSpec.
 
     Args:
-        raw: The cadence mapping (a dataset's ``every`` or ``train.eval_default_every``).
+        raw: The cadence mapping (a dataset's ``every`` or ``train.eval_every``).
         label: Human-readable source used in error messages.
 
     Raises:
@@ -324,20 +324,6 @@ def _reject_removed_sequence_length_alias(override_dicts: list[Any]) -> None:
         )
 
 
-def _reject_removed_eval_every_alias(override_dicts: list[Any]) -> None:
-    """Reject the removed steps-only ``train.eval_every`` override."""
-    present = any(
-        _lookup_nested_mapping_value(ov, ("train", "eval_every")) is not _NESTED_VALUE_MISSING
-        for ov in override_dicts
-    )
-    if present:
-        raise ValueError(
-            "`train.eval_every` has been removed. Use "
-            "`train.eval_default_every: {steps: N}` (or {tokens: N}) for the global "
-            "default eval cadence."
-        )
-
-
 def load_config(argv: list[str]) -> OplmConfig:
     """Load config from defaults, optional preset, optional YAML file, and CLI overrides.
 
@@ -391,7 +377,6 @@ def load_config(argv: list[str]) -> OplmConfig:
 
     override_dicts = [OmegaConf.to_container(ov, resolve=True) for ov in overrides]
     _reject_removed_sequence_length_alias(override_dicts)
-    _reject_removed_eval_every_alias(override_dicts)
 
     # Merge all overrides into base
     for ov in overrides:

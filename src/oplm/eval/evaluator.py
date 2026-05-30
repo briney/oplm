@@ -27,9 +27,7 @@ class Evaluator:
     def __init__(self, cfg: OplmConfig) -> None:
         import oplm.eval.tasks  # noqa: F401  -- triggers task registration
 
-        default_schedule = parse_schedule_block(
-            cfg.train.eval_default_every, "train.eval_default_every"
-        )
+        default_schedule = parse_schedule_block(cfg.train.eval_every, "train.eval_every")
         entries = parse_eval_configs(cfg.data.eval, default_schedule)
         self.tasks: list[EvalTask] = []
         for entry in entries:

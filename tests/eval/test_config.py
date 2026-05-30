@@ -122,15 +122,16 @@ def test_entry_every_malformed_propagates() -> None:
 # --- load_config ---------------------------------------------------------------
 
 
-def test_load_config_rejects_removed_train_eval_every() -> None:
-    """The removed global ``train.eval_every`` override points at ``eval_default_every``."""
-    with pytest.raises(ValueError, match="eval_default_every"):
-        load_config(["train.eval_every=500"])
-
-
-def test_load_config_accepts_eval_default_every() -> None:
-    """The new ``train.eval_default_every`` override resolves and parses as a cadence."""
-    cfg = load_config(["train.eval_default_every={steps: 7}"])
-    assert parse_schedule_block(cfg.train.eval_default_every, "train.eval_default_every") == (
+def test_load_config_accepts_eval_every() -> None:
+    """The global ``train.eval_every`` override resolves and parses as a cadence."""
+    cfg = load_config(["train.eval_every={steps: 7}"])
+    assert parse_schedule_block(cfg.train.eval_every, "train.eval_every") == (
         ScheduleSpec("steps", 7)
     )
+
+
+def test_load_config_eval_every_int_form_caught_by_schedule_parser() -> None:
+    """An int ``train.eval_every`` loads but fails schedule parsing (must be a mapping)."""
+    cfg = load_config(["train.eval_every=500"])
+    with pytest.raises(ValueError, match="mapping"):
+        parse_schedule_block(cfg.train.eval_every, "train.eval_every")

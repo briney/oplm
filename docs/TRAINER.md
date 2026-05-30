@@ -292,9 +292,11 @@ class OplmConfig:
   ```
 
 - Keep `cfg.train.config_path` provenance.
-- Keep the existing `train.eval_every` rejection. **Update** the `data.max_length`
-  rejection message — it currently points at the now-renamed `model.max_seq_len`;
-  it should point at `model.max_position_embeddings`.
+- Drop the old `train.eval_every` rejection — `train.eval_every` is now the
+  canonical global-cadence field (a cadence mapping; the int form is caught by the
+  schedule parser). **Update** the `data.max_length` rejection message — it currently
+  points at the now-renamed `model.max_seq_len`; it should point at
+  `model.max_position_embeddings`.
 
 **No special handling for old/removed model field names (decision).** Unknown
 `model.*` keys flow into the HF config's `**kwargs` and are absorbed by
@@ -406,7 +408,7 @@ sync boundary) is retained. Cleanups:
   fallback when an iterable/sharded dataset reports no length.
 - **Logging / checkpointing** — step-modulo (`log_every`, `save_every`).
 - **Eval** — step or token cadence per dataset via the harness schedules
-  (`every: {steps: N}` / `{tokens: N}`), defaulting to `train.eval_default_every`.
+  (`every: {steps: N}` / `{tokens: N}`), defaulting to `train.eval_every`.
   **Epoch-based eval cadence stays deferred** ([`EVAL_HARNESS.md`](EVAL_HARNESS.md) §4.6);
   `epoch`/`epoch_delta` are still carried in the `EvalContext` for forward
   compatibility.

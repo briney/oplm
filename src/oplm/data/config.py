@@ -134,7 +134,7 @@ def parse_eval_configs(raw: Any, default_schedule: ScheduleSpec) -> list[EvalDat
 
     Args:
         raw: The ``data.eval`` value from config — a mapping or ``None``.
-        default_schedule: Fallback cadence (``train.eval_default_every``) applied
+        default_schedule: Fallback cadence (``train.eval_every``) applied
             when an entry omits ``every``.
 
     Returns:

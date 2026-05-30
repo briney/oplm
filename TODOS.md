@@ -337,7 +337,7 @@ default layer, not just documentation. Keep it section-wrapped under `model:`.
 
     # Logging
     log_every: 10
-    eval_default_every: { steps: 10_000 }   # default cadence: {steps: N} | {tokens: N}
+    eval_every: { steps: 10_000 }   # default cadence: {steps: N} | {tokens: N}
     wandb_project: oplm
     wandb_run_name: null
     wandb_enabled: true
@@ -383,7 +383,7 @@ helpful `train`/`eval` syntax comments.
     # (sequence, structure, proteingym, tape, proteinglue, everest). Per-dataset
     # cadence (`every`): exactly one of {steps: N} | {tokens: N}, optional
     # at_start (default false) / at_end (default true); datasets that omit `every`
-    # use train.eval_default_every. Task-specific keys sit at the same level as
+    # use train.eval_every. Task-specific keys sit at the same level as
     # `path`/`type`. See docs/EVAL_HARNESS.md §9.
     #   eval:
     #     heldout:    { path: /data/eval.parquet, type: sequence, every: { tokens: 20_000_000 } }

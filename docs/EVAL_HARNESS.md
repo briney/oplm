@@ -688,22 +688,20 @@ A single global default applies to entries that omit `every`:
 
 ```yaml
 train:
-  eval_default_every: { steps: 10_000 }   # same grammar as per-entry `every`
+  eval_every: { steps: 10_000 }   # same grammar as per-entry `every`
 ```
 
-Resolution: an entry's `every` wins; otherwise `train.eval_default_every`. One shared
+Resolution: an entry's `every` wins; otherwise `train.eval_every`. One shared
 `_parse_schedule_block` helper parses both the global default and each per-entry
 `every` into a `ScheduleSpec`.
 
 ### 9.4 Validation and removed-alias errors
 
-Following the project's clean-break convention (cf. `_reject_removed_sequence_length_alias`
-in `config.py`, which rejects `data.max_length`), the steps-only `eval_every` is
-**removed** and rejected with an explicit message rather than silently honored:
+The global default cadence is `train.eval_every` (a cadence mapping, consistent with
+`log_every` / `save_every`). The old steps-only **int** form is no longer honored: an
+int loads but fails schedule parsing with *"cadence must be a mapping like {steps: N}
+or {tokens: N}"*. The per-entry `eval_every` key is still removed outright and rejected:
 
-- `train.eval_every` (global): rejected in `load_config` —
-  *"`train.eval_every` has been removed. Use `train.eval_default_every: {steps: N}`
-  (or `{tokens: N}`)."*
 - per-entry `eval_every`: rejected in `parse_eval_configs` before the `extra` fold —
   *"Eval dataset {name!r} uses the removed `eval_every` key. Use `every: {steps: N}`
   (or `{tokens: N}`)."*
@@ -712,7 +710,7 @@ in `config.py`, which rejects `data.max_length`), the steps-only `eval_every` is
 
 ```yaml
 train:
-  eval_default_every: { steps: 5000 }
+  eval_every: { steps: 5000 }
 
 data:
   eval:
@@ -766,7 +764,7 @@ Prefer real data over synthetic; session-scope fixtures that load files.
 | `global_step % task.eval_every == 0` inside `Evaluator` | `task.schedule.is_due(ctx)` via `_crossed` (§4) |
 | `EvalTask.eval_every: int` | `EvalTask.schedule: Schedule` |
 | `EvalDatasetEntry.eval_every: int \| None` | `EvalDatasetEntry.schedule: ScheduleSpec` |
-| `TrainConfig.eval_every: int` | `TrainConfig.eval_default_every: {unit: N}` + rejection of the old key (§9.4) |
+| `TrainConfig.eval_every: int` | `TrainConfig.eval_every: {unit: N}` (cadence mapping; int form caught by the schedule parser, §9.4) |
 | `eval/data/sequence_loader.py`, `eval/data/structure_loader.py` | **deleted**; tasks import `oplm.data` (`build_sequence_eval_dataloader`, `load_structures`/`StructureData`) |
 | `StructureEvalTask` uses `ProteinTokenizer` | uses `oplm.data.get_tokenizer()` |
 | `tokens_seen += local_batch_tokens * num_processes` (per-rank) | `accelerator.reduce` of per-step tokens (rank-identical, §6.2) |

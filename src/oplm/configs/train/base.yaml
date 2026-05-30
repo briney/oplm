@@ -31,7 +31,7 @@ train:
 
   # Logging
   log_every: 10
-  eval_default_every: { steps: 10_000 }   # default cadence: {steps: N} | {tokens: N}
+  eval_every: { steps: 10_000 }   # default cadence: {steps: N} | {tokens: N}
   wandb_project: oplm
   wandb_run_name: null
   wandb_enabled: true
