@@ -50,8 +50,8 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
     Args:
         cfg: Fully resolved configuration. Reads ``cfg.data.train`` (the dataset
             spec), the masking knobs, the shard-iteration flags, the DataLoader
-            settings, and ``cfg.model.max_seq_len`` / ``cfg.train`` (seed,
-            batch size).
+            settings, and ``cfg.model.max_position_embeddings`` / ``cfg.train``
+            (seed, batch size).
 
     Returns:
         A :class:`~torch.utils.data.DataLoader` yielding the §4.7 batch contract
@@ -87,7 +87,7 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
 
     collator = MLMCollator(
         get_tokenizer(),
-        max_length=cfg.model.max_seq_len,
+        max_length=cfg.model.max_position_embeddings,
         mask_prob=cfg.data.mask_prob,
         mask_token_prob=cfg.data.mask_token_prob,
         random_token_prob=cfg.data.random_token_prob,
@@ -109,7 +109,8 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
     Args:
         path: A single ``.parquet`` file or directory of shards to evaluate on.
         cfg: Fully resolved configuration; shares masking knobs, DataLoader
-            settings, and ``cfg.model.max_seq_len`` with the training builder.
+            settings, and ``cfg.model.max_position_embeddings`` with the
+            training builder.
 
     Returns:
         A :class:`~torch.utils.data.DataLoader` yielding the §4.7 batch contract.
@@ -123,7 +124,7 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
     )
     collator = MLMCollator(
         get_tokenizer(),
-        max_length=cfg.model.max_seq_len,
+        max_length=cfg.model.max_position_embeddings,
         mask_prob=cfg.data.mask_prob,
         mask_token_prob=cfg.data.mask_token_prob,
         random_token_prob=cfg.data.random_token_prob,

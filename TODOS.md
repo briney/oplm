@@ -570,16 +570,20 @@ the FFN is always gated (3 projections).
 Rename every `cfg.model.max_seq_len` read to `cfg.model.max_position_embeddings`
 (the HF field). These modules otherwise need no change.
 
-- [ ] `loaders.py:90` — `max_length=cfg.model.max_position_embeddings` (train builder).
-- [ ] `loaders.py:126` — `max_length=cfg.model.max_position_embeddings` (eval builder).
-- [ ] `loaders.py` docstrings at ≈ lines 53 and 112 — update the
+- [x] `loaders.py:90` — `max_length=cfg.model.max_position_embeddings` (train builder).
+- [x] `loaders.py:126` — `max_length=cfg.model.max_position_embeddings` (eval builder).
+- [x] `loaders.py` docstrings at ≈ lines 53 and 112 — update the
       `cfg.model.max_seq_len` mentions to `cfg.model.max_position_embeddings`.
-- [ ] `structure.py:216` — `self.cfg.model.max_position_embeddings - 2` (log line).
-- [ ] `structure.py:323` — `len(struct.sequence) + 2 <= self.cfg.model.max_position_embeddings`.
+- [x] `structure.py:216` — `self.cfg.model.max_position_embeddings - 2` (log line).
+- [x] `structure.py:323` — `len(struct.sequence) + 2 <= self.cfg.model.max_position_embeddings`.
+      (Wrapped in `bool(...)` to resolve the pre-existing `Any`-return mypy error
+      from Phase 1's `model: Any` change.)
 
 ### Phase-4 acceptance
 
-- [ ] `grep -rn "max_seq_len" src/` returns no hits.
+- [~] `grep -rn "max_seq_len" src/` — clean in `loaders.py`/`structure.py`. Two
+      hits remain in `cli.py` (lines 106, 163); those are rewritten in Phase 7,
+      after which the grep is fully clean (re-verified in Phase 9).
 
 ---
 
