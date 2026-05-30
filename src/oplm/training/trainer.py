@@ -90,9 +90,9 @@ class Trainer:
 
         # Model
         _status("[dim]Building model...[/dim]")
-        model = OplmForMaskedLM(cfg.model)
+        model = OplmForMaskedLM(cfg.model)  # cfg.model is the HF OplmConfig
         if cfg.model.gradient_checkpointing:
-            model.encoder.gradient_checkpointing = True
+            model.gradient_checkpointing_enable()  # propagates to every OplmBlock
 
         # Optimizer and dataloader
         optimizers = build_optimizers(model, cfg.train)
@@ -169,6 +169,7 @@ class Trainer:
         self.model.train()
         data_iter = iter(self.dataloader)
         current_loss = float("nan")
+        step_loss_sum = 0.0
 
         try:
             while self.global_step < self.total_steps:
@@ -199,8 +200,11 @@ class Trainer:
 
                     for optimizer in self.optimizers:
                         optimizer.step()
-                    for optimizer in self.optimizers:
                         optimizer.zero_grad()
+
+                # Accumulate the per-micro-batch loss so logging reports the mean
+                # across the optimizer step, not just the final micro-batch.
+                step_loss_sum += loss.detach().item()
 
                 # Track tokens (local; reduced across ranks on the opt-step boundary
                 # below) and samples
@@ -214,7 +218,8 @@ class Trainer:
                 for scheduler in self.schedulers:
                     scheduler.step()
                 self.global_step += 1
-                current_loss = loss.item()
+                current_loss = step_loss_sum / cfg.gradient_accumulation_steps
+                step_loss_sum = 0.0
 
                 # Rank-reduce this step's tokens so tokens_seen / tokens_delta are
                 # rank-identical (the EvalContext rank-sync invariant; see design §3.2).
@@ -354,6 +359,7 @@ class Trainer:
         checkpoint_dir = Path(self.cfg.train.output_dir) / f"checkpoint-{self.global_step}"
         save_checkpoint(
             accelerator=self.accelerator,
+            model=self.model,
             cfg=self.cfg,
             output_dir=self.cfg.train.output_dir,
             global_step=self.global_step,
@@ -458,12 +464,12 @@ def _config_to_flat_dict(cfg: OplmConfig) -> dict[str, Any]:
     from dataclasses import asdict
 
     flat: dict[str, Any] = {}
-    for section_name, section in asdict(cfg).items():
-        if isinstance(section, dict):
-            for key, value in section.items():
-                flat[f"{section_name}/{key}"] = value
-        else:
-            flat[section_name] = section
+    for key, value in cfg.model.to_dict().items():
+        flat[f"model/{key}"] = value
+    for section_name in ("train", "data"):
+        section = asdict(getattr(cfg, section_name))
+        for key, value in section.items():
+            flat[f"{section_name}/{key}"] = value
     return flat
 
 

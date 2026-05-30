@@ -593,7 +593,7 @@ Rename every `cfg.model.max_seq_len` read to `cfg.model.max_position_embeddings`
 
 ### 5.1 Model construction + gradient checkpointing (`__init__`, ≈ lines 92–95)
 
-- [ ] Replace the broken `model.encoder` line:
+- [x] Replace the broken `model.encoder` line:
 
   ```python
   # before
@@ -608,7 +608,7 @@ Rename every `cfg.model.max_seq_len` read to `cfg.model.max_position_embeddings`
 
 ### 5.2 Single optimizer step/zero loop (inside `accelerator.accumulate`, ≈ 200–203)
 
-- [ ] Fold the two `for optimizer in self.optimizers` loops into one:
+- [x] Fold the two `for optimizer in self.optimizers` loops into one:
 
   ```python
   for optimizer in self.optimizers:
@@ -625,7 +625,7 @@ micro-batch. Accumulate a running sum across micro-steps and divide by
 `outputs["loss"]` value is unscaled mean-per-token, so the across-micro-step
 mean is the correct step loss. For `grad_accum=1` behavior is unchanged.)
 
-- [ ] Before the `while` loop, alongside `current_loss = float("nan")`, add a
+- [x] Before the `while` loop, alongside `current_loss = float("nan")`, add a
       step accumulator:
 
   ```python
@@ -633,7 +633,7 @@ mean is the correct step loss. For `grad_accum=1` behavior is unchanged.)
   step_loss_sum = 0.0
   ```
 
-- [ ] Inside the `accelerator.accumulate` block, after `self.accelerator.backward(loss)`
+- [x] Inside the `accelerator.accumulate` block, after `self.accelerator.backward(loss)`
       and the optimizer step/zero, accumulate the detached loss. Place the
       accumulation immediately after the existing token/sample tracking (it must
       run on **every** micro-step, before the `if not sync_gradients: continue`):
@@ -647,7 +647,7 @@ mean is the correct step loss. For `grad_accum=1` behavior is unchanged.)
       continue
   ```
 
-- [ ] On the sync boundary, replace `current_loss = loss.item()` with the mean
+- [x] On the sync boundary, replace `current_loss = loss.item()` with the mean
       and reset the accumulator (keep this right after `self.global_step += 1`):
 
   ```python
@@ -666,7 +666,7 @@ mean is the correct step loss. For `grad_accum=1` behavior is unchanged.)
 dataclass. Flatten the model via `to_dict()` and the dataclass sections via
 `asdict`.
 
-- [ ] Rewrite the function:
+- [x] Rewrite the function:
 
   ```python
   def _config_to_flat_dict(cfg: OplmConfig) -> dict[str, Any]:
@@ -689,7 +689,7 @@ The checkpoint now writes an HF export, which needs the (unwrapped) model. Add a
 `model=self.model` argument to the `save_checkpoint(...)` call (the new
 parameter is added in Phase 6):
 
-- [ ] Update the call:
+- [x] Update the call:
 
   ```python
   save_checkpoint(
@@ -707,14 +707,16 @@ parameter is added in Phase 6):
 
 ### 5.6 Eval integration — leave unchanged
 
-- [ ] Confirm (no edit) that `_build_eval_context`, `_run_eval`, and the
+- [x] Confirm (no edit) that `_build_eval_context`, `_run_eval`, and the
       unconditional `accelerator.reduce` of per-step tokens are untouched. This
       is the rank-identical-tokens contract the `EvalContext` relies on.
 
 ### Phase-5 acceptance
 
-- [ ] Trainer imports without error and `OplmForMaskedLM(cfg.model)` succeeds.
-- [ ] Verified via Phase 8 integration/pilot tests.
+- [x] Trainer imports without error and `OplmForMaskedLM(cfg.model)` succeeds.
+- [ ] Verified via Phase 8 integration/pilot tests. (Pending Phase 8; the
+      `model=` kwarg on `save_checkpoint` also flags one `mypy` call-arg error
+      until Phase 6 adds the parameter.)
 
 ---
 
