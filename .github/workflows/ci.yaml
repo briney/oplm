@@ -31,7 +31,7 @@ jobs:
         run: ruff format --check src/
 
       - name: Type check
-        run: mypy src/
+        run: ty check src/
 
       - name: Test
         run: pytest -m "not slow" --cov=oplm
