@@ -79,6 +79,8 @@ tests/                         # pytest tests, mirrors src/ structure
 - Use `pytest.fixture` for setup, `@pytest.mark.parametrize` for input variation.
 - Mark slow tests with `@pytest.mark.slow`.
 - Prefer real data over synthetic data in tests.
+- End-to-end training-run tests (the slow, multi-step `Trainer` suite) follow the
+  plan in [docs/TESTING_E2E.md](docs/TESTING_E2E.md).
 
 ## What Not To Do
 
