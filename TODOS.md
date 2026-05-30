@@ -83,12 +83,39 @@ pytest                    # full suite, including slow pilot/integration runs
 
 ---
 
-## Phase 1 — Config system & YAML presets
+## Phase 1 — Config system & YAML defaults
 
 **Files:** `src/oplm/config.py`, `src/oplm/configs/model/base.yaml`,
+`src/oplm/configs/train/base.yaml` (**new**), `src/oplm/configs/data/base.yaml`,
+`src/oplm/configs/train/__init__.py` (**new**),
 `src/oplm/configs/model/presets/{small,medium,base,large,xlarge}.yaml`.
 
 Everything else imports from here, so do this first.
+
+> **Design decision — YAML defaults are authoritative.** Today the `base.yaml`
+> files are *documentation mirrors* that `load_config` never reads; defaults come
+> only from the Python dataclasses (`OmegaConf.structured(OplmConfig)`). This
+> phase makes the per-concern `base.yaml` files the **loaded defaults layer**, so
+> there is one human-editable home for defaults across model/train/data. New
+> merge order:
+>
+> ```text
+> structured(OplmConfig)         # schema + dataclass fallbacks
+>   → configs/model/base.yaml    # authoritative model defaults  ┐
+>   → configs/train/base.yaml    # authoritative train defaults  │ NEW base layer
+>   → configs/data/base.yaml     # authoritative data defaults   ┘
+>   → --preset YAML              # size preset (model only)
+>   → --config YAML              # user run config
+>   → CLI dotlist overrides
+> ```
+>
+> The dataclass defaults remain (they keep `OmegaConf.structured` working, allow
+> direct `TrainConfig()`/`DataConfig()` construction in tests, and run
+> `__post_init__` validation), but for `load_config` the YAML wins. To neutralize
+> the YAML↔Python drift hazard this introduces, Phase 8 adds a **consistency
+> test** asserting each `base.yaml` agrees with its dataclass / HF-config fields.
+> All three files must use the **section-wrapped convention** (`model:` / `train:`
+> / `data:` at the top level) so they merge at the config root.
 
 ### 1.1 Delete the old `ModelConfig` and its machinery (`config.py`)
 
@@ -133,19 +160,54 @@ Everything else imports from here, so do this first.
 
 - [ ] Leave `_reject_removed_eval_every_alias` unchanged.
 
-### 1.4 Rewrite `load_config` to build the HF config (`config.py`)
+### 1.4 Rewrite `load_config`: load YAML defaults + build the HF config (`config.py`)
 
-Keep the merge order (defaults → `--preset` → `--config` YAML → CLI dotlist) and
-the flag parsing. Replace the derived-field reset + `OmegaConf.to_object` tail
-with HF-config construction.
+Insert the authoritative `base.yaml` layer between the structured defaults and
+the preset/config/CLI overrides, then replace the derived-field reset +
+`OmegaConf.to_object` tail with HF-config construction.
+
+- [ ] Add a packaged-YAML loader and a base-layer table near `get_preset_config`
+      (reuse the existing `from importlib.resources import files` import):
+
+  ```python
+  # Per-concern default layers, merged at the config root in this order. Each
+  # file is section-wrapped (top-level `model:` / `train:` / `data:`).
+  _BASE_CONFIG_LAYERS = (
+      ("oplm.configs.model", "base.yaml"),
+      ("oplm.configs.train", "base.yaml"),
+      ("oplm.configs.data", "base.yaml"),
+  )
+
+
+  def _load_packaged_yaml(package: str, filename: str) -> DictConfig:
+      """Load a YAML resource shipped inside the package as a DictConfig."""
+      text = files(package).joinpath(filename).read_text()
+      return cast("DictConfig", OmegaConf.create(text))
+  ```
+
+- [ ] In `load_config`, after `base = OmegaConf.structured(OplmConfig)` and
+      `OmegaConf.set_struct(base, False)`, merge the base layer **before** flag
+      parsing / overrides:
+
+  ```python
+  base: DictConfig = OmegaConf.structured(OplmConfig)
+  OmegaConf.set_struct(base, False)
+
+  # Authoritative YAML defaults layer (model → train → data).
+  for package, filename in _BASE_CONFIG_LAYERS:
+      base = cast("DictConfig", OmegaConf.merge(base, _load_packaged_yaml(package, filename)))
+  ```
+
+  The two `_reject_removed_*` checks still run only on the user
+  `override_dicts` (preset / `--config` / CLI), never on the trusted base layer.
 
 - [ ] Remove the `explicit_model_keys` discovery loop and the
       `for fname in _DERIVED_MODEL_FIELDS: base.model[fname] = None` block.
 - [ ] Replace the final conversion so `model` becomes an HF `OplmConfig`:
 
   ```python
-  # ... after merging all overrides into `base`, and after the two
-  #     _reject_removed_* calls on override_dicts ...
+  # ... after merging the base layer, then all user overrides into `base`,
+  #     and after the two _reject_removed_* calls on override_dicts ...
 
   # Build train/data dataclasses (triggers their __post_init__ validation);
   # `model` is an Any field so it round-trips as a plain dict here.
@@ -163,22 +225,30 @@ with HF-config construction.
   ```
 
   Notes:
-  - Derived fields are simply **omitted** from `model_dict` unless the user set
-    them, and resolve to `None` → derived inside `OplmModelConfig.__init__`.
+  - Derived fields are **omitted** from the model YAML / `model_dict` unless set,
+    and resolve to `None` → derived inside `OplmModelConfig.__init__`.
   - Unknown / old / mistyped `model.*` keys flow into `**model_dict` →
     `PretrainedConfig` `**kwargs` and are silently retained (documented caveat —
-    they do **not** raise).
+    they do **not** raise). The Phase-8 base-layer test guards against typos in
+    `model/base.yaml` itself.
+  - `_load_packaged_yaml` needs `oplm.configs.train` to be an importable package,
+    so create `src/oplm/configs/train/__init__.py` (empty — see 1.6).
 
 ### 1.5 Rewrite `configs/model/base.yaml` with HF field names
 
+This file is now **loaded by `load_config`** (1.4) as the authoritative model
+default layer, not just documentation. Keep it section-wrapped under `model:`.
+
 - [ ] Replace the file contents entirely. Use HF names and the documented
-      defaults (only fields worth surfacing; everything else inherits HF
-      defaults):
+      defaults (only fields worth surfacing; everything else inherits the HF
+      `OplmConfig.__init__` defaults):
 
   ```yaml
   # OPLM default model configuration (HuggingFace OplmConfig field names).
-  # Derived fields (head_dim, intermediate_size, rope_dim, nope_dim) are omitted
-  # so they resolve from the source dimensions unless explicitly overridden.
+  # Authoritative defaults: loaded by oplm.config.load_config. Any field omitted
+  # here falls through to the OplmConfig.__init__ default. Derived fields
+  # (head_dim, intermediate_size, rope_dim, nope_dim) are omitted so they resolve
+  # from the source dimensions unless explicitly overridden.
   model:
     # Core dimensions
     vocab_size: 33
@@ -224,7 +294,120 @@ with HF-config construction.
     gradient_checkpointing: false
   ```
 
-### 1.6 Rewrite the size presets with HF field names
+### 1.6 Create `configs/train/base.yaml` (new authoritative train defaults)
+
+- [ ] Create the package marker `src/oplm/configs/train/__init__.py` (empty file;
+      no logic) so `files("oplm.configs.train")` resolves.
+- [ ] Create `src/oplm/configs/train/base.yaml`, section-wrapped under `train:`,
+      mirroring every `TrainConfig` field default **exactly** (the Phase-8
+      consistency test enforces this). Omit `config_path` (auto-populated by
+      `load_config`).
+
+  ```yaml
+  # OPLM default training configuration (mirrors oplm.config.TrainConfig).
+  # Authoritative defaults: loaded by oplm.config.load_config. Values here MUST
+  # equal the TrainConfig dataclass defaults (enforced by tests/training/test_config.py).
+  train:
+    # Duration
+    max_steps: 50_000
+    max_epochs: null
+
+    # Batch
+    batch_size: 32
+    gradient_accumulation_steps: 1
+
+    # Optimizer
+    optimizer: adamw            # adamw | muon
+    lr: 1.0e-4
+    min_lr: 0.0
+    weight_decay: 0.01
+    adam_beta1: 0.9
+    adam_beta2: 0.98
+    adam_eps: 1.0e-8
+    muon_adjust_lr_fn: match_rms_adamw   # match_rms_adamw | original
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    max_grad_norm: 1.0
+
+    # Scheduler
+    scheduler: warmup_linear    # warmup_linear | warmup_cosine | wsd_linear | wsd_cosine
+    warmup_steps: 5_000
+    stable_steps: 0             # WSD plateau length (WSD schedules only)
+
+    # Logging
+    log_every: 10
+    eval_default_every: { steps: 10_000 }   # default cadence: {steps: N} | {tokens: N}
+    wandb_project: oplm
+    wandb_run_name: null
+    wandb_enabled: true
+
+    # Checkpointing
+    save_every: 10_000
+    save_total_limit: 3
+    resume_from: null
+
+    # Infrastructure
+    seed: 42
+    output_dir: outputs
+    mixed_precision: bf16       # bf16 | fp16 | no
+  ```
+
+### 1.7 Rewrite `configs/data/base.yaml` to the section-wrapped convention
+
+The existing `data/base.yaml` lists keys at the **top level** (not under `data:`),
+which was harmless when it was documentation-only but is wrong now that the file
+is merged at the config root. Re-nest everything under `data:` and keep the
+helpful `train`/`eval` syntax comments.
+
+- [ ] Rewrite the file, section-wrapped under `data:`, mirroring `DataConfig`
+      defaults exactly (Phase-8 test enforces this for the scalar fields):
+
+  ```yaml
+  # OPLM default data configuration (mirrors oplm.config.DataConfig).
+  # Authoritative defaults: loaded by oplm.config.load_config.
+  data:
+    # Training dataset(s). Single path (100% sampling):
+    #   data: { train: /path/to/dataset }   (CLI: data.train=/path/to/dataset)
+    # Multiple datasets with fractional sampling:
+    #   data:
+    #     train:
+    #       uniref50: { path: /data/uniref50/, fraction: 0.6 }
+    #       bfd:      { path: /data/bfd/,      fraction: 0.4 }
+    # Notes: each path is a .parquet file or a directory of shards; fractions are
+    # normalized to 1.0; omitted fractions share the remaining mass equally;
+    # parquet must have columns sequence_id, sequence.
+    train: null
+
+    # Evaluation dataset(s). Named map; each entry needs `path` and `type`
+    # (sequence, structure, proteingym, tape, proteinglue, everest). Per-dataset
+    # cadence (`every`): exactly one of {steps: N} | {tokens: N}, optional
+    # at_start (default false) / at_end (default true); datasets that omit `every`
+    # use train.eval_default_every. Task-specific keys sit at the same level as
+    # `path`/`type`. See docs/EVAL_HARNESS.md §9.
+    #   eval:
+    #     heldout:    { path: /data/eval.parquet, type: sequence, every: { tokens: 20_000_000 } }
+    #     structures: { path: /data/pdb, type: structure, every: { steps: 20_000 },
+    #                   categorical_jacobian_sample_size: 12 }
+    eval: null
+
+    # Sequence masking
+    mask_prob: 0.15
+    mask_token_prob: 0.8
+    random_token_prob: 0.1
+    weighted_masking: false     # set true to honor the masking_weights column
+
+    # DataLoader settings
+    num_workers: 4
+    pin_memory: true
+    prefetch_factor: 4
+
+    # Shard iteration behavior (only affects sharded parquet directories)
+    shuffle_shards: true
+    shuffle_rows: true
+  ```
+
+### 1.8 Rewrite the size presets with HF field names
 
 Drop `num_kv_heads` (no GQA). Confirm `hidden_size % num_attention_heads == 0`
 for each (all listed below satisfy it).
@@ -281,11 +464,16 @@ for each (all listed below satisfy it).
     gradient_checkpointing: true
   ```
 
-### 1.7 Phase-1 acceptance
+### 1.9 Phase-1 acceptance
 
 - [ ] `python -c "from oplm.config import load_config; c=load_config(['--preset','small','model.num_hidden_layers=4']); print(type(c.model), c.model.num_hidden_layers, c.model.head_dim, c.model.intermediate_size)"`
       prints the HF `OplmConfig` type, `num_hidden_layers=4`, and resolved
       `head_dim`/`intermediate_size`.
+- [ ] `load_config([])` actually reads the YAML layer: temporarily edit a value
+      in `configs/train/base.yaml` (e.g. `seed: 99`) and confirm
+      `load_config([]).train.seed == 99`, then revert.
+- [ ] Override precedence holds: `load_config(['train.seed=7']).train.seed == 7`
+      (CLI beats the YAML base layer).
 - [ ] `load_config(['data.max_length=5'])` raises `ValueError` mentioning
       `model.max_position_embeddings`.
 - [ ] `grep -rn "ModelConfig" src/` returns no hits except inside docstrings you
@@ -840,6 +1028,21 @@ HF config via the `OplmModelConfig` alias. The data/eval code reads only
         `cfg.model.bogus_key == 1` (documented caveat).
   - [ ] `load_config(["data.max_length=5"])` raises `ValueError` mentioning
         `model.max_position_embeddings`.
+  - [ ] **Base-layer is loaded** (not just documentation): build the merged base
+        layer directly and assert it is non-empty, e.g. load
+        `configs/train/base.yaml` via `importlib.resources.files` and assert its
+        `train.seed` equals `load_config([]).train.seed`.
+  - [ ] **YAML↔dataclass consistency (drift guard):** for every key present in
+        `configs/train/base.yaml` under `train:`, its value equals the
+        corresponding `dataclasses.asdict(TrainConfig())[key]`; same for
+        `configs/data/base.yaml` under `data:` vs `DataConfig()` (compare scalar
+        fields; `train`/`eval` are both `None`). Parametrize over the keys so a
+        mismatch names the offending field.
+  - [ ] **No typos in `model/base.yaml` (drift guard):** every key under `model:`
+        in `configs/model/base.yaml` is a recognized HF field — i.e. appears in
+        `set(OplmModelConfig().to_dict())`. (Unknown keys are silently absorbed at
+        runtime, so this test is the only thing that catches a misspelled model
+        default.)
 
 - [ ] `tests/training/test_optim.py` (build a tiny model with the HF config):
 
@@ -939,8 +1142,10 @@ HF config via the `OplmModelConfig` alias. The data/eval code reads only
 
 | File | Change | Phase |
 |---|---|---|
-| `src/oplm/config.py` | delete `ModelConfig` + derived machinery (`round_multiple`, `_VALID_CONV_KERNEL_SCHEDULES`, `_DERIVED_MODEL_FIELDS`); `OplmConfig.model: Any`; `load_config` builds HF `OplmConfig`; update `data.max_length` message | 1 |
-| `src/oplm/configs/model/base.yaml` + `presets/*.yaml` | rewrite with HF field names; drop `num_kv_heads` | 1 |
+| `src/oplm/config.py` | delete `ModelConfig` + derived machinery (`round_multiple`, `_VALID_CONV_KERNEL_SCHEDULES`, `_DERIVED_MODEL_FIELDS`); `OplmConfig.model: Any`; `load_config` merges the `base.yaml` layer + builds HF `OplmConfig`; add `_load_packaged_yaml` / `_BASE_CONFIG_LAYERS`; update `data.max_length` message | 1 |
+| `src/oplm/configs/model/base.yaml` + `presets/*.yaml` | rewrite with HF field names; drop `num_kv_heads`; base.yaml now authoritative (loaded) | 1 |
+| `src/oplm/configs/train/base.yaml` + `train/__init__.py` (**new**) | new authoritative train defaults, section-wrapped under `train:`, mirroring `TrainConfig` | 1 |
+| `src/oplm/configs/data/base.yaml` | re-nest under `data:` (was top-level); now authoritative (loaded) | 1 |
 | `src/oplm/training/flops.py` | rewrite for HF fields; drop GQA; FFN always 3 projections | 2 |
 | `src/oplm/training/optim.py` | Muon head-exclusion prefix `mlm_head.` → `lm_head.` | 3 |
 | `src/oplm/data/sequence/loaders.py` | `max_seq_len` → `max_position_embeddings` (x2 + docstrings) | 4 |
