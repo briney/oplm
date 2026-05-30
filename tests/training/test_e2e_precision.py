@@ -1,0 +1,74 @@
+"""G5 — mixed-precision training (docs/TESTING_E2E.md §5). CUDA-only.
+
+Guards the Accelerate autocast / GradScaler path that every fp32 test skips: a
+bf16 and an fp16 run must complete with finite loss, actually reduce eval loss
+over the run, and write a checkpoint whose ``hf/`` export reloads via
+``from_pretrained`` and produces finite logits.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING
+
+import pytest
+import torch
+
+from tests.training.conftest import FullRecordingCallback, tiny_train_cfg
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="mixed precision requires CUDA"),
+]
+
+
+@pytest.mark.parametrize("precision", ["bf16", "fp16"])
+def test_mixed_precision_run_learns_and_checkpoints(
+    precision: str, training_parquet: Path, tmp_path: Path
+) -> None:
+    """A bf16/fp16 run stays finite, reduces eval loss, and writes a loadable checkpoint."""
+    from oplm.model import OplmForMaskedLM
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=40,
+        batch_size=8,
+        lr=1e-3,
+        mixed_precision=precision,
+        max_grad_norm=1.0,  # realistic setup; also exercises clipping under autocast
+        log_every=10,
+        eval={
+            "hd": {
+                "path": str(training_parquet),
+                "type": "sequence",
+                "every": {"steps": 1000, "at_start": True, "at_end": True},
+            }
+        },
+    )
+    callback = FullRecordingCallback()
+    Trainer(cfg, callbacks=[callback]).train()
+
+    # Every logged train loss is finite (no NaN from autocast / scaler underflow).
+    train_losses = [m["train/loss"] for _, m in callback.train_logs]
+    assert train_losses and all(math.isfinite(v) for v in train_losses)
+
+    # Eval loss decreased from its at_start value to its at_end value.
+    eval_losses = [m["eval/hd/loss"] for _, m in callback.evals]
+    assert len(eval_losses) >= 2
+    assert all(math.isfinite(v) for v in eval_losses)
+    assert eval_losses[-1] < eval_losses[0]
+
+    # The final checkpoint's HF export reloads and runs a finite forward.
+    hf_dir = tmp_path / "checkpoint-40" / "hf"
+    assert (hf_dir / "model.safetensors").exists()
+    reloaded = OplmForMaskedLM.from_pretrained(str(hf_dir)).eval()
+    with torch.no_grad():
+        input_ids = torch.randint(0, reloaded.config.vocab_size, (2, 8))
+        logits = reloaded(input_ids=input_ids, attention_mask=torch.ones_like(input_ids)).logits
+    assert logits.shape == (2, 8, reloaded.config.vocab_size)
+    assert torch.isfinite(logits).all()

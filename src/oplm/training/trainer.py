@@ -90,8 +90,14 @@ class Trainer:
 
         # Model
         _status("[dim]Building model...[/dim]")
+        # Read the flag before constructing the model: transformers strips
+        # ``config.gradient_checkpointing`` during ``PreTrainedModel.__init__`` (and
+        # auto-enables checkpointing on the model), so reading it afterward raises
+        # AttributeError. Re-enabling here is idempotent and keeps the wiring
+        # explicit across transformers versions.
+        gradient_checkpointing = getattr(cfg.model, "gradient_checkpointing", False)
         model = OplmForMaskedLM(cfg.model)  # cfg.model is the HF OplmConfig
-        if cfg.model.gradient_checkpointing:
+        if gradient_checkpointing:
             model.gradient_checkpointing_enable()  # propagates to every OplmBlock
 
         # Optimizer and dataloader
