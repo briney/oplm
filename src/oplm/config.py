@@ -5,7 +5,6 @@ Uses OmegaConf for YAML serialization, CLI overrides, and type-safe merging.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
@@ -14,162 +13,6 @@ from typing import Any, cast
 from omegaconf import DictConfig, OmegaConf
 
 AVAILABLE_PRESETS = ("small", "medium", "base", "large", "xlarge")
-_VALID_CONV_KERNEL_SCHEDULES = ("static", "block_step")
-
-
-def round_multiple(x: float, multiple: int) -> int:
-    """Round x up to the nearest multiple."""
-    return int(math.ceil(x / multiple) * multiple)
-
-
-@dataclass
-class ModelConfig:
-    """Model architecture configuration."""
-
-    # Core dimensions
-    hidden_dim: int = 768
-    num_layers: int = 12
-    num_heads: int = 12
-    num_kv_heads: int = 4
-    head_dim: int | None = None
-    ffn_dim: int | None = None
-    ffn_activation: str = "swiglu"
-    vocab_size: int = 33
-    max_seq_len: int = 512
-
-    # Attention features
-    shared_kv: bool = False
-    qk_norm: bool = True
-    output_gate: bool = False
-    query_dependent_gate: bool = False
-    post_sdpa_norm: bool = False
-
-    # Positional encoding
-    rope_theta: float = 10000.0
-    partial_rope: bool = False
-    nope_dim: int | None = None
-    rope_dim: int | None = None
-
-    # Cross-layer value residuals (Proust)
-    value_residual: bool = False
-    value_residual_lambda_init: float = 0.5
-
-    # Value embeddings (Proust)
-    num_value_embeds: int = 0
-    value_embed_gate_dim: int = 16
-
-    # Depthwise convolutions
-    conv_positions: str = ""
-    conv_kernel_size: int = 7
-    conv_kernel_schedule: str = "static"
-    conv_kernel_increment: int = 2
-    conv_kernel_block_size: int = 1
-    conv_kernel_max_size: int | None = None
-    conv_activation: bool = True
-
-    # Attention residuals (depth-wise, Kimi)
-    attn_residual: bool = False
-    attn_residual_block_size: int = 8
-
-    # Normalization
-    norm_eps: float = 1e-6
-    post_embed_norm: bool = False
-    pre_norm: bool = True
-    post_norm: bool = False
-    sandwich_norm: bool = False
-
-    # Training features
-    gradient_checkpointing: bool = False
-    tie_embeddings: bool = False
-    # Reserved for a future model-construction dtype surface. Runtime precision
-    # is currently controlled by ``train.mixed_precision``.
-    dtype: str = "bfloat16"
-
-    def __post_init__(self) -> None:
-        """Compute derived fields and validate configuration."""
-        # Derived fields
-        if self.head_dim is None:
-            self.head_dim = self.hidden_dim // self.num_heads
-        if self.ffn_dim is None:
-            if self.ffn_activation == "swiglu":
-                self.ffn_dim = round_multiple(8 / 3 * self.hidden_dim, 256)
-            else:
-                self.ffn_dim = 4 * self.hidden_dim
-        if self.rope_dim is None:
-            self.rope_dim = 32 if self.partial_rope else self.head_dim
-        if self.nope_dim is None:
-            self.nope_dim = self.head_dim - self.rope_dim
-
-        # Validation
-        if self.hidden_dim % self.num_heads != 0:
-            raise ValueError(
-                f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})"
-            )
-        if self.num_heads % self.num_kv_heads != 0:
-            raise ValueError(
-                f"num_heads ({self.num_heads}) must be divisible by "
-                f"num_kv_heads ({self.num_kv_heads})"
-            )
-        if self.partial_rope and self.nope_dim + self.rope_dim != self.head_dim:
-            raise ValueError(
-                f"nope_dim ({self.nope_dim}) + rope_dim ({self.rope_dim}) "
-                f"must equal head_dim ({self.head_dim})"
-            )
-        if self.conv_kernel_size % 2 == 0:
-            raise ValueError(f"conv_kernel_size ({self.conv_kernel_size}) must be odd")
-        if self.conv_kernel_schedule not in _VALID_CONV_KERNEL_SCHEDULES:
-            raise ValueError(
-                "conv_kernel_schedule must be one of "
-                f"{_VALID_CONV_KERNEL_SCHEDULES}, got {self.conv_kernel_schedule!r}"
-            )
-        if self.conv_kernel_schedule == "block_step":
-            if self.conv_kernel_increment < 0 or self.conv_kernel_increment % 2 != 0:
-                raise ValueError(
-                    "conv_kernel_increment "
-                    f"({self.conv_kernel_increment}) must be a non-negative even integer"
-                )
-            if self.conv_kernel_block_size < 1:
-                raise ValueError(
-                    f"conv_kernel_block_size ({self.conv_kernel_block_size}) must be >= 1"
-                )
-            if self.conv_kernel_max_size is not None:
-                if self.conv_kernel_max_size % 2 == 0:
-                    raise ValueError(
-                        f"conv_kernel_max_size ({self.conv_kernel_max_size}) must be odd"
-                    )
-                if self.conv_kernel_max_size < self.conv_kernel_size:
-                    raise ValueError(
-                        "conv_kernel_max_size "
-                        f"({self.conv_kernel_max_size}) must be >= conv_kernel_size "
-                        f"({self.conv_kernel_size})"
-                    )
-        if self.conv_positions and not all(c in "ACD" for c in self.conv_positions):
-            raise ValueError(
-                f"conv_positions ({self.conv_positions!r}) must only contain 'A', 'C', 'D'"
-            )
-        if self.attn_residual and self.num_layers % self.attn_residual_block_size != 0:
-            raise ValueError(
-                f"attn_residual_block_size ({self.attn_residual_block_size}) "
-                f"must divide num_layers ({self.num_layers})"
-            )
-        valid_activations = ("swiglu", "relu_squared", "gelu")
-        if self.ffn_activation not in valid_activations:
-            raise ValueError(
-                f"ffn_activation must be one of {valid_activations}, got {self.ffn_activation!r}"
-            )
-
-    def conv_kernel_size_for_layer(self, layer_idx: int) -> int:
-        """Return the effective convolution kernel size for a given layer."""
-        if self.conv_kernel_schedule == "static":
-            return self.conv_kernel_size
-
-        kernel_size = (
-            self.conv_kernel_size
-            + (layer_idx // self.conv_kernel_block_size) * self.conv_kernel_increment
-        )
-        if self.conv_kernel_max_size is not None:
-            kernel_size = min(kernel_size, self.conv_kernel_max_size)
-        return kernel_size
 
 
 _VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
@@ -411,7 +254,10 @@ class DataConfig:
 class OplmConfig:
     """Root configuration composing model, training, and data configs."""
 
-    model: ModelConfig = field(default_factory=ModelConfig)
+    # Resolved into oplm.model.OplmConfig (the HF PretrainedConfig) by
+    # load_config. Untyped so OmegaConf can carry arbitrary HF field keys,
+    # mirroring how DataConfig.train/.eval are Any.
+    model: Any = field(default_factory=dict)
     train: TrainConfig = field(default_factory=TrainConfig)
     data: DataConfig = field(default_factory=DataConfig)
 
@@ -437,11 +283,21 @@ def get_preset_config(preset: str) -> DictConfig:
     return cast("DictConfig", OmegaConf.create(yaml_text))
 
 
-# Fields in ModelConfig that are derived from other fields in __post_init__.
-# These must be reset to None before OmegaConf.to_object() when they were not
-# explicitly set by the user, so that __post_init__ recomputes them from the
-# (potentially overridden) source dimensions.
-_DERIVED_MODEL_FIELDS = ("head_dim", "ffn_dim", "rope_dim", "nope_dim")
+# Per-concern default layers, merged at the config root in this order. Each
+# file is section-wrapped (top-level `model:` / `train:` / `data:`).
+_BASE_CONFIG_LAYERS = (
+    ("oplm.configs.model", "base.yaml"),
+    ("oplm.configs.train", "base.yaml"),
+    ("oplm.configs.data", "base.yaml"),
+)
+
+
+def _load_packaged_yaml(package: str, filename: str) -> DictConfig:
+    """Load a YAML resource shipped inside the package as a DictConfig."""
+    text = files(package).joinpath(filename).read_text()
+    return cast("DictConfig", OmegaConf.create(text))
+
+
 _NESTED_VALUE_MISSING = object()
 
 
@@ -463,8 +319,8 @@ def _reject_removed_sequence_length_alias(override_dicts: list[Any]) -> None:
     )
     if has_removed_alias:
         raise ValueError(
-            "`data.max_length` has been removed. Use `model.max_seq_len` as the "
-            "sequence-length setting."
+            "`data.max_length` has been removed. Use `model.max_position_embeddings` "
+            "as the sequence-length setting."
         )
 
 
@@ -502,6 +358,11 @@ def load_config(argv: list[str]) -> OplmConfig:
     # (data.train can be a string path or a nested dict of datasets).
     OmegaConf.set_struct(base, False)
 
+    # Authoritative YAML defaults layer (model → train → data). These are the
+    # human-editable home for defaults and override the dataclass fallbacks.
+    for package, filename in _BASE_CONFIG_LAYERS:
+        base = cast("DictConfig", OmegaConf.merge(base, _load_packaged_yaml(package, filename)))
+
     # Extract --config and --preset flags
     config_path: str | None = None
     preset: str | None = None
@@ -518,7 +379,8 @@ def load_config(argv: list[str]) -> OplmConfig:
             remaining.append(argv[i])
             i += 1
 
-    # Collect explicit overrides to track which model fields the user set
+    # Collect user overrides (preset → --config → CLI dotlist), applied on top
+    # of the authoritative base layer.
     overrides: list[DictConfig] = []
     if preset is not None:
         overrides.append(get_preset_config(preset))
@@ -535,20 +397,19 @@ def load_config(argv: list[str]) -> OplmConfig:
     for ov in overrides:
         base = cast("DictConfig", OmegaConf.merge(base, ov))
 
-    # Find which model fields were explicitly provided by the user
-    explicit_model_keys: set[str] = set()
-    for ov_dict in override_dicts:
-        model_dict = ov_dict.get("model") if isinstance(ov_dict, dict) else None
-        if isinstance(model_dict, dict):
-            explicit_model_keys.update(model_dict.keys())
-
-    # Reset derived fields not explicitly set so __post_init__ recomputes
-    # them from the (potentially overridden) source dimensions.
-    for fname in _DERIVED_MODEL_FIELDS:
-        if fname not in explicit_model_keys:
-            base.model[fname] = None
-
-    # Convert to dataclass instances (triggers __post_init__ validation)
+    # Build train/data dataclasses (triggers their __post_init__ validation);
+    # `model` is an Any field so it round-trips as a plain dict here.
     cfg: OplmConfig = OmegaConf.to_object(base)  # type: ignore[assignment]
+
+    # Instantiate the HF model config from the merged `model` subtree. HF owns
+    # derivation (head_dim, intermediate_size, rope_dim/nope_dim) and validation.
+    # Derived fields are omitted unless set, resolving to None → derived inside
+    # OplmModelConfig.__init__. Unknown / old / mistyped `model.*` keys flow into
+    # **model_dict → PretrainedConfig **kwargs and are silently retained.
+    from oplm.model import OplmConfig as OplmModelConfig
+
+    model_dict = OmegaConf.to_container(base.model, resolve=True) or {}
+    cfg.model = OplmModelConfig(**model_dict)  # type: ignore[arg-type]
+
     cfg.train.config_path = config_path
     return cfg

@@ -1,0 +1,47 @@
+# OPLM default training configuration (mirrors oplm.config.TrainConfig).
+# Authoritative defaults: loaded by oplm.config.load_config. Values here MUST
+# equal the TrainConfig dataclass defaults (enforced by tests/training/test_config.py).
+train:
+  # Duration
+  max_steps: 50_000
+  max_epochs: null
+
+  # Batch
+  batch_size: 32
+  gradient_accumulation_steps: 1
+
+  # Optimizer
+  optimizer: adamw            # adamw | muon
+  lr: 1.0e-4
+  min_lr: 0.0
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_eps: 1.0e-8
+  muon_adjust_lr_fn: match_rms_adamw   # match_rms_adamw | original
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  max_grad_norm: 1.0
+
+  # Scheduler
+  scheduler: warmup_linear    # warmup_linear | warmup_cosine | wsd_linear | wsd_cosine
+  warmup_steps: 5_000
+  stable_steps: 0             # WSD plateau length (WSD schedules only)
+
+  # Logging
+  log_every: 10
+  eval_default_every: { steps: 10_000 }   # default cadence: {steps: N} | {tokens: N}
+  wandb_project: oplm
+  wandb_run_name: null
+  wandb_enabled: true
+
+  # Checkpointing
+  save_every: 10_000
+  save_total_limit: 3
+  resume_from: null
+
+  # Infrastructure
+  seed: 42
+  output_dir: outputs
+  mixed_precision: bf16       # bf16 | fp16 | no

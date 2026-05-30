@@ -1,58 +1,41 @@
-# Training dataset(s).
-#
-# Single dataset (100% sampling):
-#   train: /path/to/dataset
-# (CLI: data.train=/path/to/dataset)
-#
-# Multiple datasets with fractional sampling:
-#   train:
-#     uniref50:
-#       path: /data/uniref50/
-#       fraction: 0.6
-#     bfd:
-#       path: /data/bfd/
-#       fraction: 0.4
-# (CLI: data.train.uniref50.path=/data/uniref50/ data.train.uniref50.fraction=0.6 ...)
-#
-# Notes:
-#   - Each dataset path can be a single .parquet file or a directory of shards.
-#   - Fractions are normalized to sum to 1.0.
-#   - Omitted fractions share the remaining mass equally.
-#   - Parquet files must have columns: sequence_id, sequence.
-train: null
+# OPLM default data configuration (mirrors oplm.config.DataConfig).
+# Authoritative defaults: loaded by oplm.config.load_config.
+data:
+  # Training dataset(s). Single path (100% sampling):
+  #   data: { train: /path/to/dataset }   (CLI: data.train=/path/to/dataset)
+  # Multiple datasets with fractional sampling:
+  #   data:
+  #     train:
+  #       uniref50: { path: /data/uniref50/, fraction: 0.6 }
+  #       bfd:      { path: /data/bfd/,      fraction: 0.4 }
+  # Notes: each path is a .parquet file or a directory of shards; fractions are
+  # normalized to 1.0; omitted fractions share the remaining mass equally;
+  # parquet must have columns sequence_id, sequence.
+  train: null
 
-# Evaluation dataset(s). Named map; each entry needs `path` and `type`
-# (sequence, structure, proteingym, tape, proteinglue, everest).
-#
-# Per-dataset cadence (`every`): exactly one of {steps: N} or {tokens: N}, with
-# optional at_start (default false) / at_end (default true). Datasets that omit
-# `every` use train.eval_default_every. Task-specific keys sit at the same level
-# as `path`/`type` (not under `extra:`). See configs/README.md and
-# docs/EVAL_HARNESS.md §9.
-#
-#   eval:
-#     heldout:
-#       path: /data/eval_sequences.parquet
-#       type: sequence
-#       every: { tokens: 20_000_000 }
-#     structures:
-#       path: /data/pdb
-#       type: structure
-#       every: { steps: 20_000 }
-#       categorical_jacobian_sample_size: 12
-eval: null
+  # Evaluation dataset(s). Named map; each entry needs `path` and `type`
+  # (sequence, structure, proteingym, tape, proteinglue, everest). Per-dataset
+  # cadence (`every`): exactly one of {steps: N} | {tokens: N}, optional
+  # at_start (default false) / at_end (default true); datasets that omit `every`
+  # use train.eval_default_every. Task-specific keys sit at the same level as
+  # `path`/`type`. See docs/EVAL_HARNESS.md §9.
+  #   eval:
+  #     heldout:    { path: /data/eval.parquet, type: sequence, every: { tokens: 20_000_000 } }
+  #     structures: { path: /data/pdb, type: structure, every: { steps: 20_000 },
+  #                   categorical_jacobian_sample_size: 12 }
+  eval: null
 
-# Sequence masking
-mask_prob: 0.15
-mask_token_prob: 0.8
-random_token_prob: 0.1
-weighted_masking: false   # set true to honor the masking_weights column
+  # Sequence masking
+  mask_prob: 0.15
+  mask_token_prob: 0.8
+  random_token_prob: 0.1
+  weighted_masking: false     # set true to honor the masking_weights column
 
-# DataLoader settings
-num_workers: 4
-pin_memory: true
-prefetch_factor: 4
+  # DataLoader settings
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 4
 
-# Shard iteration behavior (only affects sharded parquet directories)
-shuffle_shards: true
-shuffle_rows: true
+  # Shard iteration behavior (only affects sharded parquet directories)
+  shuffle_shards: true
+  shuffle_rows: true
