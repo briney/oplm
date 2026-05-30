@@ -729,7 +729,7 @@ Replace the broken `OmegaConf.structured(deepcopy(cfg))` serialization and add a
 
 ### 6.1 `save_checkpoint` signature + body
 
-- [ ] Add a `model` parameter (place it right after `accelerator`):
+- [x] Add a `model` parameter (place it right after `accelerator`):
 
   ```python
   def save_checkpoint(
@@ -748,12 +748,12 @@ Replace the broken `OmegaConf.structured(deepcopy(cfg))` serialization and add a
   Add `import torch` (or only under `TYPE_CHECKING` and type the param as
   `"torch.nn.Module"`) — keep heavy imports lazy where practical.
 
-- [ ] Keep `accelerator.save_state(str(checkpoint_dir))` (the resumable state).
+- [x] Keep `accelerator.save_state(str(checkpoint_dir))` (the resumable state).
 
-- [ ] In the `if accelerator.is_main_process:` block:
-  - [ ] Keep `trainer_state.json` exactly as is (`global_step`, `epoch`,
+- [x] In the `if accelerator.is_main_process:` block:
+  - [x] Keep `trainer_state.json` exactly as is (`global_step`, `epoch`,
         `samples_seen`, `tokens_seen`).
-  - [ ] Replace the frozen-config write with `to_dict()` + dataclass `asdict`:
+  - [x] Replace the frozen-config write with `to_dict()` + dataclass `asdict`:
 
     ```python
     from dataclasses import asdict
@@ -768,7 +768,7 @@ Replace the broken `OmegaConf.structured(deepcopy(cfg))` serialization and add a
     )
     ```
 
-  - [ ] Add the HF export under `hf/` and save the tokenizer alongside it:
+  - [x] Add the HF export under `hf/` and save the tokenizer alongside it:
 
     ```python
     from oplm.data import get_tokenizer
@@ -779,25 +779,25 @@ Replace the broken `OmegaConf.structured(deepcopy(cfg))` serialization and add a
     get_tokenizer().save_pretrained(hf_dir)    # tokenizer files for round-trip
     ```
 
-  - [ ] Keep `_rotate_checkpoints(Path(output_dir), save_total_limit)` last.
+  - [x] Keep `_rotate_checkpoints(Path(output_dir), save_total_limit)` last.
 
-- [ ] Keep the trailing `accelerator.wait_for_everyone()`.
+- [x] Keep the trailing `accelerator.wait_for_everyone()`.
 
-- [ ] Remove the now-unused `from copy import deepcopy` import.
+- [x] Remove the now-unused `from copy import deepcopy` import.
 
 ### 6.2 `load_checkpoint` — leave unchanged
 
-- [ ] Confirm (no edit) `load_checkpoint` still reads Accelerate state +
+- [x] Confirm (no edit) `load_checkpoint` still reads Accelerate state +
       `trainer_state.json` from the **top level**. The `hf/` export is for
       downstream loading, not resume.
 
 ### Phase-6 acceptance
 
-- [ ] After a save, `checkpoint-{step}/hf/` contains `config.json`,
+- [x] After a save, `checkpoint-{step}/hf/` contains `config.json`,
       `model.safetensors`, and tokenizer files, and
       `OplmForMaskedLM.from_pretrained(checkpoint-{step}/hf)` reproduces the
-      weights (Phase 8 test).
-- [ ] `checkpoint-{step}/config.yaml` exists with `model`/`train`/`data` keys and
+      weights (verified via smoke test; Phase 8 adds the formal test).
+- [x] `checkpoint-{step}/config.yaml` exists with `model`/`train`/`data` keys and
       is re-loadable by `load_config(["--config", <that file>])`.
 
 ---
