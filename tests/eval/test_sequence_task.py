@@ -10,12 +10,12 @@ import pytest
 from oplm.config import (
     DataConfig,
     EvalDatasetEntry,
-    ModelConfig,
     OplmConfig,
     ScheduleSpec,
     TrainConfig,
 )
 from oplm.eval.tasks.sequence import SequenceEvalTask
+from oplm.model import OplmConfig as OplmModelConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -32,11 +32,12 @@ _BATCH_SIZE = 8
 def _root_cfg() -> OplmConfig:
     """Root config feeding the eval dataloader (data/train) and length bound.
 
-    Only ``data`` / ``train`` / ``model.max_seq_len`` are consulted here — the
-    model itself is built separately from the HF config (see ``make_model``).
+    Only ``data`` / ``train`` / ``model.max_position_embeddings`` are consulted
+    here — the model itself is built separately from the HF config (see
+    ``make_model``).
     """
     return OplmConfig(
-        model=ModelConfig(max_seq_len=_MAX_SEQ_LEN),
+        model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
         train=TrainConfig(batch_size=_BATCH_SIZE, wandb_enabled=False),
         data=DataConfig(num_workers=0, pin_memory=False),
     )

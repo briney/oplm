@@ -15,12 +15,12 @@ import pytest
 from oplm.config import (
     DataConfig,
     EvalDatasetEntry,
-    ModelConfig,
     OplmConfig,
     ScheduleSpec,
     TrainConfig,
 )
 from oplm.eval.tasks.structure import StructureEvalTask, StructureTaskConfig
+from oplm.model import OplmConfig as OplmModelConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -70,7 +70,7 @@ def test_structure_eval_precision_in_unit_interval(
     from accelerate import Accelerator
 
     cfg = OplmConfig(
-        model=ModelConfig(max_seq_len=_MAX_SEQ_LEN),
+        model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
         train=TrainConfig(wandb_enabled=False),
         data=DataConfig(num_workers=0, pin_memory=False),
     )

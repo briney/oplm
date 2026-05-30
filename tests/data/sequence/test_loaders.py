@@ -18,10 +18,11 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from oplm.config import DataConfig, ModelConfig, OplmConfig, TrainConfig
+from oplm.config import DataConfig, OplmConfig, TrainConfig
 from oplm.data.sequence.dataset import InterleavedDataset, ShardedProteinDataset
 from oplm.data.sequence.loaders import build_sequence_eval_dataloader, build_train_dataloader
 from oplm.data.tokenizer import get_tokenizer, pad_token_id
+from oplm.model import OplmConfig as OplmModelConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,7 +45,7 @@ def _make_config(
 ) -> OplmConfig:
     """Build a tiny config wired to a fixture dataset for the loader tests."""
     return OplmConfig(
-        model=ModelConfig(max_seq_len=_MAX_SEQ_LEN),
+        model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
         train=TrainConfig(batch_size=_BATCH_SIZE, seed=seed),
         data=DataConfig(
             train=train,

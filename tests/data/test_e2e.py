@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from oplm.config import DataConfig, ModelConfig, OplmConfig, TrainConfig
+from oplm.config import DataConfig, OplmConfig, TrainConfig
 from oplm.data import build_sequence_eval_dataloader, build_train_dataloader
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM
@@ -52,12 +52,11 @@ _N_STEPS = 3
 def _make_data_config(train: object, *, weighted_masking: bool = False) -> OplmConfig:
     """Build a tiny data/training config wired to a fixture dataset."""
     return OplmConfig(
-        model=ModelConfig(
-            hidden_dim=_HIDDEN,
-            num_heads=_HEADS,
-            num_kv_heads=_HEADS,
-            num_layers=_LAYERS,
-            max_seq_len=_MAX_SEQ_LEN,
+        model=OplmModelConfig(
+            hidden_size=_HIDDEN,
+            num_attention_heads=_HEADS,
+            num_hidden_layers=_LAYERS,
+            max_position_embeddings=_MAX_SEQ_LEN,
         ),
         train=TrainConfig(batch_size=_BATCH_SIZE, seed=7),
         data=DataConfig(

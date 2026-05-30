@@ -1,0 +1,39 @@
+"""Tests for the FLOPs-per-token estimate (Phase 2 HF-field rewrite)."""
+
+from __future__ import annotations
+
+from oplm.model import OplmConfig as OplmModelConfig
+from oplm.training.flops import estimate_flops_per_token
+
+
+def _config(**overrides: int) -> OplmModelConfig:
+    """Build a small HF config, overriding only the fields a test varies."""
+    base = {
+        "hidden_size": 256,
+        "num_attention_heads": 4,
+        "num_hidden_layers": 6,
+        "max_position_embeddings": 128,
+    }
+    base.update(overrides)
+    return OplmModelConfig(**base)
+
+
+def test_estimate_is_positive_finite_int() -> None:
+    """The estimate is a positive, finite integer."""
+    flops = estimate_flops_per_token(_config())
+    assert isinstance(flops, int)
+    assert flops > 0
+
+
+def test_more_layers_increases_estimate() -> None:
+    """Doubling ``num_hidden_layers`` strictly increases the estimate."""
+    assert estimate_flops_per_token(_config(num_hidden_layers=12)) > estimate_flops_per_token(
+        _config(num_hidden_layers=6)
+    )
+
+
+def test_wider_hidden_increases_estimate() -> None:
+    """Increasing ``hidden_size`` strictly increases the estimate."""
+    assert estimate_flops_per_token(_config(hidden_size=512)) > estimate_flops_per_token(
+        _config(hidden_size=256)
+    )
