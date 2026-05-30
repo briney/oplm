@@ -26,7 +26,7 @@ try:
 
     _FLEX_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only on torch builds without flex
-    _flex_attention = None  # type: ignore[assignment]
+    _flex_attention = None  # ty: ignore[invalid-assignment]  # optional-import None sentinel
     _FLEX_AVAILABLE = False
 
 
@@ -80,7 +80,7 @@ class OplmAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         # Picked up by OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling.
-        self.o_proj._is_residual_writer = True  # type: ignore[attr-defined]
+        self.o_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
         if self.qk_norm_enabled:
             self.q_norm: nn.Module = make_norm(config.norm_type, head_dim, eps=config.norm_eps)
@@ -168,7 +168,8 @@ class OplmAttention(nn.Module):
     ) -> torch.Tensor:
         """Run `flex_attention` with a closure-built `BlockMask`."""
         block_mask = make_flex_block_mask(attention_mask, num_heads=self.num_attention_heads)
-        return _flex_attention(q, k, v, block_mask=block_mask)  # type: ignore[misc]
+        # torch's flex_attention return type is a union; this path returns a Tensor.
+        return _flex_attention(q, k, v, block_mask=block_mask)  # ty: ignore[invalid-return-type]
 
     def _manual_attention(
         self,

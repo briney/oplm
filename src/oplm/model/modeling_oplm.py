@@ -102,7 +102,8 @@ class OplmPreTrainedModel(PreTrainedModel):
             if getattr(module, "weight", None) is not None:
                 nn.init.ones_(module.weight)
             if getattr(module, "bias", None) is not None:
-                nn.init.zeros_(module.bias)
+                # nn.Module.__getattr__ types `.bias` as Tensor | Module; it is a Tensor here.
+                nn.init.zeros_(module.bias)  # ty: ignore[invalid-argument-type]
 
     # ------------------------------------------------------------------
     # Gradient checkpointing — propagate the toggle to every OplmBlock.
@@ -129,7 +130,7 @@ class OplmPreTrainedModel(PreTrainedModel):
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):  # type: ignore[override]
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         """Load the model and best-effort attach the saved tokenizer.
 
         If no tokenizer files sit next to the weights (scratch models, offline
@@ -173,7 +174,8 @@ class EsmcCompatMixin:
         defaults.update(tokenizer_kwargs)
         batch = tok(seqs, **defaults)
         try:
-            device = next(self.parameters()).device
+            # EsmcCompatMixin is always mixed into an nn.Module subclass.
+            device = next(self.parameters()).device  # ty: ignore[unresolved-attribute]
         except StopIteration:
             device = torch.device("cpu")
         return batch.to(device)
@@ -194,7 +196,7 @@ class EsmcCompatMixin:
         """Run the model on `seqs` and return a structured `LogitsOutput`."""
         cfg = config or LogitsConfig()
         batch = self.tokenize(seqs)
-        out = self(
+        out = self(  # ty: ignore[call-non-callable]  # mixin is always mixed into nn.Module
             input_ids=batch.input_ids,
             attention_mask=batch.attention_mask,
             output_hidden_states=(cfg.return_hidden_states or cfg.return_embeddings),
@@ -223,7 +225,8 @@ class EsmcCompatMixin:
                 "or assign one manually with "
                 "`model.tokenizer = AutoTokenizer.from_pretrained(...)`."
             )
-        return self.tokenizer
+        # Narrowed non-None by the guard above; ty does not track it through getattr.
+        return self.tokenizer  # ty: ignore[invalid-return-type]
 
 
 class OplmModel(OplmPreTrainedModel, EsmcCompatMixin):
@@ -291,7 +294,7 @@ class OplmMLMHead(nn.Module):
         self.norm = make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
         self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
         # The decoder writes to vocab space, NOT the residual stream: no 1/sqrt(2L) scaling.
-        self.decoder._is_residual_writer = False  # type: ignore[attr-defined]
+        self.decoder._is_residual_writer = False  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.norm(self.act(self.dense(x))))
@@ -358,7 +361,8 @@ class OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin):
             output = tuple(v for v in output if v is not None)
             return ((loss,) + output) if loss is not None else output
         return MaskedLMOutput(
-            loss=loss,
+            # transformers stubs annotate loss as FloatTensor; torch ops return Tensor.
+            loss=loss,  # ty: ignore[invalid-argument-type]
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -428,7 +432,8 @@ class OplmForSequenceClassification(OplmPreTrainedModel, EsmcCompatMixin):
             output = tuple(v for v in output if v is not None)
             return ((loss,) + output) if loss is not None else output
         return SequenceClassifierOutput(
-            loss=loss,
+            # transformers stubs annotate loss as FloatTensor; torch ops return Tensor.
+            loss=loss,  # ty: ignore[invalid-argument-type]
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -527,7 +532,8 @@ class OplmForTokenClassification(OplmPreTrainedModel, EsmcCompatMixin):
             output = tuple(v for v in output if v is not None)
             return ((loss,) + output) if loss is not None else output
         return TokenClassifierOutput(
-            loss=loss,
+            # transformers stubs annotate loss as FloatTensor; torch ops return Tensor.
+            loss=loss,  # ty: ignore[invalid-argument-type]
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,

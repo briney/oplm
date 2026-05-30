@@ -213,7 +213,7 @@ class OplmStack(nn.Module):
         """Toggle gradient checkpointing on every block in the stack."""
         self.gradient_checkpointing = enabled
         for block in self.layers:
-            block.gradient_checkpointing = enabled
+            block.gradient_checkpointing = enabled  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
     def forward(
         self,
@@ -234,6 +234,7 @@ class OplmStack(nn.Module):
             x = inputs_embeds
             batch_size, seq_len, _ = x.shape
         else:
+            assert input_ids is not None  # guaranteed by the exactly-one check above
             batch_size, seq_len = input_ids.shape
             x = self.embed_tokens(input_ids)
 

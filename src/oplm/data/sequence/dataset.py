@@ -307,7 +307,7 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         total = 0
         for ds in self._datasets:
             try:
-                total += len(ds)  # type: ignore[arg-type]  # IterableDataset len is optional
+                total += len(ds)  # ty: ignore[invalid-argument-type]  # IterableDataset len is optional
             except TypeError:
                 return 0
         return total
@@ -352,7 +352,7 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
             item = self._next_or_refill(iters, source_idx)
             if item is _EXHAUSTED:
                 continue  # source produced nothing for this (rank, worker)
-            yield item  # type: ignore[misc]  # _EXHAUSTED filtered above
+            yield item  # ty: ignore[invalid-yield]  # _EXHAUSTED sentinel filtered above
 
     def _next_or_refill(self, iters: list[Iterator[dict[str, object]]], source_idx: int) -> object:
         """Pull the next item from a source, re-iterating once if exhausted.

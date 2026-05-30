@@ -103,7 +103,7 @@ def encode(
     model = load_model_for_inference(model_path, cfg)
     if getattr(model, "tokenizer", None) is None:
         # `tokenizer` is intentionally un-annotated on the model (see modeling_oplm.py).
-        model.tokenizer = get_tokenizer()  # type: ignore[assignment]
+        model.tokenizer = get_tokenizer()
 
     with torch.no_grad():
         embeddings = model.logits(list(sequences), LogitsConfig(return_embeddings=True)).embeddings

@@ -36,7 +36,7 @@ class SwiGLU(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
         # Writes back into the residual stream: picked up by
         # OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling (§15.1).
-        self.down_proj._is_residual_writer = True  # type: ignore[attr-defined]
+        self.down_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # (B, T, D) -> (B, T, F) -> (B, T, D)

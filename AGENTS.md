@@ -27,9 +27,15 @@ ruff check src/
 # format
 ruff format src/
 
-# type check
-mypy src/
+# type check (ty — Astral's checker; configured under [tool.ty] in pyproject.toml)
+ty check src/
 ```
+
+> **Type checking uses `ty`, not mypy.** `ty` is pre-1.0/beta but handles this
+> HuggingFace/torch-heavy codebase far better than mypy (which drowned in
+> untyped-`transformers` stub noise). Framework-boundary diagnostics are
+> suppressed inline with documented `# ty: ignore[<rule>]` comments. `ty check
+> src/` must be clean.
 
 ## Architecture
 

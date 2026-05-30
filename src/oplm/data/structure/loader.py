@@ -119,19 +119,16 @@ def _parse_single_structure(path: Path) -> StructureData | None:
         ImportError: If biopython is not installed.
     """
     try:
-        # biopython ships only partial type info, so these are untyped to mypy.
-        from Bio.PDB import MMCIFParser, PDBParser  # type: ignore[attr-defined]
+        from Bio.PDB import MMCIFParser, PDBParser
     except ImportError as exc:
         raise ImportError(_BIOPYTHON_IMPORT_ERROR) from exc
 
     parser = (
-        MMCIFParser(QUIET=True)  # type: ignore[no-untyped-call]
-        if path.suffix.lower() in _MMCIF_SUFFIXES
-        else PDBParser(QUIET=True)  # type: ignore[no-untyped-call]
+        MMCIFParser(QUIET=True) if path.suffix.lower() in _MMCIF_SUFFIXES else PDBParser(QUIET=True)
     )
 
     try:
-        structure = parser.get_structure(path.stem, str(path))  # type: ignore[no-untyped-call]
+        structure = parser.get_structure(path.stem, str(path))
     except Exception:
         # biopython raises a variety of parser-specific errors on malformed
         # files; the spec is to skip-and-warn rather than propagate.

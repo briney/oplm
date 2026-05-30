@@ -70,7 +70,7 @@ def load_model_for_inference(
     hf_dir = _find_hf_export(Path(model_path))
     if hf_dir is not None:
         # transformers' from_pretrained is untyped but returns an OplmForMaskedLM here.
-        model = OplmForMaskedLM.from_pretrained(str(hf_dir))  # type: ignore[no-untyped-call]
+        model = OplmForMaskedLM.from_pretrained(str(hf_dir))
     else:
         state_dict = load_model_state_dict(model_path)
         model = OplmForMaskedLM(cfg.model)

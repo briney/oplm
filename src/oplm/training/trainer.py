@@ -302,7 +302,7 @@ class Trainer:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _compute_total_steps(self, cfg: OplmConfig, dataloader: DataLoader) -> int:  # type: ignore[type-arg]
+    def _compute_total_steps(self, cfg: OplmConfig, dataloader: DataLoader) -> int:
         """Compute total training steps from config."""
         if cfg.train.max_epochs is not None:
             dataset_size = self._get_dataset_size_from_dataloader(dataloader)
@@ -316,7 +316,7 @@ class Trainer:
         return cfg.train.max_steps
 
     @staticmethod
-    def _get_dataset_size_from_dataloader(dataloader: DataLoader) -> int:  # type: ignore[type-arg]
+    def _get_dataset_size_from_dataloader(dataloader: DataLoader) -> int:
         """Get the dataset size from the dataloader."""
         dataset = getattr(dataloader, "dataset", None)
         return _resolve_total_length(dataset)
@@ -489,6 +489,6 @@ def _resolve_total_length(dataset: object) -> int:
             return child_length
 
     try:
-        return len(dataset)  # type: ignore[arg-type]
+        return len(dataset)  # ty: ignore[invalid-argument-type]  # guarded by except TypeError
     except TypeError:
         return 0

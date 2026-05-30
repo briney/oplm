@@ -15,7 +15,7 @@ def estimate_flops_per_token(config: OplmModelConfig) -> int:
     attention-score FLOPs, normalization, and embedding lookups by design.
     """
     h = config.hidden_size
-    num_layers = config.num_hidden_layers
+    num_hidden_layers = config.num_hidden_layers
     vocab_size = config.vocab_size
     intermediate = config.intermediate_size  # always resolved post-__init__
     assert intermediate is not None, "intermediate_size is resolved in OplmConfig.__init__"
@@ -26,7 +26,7 @@ def estimate_flops_per_token(config: OplmModelConfig) -> int:
     ffn_flops = 3 * 2 * h * intermediate
 
     per_layer = attn_proj_flops + ffn_flops
-    backbone_flops = num_layers * per_layer
+    backbone_flops = num_hidden_layers * per_layer
 
     # MLM head: dense projection + vocab projection
     head_flops = 2 * h * h + 2 * h * vocab_size

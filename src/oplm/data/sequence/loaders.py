@@ -135,7 +135,7 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
     return _build_dataloader(dataset, collator, cfg, loader_cls=_ResettingDataLoader)
 
 
-class _ResettingDataLoader(DataLoader):  # type: ignore[type-arg]  # generic param set at call sites
+class _ResettingDataLoader(DataLoader):  # generic param set at call sites
     """DataLoader that rewinds a deterministic collator at the start of each pass.
 
     The deterministic :class:`MLMCollator` seeds its per-batch RNG from a running
@@ -146,7 +146,7 @@ class _ResettingDataLoader(DataLoader):  # type: ignore[type-arg]  # generic par
     the evaluation determinism contract. Training never uses this wrapper.
     """
 
-    def __iter__(self):  # type: ignore[no-untyped-def]  # delegates to DataLoader.__iter__
+    def __iter__(self):  # delegates to DataLoader.__iter__
         reset = getattr(self.collate_fn, "reset_batch_index", None)
         if callable(reset):
             reset()
@@ -158,7 +158,7 @@ def _build_dataloader(
     collator: MLMCollator,
     cfg: OplmConfig,
     *,
-    loader_cls: type[DataLoader] = DataLoader,  # type: ignore[type-arg]  # generic param set by return type
+    loader_cls: type[DataLoader] = DataLoader,  # generic param set by return type
 ) -> DataLoader[dict[str, Tensor]]:
     """Wrap a dataset + collator in a DataLoader using ``cfg``'s worker settings.
 

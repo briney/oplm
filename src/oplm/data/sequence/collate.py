@@ -246,10 +246,14 @@ class MLMCollator:
         weights: list[list[float] | None] = []
         any_present = False
         for item in batch:
-            value = item.get(_WEIGHTS_KEY) if isinstance(item, Mapping) else None
+            value = (
+                item.get(_WEIGHTS_KEY)  # ty: ignore[invalid-argument-type]  # Mapping[str, object]
+                if isinstance(item, Mapping)
+                else None
+            )
             if value is not None:
                 any_present = True
-            weights.append(value)  # type: ignore[arg-type]  # list[float] | None
+            weights.append(value)  # ty: ignore[invalid-argument-type]  # list[float] | None
 
         if not any_present and not self._warned_missing_weights:
             logger.warning(

@@ -408,7 +408,7 @@ def load_config(argv: list[str]) -> OplmConfig:
 
     # Build train/data dataclasses (triggers their __post_init__ validation);
     # `model` is an Any field so it round-trips as a plain dict here.
-    cfg: OplmConfig = OmegaConf.to_object(base)  # type: ignore[assignment]
+    cfg: OplmConfig = OmegaConf.to_object(base)  # ty: ignore[invalid-assignment]  # OmegaConf union
 
     # Instantiate the HF model config from the merged `model` subtree. HF owns
     # derivation (head_dim, intermediate_size, rope_dim/nope_dim) and validation.
@@ -418,7 +418,7 @@ def load_config(argv: list[str]) -> OplmConfig:
     from oplm.model import OplmConfig as OplmModelConfig
 
     model_dict = OmegaConf.to_container(base.model, resolve=True) or {}
-    cfg.model = OplmModelConfig(**model_dict)  # type: ignore[arg-type]
+    cfg.model = OplmModelConfig(**model_dict)  # ty: ignore[invalid-argument-type]  # OmegaConf union
 
     cfg.train.config_path = config_path
 
