@@ -171,10 +171,10 @@ oplm train --config configs/my_run.yaml
 # use a size preset
 oplm train --preset medium
 
-# preset + overrides
+# preset + overrides (bare key=value, no flag needed)
 oplm train --preset large \
-  --override model.num_layers=16 \
-  --override train.lr=3e-4
+  model.num_layers=16 \
+  train.lr=3e-4
 
 # distributed training with Accelerate
 accelerate launch -m oplm.train --config configs/my_run.yaml
@@ -225,9 +225,11 @@ The canonical field-by-field reference lives in [configs/README.md](configs/READ
 Runtime precision is controlled by `train.mixed_precision`; `model.dtype` is currently a
 reserved placeholder.
 `model.max_seq_len` is the sequence-length setting for training, eval, and inference.
-`oplm` CLI commands take repeated `--override key=value` flags, while
-`accelerate launch -m oplm.train ...` still passes raw dotlist overrides through to
-`load_config()`.
+`oplm train` and `oplm info` take config overrides as bare `key=value` positional
+arguments (e.g. `oplm train --preset large model.num_layers=16 train.lr=3e-4`).
+`oplm encode` keeps the `--override key=value` flag, since its positional slot holds
+the input sequences. `accelerate launch -m oplm.train ...` still passes raw dotlist
+overrides through to `load_config()`.
 
 ### Model presets
 

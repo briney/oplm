@@ -30,14 +30,16 @@ Examples:
 
 ```bash
 oplm train --preset medium \
-  --override train.max_steps=1000 \
-  --override data.train=/data/train.parquet
-oplm info --config configs/my_run.yaml --override model.num_layers=16
+  train.max_steps=1000 \
+  data.train=/data/train.parquet
+oplm info --config configs/my_run.yaml model.num_layers=16
 accelerate launch -m oplm.train --config configs/my_run.yaml train.resume_from=outputs/checkpoint-1000
 ```
 
-`oplm train`, `oplm info`, and `oplm encode` all use repeated `--override key=value`
-flags. The lower-level distributed entry point keeps raw dotlist passthrough because
+`oplm train` and `oplm info` take overrides as bare `key=value` positional arguments.
+`oplm encode` keeps the `--override key=value` flag because its positional slot holds
+the input sequences (e.g. `oplm encode SEQ1 SEQ2 --model … --override model.num_layers=16`).
+The lower-level distributed entry point keeps raw dotlist passthrough because
 `accelerate launch -m oplm.train ...` forwards trailing arguments directly to
 `load_config()`.
 

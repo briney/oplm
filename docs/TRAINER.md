@@ -79,9 +79,9 @@ including the parts that are now broken against the rewritten model/data/eval
   via `load_config` when `cfg` is `None`, then `Trainer(cfg).train()`. Launched
   directly (`python -m oplm.train --config …`) or distributed
   (`accelerate launch -m oplm.train --config … model.num_hidden_layers=32`).
-- **`oplm.cli.train`** (`src/oplm/cli.py:46`) — a Typer wrapper that builds the
-  same `argv` from `--config/--preset/--override`, prints a one-line model
-  summary, and delegates to `oplm.train.main`.
+- **`oplm.cli.train`** (`src/oplm/cli.py`) — a Typer wrapper that builds the
+  same `argv` from `--config`/`--preset` plus bare `key=value` positional
+  overrides, prints a one-line model summary, and delegates to `oplm.train.main`.
 
 ### 2.2 `Trainer.__init__` — setup order
 

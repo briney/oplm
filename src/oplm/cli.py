@@ -26,13 +26,29 @@ NameOpt = Annotated[
     typer.Option(
         "--name",
         "-n",
-        help="W&B run name. Ignored if train.wandb_run_name is set in YAML/--override.",
+        help="W&B run name. Ignored if train.wandb_run_name is set in the YAML or an override.",
     ),
 ]
 OverridesOpt = Annotated[
     list[str] | None,
     typer.Option("--override", help="Config override (key=value). Repeat as needed."),
 ]
+OverridesArg = Annotated[
+    list[str] | None,
+    typer.Argument(
+        metavar="[KEY=VALUE]...",
+        help="Config overrides, e.g. train.max_steps=500000 model.nope_dim=512",
+    ),
+]
+
+
+def _validate_overrides(overrides: list[str] | None) -> None:
+    """Reject positional overrides that aren't ``KEY=VALUE`` before config parsing."""
+    for tok in overrides or []:
+        if "=" not in tok:
+            raise typer.BadParameter(
+                f"override must be KEY=VALUE (e.g. train.max_steps=500000), got: {tok!r}"
+            )
 
 
 def _build_argv(
@@ -56,15 +72,16 @@ def _build_argv(
 
 @app.command()
 def train(
+    overrides: OverridesArg = None,
     config: ConfigOpt = None,
     preset: PresetOpt = None,
     name: NameOpt = None,
-    overrides: OverridesOpt = None,
 ) -> None:
     """Launch training.
 
     For distributed training: accelerate launch -m oplm.train --config <path>
     """
+    _validate_overrides(overrides)
     cfg = load_config(_build_argv(config, preset, overrides, name))
     console.print(f"[bold]Model:[/bold] {cfg.model.num_hidden_layers}L / {cfg.model.hidden_size}D")
     console.print(f"[bold]Output:[/bold] {cfg.train.output_dir}")
@@ -116,15 +133,16 @@ def encode(
 
 @app.command()
 def info(
+    overrides: OverridesArg = None,
     config: ConfigOpt = None,
     preset: PresetOpt = None,
-    overrides: OverridesOpt = None,
 ) -> None:
     """Print model config and parameter count."""
     import torch
 
     from oplm.model import OplmForMaskedLM
 
+    _validate_overrides(overrides)
     cfg = load_config(_build_argv(config, preset, overrides))
 
     # Build model on meta device to avoid memory allocation
