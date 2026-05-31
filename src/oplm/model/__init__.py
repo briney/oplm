@@ -6,8 +6,9 @@ architectural variant — norm operator (LayerNorm / RMSNorm), norm placement
 strategy (pre / sandwich / hybrid / post-SDPA), full vs. partial RoPE, optional
 QK-norm, SwiGLU feed-forward, optional Canon depthwise convolutions, and
 sqrt-depth residual scaling — so the same code path covers the whole design
-space. Attention runs a ``flex_attention`` fast path on CUDA and falls back to a
-manual SDPA implementation everywhere else. The package exposes the backbone
+space. Attention runs through PyTorch's ``scaled_dot_product_attention`` — a
+fused FlashAttention / memory-efficient kernel on CUDA, the math backend on
+CPU. The package exposes the backbone
 (:class:`OplmModel`) and the task heads (:class:`OplmForMaskedLM`,
 :class:`OplmForSequenceClassification`, :class:`OplmForTokenClassification`),
 all registered with the HuggingFace Auto* classes and carrying an ESM-C-style

@@ -112,7 +112,6 @@ def tiny_train_cfg(
     num_attention_heads: int = 4,
     num_hidden_layers: int = 2,
     max_position_embeddings: int = 64,
-    use_flex_attention: bool = True,
     gradient_checkpointing: bool = False,
     num_workers: int = 0,
     pin_memory: bool = False,
@@ -132,7 +131,6 @@ def tiny_train_cfg(
             num_attention_heads=num_attention_heads,
             num_hidden_layers=num_hidden_layers,
             max_position_embeddings=max_position_embeddings,
-            use_flex_attention=use_flex_attention,
             gradient_checkpointing=gradient_checkpointing,
         ),
         train=TrainConfig(

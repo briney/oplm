@@ -26,7 +26,7 @@ dependencies = [
     # and transformers >=5.4 shifts PretrainedConfig attribute typing so `ty`
     # reports resolved-Optional config fields (head_dim, intermediate_size, ...) as
     # errors. Bump deliberately after re-running `ty check src/` + the test suite.
-    "torch>=2.11.0,<2.12",  # flex_attention gained FlashAttention-4 support in 2.11
+    "torch>=2.11.0,<2.12",  # FlashAttention-4 backend on Blackwell (via SDPA) + torch.optim.Muon need >=2.11
     "transformers>=4.45,<5.4",
     "omegaconf>=2.3",
     "typer>=0.9",

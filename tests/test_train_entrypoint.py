@@ -58,7 +58,7 @@ def test_module_subprocess_trains_and_exits_zero(training_parquet: Path, tmp_pat
         "data.pin_memory=false",
     ]
     cmd = [sys.executable, "-m", "oplm.train", "--preset", "small", *overrides]
-    # Force CPU in the child so the run is fast and free of flex-attention compile.
+    # Force CPU in the child so the run is fast and deterministic (SDPA math backend).
     env = {**os.environ, "ACCELERATE_USE_CPU": "true"}
 
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)

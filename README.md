@@ -20,9 +20,9 @@ of sequences, and get back per-residue logits and embeddings.
   load from the Hub, and `save_pretrained` / `push_to_hub` like any other model.
 - **ESM-C-compatible tokenizer** — a 33-token `OplmTokenizerFast` with the same
   vocabulary and special tokens as ESM-C.
-- **Fast attention** — built on `torch.nn.attention.flex_attention` (no separate
-  `flash-attn` dependency), with a manual fallback for returning attention
-  weights.
+- **Fast attention** — built on PyTorch's `scaled_dot_product_attention` (a fused
+  FlashAttention / memory-efficient kernel on CUDA, no separate `flash-attn`
+  dependency), with a manual softmax path for returning attention weights.
 - **Five sizes** — from a 5M-parameter ablation model up to 13B parameters.
 
 ---
