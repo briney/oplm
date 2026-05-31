@@ -44,7 +44,6 @@ def test_defaults_match_architecture_spec():
     assert cfg.classifier_pool == "mean"
     assert cfg.classifier_dropout == 0.0
     assert cfg.pre_head_norm is False
-    assert cfg.use_flex_attention is True
     assert cfg.gradient_checkpointing is False
     assert cfg.pad_token_id == 1
     assert cfg.bos_token_id == 0

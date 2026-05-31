@@ -74,9 +74,9 @@ evaluate it. Four subsystems compose cleanly along stable contracts:
 7. **Accelerate is the only distribution layer.** No manual `torch.distributed`
    wiring in the trainer.
 
-**Packaging.** Python ≥ 3.11; `torch ≥ 2.11` (pinned for
-`torch.nn.attention.flex_attention` + the FlashAttention-4 backend on Blackwell,
-and `torch.optim.Muon`). Single `pip install oplm` installs everything — **no
+**Packaging.** Python ≥ 3.11; `torch ≥ 2.11` (pinned for the FlashAttention-4
+backend on Blackwell — reached via `scaled_dot_product_attention` — and
+`torch.optim.Muon`). Single `pip install oplm` installs everything — **no
 optional dependency groups**. Build backend: `hatchling`, single `pyproject.toml`.
 
 ---
@@ -119,7 +119,7 @@ projection, multi-token value embeddings, query-dependent attention gates.
 | Untied embeddings | Default | | GQA / value residuals / output gating | Removed |
 | Residual scaling `1/sqrt(L)` | Default | | shared K/V / value embeddings | Removed |
 | Init scaling `1/sqrt(2L)` on output projections | Default | | | |
-| `flex_attention` fast path (+ manual fallback) | Default | | | |
+| SDPA attention (+ manual softmax for weights) | Default | | | |
 
 ## 2. Public API
 
@@ -357,37 +357,36 @@ def forward(self, x, attention_mask, output_attentions=False):
     # returns (out (B,T,D), attn_weights (B,H,T,T) fp32 | None)
 ```
 
-**Path selection** (`_use_fast_path`): the `flex_attention` fast path runs only
-when **all** hold — `output_attentions is False`, `config.use_flex_attention`,
-`config.attention_dropout == 0.0`, `q.device.type == "cuda"`, and the
-`flex_attention` symbol is importable (torch ≥ 2.11). Otherwise `_manual_attention`
-runs (honors dropout, supports CPU/MPS, can return weights). QKV projection,
-QK/V-norm, RoPE, and the output projection are shared:
+**Path selection:** `output_attentions=False` (the default, used for training)
+takes the SDPA path; `output_attentions=True` takes the manual softmax path,
+since SDPA does not expose attention weights. QKV projection, QK/V-norm, RoPE,
+and the output projection are shared:
 
 ```python
 q, k, v = self._project_qkv(x)
 q, k = self._qk_norm(q, k)
 v = self._v_norm(v)               # Identity unless hybrid
 q, k = self._apply_rope(q, k)
-if self._use_fast_path(output_attentions, q.device):
-    out, attn = self._flex_attention(q, k, v, attention_mask), None
-else:
+if output_attentions:
     out, attn = self._manual_attention(q, k, v, attention_mask)
+else:
+    out, attn = self._sdpa_attention(q, k, v, attention_mask), None
 out = self._output_projection(out)
 ```
 
-**Fast path** uses `flex_attention(q, k, v, block_mask=...)` where a `mask_mod`
-closure (`attention_mask[b, kv_idx] == 1`) builds a `create_block_mask`. The
-encoder is **bidirectional** — no causal mask, only the padding mask. `H` is
-passed as an explicit int. q/k/v are bf16 under autocast; softmax is internally
-fp32; on Blackwell + torch ≥ 2.11 it dispatches to FlashAttention-4.
-`flex_attention` returns no weights and has no `dropout_p`, hence the fast-path
-gates above.
+**SDPA path** calls `F.scaled_dot_product_attention(q, k, v, attn_mask=...)` with a
+`(B, 1, 1, T)` boolean *key*-padding mask (`True` = attend). The encoder is
+**bidirectional** — no causal mask, only the padding mask. Masking only keys keeps
+every query row non-empty, so no row is all-masked and the softmax cannot NaN.
+`dropout_p` is the configured `attention_dropout` during training (0 in eval), and
+SDPA's default scale (`1/sqrt(d_head)`) matches the manual path. On CUDA this
+dispatches to a fused FlashAttention / memory-efficient kernel (FlashAttention-4 on
+Blackwell + torch ≥ 2.11); on CPU it uses the math backend. It returns no weights.
 
-**Fallback path** (manual matmul): `scores = (q @ kᵀ)/sqrt(d)`, mask pad KV
-columns to `-inf`, `softmax(..., dtype=fp32)`, dropout, `@ v`. The returned `attn`
-is the full fp32 softmax (for precision@L, attention rollout, head-pruning). It is
-slower and `O(B·H·T²)` in memory — for inspection, not training.
+**Manual path** (`output_attentions=True`, manual matmul): `scores = (q @ kᵀ)/sqrt(d)`,
+mask pad KV columns to `-inf`, `softmax(..., dtype=fp32)`, dropout, `@ v`. The
+returned `attn` is the full fp32 softmax (for precision@L, attention rollout,
+head-pruning). It is slower and `O(B·H·T²)` in memory — for inspection, not training.
 
 **Output projection:** single `W_o: (D,D)` no bias; optional `hidden_dropout`
 after (default 0.0).
@@ -533,7 +532,6 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `canon_activation` | `none` | `none`/`silu`/`gelu` |
 | `initializer_range` | 0.02 | truncated-normal std |
 | `classifier_pool` / `classifier_dropout` / `num_labels` / `pre_head_norm` | `mean` / 0.0 / 2 / `False` | task-head fields |
-| `use_flex_attention` | `True` | debug override; `False` forces fallback always |
 | `gradient_checkpointing` | `False` | activation checkpointing on `OplmBlock` |
 | `pad`/`bos`/`eos`/`unk`/`mask_token_id` | 1 / 0 / 2 / 3 / 32 | ESM vocab |
 | `auto_map` | filled by `save_pretrained` | see §13 |
@@ -573,8 +571,8 @@ users pick one:
 **Required subclass attributes** on `OplmPreTrainedModel`: `config_class =
 OplmConfig`, `base_model_prefix = "oplm"`, `main_input_name = "input_ids"`,
 `supports_gradient_checkpointing = True`, `_no_split_modules = ["OplmBlock"]`,
-`_supports_sdpa = True`, `_supports_flash_attn_2 = False` (we use
-`flex_attention`).
+`_supports_sdpa = True`, `_supports_flash_attn_2 = False` (attention runs through
+`scaled_dot_product_attention`).
 
 **Gradient checkpointing.** `config.gradient_checkpointing=True` arms
 `OplmStack`/`OplmBlock` at init; `model.gradient_checkpointing_enable()` is the
@@ -1496,7 +1494,7 @@ Prefer **real data** over synthetic; provide small fixtures (drop real samples i
 `tests/data/fixtures/`); mark heavy parsing/model tests `@pytest.mark.slow`; make
 large fixtures session-scoped. Tests mirror the source tree.
 
-- **Model** — forward shape/dtype correctness across toggles; flex-vs-fallback
+- **Model** — forward shape/dtype correctness across toggles; SDPA-vs-manual
   parity; QK-norm/RoPE/Canon math; config validation raises on bad combinations;
   `save_pretrained`/`from_pretrained` round-trip.
 - **Data** — **tokenizer parity** (data-layer IDs equal `OplmTokenizerFast`'s;
@@ -1561,9 +1559,9 @@ large fixtures session-scoped. Tests mirror the source tree.
 6. Canon depthwise conv layers — arXiv:2512.17351.
 7. ESM-C — EvolutionaryScale, `evolutionaryscale/esm` (tokenizer + public API).
 8. FlashAttention-4; PyTorch 2.11 release notes,
-   `torch.nn.attention.flex_attention` docs.
+   `torch.nn.functional.scaled_dot_product_attention` docs.
 9. HuggingFace Transformers: `PreTrainedModel`, `PretrainedConfig`, `AutoModel*`.
 
 These map to the architecture toggles: full-RoPE/partial-RoPE (1, 4), SwiGLU and
 RMSNorm (2, 3), hybrid norm (5), Canon convs (6), the tokenizer + ESM-C-style API
-(7), the `flex_attention` fast path (8), and the HF integration surface (9).
+(7), SDPA attention (8), and the HF integration surface (9).

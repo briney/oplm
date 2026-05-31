@@ -1,15 +1,10 @@
-"""Pad-mask helpers, flex_attention mask_mod factories, conv-input zeroing."""
+"""Pad-mask helpers and conv-input zeroing."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
-if TYPE_CHECKING:
-    from torch.nn.attention.flex_attention import BlockMask
-
-__all__ = ["prepare_attention_mask", "make_flex_block_mask", "zero_pad_positions"]
+__all__ = ["prepare_attention_mask", "zero_pad_positions"]
 
 
 def prepare_attention_mask(
@@ -49,45 +44,6 @@ def prepare_attention_mask(
             f"expected ({batch_size}, {seq_len})."
         )
     return attention_mask
-
-
-def make_flex_block_mask(
-    attention_mask: torch.Tensor,
-    num_heads: int,
-) -> BlockMask:
-    """Build a `BlockMask` for `flex_attention` from a `(B, T)` padding mask.
-
-    The encoder is bidirectional, so the mask only enforces KV padding: any
-    query may attend to any key whose position is a real (non-pad) token.
-
-    Args:
-        attention_mask: `(B, T)` tensor with `1` at real-token positions and
-            `0` at pad positions.
-        num_heads: Number of attention heads. Passed through to
-            `create_block_mask` as an explicit positive integer (the head
-            dimension is not actually used by the closure, but the documented
-            signature requires it).
-
-    Returns:
-        A `BlockMask` ready to be passed to
-        `torch.nn.attention.flex_attention.flex_attention`.
-    """
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    batch_size, seq_len = attention_mask.shape
-
-    def mask_mod(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor):
-        del h, q_idx  # bidirectional: no causal restriction, no head dependence
-        return attention_mask[b, kv_idx] == 1
-
-    return create_block_mask(
-        mask_mod,
-        B=batch_size,
-        H=num_heads,
-        Q_LEN=seq_len,
-        KV_LEN=seq_len,
-        device=attention_mask.device,
-    )
 
 
 def zero_pad_positions(x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:

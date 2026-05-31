@@ -79,7 +79,6 @@ class OplmConfig(PretrainedConfig):
         classifier_dropout: float = 0.0,
         num_labels: int = 2,
         pre_head_norm: bool = False,
-        use_flex_attention: bool = True,
         gradient_checkpointing: bool = False,
         pad_token_id: int = 1,
         bos_token_id: int = 0,
@@ -123,7 +122,6 @@ class OplmConfig(PretrainedConfig):
         # `id2label` (set in super().__init__). Forward it via kwargs below
         # instead of assigning here.
         self.pre_head_norm = bool(pre_head_norm)
-        self.use_flex_attention = bool(use_flex_attention)
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.unk_token_id = int(unk_token_id)
         self.mask_token_id = int(mask_token_id)

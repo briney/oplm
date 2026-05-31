@@ -1,4 +1,4 @@
-"""Dual-path multi-head attention (flex_attention fast path + manual fallback)."""
+"""Multi-head self-attention: SDPA compute path with a manual softmax for attention weights."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .masking import make_flex_block_mask
 from .norm import make_norm
 from .rope import RotaryEmbedding
 
@@ -19,26 +18,17 @@ if TYPE_CHECKING:
 __all__ = ["OplmAttention"]
 
 
-# `flex_attention` requires CUDA and a compatible torch build. Probe once at
-# import time so the per-forward fast-path guard is a cheap boolean check.
-try:
-    from torch.nn.attention.flex_attention import flex_attention as _flex_attention
-
-    _FLEX_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised only on torch builds without flex
-    _flex_attention = None  # ty: ignore[invalid-assignment]  # optional-import None sentinel
-    _FLEX_AVAILABLE = False
-
-
 class OplmAttention(nn.Module):
-    """Multi-head self-attention with a flex_attention fast path and SDPA fallback.
+    """Multi-head self-attention with an SDPA compute path and a manual-softmax path.
 
-    The two compute paths share one set of parameters and one set of
-    pre-attention transformations (Q/K/V projections, optional QK/V norm, RoPE);
-    only the attention kernel itself differs. The fast path uses
-    `torch.nn.attention.flex_attention.flex_attention` with a closure-driven
-    `BlockMask`; the fallback is a manual scaled-dot-product softmax that also
-    returns the attention weights when `output_attentions=True`.
+    Both paths share one set of parameters and one set of pre-attention
+    transformations (Q/K/V projections, optional QK/V norm, RoPE); only the
+    attention kernel differs. The default path calls
+    `torch.nn.functional.scaled_dot_product_attention` with a `(B, 1, 1, T)`
+    boolean key-padding mask, dispatching to a fused FlashAttention / memory-
+    efficient kernel on CUDA (and the math backend on CPU). When
+    `output_attentions=True` the manual scaled-dot-product softmax runs instead,
+    since SDPA does not expose the attention weights.
 
     Norm wiring (controlled by `config.norm_strategy`):
 
@@ -71,7 +61,6 @@ class OplmAttention(nn.Module):
         self.head_dim = head_dim
         self.attention_dropout = float(config.attention_dropout)
         self.hidden_dropout = float(config.hidden_dropout)
-        self.use_flex_attention = bool(config.use_flex_attention)
         self.norm_strategy = config.norm_strategy
         self.qk_norm_enabled = bool(config.qk_norm)
 
@@ -137,39 +126,28 @@ class OplmAttention(nn.Module):
         return self.o_proj(merged)
 
     # ------------------------------------------------------------------
-    # Fast-path guard / kernels
+    # Attention kernels
     # ------------------------------------------------------------------
 
-    def _use_fast_path(self, output_attentions: bool, device: torch.device) -> bool:
-        """Decide whether to dispatch to `flex_attention`.
-
-        All conditions must hold; otherwise the manual fallback runs. The fast
-        path returns no attention weights and applies no dropout, so requesting
-        either forces the fallback. CUDA is required by the kernel itself.
-        """
-        if output_attentions:
-            return False
-        if not self.use_flex_attention:
-            return False
-        # flex_attention exposes no `dropout_p` argument; honouring the
-        # configured attention_dropout exactly requires the manual fallback.
-        if self.attention_dropout != 0.0:
-            return False
-        if device.type != "cuda":
-            return False
-        return _FLEX_AVAILABLE
-
-    def _flex_attention(
+    def _sdpa_attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Run `flex_attention` with a closure-built `BlockMask`."""
-        block_mask = make_flex_block_mask(attention_mask, num_heads=self.num_attention_heads)
-        # torch's flex_attention return type is a union; this path returns a Tensor.
-        return _flex_attention(q, k, v, block_mask=block_mask)  # ty: ignore[invalid-return-type]
+        """Scaled-dot-product attention via `F.scaled_dot_product_attention`.
+
+        The `(B, T)` padding mask becomes a `(B, 1, 1, T)` boolean *key* mask
+        (`True` = attend). Masking only keys keeps every query row non-empty —
+        pad-query rows stay finite (and are discarded downstream) — so no row is
+        all-masked and the softmax cannot produce NaNs. Dropout is applied inside
+        the kernel during training only; SDPA's default scale (`1/sqrt(d_head)`)
+        already matches the manual path.
+        """
+        attn_mask = (attention_mask == 1)[:, None, None, :]  # (B, 1, 1, T) bool
+        dropout_p = self.attention_dropout if self.training else 0.0
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
 
     def _manual_attention(
         self,
@@ -205,7 +183,7 @@ class OplmAttention(nn.Module):
             x: `(B, T, D)` residual-stream input.
             attention_mask: `(B, T)` tensor with `1` at real tokens, `0` at pads.
             output_attentions: When `True`, return the fp32 attention weights;
-                forces the manual fallback (the fast path returns none).
+                selects the manual softmax path (SDPA exposes no weights).
 
         Returns:
             A `(output, attn_weights_or_None)` tuple. `output` has shape
@@ -217,11 +195,11 @@ class OplmAttention(nn.Module):
         v = self._apply_v_norm(v)
         q, k = self._apply_rope(q, k)
 
-        if self._use_fast_path(output_attentions, q.device):
-            out = self._flex_attention(q, k, v, attention_mask)
-            attn = None
-        else:
+        if output_attentions:
             out, attn = self._manual_attention(q, k, v, attention_mask)
+        else:
+            out = self._sdpa_attention(q, k, v, attention_mask)
+            attn = None
 
         out = self._output_projection(out)
         out = F.dropout(out, p=self.hidden_dropout, training=self.training)

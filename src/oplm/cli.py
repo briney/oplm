@@ -201,7 +201,6 @@ def info(
         ", ".join(cfg.model.canon_positions) if cfg.model.canon_positions else "[dim]none[/dim]"
     )
     features.add_row("Canon positions", canon_str)
-    features.add_row("Flex attention", _status(cfg.model.use_flex_attention))
     features.add_row("Gradient ckpt", _status(cfg.model.gradient_checkpointing))
     features.add_row("Tied embeddings", _status(cfg.model.tie_word_embeddings))
     console.print(features)

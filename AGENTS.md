@@ -50,12 +50,12 @@ src/oplm/                      # main package (src layout)
 └── model/                     # transformer model package (see docs/MODEL_ARCHITECTURE.md)
     ├── outputs.py             # LogitsConfig / LogitsOutput dataclasses (ESM-C-style API)
     ├── norm.py                # LayerNorm / RMSNorm (fp32 internals) + make_norm factory
-    ├── masking.py             # pad-mask helpers, flex_attention mask_mod, conv-input zeroing
+    ├── masking.py             # pad-mask helpers, conv-input zeroing
     ├── rope.py                # RoPE / partial RoPE applied to Q and K
     ├── embedding.py           # token embedding + mean / CLS pooling
     ├── ffn.py                 # SwiGLU feed-forward + make_ffn factory
     ├── conv.py                # Canon depthwise 1D convolution
-    ├── attention.py           # dual-path attention (flex_attention + manual fallback)
+    ├── attention.py           # attention (SDPA + manual softmax for weights)
     ├── transformer.py         # OplmBlock + OplmStack
     ├── configuration_oplm.py  # OplmConfig (PretrainedConfig)
     ├── tokenization_oplm.py   # OplmTokenizerFast (33-token ESM-C-compatible)

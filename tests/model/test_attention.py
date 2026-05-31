@@ -1,4 +1,4 @@
-"""Tests for `oplm.model.attention` — OplmAttention dual-path multi-head attention."""
+"""Tests for `oplm.model.attention` — OplmAttention (SDPA + manual-softmax paths)."""
 
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ def _config(
     qk_norm: bool = True,
     attention_dropout: float = 0.0,
     hidden_dropout: float = 0.0,
-    use_flex_attention: bool = True,
     norm_strategy: str = "pre",
 ) -> SimpleNamespace:
     head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
@@ -42,7 +41,6 @@ def _config(
         qk_norm=qk_norm,
         attention_dropout=attention_dropout,
         hidden_dropout=hidden_dropout,
-        use_flex_attention=use_flex_attention,
         norm_strategy=norm_strategy,
     )
 
@@ -134,10 +132,9 @@ def test_forward_output_shape_matches_input():
     x = torch.randn(2, 7, 32)
     out, attn_weights = attn(x, _ones_mask(2, 7))
     assert out.shape == (2, 7, 32)
-    # No output_attentions requested -> attn weights returned but optional;
-    # the manual-fallback path always computes them, the flex path returns None.
-    # On CPU we always take the manual path.
-    assert attn_weights is None or attn_weights.shape == (2, 4, 7, 7)
+    # output_attentions defaults to False -> the SDPA path runs and returns no
+    # weights (the manual softmax path is used only when they are requested).
+    assert attn_weights is None
 
 
 def test_output_attentions_returns_fp32_weights_summing_to_one():
@@ -190,29 +187,24 @@ def test_softmax_row_masks_pads_to_zero():
 
 
 # ---------------------------------------------------------------------------
-# Fast-path guards
+# Path selection: SDPA by default, manual softmax for output_attentions
 # ---------------------------------------------------------------------------
 
 
-def test_use_fast_path_returns_false_on_cpu():
-    attn = OplmAttention(_config(use_flex_attention=True))
-    assert attn._use_fast_path(output_attentions=False, device=torch.device("cpu")) is False
+def test_default_path_returns_no_attention_weights():
+    """output_attentions=False takes the SDPA path, which yields no weights."""
+    attn = OplmAttention(_config()).eval()
+    out, w = attn(torch.randn(2, 6, 32), _ones_mask(2, 6), output_attentions=False)
+    assert out.shape == (2, 6, 32)
+    assert w is None
 
 
-def test_use_fast_path_returns_false_when_dropout_nonzero():
-    attn = OplmAttention(_config(use_flex_attention=True, attention_dropout=0.1))
-    # Even on a fake CUDA device claim, dropout != 0 forces the fallback.
-    assert attn._use_fast_path(output_attentions=False, device=torch.device("cuda")) is False
-
-
-def test_use_fast_path_returns_false_when_output_attentions():
-    attn = OplmAttention(_config(use_flex_attention=True))
-    assert attn._use_fast_path(output_attentions=True, device=torch.device("cuda")) is False
-
-
-def test_use_fast_path_returns_false_when_disabled_via_config():
-    attn = OplmAttention(_config(use_flex_attention=False))
-    assert attn._use_fast_path(output_attentions=False, device=torch.device("cuda")) is False
+def test_output_attentions_path_returns_weights():
+    """output_attentions=True takes the manual softmax path, which yields weights."""
+    attn = OplmAttention(_config()).eval()
+    _, w = attn(torch.randn(2, 6, 32), _ones_mask(2, 6), output_attentions=True)
+    assert w is not None
+    assert w.shape == (2, 4, 6, 6)
 
 
 # ---------------------------------------------------------------------------
@@ -270,30 +262,27 @@ def test_grad_flows_through_all_projections():
 
 
 # ---------------------------------------------------------------------------
-# Two-path equivalence (CUDA-only)
+# SDPA / manual-softmax equivalence
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex_attention requires CUDA.")
-def test_fast_and_fallback_paths_agree_on_cuda():
-    """Outputs from the fast and fallback paths match within `1e-2` rel tol.
+def test_sdpa_and_manual_paths_agree():
+    """The SDPA and manual-softmax paths produce the same `(B, T, D)` output.
 
-    The fast path returns no attention weights; we compare the projected
-    `(B, T, D)` outputs only.
+    Both share the scale (`1/sqrt(d_head)`) and key-padding semantics, so in
+    fp32 they agree to tight tolerance. The SDPA path returns no weights; we
+    compare the projected outputs only. Runs on CPU via SDPA's math backend, so
+    it is not gated on CUDA.
     """
     torch.manual_seed(0)
-    cfg = _config(hidden_size=32, num_attention_heads=4, attention_dropout=0.0)
-    attn = OplmAttention(cfg).to("cuda").eval()
-    x = torch.randn(2, 8, 32, device="cuda")
-    mask = torch.ones(2, 8, dtype=torch.long, device="cuda")
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4)).eval()
+    x = torch.randn(2, 8, 32)
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.long)
 
     with torch.no_grad():
-        # Force the fast path.
-        attn.use_flex_attention = True
-        out_fast, w_fast = attn(x, mask, output_attentions=False)
-        assert w_fast is None
-        # Force the fallback path.
-        attn.use_flex_attention = False
-        out_slow, _ = attn(x, mask, output_attentions=False)
+        out_sdpa, w_sdpa = attn(x, mask, output_attentions=False)
+        out_manual, w_manual = attn(x, mask, output_attentions=True)
 
-    assert torch.allclose(out_fast, out_slow, rtol=1e-2, atol=1e-2)
+    assert w_sdpa is None
+    assert w_manual is not None
+    assert torch.allclose(out_sdpa, out_manual, rtol=1e-4, atol=1e-5)

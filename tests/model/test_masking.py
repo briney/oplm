@@ -1,15 +1,11 @@
-"""Tests for `oplm.model.masking` — prepare_attention_mask, zero_pad_positions, flex."""
+"""Tests for `oplm.model.masking` — prepare_attention_mask, zero_pad_positions."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from oplm.model.masking import (
-    make_flex_block_mask,
-    prepare_attention_mask,
-    zero_pad_positions,
-)
+from oplm.model.masking import prepare_attention_mask, zero_pad_positions
 
 # ---------------------------------------------------------------------------
 # prepare_attention_mask
@@ -89,47 +85,3 @@ def test_zero_pad_positions_with_float_mask():
     assert torch.equal(out[0, 2], torch.zeros(4))
     assert torch.equal(out[1, 1], torch.zeros(4))
     assert torch.equal(out[0, 0], x[0, 0])
-
-
-# ---------------------------------------------------------------------------
-# make_flex_block_mask
-# ---------------------------------------------------------------------------
-
-
-def _flex_available_on_device(device: torch.device) -> bool:
-    try:
-        from torch.nn.attention.flex_attention import create_block_mask  # noqa: F401
-    except ImportError:
-        return False
-    # create_block_mask itself runs on CPU; the kernel needs CUDA but the
-    # mask construction does not.
-    return True
-
-
-@pytest.mark.skipif(
-    not _flex_available_on_device(torch.device("cpu")),
-    reason="flex_attention not importable",
-)
-def test_make_flex_block_mask_builds_for_full_mask():
-    mask = torch.ones(2, 8, dtype=torch.long)
-    block_mask = make_flex_block_mask(mask, num_heads=4)
-    # Sanity: the BlockMask reports the expected query/kv lengths.
-    assert block_mask.kv_num_blocks is not None
-    # repr should mention the lengths we built it for.
-    text = repr(block_mask)
-    assert "8" in text
-
-
-@pytest.mark.skipif(
-    not _flex_available_on_device(torch.device("cpu")),
-    reason="flex_attention not importable",
-)
-def test_make_flex_block_mask_with_padding():
-    # Real tokens at positions 0..4, pads at 5..7 in row 0; row 1 fully real.
-    mask = torch.tensor(
-        [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1]],
-        dtype=torch.long,
-    )
-    block_mask = make_flex_block_mask(mask, num_heads=2)
-    # The row that has pads must allow strictly fewer KV slots than the all-ones row.
-    assert block_mask.kv_num_blocks is not None

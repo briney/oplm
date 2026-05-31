@@ -55,7 +55,7 @@ oplm info --preset large model.num_hidden_layers=40
 
 # encode keeps --override, since its positional slot holds the sequences
 oplm encode SEQ1 SEQ2 --model outputs/base-run/checkpoint-10000 \
-  --override model.use_flex_attention=false
+  --override model.attention_dropout=0.0
 
 # the distributed entry point forwards trailing dotlist args to load_config()
 accelerate launch -m oplm.train --config configs/my_run.yaml \
@@ -160,7 +160,6 @@ Consumed by `OplmForSequenceClassification` / `OplmForTokenClassification`.
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
 | `model.initializer_range` | `float` | `0.02` | Truncated-normal init std. |
-| `model.use_flex_attention` | `bool` | `true` | Use the `flex_attention` fast path. Falls back to the manual kernel when returning attention weights. |
 | `model.gradient_checkpointing` | `bool` | `false` | Activation checkpointing in the encoder. |
 | `model.pad_token_id` | `int` | `1` | `<pad>`. |
 | `model.bos_token_id` | `int` | `0` | `<cls>` (prepended to every sequence). |

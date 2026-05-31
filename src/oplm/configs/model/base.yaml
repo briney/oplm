@@ -42,7 +42,6 @@ model:
   canon_kernel_sizes: 4
   canon_activation: none      # none | silu | gelu
 
-  # Init / attention kernel / checkpointing
+  # Init / checkpointing
   initializer_range: 0.02
-  use_flex_attention: true
   gradient_checkpointing: false
