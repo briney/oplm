@@ -4,11 +4,11 @@
 # (head_dim, intermediate_size, rope_dim, nope_dim) are omitted so they resolve
 # from the source dimensions unless explicitly overridden.
 model:
-  # Core dimensions
+  # Core dimensions (~400M parameters)
   vocab_size: 33
-  hidden_size: 768
-  num_hidden_layers: 12
-  num_attention_heads: 12
+  hidden_size: 1024
+  num_hidden_layers: 32
+  num_attention_heads: 16
   max_position_embeddings: 1024
 
   # Positional encoding (full RoPE by default: rope_dim resolves to head_dim)
@@ -16,16 +16,16 @@ model:
   nope_dim: 0
 
   # Normalization
-  norm_type: layernorm        # layernorm | rmsnorm
+  norm_type: layernorm # layernorm | rmsnorm
   norm_eps: 1.0e-6
-  norm_strategy: pre          # pre | sandwich | hybrid | post_sdpa
+  norm_strategy: pre # pre | sandwich | hybrid | post_sdpa
   qk_norm: true
   post_embed_norm: false
-  residual_scaling: sqrt_num_layers   # sqrt_num_layers | none
+  residual_scaling: sqrt_num_layers # sqrt_num_layers | none
   init_scale_output_projections: true
 
   # Feed-forward
-  ffn_activation: swiglu      # swiglu | geglu (both gated, 3 projections)
+  ffn_activation: swiglu # swiglu | geglu (both gated, 3 projections)
   ffn_bias: false
 
   # Dropout
@@ -34,13 +34,13 @@ model:
 
   # Embeddings / head
   tie_word_embeddings: false
-  mlm_head_activation: gelu   # gelu | silu | relu
+  mlm_head_activation: gelu # gelu | silu | relu
 
   # Canon depthwise convolution (off by default)
   canon_enabled: false
-  canon_positions: []         # subset of {A, B, C, D}
+  canon_positions: [] # subset of {A, B, C, D}
   canon_kernel_sizes: 4
-  canon_activation: none      # none | silu | gelu
+  canon_activation: none # none | silu | gelu
 
   # Init / checkpointing
   initializer_range: 0.02

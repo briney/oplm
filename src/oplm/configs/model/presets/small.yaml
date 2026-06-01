@@ -1,5 +1,0 @@
-# ~25M parameters — fast ablation
-model:
-  hidden_size: 256
-  num_hidden_layers: 6
-  num_attention_heads: 4

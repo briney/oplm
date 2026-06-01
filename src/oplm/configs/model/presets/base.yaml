@@ -1,5 +1,0 @@
-# ~350M parameters — Proust-scale
-model:
-  hidden_size: 1024
-  num_hidden_layers: 24
-  num_attention_heads: 16

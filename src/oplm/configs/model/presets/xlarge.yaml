@@ -1,6 +1,0 @@
-# ~15B parameters — production
-model:
-  hidden_size: 5120
-  num_hidden_layers: 40
-  num_attention_heads: 40
-  gradient_checkpointing: true

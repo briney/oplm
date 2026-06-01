@@ -1,0 +1,6 @@
+# ~50M parameters
+# 32 width:depth ratio
+model:
+  hidden_size: 512
+  num_hidden_layers: 16
+  num_attention_heads: 8

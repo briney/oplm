@@ -1,0 +1,7 @@
+# ~6B parameters
+# 32 width:depth ratio
+model:
+  hidden_size: 2560
+  num_hidden_layers: 80
+  num_attention_heads: 40
+  # gradient_checkpointing: true
