@@ -152,3 +152,26 @@ def test_model_base_yaml_has_no_typos(key: str) -> None:
     this is the only guard against a misspelled model default.
     """
     assert key in set(OplmModelConfig().to_dict())
+
+
+# --- torch.compile config fields -----------------------------------------------
+
+
+def test_compile_defaults() -> None:
+    """``compile`` is False and ``compile_mode`` is 'default' out of the box."""
+    cfg = TrainConfig(wandb_enabled=False)
+    assert cfg.compile is False
+    assert cfg.compile_mode == "default"
+
+
+@pytest.mark.parametrize("mode", ["default", "reduce-overhead", "max-autotune"])
+def test_compile_mode_valid(mode: str) -> None:
+    """Each recognized compile mode is accepted without error."""
+    cfg = TrainConfig(wandb_enabled=False, compile_mode=mode)
+    assert cfg.compile_mode == mode
+
+
+def test_compile_mode_invalid() -> None:
+    """An unrecognized compile_mode raises ValueError."""
+    with pytest.raises(ValueError, match="compile_mode"):
+        TrainConfig(wandb_enabled=False, compile_mode="turbo")

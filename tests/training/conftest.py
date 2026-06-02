@@ -20,7 +20,7 @@ from oplm.model import OplmConfig as OplmModelConfig
 from oplm.training import TrainerCallback
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
     from pathlib import Path
 
     from oplm.training.trainer import Trainer
@@ -105,6 +105,8 @@ def tiny_train_cfg(
     resume_from: str | None = None,
     seed: int = 42,
     mixed_precision: str = "no",
+    compile: bool = False,
+    compile_mode: str = "default",
     wandb_enabled: bool = False,
     wandb_project: str = "oplm",
     wandb_run_name: str | None = None,
@@ -154,6 +156,8 @@ def tiny_train_cfg(
             seed=seed,
             output_dir=str(output_dir),
             mixed_precision=mixed_precision,
+            compile=compile,
+            compile_mode=compile_mode,
             wandb_enabled=wandb_enabled,
             wandb_project=wandb_project,
             wandb_run_name=wandb_run_name,
@@ -198,3 +202,11 @@ DEVICE_PRECISION_PARAMS = [
 def make_tiny_cfg() -> Callable[..., OplmConfig]:
     """Fixture wrapper around :func:`tiny_train_cfg` for tests that prefer injection."""
     return tiny_train_cfg
+
+
+@pytest.fixture
+def reset_dynamo() -> Generator[None, None, None]:
+    """Clear torch.compile cache before and after a test."""
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()

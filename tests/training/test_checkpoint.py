@@ -124,6 +124,39 @@ def test_load_checkpoint_restores_state(tmp_path: Path) -> None:
     assert state["tokens_seen"] == 400
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_hf_export_round_trips_with_compile(tmp_path: Path, reset_dynamo: None) -> None:
+    """HF export succeeds and weights match when the model was torch.compiled."""
+    from accelerate import Accelerator
+
+    cfg = _cfg()
+    accelerator = Accelerator(mixed_precision="no")
+    model = OplmForMaskedLM(cfg.model)
+    model = torch.compile(model, dynamic=True)
+    model = accelerator.prepare(model)
+
+    original_bias = (
+        accelerator.unwrap_model(model)._orig_mod.lm_head.decoder.bias.detach().clone()
+    )
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    hf_dir = tmp_path / "checkpoint-10" / "hf"
+    assert (hf_dir / "model.safetensors").exists()
+
+    reloaded = OplmForMaskedLM.from_pretrained(str(hf_dir))
+    assert torch.allclose(reloaded.lm_head.decoder.bias.detach().cpu(), original_bias.cpu())
+
+
 def test_rotation_keeps_save_total_limit(tmp_path: Path) -> None:
     """Saving beyond ``save_total_limit`` deletes the oldest checkpoints."""
     cfg = _cfg()

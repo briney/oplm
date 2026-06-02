@@ -119,8 +119,7 @@ class TrainConfig:
             )
         if self.compile_mode not in _VALID_COMPILE_MODES:
             raise ValueError(
-                f"compile_mode must be one of {_VALID_COMPILE_MODES}, "
-                f"got {self.compile_mode!r}"
+                f"compile_mode must be one of {_VALID_COMPILE_MODES}, got {self.compile_mode!r}"
             )
         if self.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
@@ -294,7 +293,8 @@ def get_preset_config(preset: str) -> DictConfig:
     """Load a model size preset by name.
 
     Args:
-        preset: One of ``"50M"``, ``"170M"``, ``"400M"``, ``"800M"``, ``"1B"``, ``"3B"``, ``"6B"``, ``"12B"``.
+        preset: One of ``"50M"``, ``"170M"``, ``"400M"``, ``"800M"``, ``"1B"``, ``"3B"``,
+            ``"6B"``, ``"12B"``.
 
     Returns:
         DictConfig loaded from the preset YAML.

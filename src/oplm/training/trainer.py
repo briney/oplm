@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import torch.nn as nn
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -102,7 +103,11 @@ class Trainer:
 
         if cfg.train.compile:
             _status("[dim]Compiling model (torch.compile)...[/dim]")
-            model = torch.compile(model, dynamic=True, mode=cfg.train.compile_mode)
+            # torch.compile stubs return Callable; cast to nn.Module so downstream
+            # calls are well-typed — OptimizedModule IS an nn.Module at runtime.
+            model = cast(
+                "nn.Module", torch.compile(model, dynamic=True, mode=cfg.train.compile_mode)
+            )
 
         # Optimizer and dataloader
         optimizers = build_optimizers(model, cfg.train)

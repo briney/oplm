@@ -80,6 +80,10 @@ def save_checkpoint(
         # HuggingFace export for from_pretrained-style downstream loading
         hf_dir = checkpoint_dir / "hf"
         unwrapped = accelerator.unwrap_model(model)
+        # torch.compile wraps the model in OptimizedModule; peel it off to reach
+        # the underlying PreTrainedModel for save_pretrained.
+        if hasattr(unwrapped, "_orig_mod"):
+            unwrapped = unwrapped._orig_mod
         unwrapped.save_pretrained(hf_dir)  # config.json + model.safetensors
         get_tokenizer().save_pretrained(hf_dir)  # tokenizer files for round-trip
 
