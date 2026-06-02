@@ -5,6 +5,7 @@ Uses OmegaConf for YAML serialization, CLI overrides, and type-safe merging.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
@@ -18,6 +19,8 @@ AVAILABLE_PRESETS = ("50M", "170M", "400M", "800M", "1B", "3B", "6B", "12B")
 _VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
 _VALID_OPTIMIZERS = ("adamw", "muon")
 _VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
+_VALID_PRECISION = ("bf16", "fp8")
+_VALID_FSDP_STRATEGIES = ("full", "hybrid", "none")
 _VALID_COMPILE_MODES = ("default", "reduce-overhead", "max-autotune")
 _VALID_MUON_ADJUST_LR_FNS = ("match_rms_adamw", "original")
 
@@ -82,7 +85,22 @@ class TrainConfig:
     output_dir: str = "outputs"
     # Provenance field populated by ``load_config()`` when a YAML file is used.
     config_path: str | None = None
+    # DEPRECATED: superseded by ``precision`` (below). Retained only so existing
+    # configs keep loading. The native FSDP2 Trainer consults ``precision`` exclusively
+    # and ignores this field. Setting both ``mixed_precision`` and ``precision`` to
+    # non-bf16 values is rejected in __post_init__ to avoid ambiguity.
     mixed_precision: str = "bf16"
+    # Training precision:
+    #   "bf16" — standard BF16 mixed precision (default).
+    #   "fp8"  — torchao FP8 training with rowwise scaling; requires sm90+
+    #            (Blackwell / H100+) hardware. Fallback is NOT automatic — the
+    #            Trainer raises early if the device lacks FP8 support.
+    precision: str = "bf16"
+    # FSDP2 sharding strategy:
+    #   "full"   — shard weights + grads + optimizer state across all ranks (default).
+    #   "hybrid" — shard within a node, replicate across nodes (NVLink-rich clusters).
+    #   "none"   — no sharding (single-GPU or debugging).
+    fsdp_sharding_strategy: str = "full"
     # torch.compile
     # Compiles the model with torch.compile before DDP wrapping. Requires an
     # initial compilation step on the first forward pass (may take several minutes
@@ -117,6 +135,23 @@ class TrainConfig:
                 f"mixed_precision must be one of {_VALID_MIXED_PRECISION}, "
                 f"got {self.mixed_precision!r}"
             )
+        if self.precision not in _VALID_PRECISION:
+            raise ValueError(f"precision must be one of {_VALID_PRECISION}, got {self.precision!r}")
+        if self.fsdp_sharding_strategy not in _VALID_FSDP_STRATEGIES:
+            raise ValueError(
+                f"fsdp_sharding_strategy must be one of {_VALID_FSDP_STRATEGIES}, "
+                f"got {self.fsdp_sharding_strategy!r}"
+            )
+        # ``mixed_precision`` is deprecated in favor of ``precision``. Setting both to
+        # non-bf16 values is ambiguous (which one wins?), so reject it outright.
+        if self.mixed_precision != "bf16" and self.precision != "bf16":
+            raise ValueError(
+                "mixed_precision is deprecated; use precision instead. Both cannot be "
+                f"set to non-bf16 values simultaneously (got mixed_precision="
+                f"{self.mixed_precision!r}, precision={self.precision!r})."
+            )
+        if self.precision == "fp8":
+            self._warn_if_fp8_unsupported()
         if self.compile_mode not in _VALID_COMPILE_MODES:
             raise ValueError(
                 f"compile_mode must be one of {_VALID_COMPILE_MODES}, got {self.compile_mode!r}"
@@ -136,6 +171,31 @@ class TrainConfig:
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
+            )
+
+    def _warn_if_fp8_unsupported(self) -> None:
+        """Warn (never raise) if FP8 was requested on detectably unsupported hardware.
+
+        FP8 needs sm90+ (Blackwell / H100+). Config loading can run before CUDA init
+        (e.g. CPU-only test contexts), so this only warns when device capability is
+        actually queryable and below sm90. The Trainer performs the authoritative,
+        fail-fast check via ``oplm.training.precision.is_fp8_supported`` before
+        converting the model.
+        """
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return
+            major, _ = torch.cuda.get_device_capability()
+        except ImportError:
+            return
+        if major < 9:
+            warnings.warn(
+                f"train.precision='fp8' requires an sm90+ GPU (Blackwell / H100+), but "
+                f"the detected device reports compute capability sm{major}x. FP8 matmuls "
+                f"will fail at runtime on this hardware.",
+                stacklevel=3,
             )
 
 

@@ -41,14 +41,14 @@ target) this leaves two remaining performance gaps (one has already been closed)
 
 - [x] **1.1** Create branch `native-fsdp2-and-fp8` from `main`
 
-- [ ] **1.2** Update `pyproject.toml`:
+- [x] **1.2** Update `pyproject.toml`:
   - Add `torchao>=0.7` to `[project.dependencies]` (core dep, not extras)
   - In `[project.optional-dependencies]` under `train`: remove `accelerate>=0.30`
     and `deepspeed>=0.14`; add a comment indicating accelerate is no longer required
   - Torch constraint `>=2.11,<2.12` is already correct — `fully_shard` composable API
     and `torch.optim.Muon` are 2.11 features; leave it untouched
 
-- [ ] **1.3** Add new fields to `TrainConfig` in `src/oplm/config.py`:
+- [x] **1.3** Add new fields to `TrainConfig` in `src/oplm/config.py`:
 
   > **Note:** `compile: bool = False` and `compile_mode: str = "default"` were already
   > added on `main` (PR #3). Still needed: `precision`, `fsdp_sharding_strategy`, and
@@ -76,7 +76,7 @@ target) this leaves two remaining performance gaps (one has already been closed)
   `precision != "bf16"` are set simultaneously (prevents ambiguity). In the new Trainer,
   only `precision` is consulted.
 
-- [ ] **1.4** Update `src/oplm/configs/train/base.yaml` to include the new fields:
+- [x] **1.4** Update `src/oplm/configs/train/base.yaml` to include the new fields:
 
   > **Note:** `compile: false` and `compile_mode: default` already present on `main`
   > (PR #3). Still needed: `precision: bf16` and `fsdp_sharding_strategy: full`.
@@ -87,7 +87,7 @@ target) this leaves two remaining performance gaps (one has already been closed)
     fsdp_sharding_strategy: full
   ```
 
-- [ ] **1.5** Add `@pytest.mark.blackwell` to `pyproject.toml` markers list:
+- [x] **1.5** Add `@pytest.mark.blackwell` to `pyproject.toml` markers list:
 
   ```toml
   [tool.pytest.ini_options]

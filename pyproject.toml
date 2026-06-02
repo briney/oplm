@@ -27,6 +27,7 @@ dependencies = [
     # reports resolved-Optional config fields (head_dim, intermediate_size, ...) as
     # errors. Bump deliberately after re-running `ty check src/` + the test suite.
     "torch>=2.11.0,<2.12",  # FlashAttention-4 backend on Blackwell (via SDPA) + torch.optim.Muon need >=2.11
+    "torchao>=0.7",  # FP8 training (rowwise scaling) + Float8Linear conversion; core dep
     "transformers>=4.45,<5.4",
     "omegaconf>=2.3",
     "typer>=0.9",
@@ -37,8 +38,8 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
-    "accelerate>=0.30",
-    "deepspeed>=0.14",
+    # accelerate is no longer required: the trainer uses native torch.distributed
+    # (FSDP2 / fully_shard) + DCP checkpointing. DeepSpeed has been removed entirely.
     "wandb>=0.16",
     "datasets>=2.18",
     "biopython>=1.83",
@@ -86,6 +87,7 @@ known-first-party = ["oplm"]
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "blackwell: requires sm90+ GPU (Blackwell / H100+); skip on other hardware",
 ]
 
 [tool.ty.environment]
