@@ -86,9 +86,9 @@ def test_default_model_is_hf_config() -> None:
 
 def test_preset_and_cli_override_apply() -> None:
     """A size preset sets dims; a CLI dotlist override beats the preset/base layer."""
-    cfg = load_config(["--preset", "small", "model.num_hidden_layers=4"])
+    cfg = load_config(["--preset", "50M", "model.num_hidden_layers=4"])
     assert cfg.model.num_hidden_layers == 4  # CLI override wins
-    assert cfg.model.hidden_size == 256  # from the `small` preset
+    assert cfg.model.hidden_size == 512  # from the `50M` preset
 
 
 def test_derived_fields_resolve_when_omitted() -> None:
@@ -152,3 +152,26 @@ def test_model_base_yaml_has_no_typos(key: str) -> None:
     this is the only guard against a misspelled model default.
     """
     assert key in set(OplmModelConfig().to_dict())
+
+
+# --- torch.compile config fields -----------------------------------------------
+
+
+def test_compile_defaults() -> None:
+    """``compile`` is False and ``compile_mode`` is 'default' out of the box."""
+    cfg = TrainConfig(wandb_enabled=False)
+    assert cfg.compile is False
+    assert cfg.compile_mode == "default"
+
+
+@pytest.mark.parametrize("mode", ["default", "reduce-overhead", "max-autotune"])
+def test_compile_mode_valid(mode: str) -> None:
+    """Each recognized compile mode is accepted without error."""
+    cfg = TrainConfig(wandb_enabled=False, compile_mode=mode)
+    assert cfg.compile_mode == mode
+
+
+def test_compile_mode_invalid() -> None:
+    """An unrecognized compile_mode raises ValueError."""
+    with pytest.raises(ValueError, match="compile_mode"):
+        TrainConfig(wandb_enabled=False, compile_mode="turbo")

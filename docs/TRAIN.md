@@ -353,6 +353,40 @@ Trainer(cfg, callbacks=[PrintLoss()]).train()
 
 ---
 
+## 13. torch.compile
+
+Pass `train.compile=true` to enable `torch.compile(model, dynamic=True)`.
+
+The model is compiled before DDP wrapping (after gradient checkpointing is
+enabled, if set), so the compiled graph includes the recompute wrapper and DDP
+sees an `OptimizedModule` rather than a raw model — the standard ordering.
+`dynamic=True` is mandatory: protein sequences are padded to the batch maximum,
+so `seq_len` varies per batch; without dynamic shapes every unique length would
+trigger a recompile.
+
+**First-step latency:** compilation runs on the first forward pass and may take
+several minutes for large models. Subsequent steps run the compiled graph.
+Triton autotune artifacts are cached under `~/.cache/oplm/triton/autotune` so
+repeated runs skip recompilation.
+
+**Compile modes** (`train.compile_mode`):
+
+| Mode | When to use |
+|------|-------------|
+| `default` | Balanced; safe for all hardware. |
+| `reduce-overhead` | Uses CUDA graphs to reduce kernel-launch overhead; best for small batch sizes. |
+| `max-autotune` | Tries more optimization strategies; longest compile time, best peak throughput on Blackwell. |
+
+Recommended for all multi-GPU production runs. Use `compile_mode=max-autotune`
+on Blackwell for best throughput at the cost of a longer initial compile.
+
+```bash
+# opt in via CLI override
+torchrun --nproc_per_node=8 -m oplm.train --config my_run.yaml train.compile=true
+```
+
+---
+
 ## See also
 
 - [CONFIG.md](CONFIG.md) — full configuration reference.

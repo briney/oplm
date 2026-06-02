@@ -11,12 +11,12 @@ from oplm.eval.registry import get_eval_task_class
 from oplm.eval.schedule import EveryNSteps, EveryNTokens
 
 if TYPE_CHECKING:
+    import torch.nn as nn
     from accelerate import Accelerator
 
     from oplm.config import OplmConfig
     from oplm.eval.context import EvalContext
     from oplm.eval.tasks.base import EvalTask
-    from oplm.model import OplmForMaskedLM
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ class Evaluator:
                 )
 
     def run_due(
-        self, ctx: EvalContext, model: OplmForMaskedLM, accelerator: Accelerator
+        self, ctx: EvalContext, model: nn.Module, accelerator: Accelerator
     ) -> dict[str, float]:
         """Run every task due at ``ctx`` and return merged ``eval/<name>/<metric>`` metrics.
 

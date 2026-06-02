@@ -5,7 +5,7 @@ Cross-cutting flow, so it lives at ``tests/`` top level rather than under
 
 * ``oplm.train.main(cfg)`` with a pre-built config runs a tiny real loop to a
   checkpoint; and
-* a ``python -m oplm.train --preset small <overrides>`` subprocess covers the
+* a ``python -m oplm.train --preset 50M <overrides>`` subprocess covers the
   full ``argv -> load_config -> _bootstrap_training_environment -> main ->
   Trainer`` chain and exits 0.
 """
@@ -57,7 +57,7 @@ def test_module_subprocess_trains_and_exits_zero(training_parquet: Path, tmp_pat
         "data.num_workers=0",
         "data.pin_memory=false",
     ]
-    cmd = [sys.executable, "-m", "oplm.train", "--preset", "small", *overrides]
+    cmd = [sys.executable, "-m", "oplm.train", "--preset", "50M", *overrides]
     # Force CPU in the child so the run is fast and deterministic (SDPA math backend).
     env = {**os.environ, "ACCELERATE_USE_CPU": "true"}
 

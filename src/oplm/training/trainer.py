@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import torch.nn as nn
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -115,6 +116,22 @@ class Trainer:
         prepared = self.accelerator.prepare(model, *optimizers, dataloader, *schedulers)
         num_optimizers = len(optimizers)
         self.model = prepared[0]
+
+        # Apply torch.compile AFTER accelerator.prepare so that accelerate always
+        # receives the raw model and wraps it with DDP normally. Compiling the
+        # DDP-wrapped model produces OptimizedModule(_orig_mod=DDP(model)), which
+        # accelerate.unwrap_model can unambiguously peel. Compiling before prepare
+        # causes some accelerate versions to strip the compile wrapper during prepare,
+        # leaving self.model = DDP(model) with no _orig_mod — and unwrap_model then
+        # fails with KeyError: '_orig_mod' at the first eval call.
+        if cfg.train.compile:
+            _status("[dim]Compiling model (torch.compile)...[/dim]")
+            # torch.compile stubs return Callable; cast to nn.Module so downstream
+            # calls are well-typed — OptimizedModule IS an nn.Module at runtime.
+            self.model = cast(
+                "nn.Module",
+                torch.compile(self.model, dynamic=True, mode=cfg.train.compile_mode),
+            )
         self.optimizers = list(prepared[1 : 1 + num_optimizers])
         self.optimizer = self.optimizers[0]
         self.dataloader = prepared[1 + num_optimizers]

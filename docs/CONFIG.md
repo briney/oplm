@@ -222,6 +222,8 @@ Backed by `oplm.config.TrainConfig`.
 | `train.seed` | `int` | `42` | Global seed. |
 | `train.output_dir` | `str` | `outputs` | Base dir for logs and checkpoints. |
 | `train.mixed_precision` | `str` | `bf16` | `bf16`, `fp16`, or `no`. |
+| `train.compile` | `bool` | `false` | Enable `torch.compile` (opt-in; adds first-step latency). |
+| `train.compile_mode` | `str` | `default` | Compile mode: `default` \| `reduce-overhead` \| `max-autotune`. |
 | `train.config_path` | `str \| null` | `null` | Auto-populated from `--config` for provenance. |
 
 ## Data fields (`data.*`)

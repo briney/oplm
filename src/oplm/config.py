@@ -12,12 +12,13 @@ from typing import Any, cast
 
 from omegaconf import DictConfig, OmegaConf
 
-AVAILABLE_PRESETS = ("small", "medium", "base", "large", "xlarge")
+AVAILABLE_PRESETS = ("50M", "170M", "400M", "800M", "1B", "3B", "6B", "12B")
 
 
 _VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
 _VALID_OPTIMIZERS = ("adamw", "muon")
 _VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
+_VALID_COMPILE_MODES = ("default", "reduce-overhead", "max-autotune")
 _VALID_MUON_ADJUST_LR_FNS = ("match_rms_adamw", "original")
 
 # Effective default for ``train.eval_every`` when left null. The field itself
@@ -82,6 +83,19 @@ class TrainConfig:
     # Provenance field populated by ``load_config()`` when a YAML file is used.
     config_path: str | None = None
     mixed_precision: str = "bf16"
+    # torch.compile
+    # Compiles the model with torch.compile before DDP wrapping. Requires an
+    # initial compilation step on the first forward pass (may take several minutes
+    # for large models). Uses dynamic=True internally so variable sequence lengths
+    # do not trigger recompilation. Disabled by default.
+    compile: bool = False
+    # Compilation mode passed to torch.compile(mode=...).
+    # "default"          — balanced; safe for all hardware.
+    # "reduce-overhead"  — uses CUDA graphs to reduce kernel-launch overhead;
+    #                      best for small batch sizes.
+    # "max-autotune"     — tries more optimization strategies; longest compile
+    #                      time, best peak throughput on Blackwell.
+    compile_mode: str = "default"
 
     def __post_init__(self) -> None:
         """Validate training configuration."""
@@ -102,6 +116,10 @@ class TrainConfig:
             raise ValueError(
                 f"mixed_precision must be one of {_VALID_MIXED_PRECISION}, "
                 f"got {self.mixed_precision!r}"
+            )
+        if self.compile_mode not in _VALID_COMPILE_MODES:
+            raise ValueError(
+                f"compile_mode must be one of {_VALID_COMPILE_MODES}, got {self.compile_mode!r}"
             )
         if self.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
@@ -275,7 +293,8 @@ def get_preset_config(preset: str) -> DictConfig:
     """Load a model size preset by name.
 
     Args:
-        preset: One of ``"small"``, ``"medium"``, ``"base"``, ``"large"``, ``"xlarge"``.
+        preset: One of ``"50M"``, ``"170M"``, ``"400M"``, ``"800M"``, ``"1B"``, ``"3B"``,
+            ``"6B"``, ``"12B"``.
 
     Returns:
         DictConfig loaded from the preset YAML.

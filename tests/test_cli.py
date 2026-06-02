@@ -58,7 +58,7 @@ def test_encode_help_keeps_override_flag() -> None:
 
 def test_info_positional_override_applies() -> None:
     """A bare ``model.num_hidden_layers=4`` token flows through to the config."""
-    result = runner.invoke(app, ["info", "--preset", "small", "model.num_hidden_layers=4"])
+    result = runner.invoke(app, ["info", "--preset", "50M", "model.num_hidden_layers=4"])
     assert result.exit_code == 0, result.output
     # The "Layers" row of the architecture table should report the override.
     assert re.search(r"Layers[^\n]*\b4\b", _plain(result.output)), result.output
@@ -88,6 +88,6 @@ def test_train_positional_override_reaches_config(monkeypatch: pytest.MonkeyPatc
     # so patching the module attribute intercepts the real training launch.
     monkeypatch.setattr("oplm.train.main", fake_main)
 
-    result = runner.invoke(app, ["train", "--preset", "small", "train.max_steps=123"])
+    result = runner.invoke(app, ["train", "--preset", "50M", "train.max_steps=123"])
     assert result.exit_code == 0, result.output
     assert captured["cfg"].train.max_steps == 123
