@@ -104,7 +104,7 @@ target) this leaves two remaining performance gaps (one has already been closed)
 Create `src/oplm/training/precision.py`. This module is standalone — no Accelerate
 dependency, no Trainer dependency. It encapsulates all torchao FP8 logic.
 
-- [ ] **2.1** Implement `is_fp8_supported() -> bool`:
+- [x] **2.1** Implement `is_fp8_supported() -> bool`:
 
   ```python
   def is_fp8_supported() -> bool:
@@ -115,7 +115,7 @@ dependency, no Trainer dependency. It encapsulates all torchao FP8 logic.
       return major >= 9
   ```
 
-- [ ] **2.2** Implement `apply_fp8_training(model: nn.Module) -> None`:
+- [x] **2.2** Implement `apply_fp8_training(model: nn.Module) -> None`:
 
   ```python
   def apply_fp8_training(model: nn.Module) -> None:
@@ -133,21 +133,34 @@ dependency, no Trainer dependency. It encapsulates all torchao FP8 logic.
       )
   ```
 
-- [ ] **2.3** Implement `sync_fp8_history(model: nn.Module) -> None`:
+- [x] **2.3** Implement `sync_fp8_history(model: nn.Module) -> None`:
+
+  > **API change (torchao 0.17, satisfies the `>=0.7` pin):**
+  > `sync_float8_amax_and_scale_history` was a *delayed-scaling* primitive and has
+  > been **removed**. The `rowwise` recipe is *dynamic* scaling — scales are derived
+  > from current tensor values each forward, so there is no cross-iteration amax
+  > history to sync. The modern FSDP2 equivalent is
+  > `precompute_float8_dynamic_scale_for_fsdp`, which precomputes each sharded
+  > weight's scale in one all-reduce that overlaps the next all-gather.
+  >
+  > **Downstream impact on Phase 4 (4.13 / 4.16):** the FP8 sync call **moves to
+  > AFTER `optimizer.step()`**, not before — the weights must be updated first.
+  > It no-ops when there are no FSDP2-sharded `Float8Linear` weights (including the
+  > `fsdp_sharding_strategy="none"` debug path, where weights are not `DTensor`),
+  > so it stays safe to call unconditionally when `precision == "fp8"`.
 
   ```python
   def sync_fp8_history(model: nn.Module) -> None:
-      """Sync FP8 amax/scale history across ranks.
+      """Precompute dynamic FP8 weight scales for FSDP2.
 
-      Call at the gradient-accumulation boundary, after loss.backward() and
-      before optimizer.step(). This is a no-op if the model has no Float8Linear
-      layers (i.e., safe to call unconditionally if precision=="fp8").
+      Call AFTER optimizer.step(). No-op when the model has no FSDP2-sharded
+      Float8Linear weights, so safe to call unconditionally if precision=="fp8".
       """
-      from torchao.float8 import sync_float8_amax_and_scale_history
-      sync_float8_amax_and_scale_history(model)
+      from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+      precompute_float8_dynamic_scale_for_fsdp(model)
   ```
 
-- [ ] **2.4** Export all three from `src/oplm/training/__init__.py`.
+- [x] **2.4** Export all three from `src/oplm/training/__init__.py`.
 
 ---
 
@@ -376,11 +389,13 @@ with native PyTorch distributed primitives.
   else:
       loss = self.model(...).loss / cfg.gradient_accumulation_steps
       loss.backward()
-      # Sync FP8 amax/scale history before optimizer step
-      if cfg.precision == "fp8":
-          from oplm.training.precision import sync_fp8_history
-          sync_fp8_history(self.model)
   ```
+
+  > **CORRECTION (see Phase 2.3):** the FP8 sync does **not** go here. With torchao's
+  > dynamic `rowwise` recipe, `sync_fp8_history` wraps
+  > `precompute_float8_dynamic_scale_for_fsdp`, which must run **after**
+  > `optimizer.step()` (weights must be updated first). Wire it into task **4.16**,
+  > not here.
 
   Note: `model.no_sync()` on an FSDP2 module skips the reduce-scatter of gradients
   during backward. This is the correct accumulation pattern for FSDP2.
@@ -405,6 +420,11 @@ with native PyTorch distributed primitives.
       for optimizer in self.optimizers:
           optimizer.step()
           optimizer.zero_grad()
+      # FP8 (dynamic rowwise): precompute next-iter weight scales AFTER the step.
+      # No-op unless the model has FSDP2-sharded Float8Linear weights. See Phase 2.3.
+      if self.cfg.train.precision == "fp8":
+          from oplm.training.precision import sync_fp8_history
+          sync_fp8_history(self.model)
       for scheduler in self.schedulers:
           scheduler.step()
       self.global_step += 1
