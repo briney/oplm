@@ -1,12 +1,18 @@
 """Training entry point.
 
-Run directly:     python -m oplm.train --config configs/my_run.yaml model.num_hidden_layers=32
-Run distributed:  accelerate launch -m oplm.train --config configs/my_run.yaml
+Launch with torchrun (single- or multi-GPU)::
+
+    torchrun --nproc_per_node=1 -m oplm.train --config configs/my_run.yaml
+    torchrun --nproc_per_node=8 -m oplm.train --config configs/my_run.yaml
+
+Append dotlist overrides to opt into features::
+
+    train.precision=fp8     FP8 training (Blackwell / sm90+ only)
+    train.compile=true      torch.compile the model
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import sys
 import tempfile
@@ -20,19 +26,6 @@ if TYPE_CHECKING:
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-_DEEPSPEED_OPT_IN_ENV = "OPLM_ENABLE_DEEPSPEED"
-_DEEPSPEED_ENV_VARS = (
-    "ACCELERATE_USE_DEEPSPEED",
-    "ACCELERATE_DEEPSPEED_CONFIG_FILE",
-    "ACCELERATE_DEEPSPEED_MOE_LAYER_CLS_NAMES",
-    "ACCELERATE_CONFIG_DS_FIELDS",
-)
-_DEEPSPEED_LOGGER_NAME = "DeepSpeed"
-
-
-def _env_flag_is_enabled(value: str | None) -> bool:
-    return value is not None and value.lower() in {"1", "true", "yes", "on"}
-
 
 def _ensure_triton_cache_dir(
     env: MutableMapping[str, str],
@@ -40,6 +33,11 @@ def _ensure_triton_cache_dir(
     home_dir: Path | None = None,
     tmp_dir: Path | None = None,
 ) -> Path:
+    """Resolve (or create) a writable Triton autotune cache dir and export it in ``env``.
+
+    Honors an already-set ``TRITON_CACHE_DIR``; otherwise tries a home-cache
+    location and falls back to a tmp location. Returns the resolved directory.
+    """
     existing = env.get("TRITON_CACHE_DIR")
     if existing:
         return Path(existing)
@@ -60,26 +58,27 @@ def _ensure_triton_cache_dir(
     raise RuntimeError("Unable to create a Triton cache directory for training.")
 
 
-def _set_deepspeed_logger_enabled(enabled: bool) -> None:
-    logger = logging.getLogger(_DEEPSPEED_LOGGER_NAME)
-    logger.disabled = not enabled
-
-
-def _bootstrap_training_environment(
+def _setup_triton_cache(
     env: MutableMapping[str, str] | None = None,
     *,
     home_dir: Path | None = None,
     tmp_dir: Path | None = None,
 ) -> Path:
+    """Ensure ``torch.compile``'s Triton backend has a writable autotune cache.
+
+    The Triton backend writes autotune artifacts to ``TRITON_CACHE_DIR``; this
+    guarantees the variable points at a directory that exists. Defaults to the
+    live process environment when ``env`` is omitted.
+
+    Args:
+        env: Environment mapping to read/update. Defaults to ``os.environ``.
+        home_dir: Override for the home-cache root (testing).
+        tmp_dir: Override for the tmp fallback root (testing).
+
+    Returns:
+        The resolved Triton cache directory.
+    """
     runtime_env = os.environ if env is None else env
-    deepspeed_enabled = _env_flag_is_enabled(runtime_env.get(_DEEPSPEED_OPT_IN_ENV))
-
-    if not deepspeed_enabled:
-        runtime_env["ACCELERATE_USE_DEEPSPEED"] = "false"
-        for key in _DEEPSPEED_ENV_VARS[1:]:
-            runtime_env.pop(key, None)
-
-    _set_deepspeed_logger_enabled(deepspeed_enabled)
     return _ensure_triton_cache_dir(runtime_env, home_dir=home_dir, tmp_dir=tmp_dir)
 
 
@@ -89,7 +88,7 @@ def main(cfg: OplmConfig | None = None) -> None:
     Args:
         cfg: Pre-loaded config. If None, parses from sys.argv.
     """
-    _bootstrap_training_environment()
+    _setup_triton_cache()
 
     if cfg is None:
         from oplm.config import load_config

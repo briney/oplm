@@ -169,7 +169,7 @@ dependency, no Trainer dependency. It encapsulates all torchao FP8 logic.
 Replace Accelerate's `save_state` / `load_state` with PyTorch Distributed
 Checkpointing (DCP). The HF export (`save_pretrained`) path is preserved.
 
-- [ ] **3.1** Replace `save_checkpoint` signature and body:
+- [x] **3.1** Replace `save_checkpoint` signature and body:
 
   ```python
   def save_checkpoint(
@@ -218,7 +218,7 @@ Checkpointing (DCP). The HF export (`save_pretrained`) path is preserved.
   `model.save_pretrained(hf_dir)`. This avoids needing the Accelerate
   `unwrap_model` utility.
 
-- [ ] **3.2** Replace `load_checkpoint` signature and body:
+- [x] **3.2** Replace `load_checkpoint` signature and body:
 
   ```python
   def load_checkpoint(
@@ -239,9 +239,9 @@ Checkpointing (DCP). The HF export (`save_pretrained`) path is preserved.
   return state_json
   ```
 
-- [ ] **3.3** Remove the `Accelerator` type annotation and import from the file.
+- [x] **3.3** Remove the `Accelerator` type annotation and import from the file.
 
-- [ ] **3.4** `_rotate_checkpoints` helper is unchanged; keep it.
+- [x] **3.4** `_rotate_checkpoints` helper is unchanged; keep it.
 
 ---
 
@@ -252,7 +252,7 @@ with native PyTorch distributed primitives.
 
 ### 4a. `__init__` — process group, model, FSDP2, compile, optimizer
 
-- [ ] **4.1** Remove all `accelerate` imports. Add:
+- [x] **4.1** Remove all `accelerate` imports. Add:
 
   ```python
   import os
@@ -261,7 +261,7 @@ with native PyTorch distributed primitives.
   from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
   ```
 
-- [ ] **4.2** Replace Accelerator construction with process-group init:
+- [x] **4.2** Replace Accelerator construction with process-group init:
 
   ```python
   if not dist.is_initialized():
@@ -274,12 +274,12 @@ with native PyTorch distributed primitives.
   self.is_main = self.rank == 0
   ```
 
-- [ ] **4.3** Seeding: replace `set_seed(cfg.train.seed)` with
+- [x] **4.3** Seeding: replace `set_seed(cfg.train.seed)` with
   `torch.manual_seed(cfg.train.seed + self.rank)`. Each rank gets a different
   data seed; model init happens before sharding so all ranks start from the same
   weights.
 
-- [ ] **4.4** wandb init (rank 0 only):
+- [x] **4.4** wandb init (rank 0 only):
 
   ```python
   if self.is_main and cfg.train.wandb_enabled:
@@ -291,7 +291,7 @@ with native PyTorch distributed primitives.
       )
   ```
 
-- [ ] **4.5** Model construction and FP8 conversion (before FSDP2):
+- [x] **4.5** Model construction and FP8 conversion (before FSDP2):
 
   ```python
   model = OplmForMaskedLM(cfg.model)  # CPU init
@@ -302,7 +302,7 @@ with native PyTorch distributed primitives.
       apply_fp8_training(model)
   ```
 
-- [ ] **4.6** FSDP2 sharding. Per-block sharding is critical — it enables
+- [x] **4.6** FSDP2 sharding. Per-block sharding is critical — it enables
   activation offloading and keeps all-gather granularity manageable:
 
   ```python
@@ -337,7 +337,7 @@ with native PyTorch distributed primitives.
   and pass `mesh["shard"]` to per-block `fully_shard`, `mesh` to the root shard.
   Document this as a follow-on — for now implementing `"full"` and `"none"` is sufficient.
 
-- [ ] **4.7** `torch.compile` (after FSDP2):
+- [x] **4.7** `torch.compile` (after FSDP2):
 
   > **Reference:** already implemented in `src/oplm/training/trainer.py:127–133`
   > (Accelerate trainer). Port the same pattern here, after task 4.6.
@@ -349,28 +349,28 @@ with native PyTorch distributed primitives.
       # Without it, each unique (batch_size, seq_len) combination triggers a recompile.
   ```
 
-- [ ] **4.8** Optimizer construction after FSDP2. The current `build_optimizers(model, cfg.train)`
+- [x] **4.8** Optimizer construction after FSDP2. The current `build_optimizers(model, cfg.train)`
   call is unchanged in signature; it must be called after `fully_shard` so
   `model.parameters()` yields FSDP2-managed DTensor parameters. AdamW handles
   DTensors natively. Muon's NS orthogonalization all-gathers the full weight
   matrix before computing the update, so it is also correct with FSDP2 sharded params.
 
-- [ ] **4.9** Dataloader: `build_train_dataloader(cfg)` is unchanged. Remove
+- [x] **4.9** Dataloader: `build_train_dataloader(cfg)` is unchanged. Remove
   `accelerator.prepare()` wrapping. The dataloader's `DistributedSampler` (or
   dataset's built-in sharding for iterable datasets) handles rank-aware batching.
 
-- [ ] **4.10** Replace `_compute_total_steps` reference to `self.accelerator.num_processes`
+- [x] **4.10** Replace `_compute_total_steps` reference to `self.accelerator.num_processes`
   with `self.world_size`.
 
-- [ ] **4.11** Replace `_global_effective_batch_size` reference to
+- [x] **4.11** Replace `_global_effective_batch_size` reference to
   `self.accelerator.num_processes` with `self.world_size`.
 
 ### 4b. `train()` — training loop
 
-- [ ] **4.12** Rich progress bar: replace `self.accelerator.is_main_process` with
+- [x] **4.12** Rich progress bar: replace `self.accelerator.is_main_process` with
   `self.is_main`.
 
-- [ ] **4.13** Replace the `with self.accelerator.accumulate(self.model):` block with
+- [x] **4.13** Replace the `with self.accelerator.accumulate(self.model):` block with
   manual gradient accumulation. Track micro-step index:
 
   ```python
@@ -403,16 +403,16 @@ with native PyTorch distributed primitives.
   Note: divide loss by `gradient_accumulation_steps` so the effective gradient
   magnitude is the same regardless of accumulation depth.
 
-- [ ] **4.14** Replace `self.accelerator.backward(loss)` with `loss.backward()`.
+- [x] **4.14** Replace `self.accelerator.backward(loss)` with `loss.backward()`.
 
-- [ ] **4.15** Gradient clipping: replace `self.accelerator.clip_grad_norm_()` with:
+- [x] **4.15** Gradient clipping: replace `self.accelerator.clip_grad_norm_()` with:
 
   ```python
   if cfg.max_grad_norm > 0 and is_last_micro_step:
       torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
   ```
 
-- [ ] **4.16** Optimizer and scheduler steps: move inside the `is_last_micro_step`
+- [x] **4.16** Optimizer and scheduler steps: move inside the `is_last_micro_step`
   block (mirrors the current `accelerator.sync_gradients` guard):
 
   ```python
@@ -431,7 +431,7 @@ with native PyTorch distributed primitives.
       micro_step = 0  # reset for next optimizer step
   ```
 
-- [ ] **4.17** Token reduction: replace `self.accelerator.reduce(tokens_tensor, reduction="sum")`
+- [x] **4.17** Token reduction: replace `self.accelerator.reduce(tokens_tensor, reduction="sum")`
   with:
 
   ```python
@@ -442,7 +442,7 @@ with native PyTorch distributed primitives.
   tokens_delta = int(tokens_tensor.item())
   ```
 
-- [ ] **4.18** Metric logging: replace `self.accelerator.log(metrics, step=...)` with:
+- [x] **4.18** Metric logging: replace `self.accelerator.log(metrics, step=...)` with:
 
   ```python
   def _log_metrics(self, metrics: dict[str, float]) -> None:
@@ -455,7 +455,7 @@ with native PyTorch distributed primitives.
           callback.on_log(self, dict(metrics), self.global_step)
   ```
 
-- [ ] **4.19** Replace `self.accelerator.end_training()` with:
+- [x] **4.19** Replace `self.accelerator.end_training()` with:
 
   ```python
   if self.cfg.train.wandb_enabled and self.is_main:
@@ -464,13 +464,13 @@ with native PyTorch distributed primitives.
   dist.destroy_process_group()
   ```
 
-- [ ] **4.20** Replace all remaining `self.accelerator.is_main_process` with `self.is_main`,
+- [x] **4.20** Replace all remaining `self.accelerator.is_main_process` with `self.is_main`,
   `self.accelerator.wait_for_everyone()` with `dist.barrier()`, and
   `self.accelerator.device` with `self.device`.
 
 ### 4c. Checkpoint integration
 
-- [ ] **4.21** Update `_save_checkpoint` to call the new DCP-based `save_checkpoint`:
+- [x] **4.21** Update `_save_checkpoint` to call the new DCP-based `save_checkpoint`:
 
   ```python
   def _save_checkpoint(self) -> None:
@@ -490,11 +490,11 @@ with native PyTorch distributed primitives.
       self._emit_checkpoint_saved(checkpoint_dir)
   ```
 
-- [ ] **4.22** Update `_resume_from_checkpoint` to call the new `load_checkpoint(model, optimizer, ...)`.
+- [x] **4.22** Update `_resume_from_checkpoint` to call the new `load_checkpoint(model, optimizer, ...)`.
 
 ### 4d. Evaluator interface update
 
-- [ ] **4.23** The current `_run_eval` passes `self.accelerator` to
+- [x] **4.23** The current `_run_eval` passes `self.accelerator` to
   `evaluator.run_due(ctx, model, accelerator)`. Replace with a thin context object:
 
   ```python
@@ -517,16 +517,16 @@ with native PyTorch distributed primitives.
 
 ## Phase 5: Simplify `train.py`
 
-- [ ] **5.1** Remove the DeepSpeed env-var gate entirely:
+- [x] **5.1** Remove the DeepSpeed env-var gate entirely:
   - Delete `_DEEPSPEED_OPT_IN_ENV`, `_DEEPSPEED_ENV_VARS`, `_DEEPSPEED_LOGGER_NAME`
   - Delete `_env_flag_is_enabled` and `_set_deepspeed_logger_enabled`
   - Remove the deepspeed branch from `_bootstrap_training_environment`
 
-- [ ] **5.2** Keep `_ensure_triton_cache_dir` — still needed for `torch.compile`'s
+- [x] **5.2** Keep `_ensure_triton_cache_dir` — still needed for `torch.compile`'s
   Triton backend. Rename `_bootstrap_training_environment` to `_setup_triton_cache`
   to reflect reduced scope.
 
-- [ ] **5.3** Update module docstring:
+- [x] **5.3** Update module docstring:
 
   ```python
   """Training entry point.
