@@ -86,9 +86,9 @@ def test_default_model_is_hf_config() -> None:
 
 def test_preset_and_cli_override_apply() -> None:
     """A size preset sets dims; a CLI dotlist override beats the preset/base layer."""
-    cfg = load_config(["--preset", "small", "model.num_hidden_layers=4"])
+    cfg = load_config(["--preset", "50M", "model.num_hidden_layers=4"])
     assert cfg.model.num_hidden_layers == 4  # CLI override wins
-    assert cfg.model.hidden_size == 256  # from the `small` preset
+    assert cfg.model.hidden_size == 512  # from the `50M` preset
 
 
 def test_derived_fields_resolve_when_omitted() -> None:
