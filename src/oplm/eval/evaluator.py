@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from oplm.config import OplmConfig
     from oplm.eval.context import EvalContext
     from oplm.eval.tasks.base import EvalTask
-    from oplm.model import OplmForMaskedLM
 
 logger = logging.getLogger(__name__)
 
