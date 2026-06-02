@@ -17,7 +17,7 @@ import pytest
 
 from tests.training.conftest import (
     FullRecordingCallback,
-    configure_accelerator_device,
+    force_device,
     tiny_train_cfg,
 )
 
@@ -38,7 +38,7 @@ def test_gradient_checkpointing_matches_plain_run(
     training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Checkpointed and non-checkpointed runs produce the same loss trajectory."""
-    configure_accelerator_device("cpu", monkeypatch)
+    force_device("cpu", monkeypatch)
 
     on_cb = FullRecordingCallback()
     on_losses = _run_losses(

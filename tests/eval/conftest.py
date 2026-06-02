@@ -17,8 +17,7 @@ from oplm.eval import EvalContext, EvalTask
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from accelerate import Accelerator
-
+    from oplm.eval.context import DistContext
     from oplm.model import OplmForMaskedLM
 
 
@@ -59,8 +58,8 @@ class DummyScoreTask(EvalTask):
 
     default_metrics = ["score"]
 
-    def evaluate(self, model: OplmForMaskedLM, accelerator: Accelerator) -> dict[str, float]:
-        """Return a constant metric dict; ``model`` / ``accelerator`` are unused."""
+    def evaluate(self, model: OplmForMaskedLM, dist_ctx: DistContext) -> dict[str, float]:
+        """Return a constant metric dict; ``model`` / ``dist_ctx`` are unused."""
         return {"score": 1.0}
 
 

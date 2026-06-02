@@ -67,7 +67,9 @@ def test_structure_eval_precision_in_unit_interval(
     structure_fixtures_dir: Path, make_model: Callable[..., OplmForMaskedLM]
 ) -> None:
     """Categorical-Jacobian P@L runs over a few real structures and lands in ``[0, 1]``."""
-    from accelerate import Accelerator
+    import torch
+
+    from oplm.eval.context import DistContext
 
     cfg = OplmConfig(
         model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
@@ -85,9 +87,11 @@ def test_structure_eval_precision_in_unit_interval(
         extra={"max_structures": 2},
     )
     task = StructureEvalTask(entry, cfg)
-    accelerator = Accelerator(cpu=True)
+    # Single-rank CPU context: _gather_data short-circuits at world_size=1, so the
+    # categorical-Jacobian path runs without a live process group.
+    dist_ctx = DistContext(rank=0, world_size=1, device=torch.device("cpu"), is_main=True)
 
-    metrics = task.evaluate(model, accelerator)
+    metrics = task.evaluate(model, dist_ctx)
 
     assert "precision_at_L" in metrics
     p = metrics["precision_at_L"]

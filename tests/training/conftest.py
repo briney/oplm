@@ -3,7 +3,7 @@
 These helpers drive the *real* :class:`~oplm.training.trainer.Trainer` over a tiny
 model and real data and assert observable contracts. The pieces are deliberately
 importable (``from tests.training.conftest import ...``) as well as available as
-fixtures, because :data:`DEVICE_PRECISION_PARAMS` is referenced at decoration time
+fixtures, because :data:`DEVICE_PARAMS` is referenced at decoration time
 by ``@pytest.mark.parametrize`` and :class:`FullRecordingCallback` is instantiated
 multiple times per test (e.g. one per trainer in resume-equivalence runs).
 """
@@ -104,7 +104,9 @@ def tiny_train_cfg(
     eval_every: object = None,
     resume_from: str | None = None,
     seed: int = 42,
-    mixed_precision: str = "no",
+    mixed_precision: str = "bf16",
+    precision: str = "bf16",
+    fsdp_sharding_strategy: str = "none",
     compile: bool = False,
     compile_mode: str = "default",
     wandb_enabled: bool = False,
@@ -124,8 +126,11 @@ def tiny_train_cfg(
     Defaults are chosen for fast, isolated assertions: a 2-layer/32-hidden model,
     ``wandb`` off, single-process data loading, fp32, clipping off, and a
     save cadence effectively disabled (only the final checkpoint is written) so a
-    test opts into checkpointing explicitly. ``output_dir`` and ``train_data``
-    are paths; everything else mirrors the like-named config field.
+    test opts into checkpointing explicitly. ``fsdp_sharding_strategy`` defaults to
+    ``"none"`` so the run forms a single-rank process group and moves the model to
+    the device without real FSDP2 sharding — the path that works on both CPU-only
+    CI and a single GPU. ``output_dir`` and ``train_data`` are paths; everything
+    else mirrors the like-named config field.
     """
     return OplmConfig(
         model=OplmModelConfig(
@@ -156,6 +161,8 @@ def tiny_train_cfg(
             seed=seed,
             output_dir=str(output_dir),
             mixed_precision=mixed_precision,
+            precision=precision,
+            fsdp_sharding_strategy=fsdp_sharding_strategy,
             compile=compile,
             compile_mode=compile_mode,
             wandb_enabled=wandb_enabled,
@@ -172,29 +179,29 @@ def tiny_train_cfg(
     )
 
 
-def configure_accelerator_device(device: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Force the trainer's Accelerator onto ``device`` for this test.
+def force_device(device: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the native Trainer onto ``device`` for this test.
 
-    The :class:`~oplm.training.trainer.Trainer` constructs its own ``Accelerator``
-    without a ``cpu=`` argument, so CPU is forced through the ``ACCELERATE_USE_CPU``
-    environment variable (the same knob ``Accelerator(cpu=True)`` sets). The
-    autouse ``_reset_accelerator_state`` fixture clears the global accelerate state
-    between tests, so toggling this per-parametrization is safe.
+    The native-FSDP2 :class:`~oplm.training.trainer.Trainer` selects its device from
+    ``torch.cuda.is_available()`` (CUDA + NCCL when true, CPU + Gloo otherwise) — it
+    no longer reads any Accelerate env var. To exercise the CPU/Gloo path on a GPU
+    box we patch ``torch.cuda.is_available`` to ``False``; the ``"cuda"`` case leaves
+    detection intact (those rows are CUDA-gated by :data:`DEVICE_PARAMS`). Pair only
+    with ``fsdp_sharding_strategy="none"`` — the ``"full"`` path builds a CUDA device
+    mesh and cannot run on CPU.
     """
     if device == "cpu":
-        monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
-    else:
-        monkeypatch.delenv("ACCELERATE_USE_CPU", raising=False)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-# (device, precision) matrix. CUDA rows skip on CPU-only machines; the cpu row is
-# forced onto CPU via configure_accelerator_device even on a GPU box, so both
-# code paths are exercised wherever the suite runs.
+# Device matrix for the single-rank (``fsdp_sharding_strategy="none"``) e2e runs.
+# The cpu row is forced onto CPU/Gloo via force_device even on a GPU box, and the
+# cuda row is gated so it skips on CPU-only machines — both paths run wherever
+# possible.
 _REQUIRES_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-DEVICE_PRECISION_PARAMS = [
-    pytest.param("cpu", "no", id="cpu-no"),
-    pytest.param("cuda", "no", id="cuda-no", marks=_REQUIRES_CUDA),
-    pytest.param("cuda", "bf16", id="cuda-bf16", marks=_REQUIRES_CUDA),
+DEVICE_PARAMS = [
+    pytest.param("cpu", id="cpu"),
+    pytest.param("cuda", id="cuda", marks=_REQUIRES_CUDA),
 ]
 
 

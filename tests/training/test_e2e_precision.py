@@ -1,9 +1,13 @@
-"""G5 — mixed-precision training (docs/TESTING_E2E.md §5). CUDA-only.
+"""G5 — BF16 mixed-precision training on real FSDP2 (docs/TESTING_E2E.md §5). CUDA-only.
 
-Guards the Accelerate autocast / GradScaler path that every fp32 test skips: a
-bf16 and an fp16 run must complete with finite loss, actually reduce eval loss
-over the run, and write a checkpoint whose ``hf/`` export reloads via
-``from_pretrained`` and produces finite logits.
+In the native stack, mixed precision is supplied by FSDP2's
+``MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32)`` rather than an
+Accelerate autocast/GradScaler. This guards that path end to end with real
+sharding (``fsdp_sharding_strategy="full"``): a bf16 run must complete with finite
+loss, actually reduce eval loss over the run, and write a checkpoint whose ``hf/``
+export reloads via ``from_pretrained`` and produces finite logits. (The legacy
+fp16 path is gone — ``precision`` is ``bf16`` or ``fp8``; fp8 lives in the
+Blackwell-gated ``test_e2e_fsdp2`` suite.)
 """
 
 from __future__ import annotations
@@ -21,15 +25,12 @@ if TYPE_CHECKING:
 
 pytestmark = [
     pytest.mark.slow,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="mixed precision requires CUDA"),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="FSDP2 mixed precision requires CUDA"),
 ]
 
 
-@pytest.mark.parametrize("precision", ["bf16", "fp16"])
-def test_mixed_precision_run_learns_and_checkpoints(
-    precision: str, training_parquet: Path, tmp_path: Path
-) -> None:
-    """A bf16/fp16 run stays finite, reduces eval loss, and writes a loadable checkpoint."""
+def test_bf16_fsdp2_run_learns_and_checkpoints(training_parquet: Path, tmp_path: Path) -> None:
+    """A bf16 FSDP2 run stays finite, reduces eval loss, and writes a loadable checkpoint."""
     from oplm.model import OplmForMaskedLM
     from oplm.training.trainer import Trainer
 
@@ -39,8 +40,9 @@ def test_mixed_precision_run_learns_and_checkpoints(
         max_steps=40,
         batch_size=8,
         lr=1e-3,
-        mixed_precision=precision,
-        max_grad_norm=1.0,  # realistic setup; also exercises clipping under autocast
+        precision="bf16",
+        fsdp_sharding_strategy="full",
+        max_grad_norm=1.0,  # realistic setup; also exercises clipping under bf16 params
         log_every=10,
         eval={
             "hd": {
@@ -53,7 +55,7 @@ def test_mixed_precision_run_learns_and_checkpoints(
     callback = FullRecordingCallback()
     Trainer(cfg, callbacks=[callback]).train()
 
-    # Every logged train loss is finite (no NaN from autocast / scaler underflow).
+    # Every logged train loss is finite (no NaN from bf16 compute).
     train_losses = [m["train/loss"] for _, m in callback.train_logs]
     assert train_losses and all(math.isfinite(v) for v in train_losses)
 

@@ -1,9 +1,9 @@
 """End-to-end pilot training run (Phase 5/6 trainer + checkpoint integration).
 
 Runs the live :class:`~oplm.training.trainer.Trainer` over a tiny model and the
-real ``training_parquet`` fixture for a handful of CPU steps: the loop must
-complete with no shape errors, write a checkpoint, fire eval on its cadence, and
-resume cleanly from a checkpoint to continue to a larger ``max_steps``.
+real ``training_parquet`` fixture for a handful of single-rank, unsharded steps:
+the loop must complete with no shape errors, write a checkpoint, fire eval on its
+cadence, and resume cleanly from a checkpoint to continue to a larger ``max_steps``.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def _cfg(
     max_steps: int = 4,
     resume_from: str | None = None,
 ) -> OplmConfig:
-    """Tiny end-to-end config: CPU, no wandb, sequence eval every 2 steps."""
+    """Tiny single-rank end-to-end config: no wandb, sequence eval every 2 steps."""
     return OplmConfig(
         model=OplmModelConfig(
             hidden_size=32,
@@ -55,7 +55,7 @@ def _cfg(
             batch_size=4,
             warmup_steps=0,
             wandb_enabled=False,
-            mixed_precision="no",
+            fsdp_sharding_strategy="none",  # single-rank, unsharded (CPU or 1 GPU)
             save_every=2,
             save_total_limit=2,
             output_dir=str(output_dir),

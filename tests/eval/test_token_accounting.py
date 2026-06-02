@@ -12,21 +12,23 @@ from __future__ import annotations
 import os
 import socket
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 from oplm.eval import EvalContext, EveryNTokens
 
-if TYPE_CHECKING:
-    from accelerate import Accelerator
 
+def _opt_step_tokens(step_local_tokens: int) -> int:
+    """Mirror the trainer's per-opt-step token reduction at a single rank.
 
-def _opt_step_tokens(accelerator: Accelerator, step_local_tokens: int) -> int:
-    """Mirror the trainer's per-opt-step token reduction (Phase 6.2)."""
-    tokens_tensor = torch.tensor(step_local_tokens, device=accelerator.device, dtype=torch.long)
-    return int(accelerator.reduce(tokens_tensor, reduction="sum").item())
+    The trainer rank-reduces each step's local tokens with
+    ``dist.all_reduce(..., op=SUM)``; with one rank that reduction is the identity,
+    so the global count equals the local count. (The genuine multi-rank reduction is
+    exercised by ``test_ragged_distributed_token_reduction_no_deadlock`` below.)
+    """
+    tokens_tensor = torch.tensor(step_local_tokens, dtype=torch.long)
+    return int(tokens_tensor.item())
 
 
 def test_token_accounting_is_exact_global_count() -> None:
@@ -35,12 +37,8 @@ def test_token_accounting_is_exact_global_count() -> None:
     Drives the trainer's accumulate-then-reduce logic over micro-batches grouped
     into optimizer steps. With a single process the reduction is identity, so this
     nails the per-step accumulation, the reset of ``_step_local_tokens`` each step,
-    and that the result is a true count — not a ``local × num_processes`` estimate.
+    and that the result is a true count — not a ``local × world_size`` estimate.
     """
-    from accelerate import Accelerator
-
-    accelerator = Accelerator(cpu=True)
-
     # Ragged micro-batches grouped into 3 optimizer steps (gradient accumulation).
     steps_mask_sums = [[5, 3], [7], [2, 6, 1]]
     expected_total = sum(s for step in steps_mask_sums for s in step)
@@ -51,14 +49,13 @@ def test_token_accounting_is_exact_global_count() -> None:
         for n_ones in step_sums:
             attention_mask = torch.ones(1, n_ones, dtype=torch.long)
             step_local_tokens += int(attention_mask.sum().item())
-        tokens_delta = _opt_step_tokens(accelerator, step_local_tokens)
+        tokens_delta = _opt_step_tokens(step_local_tokens)
         tokens_seen += tokens_delta
         step_local_tokens = 0  # reset at the opt-step boundary
         assert tokens_delta == sum(step_sums)
         assert step_local_tokens == 0
 
     assert tokens_seen == expected_total
-    assert accelerator.num_processes == 1  # the reduction was identity here
 
 
 def test_is_due_is_a_pure_function_of_context() -> None:

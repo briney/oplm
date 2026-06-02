@@ -1,10 +1,10 @@
 """G1 — logging cadence & train-metric contract (docs/TESTING_E2E.md §5).
 
 Drives a real ~12-step :class:`~oplm.training.trainer.Trainer` run with
-``log_every=3`` across the ``(device, precision)`` matrix and asserts the
-observable logging contract: train metrics are emitted exactly on the cadence,
-every payload carries the full ``train/*`` key set with finite values, the
-sample/token counters advance by their hand-computed amounts, and the FLOP
+``log_every=3`` across the CPU/CUDA device matrix (single-rank, unsharded) and
+asserts the observable logging contract: train metrics are emitted exactly on the
+cadence, every payload carries the full ``train/*`` key set with finite values,
+the sample/token counters advance by their hand-computed amounts, and the FLOP
 accounting is internally consistent with ``estimate_flops_per_token``.
 """
 
@@ -17,9 +17,9 @@ import pytest
 
 from oplm.training.flops import estimate_flops_per_token
 from tests.training.conftest import (
-    DEVICE_PRECISION_PARAMS,
+    DEVICE_PARAMS,
     FullRecordingCallback,
-    configure_accelerator_device,
+    force_device,
     tiny_train_cfg,
 )
 
@@ -41,10 +41,9 @@ _LOG_EVERY = 3
 _BATCH_SIZE = 4
 
 
-@pytest.mark.parametrize(("device", "precision"), DEVICE_PRECISION_PARAMS)
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_logging_cadence_and_metric_contract(
     device: str,
-    precision: str,
     training_parquet: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -52,14 +51,13 @@ def test_logging_cadence_and_metric_contract(
     """Train logs land on multiples of ``log_every`` with a complete, finite payload."""
     from oplm.training.trainer import Trainer
 
-    configure_accelerator_device(device, monkeypatch)
+    force_device(device, monkeypatch)
     cfg = tiny_train_cfg(
         tmp_path,
         training_parquet,
         max_steps=_MAX_STEPS,
         batch_size=_BATCH_SIZE,
         log_every=_LOG_EVERY,
-        mixed_precision=precision,
     )
     callback = FullRecordingCallback()
     Trainer(cfg, callbacks=[callback]).train()

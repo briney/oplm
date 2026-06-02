@@ -47,7 +47,9 @@ def test_sequence_eval_returns_finite_metrics(
     training_parquet: Path, make_model: Callable[..., OplmForMaskedLM]
 ) -> None:
     """``SequenceEvalTask.evaluate`` yields finite loss/accuracy/perplexity."""
-    from accelerate import Accelerator
+    import torch
+
+    from oplm.eval.context import DistContext
 
     cfg = _root_cfg()
     model = make_model(max_position_embeddings=_MAX_SEQ_LEN)
@@ -58,9 +60,11 @@ def test_sequence_eval_returns_finite_metrics(
         schedule=ScheduleSpec("steps", 1),
     )
     task = SequenceEvalTask(entry, cfg)
-    accelerator = Accelerator(cpu=True)
+    # Single-rank CPU context: the sequence task runs no collectives at world_size=1,
+    # so no live process group is required.
+    dist_ctx = DistContext(rank=0, world_size=1, device=torch.device("cpu"), is_main=True)
 
-    metrics = task.evaluate(model, accelerator)
+    metrics = task.evaluate(model, dist_ctx)
 
     assert set(metrics) == {"loss", "accuracy", "perplexity"}
     assert all(math.isfinite(v) for v in metrics.values())

@@ -1,9 +1,9 @@
 """G13 — wandb tracker path (docs/TESTING_E2E.md §5, optional).
 
 Runs a tiny trainer with ``wandb_enabled=True`` under ``WANDB_MODE=offline`` so the
-real ``init_trackers`` + ``_config_to_flat_dict`` + ``accelerator.log`` path runs
-without a network or login. Config flattening is a genuine serialization risk
-(HF config + dataclasses -> one flat dict), so it is also asserted directly.
+real ``wandb.init`` + ``_config_to_flat_dict`` + ``wandb.log`` path runs without a
+network or login. Config flattening is a genuine serialization risk (HF config +
+dataclasses -> one flat dict), so it is also asserted directly.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def test_config_to_flat_dict_is_flat_and_namespaced(training_parquet: Path, tmp_
 def test_wandb_offline_run_completes(
     training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A wandb-enabled run completes end to end in offline mode (init_trackers + log)."""
+    """A wandb-enabled run completes end to end in offline mode (wandb.init + wandb.log)."""
     pytest.importorskip("wandb")
     monkeypatch.setenv("WANDB_MODE", "offline")
     monkeypatch.setenv("WANDB_SILENT", "true")

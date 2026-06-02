@@ -50,7 +50,7 @@ def _cfg(training_parquet: Path, output_dir: Path, every: dict[str, int]) -> Opl
             batch_size=4,
             warmup_steps=0,
             wandb_enabled=False,
-            mixed_precision="no",
+            fsdp_sharding_strategy="none",  # single-rank, unsharded (CPU or 1 GPU)
             output_dir=str(output_dir),
         ),
         data=DataConfig(

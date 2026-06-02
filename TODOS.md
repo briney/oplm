@@ -542,7 +542,7 @@ with native PyTorch distributed primitives.
 
 ## Phase 6: Tests
 
-- [ ] **6.1** Add `blackwell` marker skip logic to `tests/conftest.py`:
+- [x] **6.1** Add `blackwell` marker skip logic to `tests/conftest.py`:
 
   ```python
   import torch
@@ -554,7 +554,7 @@ with native PyTorch distributed primitives.
               pytest.skip("Test requires sm90+ (Blackwell / H100+) GPU")
   ```
 
-- [ ] **6.2** Create `tests/training/test_precision.py`:
+- [x] **6.2** Create `tests/training/test_precision.py`:
 
   - `test_apply_fp8_skips_non_linear`: construct a small `OplmForMaskedLM`, call
     `apply_fp8_training`, verify all `nn.Linear` are replaced with `Float8Linear`
@@ -563,21 +563,21 @@ with native PyTorch distributed primitives.
     happens and the model's Linear modules remain standard `nn.Linear`.
   - `test_is_fp8_supported_returns_bool`: basic type check, no GPU required.
 
-- [ ] **6.3** Update `tests/test_train_entrypoint.py`:
+- [x] **6.3** Update `tests/test_train_entrypoint.py`:
   - Remove patching of `accelerate.Accelerator`.
   - Patch `torch.distributed.init_process_group` and `torch.distributed.destroy_process_group`
     for unit-test isolation.
   - Patch `torch.distributed.get_rank` → 0, `torch.distributed.get_world_size` → 1.
   - Verify `main()` calls `Trainer(cfg).train()` with a mocked Trainer.
 
-- [ ] **6.4** Update `tests/test_e2e_lifecycle.py` and any existing E2E tests that
+- [x] **6.4** Update `tests/test_e2e_lifecycle.py` and any existing E2E tests that
   construct a `Trainer` directly:
   - Update `Trainer(cfg)` construction expectations (no Accelerator).
   - Run 3–5 training steps with `fsdp_sharding_strategy="none"` (single-GPU, no
     actual sharding) so the test works locally.
   - Use a tiny `small` preset model and a synthetic in-memory dataset.
 
-- [ ] **6.5** Create `tests/training/test_e2e_fsdp2.py` (`@pytest.mark.slow`):
+- [x] **6.5** Create `tests/training/test_e2e_fsdp2.py` (`@pytest.mark.slow`):
 
   ```python
   @pytest.mark.slow
@@ -603,7 +603,7 @@ with native PyTorch distributed primitives.
       trainer.train()
   ```
 
-- [ ] **6.6** Verify `pytest -m "not slow and not blackwell"` passes cleanly on
+- [x] **6.6** Verify `pytest -m "not slow and not blackwell"` passes cleanly on
   local hardware (no Blackwell GPU required).
 
 ---

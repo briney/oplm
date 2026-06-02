@@ -3,26 +3,49 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import torch
+import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 _FAST_TRAINING_ROWS = 256
 
 
-@pytest.fixture(autouse=True)
-def _reset_accelerator_state() -> None:
-    """Reset accelerate singleton state between tests.
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skip ``@pytest.mark.blackwell`` tests on hardware without FP8 support.
 
-    AcceleratorState is a process-global singleton. Without resetting it,
-    a test that creates an Accelerator with mixed_precision="no" prevents
-    a later test from using mixed_precision="bf16" in the same process.
+    FP8 matmuls require sm90+ (Blackwell / H100+). Tests carrying the marker run
+    only where the device reports compute capability >= 9; everywhere else
+    (CPU-only CI, Ampere boxes) they are skipped rather than failing deep inside
+    a torchao kernel.
     """
-    from accelerate.state import AcceleratorState
+    if "blackwell" in item.keywords and (
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9
+    ):
+        pytest.skip("Test requires sm90+ (Blackwell / H100+) GPU")
 
-    AcceleratorState._reset_state(reset_partial_state=True)
+
+@pytest.fixture(autouse=True)
+def _cleanup_distributed() -> Iterator[None]:
+    """Tear down any process group a test leaves behind.
+
+    The native-FSDP2 Trainer initializes a ``torch.distributed`` process group in
+    ``__init__`` and destroys it in ``train()``'s teardown, but a test that
+    constructs a Trainer without running ``train()`` (or that errors mid-run) would
+    leak the group into the next test — whose ``_init_distributed`` then sees
+    ``dist.is_initialized()`` and skips re-init, inheriting the wrong backend. This
+    fixture guarantees a clean slate after every test.
+    """
+    yield
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 @pytest.fixture(scope="session")

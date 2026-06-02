@@ -562,6 +562,7 @@ class Trainer:
             state.get("samples_seen", self.global_step * self._global_effective_batch_size())
         )
         self._set_dataset_epoch(self.epoch)
+        self._fast_forward_schedulers()
 
         # Reset per-opt-step snapshot markers so the first post-resume step computes
         # correct deltas. tokens_seen is already restored from trainer_state.json; the
@@ -577,6 +578,30 @@ class Trainer:
             self._samples_seen,
             self.tokens_seen,
         )
+
+    def _fast_forward_schedulers(self) -> None:
+        """Re-seat each LambdaLR scheduler to the restored ``global_step`` after resume.
+
+        DCP checkpoints persist the model and primary-optimizer state but not the
+        scheduler — a ``LambdaLR`` is a pure function of ``last_epoch``, so setting it
+        to ``global_step`` reproduces the exact LR the schedule prescribes, equivalent
+        to having stepped it ``global_step`` times. Without this, a freshly built
+        scheduler resumes from step 0 and the post-resume LR trajectory is wrong.
+
+        Computes LRs directly from the scheduler's ``lr_lambdas`` / ``base_lrs`` (rather
+        than ``get_lr()``) to avoid the "called outside step()" warning, then mirrors
+        what ``LRScheduler.step`` does: assign to the param groups and record
+        ``_last_lr`` so ``get_last_lr()`` reports the resumed value.
+        """
+        for scheduler in self.schedulers:
+            scheduler.last_epoch = self.global_step
+            values = [
+                base_lr * lmbda(self.global_step)
+                for lmbda, base_lr in zip(scheduler.lr_lambdas, scheduler.base_lrs, strict=True)
+            ]
+            for group, lr in zip(scheduler.optimizer.param_groups, values, strict=True):
+                group["lr"] = lr
+            scheduler._last_lr = values
 
     def _global_effective_batch_size(self) -> int:
         """Return the batch size represented by one optimizer step."""

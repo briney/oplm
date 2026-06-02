@@ -5,7 +5,7 @@ Covers four trainer surfaces that fp32/AdamW/constant-LR runs never exercise:
 * the two-optimizer / two-scheduler Muon ``prepare`` path (CUDA-only);
 * the LR trajectory of all four schedulers, asserted against ``get_schedule_fn``;
 * that a real run on real data actually reduces eval loss; and
-* that ``max_grad_norm`` is wired through ``accelerator.clip_grad_norm_`` (G7).
+* that ``max_grad_norm`` is wired through ``torch.nn.utils.clip_grad_norm_`` (G7).
 """
 
 from __future__ import annotations
@@ -138,19 +138,19 @@ def test_model_learns_over_run(training_parquet: Path, tmp_path: Path) -> None:
 def test_grad_clipping_is_wired(
     training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``max_grad_norm`` routes through ``accelerator.clip_grad_norm_`` once per opt step."""
-    from accelerate import Accelerator
-
+    """``max_grad_norm`` routes through ``torch.nn.utils.clip_grad_norm_`` once per opt step."""
     from oplm.training.trainer import Trainer
 
     clip_calls: list[float] = []
-    original = Accelerator.clip_grad_norm_
+    original = torch.nn.utils.clip_grad_norm_
 
-    def spy(self: Accelerator, parameters: object, max_norm: float, *args: object, **kw: object):  # noqa: ANN202
+    def spy(parameters: object, max_norm: float, *args: object, **kw: object):  # noqa: ANN202
         clip_calls.append(max_norm)
-        return original(self, parameters, max_norm, *args, **kw)
+        return original(parameters, max_norm, *args, **kw)
 
-    monkeypatch.setattr(Accelerator, "clip_grad_norm_", spy)
+    # The trainer calls torch.nn.utils.clip_grad_norm_ once per optimizer step, only
+    # on the last micro-step, when max_grad_norm > 0.
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy)
 
     # Clipping enabled: one clip call per optimizer step, with the configured norm.
     cfg = tiny_train_cfg(
