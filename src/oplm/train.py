@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
     from oplm.config import OplmConfig
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 _DEEPSPEED_OPT_IN_ENV = "OPLM_ENABLE_DEEPSPEED"
 _DEEPSPEED_ENV_VARS = (
     "ACCELERATE_USE_DEEPSPEED",
