@@ -100,6 +100,10 @@ class Trainer:
         if gradient_checkpointing:
             model.gradient_checkpointing_enable()  # propagates to every OplmBlock
 
+        if cfg.train.compile:
+            _status("[dim]Compiling model (torch.compile)...[/dim]")
+            model = torch.compile(model, dynamic=True, mode=cfg.train.compile_mode)
+
         # Optimizer and dataloader
         optimizers = build_optimizers(model, cfg.train)
         _status("[dim]Loading training data...[/dim]")
