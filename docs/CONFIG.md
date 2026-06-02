@@ -47,18 +47,18 @@ Notes:
 
 ```bash
 # bare key=value positional overrides (train, info)
-oplm train --preset base \
+oplm train --preset 400M \
   train.max_steps=100_000 \
   data.train=/data/train.parquet
 
-oplm info --preset large model.num_hidden_layers=40
+oplm info --preset 3B model.num_hidden_layers=40
 
 # encode keeps --override, since its positional slot holds the sequences
 oplm encode SEQ1 SEQ2 --model outputs/base-run/checkpoint-10000 \
   --override model.attention_dropout=0.0
 
 # the distributed entry point forwards trailing dotlist args to load_config()
-accelerate launch -m oplm.train --config configs/my_run.yaml \
+torchrun --nproc_per_node=8 -m oplm.train --config configs/my_run.yaml \
   train.resume_from=outputs/base-run/checkpoint-10000
 ```
 
@@ -70,13 +70,16 @@ Flags: `--preset/-p` (size preset), `--config/-c` (YAML file), `--name/-n`
 `--preset <name>` loads `src/oplm/configs/model/presets/<name>.yaml`, which sets
 only the core dimensions; everything else inherits the defaults below.
 
-| Preset   | Parameters | Layers | Hidden | Heads | Head dim |
-|----------|-----------:|-------:|-------:|------:|---------:|
-| `small`  |       5.2M |      6 |    256 |     4 |       64 |
-| `medium` |      85.6M |     12 |    768 |    12 |       64 |
-| `base`   |     309.5M |     24 |   1024 |    16 |       64 |
-| `large`  |       2.5B |     32 |   2560 |    32 |       80 |
-| `xlarge` |      12.7B |     40 |   5120 |    40 |      128 |
+| Preset | Parameters | Layers | Hidden | Heads | Head dim |
+|--------|-----------:|-------:|-------:|------:|---------:|
+| `50M`  |      54.9M |     16 |    512 |     8 |       64 |
+| `170M` |     170.6M |     24 |    768 |    12 |       64 |
+| `400M` |     412.3M |     32 |   1024 |    16 |       64 |
+| `800M` |     814.6M |     40 |   1280 |    16 |       80 |
+| `1B`   |       1.6B |     50 |   1600 |    25 |       64 |
+| `3B`   |       3.3B |     64 |   2048 |    32 |       64 |
+| `6B`   |       6.4B |     80 |   2560 |    40 |       64 |
+| `12B`  |      12.5B |    100 |   3200 |    50 |       64 |
 
 `large` and `xlarge` also enable `model.gradient_checkpointing`. Run
 `oplm info --preset <name>` to print the resolved architecture and exact
@@ -218,10 +221,12 @@ Backed by `oplm.config.TrainConfig`.
 | `train.wandb_enabled` | `bool` | `true` | Toggle W&B logging. |
 | `train.save_every` | `int` | `10_000` | Checkpoint cadence (optimizer steps). |
 | `train.save_total_limit` | `int` | `3` | Checkpoints to keep. |
-| `train.resume_from` | `str \| null` | `null` | Path to an Accelerate checkpoint directory. |
+| `train.resume_from` | `str \| null` | `null` | Path to a DCP checkpoint directory (`checkpoint-N`). |
 | `train.seed` | `int` | `42` | Global seed. |
 | `train.output_dir` | `str` | `outputs` | Base dir for logs and checkpoints. |
-| `train.mixed_precision` | `str` | `bf16` | `bf16`, `fp16`, or `no`. |
+| `train.precision` | `str` | `bf16` | `bf16` (BF16 mixed precision) or `fp8` (torchao rowwise FP8; **requires sm90+ / Blackwell**). |
+| `train.fsdp_sharding_strategy` | `str` | `full` | `full` (shard weights + grads + optimizer state), `none` (no sharding; single-GPU / debug), or `hybrid` (planned, not yet implemented). |
+| `train.mixed_precision` | `str` | `bf16` | **Deprecated** — superseded by `precision` and ignored by the FSDP2 trainer. `bf16`, `fp16`, or `no`. |
 | `train.compile` | `bool` | `false` | Enable `torch.compile` (opt-in; adds first-step latency). |
 | `train.compile_mode` | `str` | `default` | Compile mode: `default` \| `reduce-overhead` \| `max-autotune`. |
 | `train.config_path` | `str \| null` | `null` | Auto-populated from `--config` for provenance. |

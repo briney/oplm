@@ -71,13 +71,16 @@ evaluate it. Four subsystems compose cleanly along stable contracts:
    shared components — no `DeterministicMLMCollator`, no parallel "eval dataset."
 6. **Typed config over loose dicts.** YAML enters as dicts at boundaries and is
    cast once into frozen, validated dataclasses.
-7. **Accelerate is the only distribution layer.** No manual `torch.distributed`
-   wiring in the trainer.
+7. **Native `torch.distributed` is the distribution layer.** FSDP2
+   (`fully_shard`) shards weights and optimizer state; the trainer owns
+   process-group init, the gradient-sync toggle, and collectives directly — no
+   Accelerate, no DeepSpeed.
 
-**Packaging.** Python ≥ 3.11; `torch ≥ 2.11` (pinned for the FlashAttention-4
-backend on Blackwell — reached via `scaled_dot_product_attention` — and
-`torch.optim.Muon`). Single `pip install oplm` installs everything — **no
-optional dependency groups**. Build backend: `hatchling`, single `pyproject.toml`.
+**Packaging.** Python ≥ 3.11; core dependencies `torch ≥ 2.11` (pinned for the
+FlashAttention-4 backend on Blackwell — reached via `scaled_dot_product_attention`
+— and `torch.optim.Muon`) and `torchao ≥ 0.7` (FP8 training). `pip install oplm`
+covers inference; the `train` and `dev` extras add the training and contributor
+toolchains. Build backend: `hatchling`, single `pyproject.toml`.
 
 ---
 
@@ -140,8 +143,8 @@ thin **ESM-C-style convenience layer** (sugar on top).
 
 ```python
 from transformers import AutoModelForMaskedLM, AutoTokenizer
-model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-base")
-tok   = AutoTokenizer.from_pretrained("brineylab/oplm-base")
+model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-400M")
+tok   = AutoTokenizer.from_pretrained("brineylab/oplm-400M")
 inputs = tok(["MEEPQSDPSVEPPLSQ"], return_tensors="pt", padding=True)
 out = model(**inputs, output_hidden_states=True)   # out.logits (B,T,V); out.hidden_states tuple
 ```
@@ -158,7 +161,7 @@ correctly; `encode` exists only for ESM-C call-site parity:
 
 ```python
 from oplm import OplmForMaskedLM, LogitsConfig
-model = OplmForMaskedLM.from_pretrained("brineylab/oplm-base")  # auto-attaches saved tokenizer
+model = OplmForMaskedLM.from_pretrained("brineylab/oplm-400M")  # auto-attaches saved tokenizer
 out = model.logits(["MEEPQSDPSVEPPLSQ", "GAGTRWPVQ"],
                    LogitsConfig(sequence=True, return_embeddings=True))
 # out.sequence_logits (B,T,V)|None ; out.embeddings (B,T,D)|None (last hidden state)
@@ -625,8 +628,9 @@ path and adds ≈`B·L·H·T²` fp32 floats of activation memory (~6 GB at
 
 ### 13.8 Numerical precision, determinism & distributed constraints
 
-**Dtype contract.** Training: bf16 autocast on CUDA (Accelerate manages fp32
-master weights); norms (incl. QK-norm), attention softmax, and RoPE compute in
+**Dtype contract.** Training: bf16 params via FSDP2's `MixedPrecisionPolicy`
+(FP32 gradient reduction; optional torchao FP8 matmuls on Blackwell); norms
+(incl. QK-norm), attention softmax, and RoPE compute in
 **fp32** internally then cast back; logits and loss are **fp32**. Inference:
 default load bf16 on CUDA / fp32 on CPU (override with `torch_dtype=`); use
 `model.eval()` + `torch.inference_mode()`. fp32-in-norms removes bf16
@@ -658,8 +662,8 @@ Parameter count (`n_norm = 2` LayerNorm / `1` RMSNorm; residual scaling is
 parameter-free): `embedding V·D` + `final norm n_norm·D` + `MLM head (D·D+D) +
 n_norm·D + (D·V+V untied | V tied)` + per layer `[attn 4·D·D + QK-norm 2·n_norm·d
 + pre-norm n_norm·D (+ extra norms per strategy)]` + `[FFN 3·D·F + pre-norm
-n_norm·D]` + per Canon conv `k_l·D`. Worked: D=768, L=12, H=12, F=2048, V=33,
-LayerNorm, untied, pre-norm → ≈ **85.6 M**.
+n_norm·D]` + per Canon conv `k_l·D`. Worked (the `170M` preset): D=768, L=24,
+H=12, F=2048, V=33, LayerNorm, untied, pre-norm → ≈ **170.6 M**.
 
 Published presets (`--preset`; full recipes in
 `src/oplm/configs/model/presets/*.yaml`; all share the 33-token tokenizer and a
@@ -667,14 +671,18 @@ Published presets (`--preset`; full recipes in
 
 | Preset / Hub id | Params | Layers | Hidden | Heads | Head dim |
 | --- | --: | --: | --: | --: | --: |
-| `oplm-small` | 5.2M | 6 | 256 | 4 | 64 |
-| `oplm-medium` | 85.6M | 12 | 768 | 12 | 64 |
-| `oplm-base` | 309.5M | 24 | 1024 | 16 | 64 |
-| `oplm-large` | 2.5B | 32 | 2560 | 32 | 80 |
-| `oplm-xlarge` | 12.7B | 40 | 5120 | 40 | 128 |
+| `oplm-50M` | 54.9M | 16 | 512 | 8 | 64 |
+| `oplm-170M` | 170.6M | 24 | 768 | 12 | 64 |
+| `oplm-400M` | 412.3M | 32 | 1024 | 16 | 64 |
+| `oplm-800M` | 814.6M | 40 | 1280 | 16 | 80 |
+| `oplm-1B` | 1.6B | 50 | 1600 | 25 | 64 |
+| `oplm-3B` | 3.3B | 64 | 2048 | 32 | 64 |
+| `oplm-6B` | 6.4B | 80 | 2560 | 40 | 64 |
+| `oplm-12B` | 12.5B | 100 | 3200 | 50 | 64 |
 
-`large`/`xlarge` additionally enable `gradient_checkpointing`. `oplm info --preset
-<name>` prints the resolved architecture and exact parameter count.
+No preset enables `gradient_checkpointing` by default — set
+`model.gradient_checkpointing=true` to turn it on. `oplm info --preset <name>`
+prints the resolved architecture and exact parameter count.
 
 ---
 
@@ -1008,7 +1016,7 @@ step from state it already tracks; `epoch_delta` is snapshotted per optimizer st
 boundary.
 
 **The rank-sync invariant (load-bearing).** Eval tasks run collective ops inside
-`evaluate` (`accelerator.reduce` to sum loss; `dist.all_gather_object` to gather
+`evaluate` (`dist.all_reduce` to sum loss; `dist.all_gather_object` to gather
 per-structure results). A collective completes only when every rank enters it, so a
 per-rank `is_due` disagreement would hang at the NCCL timeout. The invariant:
 
@@ -1081,7 +1089,7 @@ when it ships, `EveryNEpochs` is just `_crossed(ctx.epoch, ctx.epoch_delta, n)`.
 ```python
 class Evaluator:
     def __init__(self, cfg): ...
-    def run_due(self, ctx, model, accelerator) -> dict[str, float]: ...
+    def run_due(self, ctx, model, dist_ctx) -> dict[str, float]: ...
     @property
     def has_tasks(self) -> bool: ...
     @property
@@ -1095,43 +1103,44 @@ builds the task's `Schedule` from its `ScheduleSpec`); warn on any provably
 unreachable schedule.
 
 ```python
-def run_due(self, ctx, model, accelerator):
+def run_due(self, ctx, model, dist_ctx):
     due = [t for t in self.tasks if t.schedule.is_due(ctx)]
     if not due:
-        return {}                                   # cheap: pure is_due only, no unwrap
-    unwrapped = accelerator.unwrap_model(model)     # only when ≥1 due
-    unwrapped.eval()
+        return {}                                   # cheap: pure is_due only, no peel
+    eval_model = getattr(model, "_orig_mod", model) # peel torch.compile; FSDP2 stays intact
+    eval_model.eval()
     metrics = {}
     try:
         for task in due:
-            for key, value in task.evaluate(unwrapped, accelerator).items():
+            for key, value in task.evaluate(eval_model, dist_ctx).items():
                 metrics[f"eval/{task.name}/{key}"] = value
     finally:
-        unwrapped.train()
+        eval_model.train()
     return metrics
 ```
 
-`unwrap_model` moves **behind** the due-check so the common "nothing due" path
-costs only a list comprehension over pure `is_due` calls. Tasks return **bare**
-metric names (`"loss"`, `"precision_at_L"`); the `Evaluator` is the sole place that
-applies the `eval/{name}/{metric}` namespace.
+Peeling the (possibly compiled) model moves **behind** the due-check so the common
+"nothing due" path costs only a list comprehension over pure `is_due` calls. The
+FSDP2 sharding is left intact — forward all-gathers shards as needed. Tasks return
+**bare** metric names (`"loss"`, `"precision_at_L"`); the `Evaluator` is the sole
+place that applies the `eval/{name}/{metric}` namespace.
 
 ## 24. Trainer integration & distributed token accounting
 
-The trainer builds one `EvalContext` per optimizer step and calls
-`evaluator.run_due(ctx, self.model, self.accelerator)` with the **wrapped** model
-(the evaluator unwraps behind the due-check). Returned metrics are logged at
-`ctx.global_step` and forwarded to `on_eval_end`.
+The trainer builds one `EvalContext` and one `DistContext` per optimizer step and
+calls `evaluator.run_due(ctx, self.model, dist_ctx)` with the **wrapped** model
+(the evaluator peels any `torch.compile` wrapper behind the due-check). Returned
+metrics are logged at `ctx.global_step` and forwarded to `on_eval_end`.
 
 **Distributed token accounting** (required for token cadence). A per-rank estimate
-(`local_tokens × num_processes`) diverges across ranks on ragged batches and
+(`local_tokens × world_size`) diverges across ranks on ragged batches and
 violates the rank-sync invariant. Instead, reduce truly, **unconditionally** (not
 gated on `needs_token_count`; the cost is one tiny all-reduce):
 
 ```python
-local_tokens = batch["attention_mask"].sum()
-tokens_delta = int(accelerator.reduce(local_tokens, reduction="sum").item())
-self.tokens_seen += tokens_delta                   # rank-identical by construction
+tokens = torch.tensor(self._step_local_tokens, device=self.device, dtype=torch.long)
+dist.all_reduce(tokens, op=dist.ReduceOp.SUM)
+self.tokens_seen += int(tokens.item())             # rank-identical by construction
 ```
 
 Under gradient accumulation, sum micro-batch tokens locally across the window and
@@ -1152,7 +1161,7 @@ class EvalTask(ABC):
         self.schedule = build_schedule(entry.schedule)   # ScheduleSpec -> Schedule
         self.cfg = cfg
     @abstractmethod
-    def evaluate(self, model, accelerator) -> dict[str, float]: ...
+    def evaluate(self, model, dist_ctx) -> dict[str, float]: ...
 ```
 
 Data loaders initialize **lazily** on first `evaluate`. The registry:
@@ -1167,7 +1176,7 @@ Adding a benchmark = implement a subclass, register it, point a `data.eval` entr
 - **`sequence` (`SequenceEvalTask`)** — MLM metrics on held-out sequences via
   `build_sequence_eval_dataloader(path, cfg)` (deterministic frozen masking, no
   shuffle, comparable across checkpoints). Metrics `loss`, `accuracy`,
-  `perplexity`; distributed via `accelerator.reduce` over summed loss/correct/
+  `perplexity`; distributed via `dist.all_reduce` over summed loss/correct/
   masked counts.
 - **`structure` (`StructureEvalTask`)** — contact-prediction precision@L via
   `load_structures(path, max_structures)` and `get_tokenizer()`. Metrics
@@ -1204,7 +1213,7 @@ Eval-specific scoring math, kept in the harness (it is scoring, not loading).
 - **MLM (`mlm.py`)**, over masked positions only: `loss` (mean cross-entropy,
   summed locally then reduced), `accuracy` (argmax fraction correct), `perplexity`
   (`exp(loss)`, capped at 1000 to stay finite early).
-  `compute_mlm_metrics(model, dataloader, accelerator) -> {loss, accuracy,
+  `compute_mlm_metrics(model, dataloader, dist_ctx) -> {loss, accuracy,
   perplexity}`.
 - **Contact / precision@L primitives (`contact.py`)**: **contact map** — binary
   `(L,L)`, residues `i,j` in contact iff Cβ–Cβ distance (virtual Cβ from N,CA,C
@@ -1350,8 +1359,8 @@ available (torch ≥ 2.11).
 0→1) → optional stable plateau (WSD only) → decay (linear or cosine to
 `min_lr/lr`) — wrapped in a `LambdaLR` per optimizer, stepped manually each
 optimizer step. Schedulers: `warmup_linear`, `warmup_cosine`, `wsd_linear`,
-`wsd_cosine`. The `Accelerator` is built with
-`step_scheduler_with_optimizer=False` (the trainer steps schedulers itself).
+`wsd_cosine`. The trainer steps each scheduler itself, once per optimizer step
+(after the FP8 weight-scale precompute when `precision == "fp8"`).
 
 **FLOPs** (`estimate_flops_per_token`, takes the HF config). No GQA (Q/K/V each
 `hidden_size → hidden_size`); FFN always gated (3 projections). Per layer:
@@ -1361,44 +1370,49 @@ lookups are omitted.
 
 ## 30. Training loop
 
-Entry points: `oplm.train.main(cfg=None)` (bootstraps the env — writable
-`TRITON_CACHE_DIR`, DeepSpeed off unless `OPLM_ENABLE_DEEPSPEED`; loads config from
-`sys.argv[1:]` then `Trainer(cfg).train()`), launched directly (`python -m
-oplm.train --config …`) or distributed (`accelerate launch -m oplm.train --config …
-model.num_hidden_layers=32`); and `oplm.cli train` (a Typer wrapper building the
-same argv from `--config`/`--preset` plus bare `key=value` positionals).
+Entry points: `oplm.train.main(cfg=None)` (ensures a writable `TRITON_CACHE_DIR`
+for `torch.compile`'s Triton backend, loads config from `sys.argv[1:]`, then
+`Trainer(cfg).train()`), launched under `torchrun` (`torchrun --nproc_per_node=N
+-m oplm.train --config … model.num_hidden_layers=32`); and `oplm.cli train` (a
+Typer wrapper building the same argv from `--config`/`--preset` plus bare
+`key=value` positionals, for single-process runs).
 
-`Trainer.__init__` order: `set_seed`; build `Accelerator` (`mixed_precision`,
-`gradient_accumulation_steps`, `log_with="wandb"`, `project_dir`,
-`DataLoaderConfiguration(dispatch_batches=False)`,
-`step_scheduler_with_optimizer=False`); init wandb trackers early; build
-`Evaluator` when `cfg.data.eval is not None`; build the model (+ gradient
-checkpointing); `build_optimizers` + `build_train_dataloader`;
-`_compute_total_steps` + `build_schedulers`; `accelerator.prepare(model,
-*optimizers, dataloader, *schedulers)`; init state (`global_step`, `epoch`,
-`tokens_seen`, `_samples_seen`, `_epoch_at_last_opt_step`, `_step_local_tokens`,
-`flops_per_token`); resume if `cfg.train.resume_from`.
+`Trainer.__init__` order (fixed): `dist.init_process_group` (NCCL on CUDA, Gloo on
+CPU; single-rank `torchrun` env defaults filled in for un-launched runs) + per-rank
+device; `torch.manual_seed(seed)` (identical on every rank so `fully_shard` shards
+matching replicas); init wandb (rank 0) and `Evaluator` (when `cfg.data.eval is not
+None`); build the model on CPU (+ gradient checkpointing); **[fp8]**
+`apply_fp8_training(model)` before sharding (gated by `is_fp8_supported`);
+`fully_shard` per transformer block then the root — or `.to(device)` for
+`fsdp_sharding_strategy="none"`; **[compile]** `torch.compile(model, dynamic=True)`
+after sharding; `build_optimizers(model)` + `build_train_dataloader` (no `prepare` —
+`ShardedProteinDataset` stripes rows by `(rank, worker)`); `_compute_total_steps` +
+`build_schedulers`; init state (`global_step`, `epoch`, `tokens_seen`,
+`_samples_seen`, `_epoch_at_last_opt_step`, `_step_local_tokens`, `flops_per_token`);
+resume if `cfg.train.resume_from`.
 
 The loop is one `while self.global_step < self.total_steps`:
 
 ```python
-with self.accelerator.accumulate(self.model):
-    outputs = self.model(input_ids=…, attention_mask=…, labels=…)
-    loss = outputs["loss"]
-    self.accelerator.backward(loss)
-    if cfg.max_grad_norm > 0 and self.accelerator.sync_gradients:
-        self.accelerator.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
-    for optimizer in self.optimizers:           # step + zero in one loop
-        optimizer.step(); optimizer.zero_grad()
+is_last_micro_step = (micro_step + 1) % grad_accum == 0
+self._set_grad_sync(is_last_micro_step)         # FSDP2 reduce-scatter only on the last micro-step
+loss = self.model(input_ids=…, attention_mask=…, labels=…)["loss"]
+(loss / grad_accum).backward()                  # divide → depth-invariant gradient magnitude
 
-# cadence work runs only on the optimizer-step (sync_gradients) boundary:
-if not self.accelerator.sync_gradients:
+# cadence work runs only on the optimizer-step (accumulation) boundary:
+if not is_last_micro_step:
     continue
+if cfg.max_grad_norm > 0:
+    clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
+for optimizer in self.optimizers:               # step + zero in one loop
+    optimizer.step(); optimizer.zero_grad()
+if cfg.precision == "fp8":
+    sync_fp8_history(self.model)                # precompute next-iter FP8 scales AFTER the step
 for scheduler in self.schedulers: scheduler.step()
 self.global_step += 1
 # rank-reduce this step's tokens → tokens_delta / tokens_seen rank-identical (§24)
 if self.global_step % cfg.log_every == 0: self._log_step(current_loss)
-eval_metrics = self._run_eval(tokens_delta)     # build EvalContext, Evaluator.run_due
+eval_metrics = self._run_eval(tokens_delta)     # build EvalContext + DistContext, Evaluator.run_due
 if eval_metrics: self._log_metrics(...); self._emit_eval_end(...)
 if self.global_step % cfg.save_every == 0: self._save_checkpoint()
 ```
@@ -1409,11 +1423,12 @@ checkpoint) runs once per **optimizer** step, not per micro-batch; epoch rollove
 reshuffle), re-creates the iterator; **accumulation-aware loss** for logging (a
 detached running sum across micro-steps / `gradient_accumulation_steps`, not just
 the last micro-batch); a final checkpoint, progress-bar stop, `on_train_end`, and
-`accelerator.end_training()` in a `finally`.
+`_teardown` (wandb `finish()` on rank 0, `dist.destroy_process_group()`) in a
+`finally`.
 
 **Cadence.** Duration: `max_steps` (default) or `max_epochs` (steps-per-epoch
 derived from resolved dataset length and the global effective batch `batch_size ·
-grad_accum · num_processes`; documented fallback when an iterable dataset reports no
+grad_accum · world_size`; documented fallback when an iterable dataset reports no
 length). Logging/checkpointing: step-modulo (`log_every`, `save_every`). Eval: step
 or token cadence per dataset via harness schedules, defaulting to
 `train.eval_every`. **Steps are the native clock**; epochs/tokens are derived
@@ -1422,26 +1437,31 @@ carried for forward compatibility).
 
 ## 31. Checkpointing, logging, callbacks
 
-**`save_checkpoint`** writes `checkpoint-{step}/`:
+**`save_checkpoint`** writes `checkpoint-{step}/` via PyTorch Distributed
+Checkpoint (DCP):
 
-- **Accelerate state** at top level (`accelerator.save_state(...)`) — model,
-  optimizer(s), scheduler(s), RNG — the resumable state.
-- **`trainer_state.json`** — `global_step`, `epoch`, `samples_seen`, `tokens_seen`.
-- **HF export** under `checkpoint-{step}/hf/` via the unwrapped model
-  (`unwrap_model(model).save_pretrained(.../hf)` → `config.json` +
-  `model.safetensors`, honoring tied weights) plus the tokenizer
-  (`get_tokenizer().save_pretrained(.../hf)`), so
+- **DCP shards** at top level (`dcp.save({"model", "optimizer"}, …)`) — the
+  FSDP2-sharded model and the **primary** optimizer, written as `.metadata` + a
+  per-rank `__{rank}_0.distcp`; all ranks participate.
+- **`trainer_state.json`** — `global_step`, `epoch`, `samples_seen`, `tokens_seen`
+  (rank 0).
+- **HF export** under `checkpoint-{step}/hf/` from a *full* (unsharded,
+  CPU-offloaded) state dict gathered with `get_model_state_dict(full_state_dict=
+  True)` then loaded into a throwaway CPU model → `config.json` +
+  `model.safetensors` + tokenizer, so
   `OplmForMaskedLM.from_pretrained(checkpoint-{step}/hf)` round-trips with its
-  tokenizer.
+  tokenizer (rank 0 writes; the gather itself is collective across all ranks).
 
 The run config is persisted for provenance via `cfg.model.to_dict()` + OmegaConf
-YAML for `train`/`data` (this replaces the broken `OmegaConf.structured(cfg)` that
-can't structure a `PretrainedConfig`). `_rotate_checkpoints` keeps at most
-`save_total_limit`. Resume reads Accelerate state + `trainer_state.json` from the
-top level (the `hf/` export is for downstream loading, not resume), re-seeds the
-dataset epoch, and resets per-opt-step delta markers.
+YAML for `train`/`data` (a `PretrainedConfig` can't be structured directly).
+`_rotate_checkpoints` keeps at most `save_total_limit`. Resume (`load_checkpoint`)
+restores the sharded model + primary optimizer via `dcp.load` + `set_state_dict`,
+reads `trainer_state.json` on rank 0 and broadcasts it, fast-forwards each LR
+scheduler to the restored `global_step` (schedulers aren't persisted — a `LambdaLR`
+is a pure function of `last_epoch`), re-seeds the dataset epoch, and resets
+per-opt-step delta markers (the `hf/` export is for downstream loading, not resume).
 
-**Logging / wandb:** `accelerator.log(metrics, step=global_step)`; training metrics
+**Logging / wandb:** `wandb.log(metrics, step=global_step)` on rank 0; training metrics
 `train/{loss,epoch,samples,tokens,flops,lr}`; eval metrics `eval/<task>/<metric>`.
 `_config_to_flat_dict` flattens `cfg.model.to_dict()` under a `model/` prefix and
 `asdict` of `train`/`data` under theirs (the old `dataclasses.asdict(cfg)` failed on

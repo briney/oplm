@@ -23,7 +23,7 @@ of sequences, and get back per-residue logits and embeddings.
 - **Fast attention** — built on PyTorch's `scaled_dot_product_attention` (a fused
   FlashAttention / memory-efficient kernel on CUDA, no separate `flash-attn`
   dependency), with a manual softmax path for returning attention weights.
-- **Five sizes** — from a 5M-parameter ablation model up to 13B parameters.
+- **Eight sizes** — from a 55M-parameter model up to 12.5B parameters.
 
 ---
 
@@ -46,7 +46,7 @@ pip install -e .
 Inference needs no extras. The optional groups are for contributors:
 
 ```bash
-pip install "oplm[train]"   # distributed training (Accelerate, W&B, datasets)
+pip install "oplm[train]"   # distributed training (W&B, datasets, BioPython)
 pip install "oplm[dev]"     # tests, linting, type checking
 ```
 
@@ -63,7 +63,7 @@ and attaches the matching tokenizer, so `.logits()` takes raw sequences directly
 import torch
 from oplm import OplmForMaskedLM, LogitsConfig
 
-model = OplmForMaskedLM.from_pretrained("brineylab/oplm-base").eval()
+model = OplmForMaskedLM.from_pretrained("brineylab/oplm-400M").eval()
 
 sequences = [
     "MSHHWGYGKHNGPEHWHKDFPIAKGERQSPVDIDTHTAKYDPSLKPLSVSYDQATSLRIL",
@@ -93,7 +93,7 @@ import torch
 from oplm import OplmModel
 from oplm.model import mean_pool
 
-model = OplmModel.from_pretrained("brineylab/oplm-base").eval()
+model = OplmModel.from_pretrained("brineylab/oplm-400M").eval()
 
 batch = model.tokenize(sequences)            # BatchEncoding on the model's device
 with torch.no_grad():
@@ -117,8 +117,8 @@ so the standard `Auto*` classes work too:
 import oplm  # registers OPLM with transformers' Auto* classes
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("brineylab/oplm-base")
-model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-base").eval()
+tokenizer = AutoTokenizer.from_pretrained("brineylab/oplm-400M")
+model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-400M").eval()
 
 batch = tokenizer(sequences, return_tensors="pt", padding=True)
 with torch.no_grad():
@@ -132,7 +132,7 @@ Each model repo also bundles its modeling code, so consumers who don't have
 `oplm` installed can load it with `trust_remote_code=True`:
 
 ```python
-model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-base", trust_remote_code=True)
+model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-400M", trust_remote_code=True)
 ```
 
 ### Coming from ESM-C?
@@ -157,13 +157,16 @@ live in `output.sequence_logits`.
 Checkpoints are published on the HuggingFace Hub under the `brineylab` org and
 selectable on the command line via `--preset`.
 
-| Preset / Hub id          | Parameters | Layers | Hidden | Heads |
-|--------------------------|-----------:|-------:|-------:|------:|
-| `brineylab/oplm-small`   |       5.2M |      6 |    256 |     4 |
-| `brineylab/oplm-medium`  |      85.6M |     12 |    768 |    12 |
-| `brineylab/oplm-base`    |     309.5M |     24 |   1024 |    16 |
-| `brineylab/oplm-large`   |       2.5B |     32 |   2560 |    32 |
-| `brineylab/oplm-xlarge`  |      12.7B |     40 |   5120 |    40 |
+| Preset / Hub id        | Parameters | Layers | Hidden | Heads |
+|------------------------|-----------:|-------:|-------:|------:|
+| `brineylab/oplm-50M`   |      54.9M |     16 |    512 |     8 |
+| `brineylab/oplm-170M`  |     170.6M |     24 |    768 |    12 |
+| `brineylab/oplm-400M`  |     412.3M |     32 |   1024 |    16 |
+| `brineylab/oplm-800M`  |     814.6M |     40 |   1280 |    16 |
+| `brineylab/oplm-1B`    |       1.6B |     50 |   1600 |    25 |
+| `brineylab/oplm-3B`    |       3.3B |     64 |   2048 |    32 |
+| `brineylab/oplm-6B`    |       6.4B |     80 |   2560 |    40 |
+| `brineylab/oplm-12B`   |      12.5B |    100 |   3200 |    50 |
 
 All sizes share the 33-token tokenizer and a 1024-position context window.
 
@@ -177,7 +180,7 @@ All sizes share the 33-token tokenizer and a 1024-position context window.
 
 ```bash
 oplm encode MKWVTFISLLLLFSSAYS MLPGLALLLLAAWTARA \
-  --model brineylab/oplm-base \
+  --model brineylab/oplm-400M \
   --output embeddings.pt
 ```
 
@@ -188,15 +191,15 @@ checkpoint directory. The saved tensor holds the per-residue embeddings,
 ### Inspect a model
 
 ```bash
-oplm info --preset base
+oplm info --preset 400M
 ```
 
 ```
 ──────────────── OPLM Model Info ────────────────
                 Architecture
- Parameters        309.5M (309,507,105)
+ Parameters        412.3M (412,302,369)
  Hidden size       1024
- Layers            24
+ Layers            32
  Attention heads   16
  Head dim          64
  Intermediate size 2816
@@ -208,12 +211,18 @@ oplm info --preset base
 
 ## Training
 
-OPLM trains with HuggingFace Accelerate (FSDP, mixed precision, gradient
-checkpointing, optional Muon optimizer) over parquet sequence datasets, with a
-built-in eval harness for MLM metrics and structure-based contact prediction.
+OPLM trains with native PyTorch distributed — FSDP2 (`fully_shard`) weight and
+optimizer sharding, BF16 or Blackwell FP8 precision (via torchao), optional
+`torch.compile`, gradient checkpointing, and an optional Muon optimizer — over
+parquet sequence datasets, with a built-in eval harness for MLM metrics and
+structure-based contact prediction.
 
 ```bash
-oplm train --preset base --config configs/my_run.yaml
+# single GPU (or CPU)
+oplm train --preset 400M --config configs/my_run.yaml
+
+# multi-GPU (8 GPUs on one node), via torchrun
+torchrun --nproc_per_node=8 -m oplm.train --preset 400M --config configs/my_run.yaml
 ```
 
 See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide.

@@ -17,7 +17,7 @@ class TrainerCallback:
         """Called once before the training loop begins."""
 
     def on_log(self, trainer: Trainer, metrics: dict[str, float], step: int) -> None:
-        """Called whenever the trainer logs metrics through ``accelerator.log``."""
+        """Called whenever the trainer logs metrics (``wandb.log`` on rank 0)."""
 
     def on_eval_end(self, trainer: Trainer, metrics: dict[str, float], step: int) -> None:
         """Called after an evaluation pass emits its aggregated metrics."""

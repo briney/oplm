@@ -79,7 +79,7 @@ def train(
 ) -> None:
     """Launch training.
 
-    For distributed training: accelerate launch -m oplm.train --config <path>
+    For distributed training: torchrun --nproc_per_node=N -m oplm.train --config <path>
     """
     _validate_overrides(overrides)
     cfg = load_config(_build_argv(config, preset, overrides, name))

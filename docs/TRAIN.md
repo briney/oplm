@@ -1,8 +1,7 @@
 # Training OPLM
 
 A practical guide to training an OPLM model end to end: prepare data, write a
-config, launch (single-GPU, multi-GPU, or DeepSpeed), monitor, checkpoint, and
-resume.
+config, launch (single-GPU or multi-GPU), monitor, checkpoint, and resume.
 
 This is the *how-to*. Related references:
 
@@ -25,9 +24,10 @@ This is the *how-to*. Related references:
 pip install -e ".[train]"
 ```
 
-The `train` extra adds Accelerate, Weights & Biases, `datasets`, and BioPython
-on top of the core dependency (`torch ≥ 2.11`). Muon (`torch.optim.Muon`) ships
-with PyTorch, so no extra install is needed to use it.
+The `train` extra adds Weights & Biases, `datasets`, and BioPython on top of the
+core dependencies (`torch ≥ 2.11`, `torchao ≥ 0.7`). Muon (`torch.optim.Muon`)
+ships with PyTorch and FP8 training ships with torchao (a core dependency), so
+neither needs an extra install.
 
 ---
 
@@ -70,7 +70,7 @@ scheme and [CONFIG.md](CONFIG.md#data-fields-data) for the masking knobs
 The smallest useful run — a size preset, one parquet file, and a few overrides:
 
 ```bash
-oplm train --preset small \
+oplm train --preset 50M \
   data.train=/data/train.parquet \
   train.max_steps=10_000 \
   train.wandb_enabled=false
@@ -147,7 +147,7 @@ There are three entry points. They share the same argument parsing (`--config`,
 |---------|-----------|
 | `oplm train …` | Single process (1 GPU or CPU). Convenience wrapper. |
 | `python -m oplm.train …` | Single process; identical, without the Typer wrapper. |
-| `accelerate launch -m oplm.train …` | **Multi-GPU / multi-node** (DDP or FSDP via Accelerate). |
+| `torchrun --nproc_per_node=N -m oplm.train …` | **Multi-GPU / multi-node** (FSDP2 via native `torch.distributed`). |
 
 ### Single GPU / CPU
 
@@ -159,55 +159,80 @@ python -m oplm.train --config my_run.yaml
 
 ### Multiple GPUs
 
-Configure Accelerate once (pick DDP or FSDP, number of GPUs, etc.):
+Launch with `torchrun`, which sets the distributed env vars (`RANK`,
+`WORLD_SIZE`, `LOCAL_RANK`). The trainer initializes the NCCL process group,
+shards the model with FSDP2, then builds the optimizers, dataloader, and
+schedulers — there is no separate `accelerate config` step:
 
 ```bash
-accelerate config
+# 8 GPUs on one node
+torchrun --nproc_per_node=8 -m oplm.train --config my_run.yaml
 ```
 
-Then launch through Accelerate — it sets up the distributed context, and the
-trainer prepares the model, optimizers, dataloader, and schedulers accordingly:
-
-```bash
-accelerate launch -m oplm.train --config my_run.yaml
-```
+Multi-node runs add the usual `torchrun` rendezvous flags (`--nnodes`,
+`--node_rank`, `--rdzv_endpoint`).
 
 `batch_size` is **per process**, so the global batch is
 `batch_size × num_processes × gradient_accumulation_steps`.
 
-### DeepSpeed (opt-in)
+### Precision: BF16 and FP8
 
-DeepSpeed is **disabled by default** — even if your environment has it enabled
-globally, the trainer clears the DeepSpeed Accelerate env vars at startup to
-avoid spurious DeepSpeed/Triton initialization. Opt in explicitly:
+`train.precision` selects the compute precision:
+
+- **`bf16`** (default) — BF16 mixed precision via FSDP2's `MixedPrecisionPolicy`
+  (BF16 params for compute, FP32 gradient reduction). Runs on any
+  Ampere/Hopper/Blackwell GPU.
+- **`fp8`** — torchao FP8 training with the **rowwise-scaling** recipe. Every
+  `nn.Linear` becomes a `Float8Linear` (norms, RoPE, `Conv1d`, and embeddings are
+  left alone), so matmuls use Blackwell's FP8 tensor cores at roughly 2× BF16
+  throughput while holding near-BF16 accuracy. **Requires sm90+ hardware**
+  (Blackwell / H100+); the trainer raises early on unsupported devices — there is
+  no automatic fallback to BF16.
 
 ```bash
-OPLM_ENABLE_DEEPSPEED=1 accelerate launch -m oplm.train --config my_run.yaml
+torchrun --nproc_per_node=8 -m oplm.train --config my_run.yaml train.precision=fp8
 ```
 
-(Configure the DeepSpeed plugin itself via `accelerate config`.)
+> The older `train.mixed_precision` knob (`bf16` / `fp16` / `no`) is
+> **deprecated** and ignored by the FSDP2 trainer — use `train.precision`.
+> Setting both to non-`bf16` values is rejected when the config loads.
+
+### Sharding strategy
+
+`train.fsdp_sharding_strategy` controls how FSDP2 distributes model state:
+
+| Strategy | Behavior |
+|----------|----------|
+| `full` (default) | Shard weights, gradients, and optimizer state across all ranks. |
+| `none` | No sharding — the model is just moved to the device. Single-GPU / debugging. |
+| `hybrid` | Shard within a node, replicate across nodes. *(Planned; not yet implemented.)* |
+
+Under `full`, each transformer block is sharded independently and then the root
+module (embedding, final norm, MLM head), which keeps all-gather granularity
+manageable.
 
 ---
 
 ## 6. What a training step does
 
-The trainer is a custom loop built on Accelerate (not the HuggingFace
-`Trainer`). Each optimizer step:
+The trainer is a custom loop on native `torch.distributed` + FSDP2 (not the
+HuggingFace `Trainer`, and no Accelerate). Each optimizer step:
 
 1. Pulls a batch — `{input_ids, attention_mask, labels}` — from the masking
    collator; `labels` are the original token ids at masked positions and `-100`
    elsewhere.
 2. Runs `OplmForMaskedLM` forward and gets the masked-LM cross-entropy loss.
-3. Backpropagates inside `accelerator.accumulate(...)`, so gradients accumulate
-   across `gradient_accumulation_steps` micro-batches before an optimizer step.
+3. Backpropagates; gradients accumulate across `gradient_accumulation_steps`
+   micro-batches (FSDP2's gradient reduce-scatter is suppressed on all but the
+   final micro-step) before an optimizer step.
 4. At the accumulation boundary: clips gradients to `train.max_grad_norm` (set
    `0` to disable), steps each optimizer, then steps each LR scheduler exactly
    once.
 
-Mixed precision is set by `train.mixed_precision` (`bf16` default, `fp16`, or
-`no`). Activation checkpointing is enabled when `model.gradient_checkpointing`
-is true (preset `large` and `xlarge` set it). For internals, see
-[TRAINER.md](TRAINER.md).
+Precision is set by `train.precision` (`bf16` default, or `fp8` on Blackwell —
+see [§5](#5-launching)). Activation checkpointing is enabled when
+`model.gradient_checkpointing` is true (no preset enables it by default — set it
+explicitly). For internals, see [TRAINER.md](TRAINER.md).
 
 ---
 
@@ -270,7 +295,8 @@ outputs/medium-uniref50/
     ├── trainer_state.json     # global_step, epoch, samples_seen, tokens_seen
     ├── config.yaml            # the full resolved run config (re-loadable)
     ├── hf/                    # HuggingFace export: config.json + model.safetensors + tokenizer
-    └── <accelerate state>     # model, optimizer(s), scheduler(s), RNG — for resuming
+    ├── .metadata              # PyTorch DCP index
+    └── __0_0.distcp, …        # DCP shards: sharded model + primary-optimizer state (one file per rank)
 ```
 
 - **`hf/`** is a standard HuggingFace model directory — load it for inference
@@ -280,8 +306,9 @@ outputs/medium-uniref50/
   kept (oldest deleted by step number).
 
 **Resume** an interrupted run by pointing `train.resume_from` at a checkpoint
-directory. It restores model, optimizer, scheduler, RNG, and step counters and
-continues:
+directory. It restores the model and primary-optimizer state from the DCP shards,
+fast-forwards the LR scheduler to the saved `global_step`, restores the step
+counters, and continues:
 
 ```bash
 oplm train --config my_run.yaml \
@@ -289,6 +316,14 @@ oplm train --config my_run.yaml \
 ```
 
 Raise `train.max_steps` first if the original budget was already reached.
+
+> **Checkpoint format change.** Resumable state is written with PyTorch
+> Distributed Checkpoint (DCP), not the previous Accelerate `save_state` format.
+> Checkpoints produced by the old Accelerate trainer **cannot** be resumed by the
+> current loader. The `hf/` export is unaffected — it stays a standard HuggingFace
+> directory loadable for inference
+> (`OplmForMaskedLM.from_pretrained(".../checkpoint-N/hf")`) regardless of the
+> trainer format, so it is the migration path for any pre-existing run.
 
 ---
 
@@ -357,12 +392,11 @@ Trainer(cfg, callbacks=[PrintLoss()]).train()
 
 Pass `train.compile=true` to enable `torch.compile(model, dynamic=True)`.
 
-The model is compiled before DDP wrapping (after gradient checkpointing is
-enabled, if set), so the compiled graph includes the recompute wrapper and DDP
-sees an `OptimizedModule` rather than a raw model — the standard ordering.
-`dynamic=True` is mandatory: protein sequences are padded to the batch maximum,
-so `seq_len` varies per batch; without dynamic shapes every unique length would
-trigger a recompile.
+The model is compiled **after** FSDP2 sharding (and after gradient checkpointing
+is enabled, if set), following the fixed init order `fully_shard → torch.compile
+→ build optimizers`. `dynamic=True` is mandatory: protein sequences are padded to
+the batch maximum, so `seq_len` varies per batch; without dynamic shapes every
+unique length would trigger a recompile.
 
 **First-step latency:** compilation runs on the first forward pass and may take
 several minutes for large models. Subsequent steps run the compiled graph.

@@ -610,13 +610,13 @@ with native PyTorch distributed primitives.
 
 ## Phase 7: Documentation and Cleanup
 
-- [ ] **7.1** Update `AGENTS.md`:
+- [x] **7.1** Update `AGENTS.md`:
   - Replace `accelerate launch -m oplm.train` with `torchrun --nproc_per_node=N`
     in the "Run distributed" example
   - Add `torchao>=0.7` to any dependency notes
   - Remove DeepSpeed references
 
-- [ ] **7.2** Update `docs/TRAIN.md` (or create it if not present):
+- [x] **7.2** Update `docs/TRAIN.md` (or create it if not present):
   - New "Precision" section: explain `train.precision=bf16` (default) vs `train.precision=fp8`
     (Blackwell only)
   - New "Compilation" section: explain `train.compile=true` and the first-step
@@ -626,16 +626,16 @@ with native PyTorch distributed primitives.
   - Note: existing Accelerate-format checkpoints are not compatible with the new
     DCP loader; provide a one-time migration note
 
-- [ ] **7.3** Update `README.md` training section: replace `accelerate launch` with
+- [x] **7.3** Update `README.md` training section: replace `accelerate launch` with
   `torchrun` example.
 
-- [ ] **7.4** Remove `deepspeed` from any CI config, workflow files under `.github/`,
+- [x] **7.4** Remove `deepspeed` from any CI config, workflow files under `.github/`,
   or environment setup scripts.
 
-- [ ] **7.5** Run `ruff check src/` and `ruff format src/` — fix any lint issues
+- [x] **7.5** Run `ruff check src/` and `ruff format src/` — fix any lint issues
   introduced by the changes.
 
-- [ ] **7.6** Run `ty check src/` — fix any new type errors. Use `# ty: ignore[<rule>]`
+- [x] **7.6** Run `ty check src/` — fix any new type errors. Use `# ty: ignore[<rule>]`
   sparingly and only with an explanation comment.
 
 ---
@@ -644,22 +644,22 @@ with native PyTorch distributed primitives.
 
 Run these in order before merging:
 
-- [ ] **8.1** `pytest -m "not slow and not blackwell"` — all pass
-- [ ] **8.2** `pytest -m "slow and not blackwell"` — all pass (single-rank FSDP2 BF16)
-- [ ] **8.3** Single-GPU smoke test:
+- [x] **8.1** `pytest -m "not slow and not blackwell"` — all pass
+- [x] **8.2** `pytest -m "slow and not blackwell"` — all pass (single-rank FSDP2 BF16)
+- [x] **8.3** Single-GPU smoke test (run with `--preset 50M`; see preset-rename note below):
   ```bash
   torchrun --nproc_per_node=1 -m oplm.train --preset small \
     train.max_steps=5 train.precision=bf16 train.save_every=5
   ```
   Verify: checkpoint directory created, `hf/` subdirectory loadable via
   `OplmForMaskedLM.from_pretrained(...)`.
-- [ ] **8.4** Single-GPU compile smoke test:
+- [x] **8.4** Single-GPU compile smoke test (run with `--preset 50M`):
   ```bash
   torchrun --nproc_per_node=1 -m oplm.train --preset small \
     train.max_steps=5 train.precision=bf16 train.compile=true
   ```
   Verify: no graph-break errors, loss decreases.
-- [ ] **8.5** Resume from checkpoint:
+- [x] **8.5** Resume from checkpoint (run with `--preset 50M`):
   ```bash
   torchrun --nproc_per_node=1 -m oplm.train --preset small \
     train.max_steps=10 train.save_every=5 train.resume_from=outputs/checkpoint-5

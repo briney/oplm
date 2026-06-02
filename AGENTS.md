@@ -29,6 +29,12 @@ ruff format src/
 
 # type check (ty — Astral's checker; configured under [tool.ty] in pyproject.toml)
 ty check src/
+
+# launch training — single process (1 GPU or CPU)
+torchrun --nproc_per_node=1 -m oplm.train --config configs/my_run.yaml
+
+# launch distributed training — N = GPUs per node (FSDP2 via native torch.distributed)
+torchrun --nproc_per_node=N -m oplm.train --config configs/my_run.yaml
 ```
 
 > **Type checking uses `ty`, not mypy.** `ty` is pre-1.0/beta but handles this
@@ -42,6 +48,10 @@ ty check src/
 - **src layout**: all package code lives under `src/oplm/`.
 - **Build system**: hatchling (`pyproject.toml` only, no `setup.py`).
 - **Testing**: pytest with tests in `tests/`.
+- **Training stack**: native `torch.distributed` — FSDP2 (`fully_shard`) for
+  weight/optimizer sharding, optional `torch.compile`, and optional torchao FP8
+  (`torchao>=0.7`, a core dependency). No Accelerate and no DeepSpeed; launch with
+  `torchrun`.
 
 ## Project Structure
 
