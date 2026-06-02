@@ -44,14 +44,21 @@ class OplmBlock(nn.Module):
         self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
 
         if config.residual_scaling == "sqrt_num_layers":
-            self.alpha = 1.0 / math.sqrt(config.num_hidden_layers)
+            alpha_val = 1.0 / math.sqrt(config.num_hidden_layers)
         elif config.residual_scaling == "none":
-            self.alpha = 1.0
+            alpha_val = 1.0
         else:
             raise ValueError(
                 f"Unknown residual_scaling {config.residual_scaling!r}; "
                 "expected 'sqrt_num_layers' or 'none'."
             )
+        # Register as a non-persistent buffer (scalar tensor) rather than a plain
+        # Python float. torch.compile + DDP (DDPOptimizer) lifts module attributes
+        # that are plain floats as graph inputs and may place them in subgraph
+        # outputs when partitioning. aot_autograd then fails with
+        # "AttributeError: 'float' has no attribute 'meta'" because it expects every
+        # output value to be an FX Node. A buffer is a proper tensor throughout.
+        self.register_buffer("alpha", torch.tensor(alpha_val), persistent=False)
 
         if config.norm_strategy not in {"pre", "sandwich", "hybrid", "post_sdpa"}:
             raise ValueError(

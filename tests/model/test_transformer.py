@@ -86,13 +86,30 @@ def _ones_mask(batch: int, seq: int) -> torch.Tensor:
 def test_block_alpha_uses_sqrt_num_layers():
     cfg = _config(num_hidden_layers=4, residual_scaling="sqrt_num_layers")
     block = OplmBlock(cfg, layer_idx=0)
-    assert block.alpha == pytest.approx(1.0 / math.sqrt(4))
+    assert isinstance(block.alpha, torch.Tensor)
+    assert block.alpha.item() == pytest.approx(1.0 / math.sqrt(4))
 
 
 def test_block_alpha_is_one_under_no_residual_scaling():
     cfg = _config(residual_scaling="none")
     block = OplmBlock(cfg, layer_idx=0)
-    assert block.alpha == 1.0
+    assert isinstance(block.alpha, torch.Tensor)
+    assert block.alpha.item() == pytest.approx(1.0)
+
+
+def test_block_alpha_is_non_persistent_buffer():
+    """alpha must be a non-persistent tensor buffer, not a plain Python float.
+
+    torch.compile + DDP (DDPOptimizer) lifts plain-float module attributes as
+    graph inputs and may include them in subgraph outputs when partitioning.
+    aot_autograd then fails with 'float has no attribute meta'. A non-persistent
+    buffer is a proper tensor throughout compilation and is not saved to state_dict.
+    """
+    cfg = _config(num_hidden_layers=4, residual_scaling="sqrt_num_layers")
+    block = OplmBlock(cfg, layer_idx=0)
+    assert isinstance(block.alpha, torch.Tensor), "alpha must be a tensor buffer"
+    assert block.alpha.ndim == 0, "alpha must be a scalar (0-dim tensor)"
+    assert "alpha" not in block.state_dict(), "alpha must be non-persistent (not saved)"
 
 
 def test_block_rejects_unknown_residual_scaling():

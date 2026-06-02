@@ -14,6 +14,40 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.slow
 
+
+# ---------------------------------------------------------------------------
+# Regression test: alpha must be a tensor buffer for DDP+compile compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_compile_aot_eager_forward_cpu(reset_dynamo: None) -> None:
+    """torch.compile with aot_eager backend must trace OplmForMaskedLM without error.
+
+    The aot_eager backend exercises the AOT autograd code path (runtime_wrappers)
+    that fails when any graph output is a plain Python float instead of a tensor.
+    This previously broke with DDP+compile because OplmBlock.alpha was a plain float
+    that got lifted as a graph input and placed in subgraph outputs by DDPOptimizer.
+    """
+    from oplm.model import OplmForMaskedLM
+    from oplm.model import OplmConfig as OplmModelConfig
+
+    config = OplmModelConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        max_position_embeddings=64,
+    )
+    model = OplmForMaskedLM(config)
+    compiled = torch.compile(model, dynamic=True, backend="aot_eager")
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    attention_mask = torch.ones(2, 8, dtype=torch.long)
+    labels = torch.randint(0, config.vocab_size, (2, 8))
+
+    output = compiled(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+    assert output.loss is not None
+    assert torch.isfinite(output.loss)
+
 _REQUIRES_CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA not available"
 )
