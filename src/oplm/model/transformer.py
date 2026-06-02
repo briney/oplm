@@ -52,13 +52,19 @@ class OplmBlock(nn.Module):
                 f"Unknown residual_scaling {config.residual_scaling!r}; "
                 "expected 'sqrt_num_layers' or 'none'."
             )
-        # Register as a non-persistent buffer (scalar tensor) rather than a plain
-        # Python float. torch.compile + DDP (DDPOptimizer) lifts module attributes
-        # that are plain floats as graph inputs and may place them in subgraph
-        # outputs when partitioning. aot_autograd then fails with
+        # Register as a persistent buffer (scalar tensor) rather than a plain Python float.
+        #
+        # Why a buffer at all: torch.compile + DDP (DDPOptimizer) lifts plain-float
+        # module attributes as graph inputs and may place them in subgraph outputs when
+        # partitioning at bucket boundaries. aot_autograd then fails with
         # "AttributeError: 'float' has no attribute 'meta'" because it expects every
         # output value to be an FX Node. A buffer is a proper tensor throughout.
-        self.register_buffer("alpha", torch.tensor(alpha_val), persistent=False)
+        #
+        # Why persistent (not persistent=False): HuggingFace's from_pretrained fast-init
+        # path creates model tensors uninitialized (torch.empty semantics) and only
+        # restores persistent buffers from the saved state dict. Non-persistent buffers
+        # stay as garbage after loading, producing near-zero alpha and broken outputs.
+        self.register_buffer("alpha", torch.tensor(alpha_val), persistent=True)
 
         if config.norm_strategy not in {"pre", "sandwich", "hybrid", "post_sdpa"}:
             raise ValueError(

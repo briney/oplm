@@ -97,19 +97,23 @@ def test_block_alpha_is_one_under_no_residual_scaling():
     assert block.alpha.item() == pytest.approx(1.0)
 
 
-def test_block_alpha_is_non_persistent_buffer():
-    """alpha must be a non-persistent tensor buffer, not a plain Python float.
+def test_block_alpha_is_persistent_buffer():
+    """alpha must be a persistent scalar tensor buffer, not a plain Python float.
 
     torch.compile + DDP (DDPOptimizer) lifts plain-float module attributes as
-    graph inputs and may include them in subgraph outputs when partitioning.
-    aot_autograd then fails with 'float has no attribute meta'. A non-persistent
-    buffer is a proper tensor throughout compilation and is not saved to state_dict.
+    graph inputs and may include them in subgraph outputs when partitioning;
+    aot_autograd then fails with 'float has no attribute meta'.
+
+    It must be persistent (saved in state_dict) so that HuggingFace's fast-init
+    path (from_pretrained) restores the correct value: fast-init creates buffers
+    with uninitialized memory and only overwrites persistent buffers from the
+    checkpoint; a non-persistent alpha would survive as garbage (~0) after loading.
     """
     cfg = _config(num_hidden_layers=4, residual_scaling="sqrt_num_layers")
     block = OplmBlock(cfg, layer_idx=0)
     assert isinstance(block.alpha, torch.Tensor), "alpha must be a tensor buffer"
     assert block.alpha.ndim == 0, "alpha must be a scalar (0-dim tensor)"
-    assert "alpha" not in block.state_dict(), "alpha must be non-persistent (not saved)"
+    assert "alpha" in block.state_dict(), "alpha must be persistent (saved in state_dict)"
 
 
 def test_block_rejects_unknown_residual_scaling():
