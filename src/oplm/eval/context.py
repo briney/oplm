@@ -3,6 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
+
+@dataclass(frozen=True)
+class DistContext:
+    """Lightweight distributed-runtime handle passed from Trainer into eval tasks.
+
+    Replaces the ``Accelerator`` object the eval harness used to receive: it carries
+    only the rank / world-size / device / is-main facts that tasks need for
+    rank-sharding work and native ``torch.distributed`` collectives, with no
+    Accelerate dependency. Constructed once per eval call by the Trainer.
+    """
+
+    rank: int  # this process's global rank (== dist.get_rank())
+    world_size: int  # total number of ranks (== dist.get_world_size())
+    device: torch.device  # the device this rank computes on
+    is_main: bool  # convenience for rank == 0
 
 
 @dataclass(frozen=True)

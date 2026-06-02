@@ -8,8 +8,7 @@ from oplm.eval.registry import register_eval_task
 from oplm.eval.tasks.base import EvalTask
 
 if TYPE_CHECKING:
-    from accelerate import Accelerator
-
+    from oplm.eval.context import DistContext
     from oplm.model import OplmForMaskedLM
 
 
@@ -40,7 +39,7 @@ class TapeEvalTask(EvalTask):
     def evaluate(
         self,
         model: OplmForMaskedLM,
-        accelerator: Accelerator,
+        dist_ctx: DistContext,
     ) -> dict[str, float]:
         raise NotImplementedError(
             "TAPE evaluation is not yet implemented. "

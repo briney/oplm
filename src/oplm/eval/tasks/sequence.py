@@ -10,11 +10,11 @@ from oplm.eval.registry import register_eval_task
 from oplm.eval.tasks.base import EvalTask
 
 if TYPE_CHECKING:
-    from accelerate import Accelerator
     from torch import Tensor
     from torch.utils.data import DataLoader
 
     from oplm.config import EvalDatasetEntry, OplmConfig
+    from oplm.eval.context import DistContext
     from oplm.model import OplmForMaskedLM
 
 
@@ -40,19 +40,19 @@ class SequenceEvalTask(EvalTask):
     def evaluate(
         self,
         model: OplmForMaskedLM,
-        accelerator: Accelerator,
+        dist_ctx: DistContext,
     ) -> dict[str, float]:
         """Run MLM evaluation on held-out sequences.
 
         The DataLoader is lazily initialized on the first call to avoid
         loading eval data before training starts and to ensure the
-        accelerator is fully set up. ``build_sequence_eval_dataloader`` returns
-        a resetting loader that rewinds its deterministic collator on every
-        ``__iter__``, so no manual reset is needed between passes.
+        distributed context is fully set up. ``build_sequence_eval_dataloader``
+        returns a resetting loader that rewinds its deterministic collator on
+        every ``__iter__``, so no manual reset is needed between passes.
 
         Args:
             model: The unwrapped model (already in eval mode).
-            accelerator: The Accelerator instance.
+            dist_ctx: Distributed-runtime context for device + collective reduction.
 
         Returns:
             Dict of metric name to scalar value, filtered to requested metrics.
@@ -60,7 +60,7 @@ class SequenceEvalTask(EvalTask):
         if self._dataloader is None:
             self._dataloader = build_sequence_eval_dataloader(self.path, self.cfg)
 
-        all_metrics = compute_mlm_metrics(model, self._dataloader, accelerator)
+        all_metrics = compute_mlm_metrics(model, self._dataloader, dist_ctx)
 
         # Filter to only the metrics requested by the config
         return {k: v for k, v in all_metrics.items() if k in self.metrics}

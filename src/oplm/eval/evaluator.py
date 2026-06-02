@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from oplm.config import DEFAULT_EVAL_CADENCE, parse_schedule_block
 from oplm.data.config import parse_eval_configs
@@ -12,11 +12,11 @@ from oplm.eval.schedule import EveryNSteps, EveryNTokens
 
 if TYPE_CHECKING:
     import torch.nn as nn
-    from accelerate import Accelerator
 
     from oplm.config import OplmConfig
-    from oplm.eval.context import EvalContext
+    from oplm.eval.context import DistContext, EvalContext
     from oplm.eval.tasks.base import EvalTask
+    from oplm.model import OplmForMaskedLM
 
 logger = logging.getLogger(__name__)
 
@@ -70,25 +70,27 @@ class Evaluator:
                 )
 
     def run_due(
-        self, ctx: EvalContext, model: nn.Module, accelerator: Accelerator
+        self, ctx: EvalContext, model: nn.Module, dist_ctx: DistContext
     ) -> dict[str, float]:
         """Run every task due at ``ctx`` and return merged ``eval/<name>/<metric>`` metrics.
 
         Returns an empty dict (and does no unwrap / no eval-mode toggle) when nothing
-        is due. ``model`` is the WRAPPED model; it is unwrapped here only when needed.
+        is due. ``model`` is the WRAPPED model; only a ``torch.compile`` wrapper is
+        peeled here (via ``_orig_mod``). Any FSDP2 sharding is left intact — forward
+        must go through the sharded module so parameters are all-gathered on demand.
         """
         due = [t for t in self.tasks if t.schedule.is_due(ctx)]
         if not due:
             return {}
-        unwrapped = accelerator.unwrap_model(model)
-        unwrapped.eval()
+        eval_model = cast("OplmForMaskedLM", getattr(model, "_orig_mod", model))
+        eval_model.eval()
         metrics: dict[str, float] = {}
         try:
             for task in due:
-                for key, value in task.evaluate(unwrapped, accelerator).items():
+                for key, value in task.evaluate(eval_model, dist_ctx).items():
                     metrics[f"eval/{task.name}/{key}"] = value
         finally:
-            unwrapped.train()
+            eval_model.train()
         return metrics
 
     @property

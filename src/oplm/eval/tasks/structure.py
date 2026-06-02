@@ -23,9 +23,8 @@ from oplm.eval.registry import register_eval_task
 from oplm.eval.tasks.base import EvalTask
 
 if TYPE_CHECKING:
-    from accelerate import Accelerator
-
     from oplm.config import EvalDatasetEntry, OplmConfig
+    from oplm.eval.context import DistContext
     from oplm.model import OplmForMaskedLM, OplmTokenizerFast
 
 logger = logging.getLogger(__name__)
@@ -129,7 +128,7 @@ class StructureEvalTask(EvalTask):
     def evaluate(
         self,
         model: OplmForMaskedLM,
-        accelerator: Accelerator,
+        dist_ctx: DistContext,
     ) -> dict[str, float]:
         """Run categorical-Jacobian contact prediction evaluation.
 
@@ -139,7 +138,7 @@ class StructureEvalTask(EvalTask):
 
         Args:
             model: The unwrapped model (already in eval mode).
-            accelerator: The Accelerator instance.
+            dist_ctx: Distributed-runtime context for rank-sharding and gathering.
 
         Returns:
             Dict of metric name to scalar value, filtered to requested metrics.
@@ -161,13 +160,13 @@ class StructureEvalTask(EvalTask):
             return {}
 
         # Shard structures across ranks
-        rank = accelerator.process_index
-        world_size = accelerator.num_processes
+        rank = dist_ctx.rank
+        world_size = dist_ctx.world_size
         rank_structures = self._structures[rank::world_size]
         selected_names = self._select_structure_names()
 
         # Process structures one at a time
-        device = accelerator.device
+        device = dist_ctx.device
         pair_score_data_list: list[StructurePairScoreData] = []
         for struct in rank_structures:
             if struct.name not in selected_names:
@@ -177,7 +176,7 @@ class StructureEvalTask(EvalTask):
                 pair_score_data_list.append(pair_score_data)
 
         # Gather across ranks
-        all_pair_score_data = self._gather_data(pair_score_data_list, accelerator)
+        all_pair_score_data = self._gather_data(pair_score_data_list, dist_ctx)
 
         if not all_pair_score_data:
             logger.warning("No valid structures after processing")
@@ -293,15 +292,15 @@ class StructureEvalTask(EvalTask):
     def _gather_data(
         self,
         local_data: list[T],
-        accelerator: Accelerator,
+        dist_ctx: DistContext,
     ) -> list[T]:
         """Gather per-rank Python objects from all ranks."""
-        if accelerator.num_processes == 1:
+        if dist_ctx.world_size == 1:
             return local_data
 
         import torch.distributed as dist
 
-        all_data_lists: list[list[T] | None] = [None] * accelerator.num_processes
+        all_data_lists: list[list[T] | None] = [None] * dist_ctx.world_size
         dist.all_gather_object(all_data_lists, local_data)
 
         gathered: list[T] = []

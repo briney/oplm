@@ -8,9 +8,8 @@ from typing import TYPE_CHECKING, ClassVar
 from oplm.eval.schedule import build_schedule
 
 if TYPE_CHECKING:
-    from accelerate import Accelerator
-
     from oplm.config import EvalDatasetEntry, OplmConfig
+    from oplm.eval.context import DistContext
     from oplm.eval.schedule import Schedule
     from oplm.model import OplmForMaskedLM
 
@@ -36,7 +35,7 @@ class EvalTask(ABC):
     def evaluate(
         self,
         model: OplmForMaskedLM,
-        accelerator: Accelerator,
+        dist_ctx: DistContext,
     ) -> dict[str, float]:
         """Run evaluation and return metrics.
 
@@ -45,7 +44,8 @@ class EvalTask(ABC):
 
         Args:
             model: The unwrapped model in eval mode.
-            accelerator: The Accelerator instance (for distributed ops).
+            dist_ctx: Distributed-runtime context (rank/world-size/device) for
+                rank-sharding and collective reductions.
 
         Returns:
             Mapping of metric name to scalar value.

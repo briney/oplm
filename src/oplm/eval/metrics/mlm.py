@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from accelerate import Accelerator
     from torch import Tensor
     from torch.utils.data import DataLoader
 
+    from oplm.eval.context import DistContext
     from oplm.model import OplmForMaskedLM
 
 _PERPLEXITY_CAP = 1000.0
@@ -20,7 +20,7 @@ _PERPLEXITY_CAP = 1000.0
 def compute_mlm_metrics(
     model: OplmForMaskedLM,
     dataloader: DataLoader[dict[str, Tensor]],
-    accelerator: Accelerator,
+    dist_ctx: DistContext,
 ) -> dict[str, float]:
     """Compute MLM metrics over an eval DataLoader.
 
@@ -33,12 +33,12 @@ def compute_mlm_metrics(
     Args:
         model: The unwrapped model (already in eval mode).
         dataloader: Eval DataLoader yielding ``{input_ids, attention_mask, labels}``.
-        accelerator: Accelerator instance for distributed reduction.
+        dist_ctx: Distributed-runtime context for device + collective reduction.
 
     Returns:
         Dict with keys ``"loss"``, ``"accuracy"``, ``"perplexity"``.
     """
-    device = accelerator.device
+    device = dist_ctx.device
 
     total_loss = torch.zeros(1, device=device)
     total_correct = torch.zeros(1, device=device, dtype=torch.long)
@@ -74,10 +74,13 @@ def compute_mlm_metrics(
                 total_correct += correct.sum()
                 total_masked += n_masked
 
-    # Gather across ranks
-    total_loss = accelerator.reduce(total_loss, reduction="sum")
-    total_correct = accelerator.reduce(total_correct, reduction="sum")
-    total_masked = accelerator.reduce(total_masked, reduction="sum")
+    # Gather across ranks (no-op for a single rank or an uninitialized group).
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_masked, op=dist.ReduceOp.SUM)
 
     n = total_masked.item()
     if n == 0:
