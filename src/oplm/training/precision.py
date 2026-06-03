@@ -35,13 +35,46 @@ def is_fp8_supported() -> bool:
     return major >= 9
 
 
+# torch._scaled_mm (the FP8 matmul) requires both weight dimensions to be a
+# multiple of this; Linears that violate it fall back to bf16.
+_FP8_DIM_MULTIPLE = 16
+
+
+def _should_convert_to_fp8(module: nn.Module, fqn: str) -> bool:
+    """Return True if ``module`` is an ``nn.Linear`` eligible for FP8 conversion.
+
+    Two classes of ``nn.Linear`` are deliberately left in bf16:
+
+    - The ``lm_head`` (matched by name): it projects to vocab space and is numerically
+      sensitive, and its ``decoder`` weight shares storage with the embedding table when
+      ``tie_word_embeddings=True`` — converting it would break that tie. Keeping the head
+      in bf16 also matches standard FP8 recipes.
+    - Any ``nn.Linear`` whose ``in_features`` or ``out_features`` is not a multiple of 16:
+      ``torch._scaled_mm`` rejects those dimensions. This covers the vocab decoder
+      (``out_features == vocab_size``, typically not a multiple of 16) and downstream
+      classification heads (``nn.Linear(hidden, num_labels)``).
+
+    Args:
+        module: Candidate module supplied by ``convert_to_float8_training``.
+        fqn: Fully-qualified module name, e.g. ``"lm_head.decoder"``.
+    """
+    if not isinstance(module, nn.Linear):
+        return False
+    if fqn == "lm_head" or fqn.startswith("lm_head."):
+        return False
+    return (
+        module.in_features % _FP8_DIM_MULTIPLE == 0 and module.out_features % _FP8_DIM_MULTIPLE == 0
+    )
+
+
 def apply_fp8_training(model: nn.Module) -> None:
-    """Convert all ``nn.Linear`` layers to ``Float8Linear`` with rowwise scaling.
+    """Convert eligible ``nn.Linear`` layers to ``Float8Linear`` with rowwise scaling.
 
     Must be called BEFORE ``fully_shard()`` — torchao swaps the linear modules in
     place, and FSDP2 must wrap the already-converted modules. Norms, RoPE, Conv1d,
-    and embedding tables are left untouched: the ``module_filter_fn`` selects only
-    ``nn.Linear`` instances, so non-Linear modules are skipped.
+    and embedding tables are left untouched (they are not ``nn.Linear``). The
+    ``lm_head`` and any ``nn.Linear`` whose dimensions are not multiples of 16 are
+    also left in bf16 — see :func:`_should_convert_to_fp8` for why.
 
     Args:
         model: The model to convert in place. The forward API is unchanged.
@@ -52,7 +85,7 @@ def apply_fp8_training(model: nn.Module) -> None:
     convert_to_float8_training(
         model,
         config=config,
-        module_filter_fn=lambda m, fqn: isinstance(m, nn.Linear),
+        module_filter_fn=_should_convert_to_fp8,
     )
 
 

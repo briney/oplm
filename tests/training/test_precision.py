@@ -29,27 +29,44 @@ def _tiny_model() -> OplmForMaskedLM:
 
 
 @pytest.mark.blackwell
-def test_apply_fp8_skips_non_linear() -> None:
-    """Every ``nn.Linear`` becomes ``Float8Linear``; norms and embeddings are untouched."""
+def test_apply_fp8_converts_backbone_and_skips_head() -> None:
+    """Eligible backbone Linears become ``Float8Linear``; the ``lm_head`` stays bf16."""
     from torchao.float8.float8_linear import Float8Linear
 
     from oplm.training.precision import apply_fp8_training
 
-    model = _tiny_model()
-    n_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+    model = _tiny_model()  # hidden_size=32, vocab_size=33 (default)
     n_norm = sum(1 for m in model.modules() if type(m).__name__ == "OplmLayerNorm")
     n_embed = sum(1 for m in model.modules() if isinstance(m, nn.Embedding))
-    assert n_linear > 0 and n_norm > 0 and n_embed > 0  # sanity: the mix exists
+    assert n_norm > 0 and n_embed > 0  # sanity: the mix exists
 
     apply_fp8_training(model)
 
-    # Float8Linear subclasses nn.Linear, so compare concrete types: every linear was
-    # converted (count matches) and no *bare* nn.Linear survives.
-    assert sum(1 for m in model.modules() if isinstance(m, Float8Linear)) == n_linear
-    assert not any(type(m) is nn.Linear for m in model.modules())
-    # Non-Linear modules are skipped by the module_filter_fn.
+    # The whole lm_head is excluded by name: both stay *bare* nn.Linear (Float8Linear
+    # subclasses nn.Linear, so check the concrete type). The decoder is also indivisible
+    # (out_features == vocab_size == 33).
+    assert type(model.lm_head.dense) is nn.Linear
+    assert type(model.lm_head.decoder) is nn.Linear
+    # A backbone Linear with divisible dims (32x32) is converted.
+    assert isinstance(model.oplm.backbone.layers[0].attention.q_proj, Float8Linear)
+    # Non-Linear modules are untouched by the module_filter_fn.
     assert sum(1 for m in model.modules() if type(m).__name__ == "OplmLayerNorm") == n_norm
     assert sum(1 for m in model.modules() if isinstance(m, nn.Embedding)) == n_embed
+
+
+def test_should_convert_to_fp8_predicate() -> None:
+    """The filter excludes the lm_head by name and any Linear with indivisible dims."""
+    from oplm.training.precision import _should_convert_to_fp8
+
+    # lm_head excluded by name even when dims are divisible by 16.
+    assert not _should_convert_to_fp8(nn.Linear(32, 32), "lm_head.dense")
+    assert not _should_convert_to_fp8(nn.Linear(32, 33), "lm_head.decoder")
+    # Indivisible dims excluded (classification head; odd in/out features).
+    assert not _should_convert_to_fp8(nn.Linear(32, 5), "classifier")
+    assert not _should_convert_to_fp8(nn.Linear(33, 32), "oplm.backbone.layers.0.ffn.down_proj")
+    # An eligible backbone Linear converts; non-Linear modules are skipped.
+    assert _should_convert_to_fp8(nn.Linear(32, 64), "oplm.backbone.layers.0.attention.q_proj")
+    assert not _should_convert_to_fp8(nn.LayerNorm(32), "norm")
 
 
 def test_bf16_path_untouched() -> None:
