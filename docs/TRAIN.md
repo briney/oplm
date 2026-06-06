@@ -206,8 +206,13 @@ The trainer is a custom loop built on Accelerate (not the HuggingFace
 
 Mixed precision is set by `train.mixed_precision` (`bf16` default, `fp16`, or
 `no`). Activation checkpointing is enabled when `model.gradient_checkpointing`
-is true (preset `large` and `xlarge` set it). For internals, see
-[TRAINER.md](TRAINER.md).
+is true (preset `large` and `xlarge` set it). `model.gradient_checkpointing_mode`
+picks the memory/compute tradeoff: `full` (default) recomputes the entire block
+on backward for maximum memory savings (~+30% compute), while `selective` keeps
+matmul/SDPA outputs resident and recomputes only cheap ops — less memory savings
+for substantially less extra compute. The mode is inert unless
+`gradient_checkpointing` is true, and both modes compose with `train.compile`.
+For internals, see [TRAINER.md](TRAINER.md).
 
 ---
 

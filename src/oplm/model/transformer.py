@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,59 @@ __all__ = ["OplmBlock", "OplmStack"]
 _CANON_POSITIONS = ("A", "B", "C", "D")
 
 
+# CheckpointPolicy is public in torch.utils.checkpoint from torch>=2.4; guard the
+# import so this module still loads on older torch (the selective branch in
+# OplmBlock.forward raises a clear error if SAC is then requested).
+try:
+    from torch.utils.checkpoint import CheckpointPolicy as _CheckpointPolicy
+except ImportError:  # torch < 2.4
+    _CheckpointPolicy = None  # type: ignore[assignment]
+
+
+# Selective Activation Checkpointing (SAC) — ops whose outputs are FLOP-heavy to
+# recompute but cheap to store. Saving these avoids re-running the expensive
+# kernels during the backward recompute, while everything else (norms, SiLU/GELU,
+# RoPE, softmax, dropout, residual scaling, reshapes) is recomputed to free
+# memory. See docs/TRAIN.md for the memory/compute tradeoff rationale.
+def _build_sac_save_ops() -> frozenset:
+    """Collect the aten overloads SAC keeps in memory (matmuls + SDPA backends).
+
+    Built lazily through getattr so a missing SDPA overload on an older torch
+    simply drops out of the set (those ops then fall to PREFER_RECOMPUTE) rather
+    than raising at import time.
+    """
+    aten = torch.ops.aten
+    candidates = (
+        "mm",  # Linear (2D) / matmuls
+        "addmm",  # Linear with bias (MLM head, etc.)
+        "bmm",  # batched matmul (manual-attention path)
+        "_scaled_dot_product_efficient_attention",
+        "_scaled_dot_product_flash_attention",
+        "_scaled_dot_product_attention_math",  # CPU / math backend
+    )
+    ops = set()
+    for name in candidates:
+        overload_packet = getattr(aten, name, None)
+        if overload_packet is not None:
+            ops.add(overload_packet.default)
+    return frozenset(ops)
+
+
+_SAC_SAVE_OPS = _build_sac_save_ops()
+
+
+def _sac_policy_fn(ctx, op, *args, **kwargs):
+    """SAC policy: keep matmul/SDPA outputs, recompute everything else.
+
+    Defined at module level (not a per-call closure) so torch.compile/Dynamo can
+    trace it as a constant global when composed with the checkpoint higher-order
+    op — a nested closure here trips ``AsPythonConstantNotImplementedError``.
+    """
+    if op in _SAC_SAVE_OPS:
+        return _CheckpointPolicy.MUST_SAVE
+    return _CheckpointPolicy.PREFER_RECOMPUTE
+
+
 class OplmBlock(nn.Module):
     """One repeating encoder block: attention + FFN sublayers, configurable norms.
 
@@ -42,6 +96,9 @@ class OplmBlock(nn.Module):
         self.norm_strategy = config.norm_strategy
         self.residual_scaling = config.residual_scaling
         self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
+        self.gradient_checkpointing_mode = str(
+            getattr(config, "gradient_checkpointing_mode", "full")
+        )
 
         if config.residual_scaling == "sqrt_num_layers":
             alpha_val = 1.0 / math.sqrt(config.num_hidden_layers)
@@ -187,6 +244,25 @@ class OplmBlock(nn.Module):
             `attn_weights_or_None` has shape `(B, H, T, T)` when requested.
         """
         if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing_mode == "selective":
+                if not hasattr(torch_checkpoint, "create_selective_checkpoint_contexts"):
+                    raise RuntimeError(
+                        "Selective activation checkpointing requires torch>=2.4; "
+                        "set gradient_checkpointing_mode='full'."
+                    )
+                context_fn = functools.partial(
+                    torch_checkpoint.create_selective_checkpoint_contexts,
+                    _sac_policy_fn,
+                )
+                return torch_checkpoint.checkpoint(
+                    self._forward_impl,
+                    x,
+                    attention_mask,
+                    output_attentions,
+                    use_reentrant=False,
+                    context_fn=context_fn,
+                )
+            # "full" — recompute the entire block on backward.
             return torch_checkpoint.checkpoint(
                 self._forward_impl,
                 x,
@@ -215,6 +291,9 @@ class OplmStack(nn.Module):
         self.config = config
         self.num_hidden_layers = config.num_hidden_layers
         self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
+        self.gradient_checkpointing_mode = str(
+            getattr(config, "gradient_checkpointing_mode", "full")
+        )
 
         self.embed_tokens = OplmEmbedding(config)
         self.layers = nn.ModuleList(
@@ -222,11 +301,26 @@ class OplmStack(nn.Module):
         )
         self.final_norm = make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
 
-    def set_gradient_checkpointing(self, enabled: bool) -> None:
-        """Toggle gradient checkpointing on every block in the stack."""
+    def set_gradient_checkpointing(self, enabled: bool, mode: str | None = None) -> None:
+        """Toggle gradient checkpointing on every block in the stack.
+
+        Args:
+            enabled: Whether activation checkpointing fires during training.
+            mode: Optional `"full"` | `"selective"` flavor. When given, it is
+                propagated to the stack and every block; when `None`, the
+                existing mode is left untouched.
+        """
         self.gradient_checkpointing = enabled
+        if mode is not None:
+            self.gradient_checkpointing_mode = mode
         for block in self.layers:
-            block.gradient_checkpointing = enabled  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+            block.gradient_checkpointing = (
+                enabled  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+            )
+            if mode is not None:
+                block.gradient_checkpointing_mode = (
+                    mode  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+                )
 
     def forward(
         self,

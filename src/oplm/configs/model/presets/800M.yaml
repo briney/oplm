@@ -5,3 +5,4 @@ model:
   num_hidden_layers: 40
   num_attention_heads: 16
   # gradient_checkpointing: true
+  # gradient_checkpointing_mode: selective # full | selective

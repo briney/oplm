@@ -161,6 +161,7 @@ Consumed by `OplmForSequenceClassification` / `OplmForTokenClassification`.
 | --- | --- | --- | --- |
 | `model.initializer_range` | `float` | `0.02` | Truncated-normal init std. |
 | `model.gradient_checkpointing` | `bool` | `false` | Activation checkpointing in the encoder. |
+| `model.gradient_checkpointing_mode` | `str` | `full` | `full` \| `selective`. `full` recomputes the whole block (max memory savings, ~+30% compute); `selective` keeps matmul/SDPA outputs resident and recomputes only cheap ops (less memory savings, much less extra compute). Inert unless `gradient_checkpointing` is `true`. |
 | `model.pad_token_id` | `int` | `1` | `<pad>`. |
 | `model.bos_token_id` | `int` | `0` | `<cls>` (prepended to every sequence). |
 | `model.eos_token_id` | `int` | `2` | `<eos>`. |

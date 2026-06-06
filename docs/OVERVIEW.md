@@ -533,6 +533,7 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `initializer_range` | 0.02 | truncated-normal std |
 | `classifier_pool` / `classifier_dropout` / `num_labels` / `pre_head_norm` | `mean` / 0.0 / 2 / `False` | task-head fields |
 | `gradient_checkpointing` | `False` | activation checkpointing on `OplmBlock` |
+| `gradient_checkpointing_mode` | `full` | `full` (recompute whole block) \| `selective` (SAC: keep matmul/SDPA, recompute cheap ops) |
 | `pad`/`bos`/`eos`/`unk`/`mask_token_id` | 1 / 0 / 2 / 3 / 32 | ESM vocab |
 | `auto_map` | filled by `save_pretrained` | see §13 |
 
@@ -576,7 +577,15 @@ OplmConfig`, `base_model_prefix = "oplm"`, `main_input_name = "input_ids"`,
 
 **Gradient checkpointing.** `config.gradient_checkpointing=True` arms
 `OplmStack`/`OplmBlock` at init; `model.gradient_checkpointing_enable()` is the
-HF-idiomatic call that propagates to every block.
+HF-idiomatic call that propagates to every block. `config.gradient_checkpointing_mode`
+(`full` | `selective`) selects the flavor: `full` recomputes the whole block on
+backward (max memory savings), while `selective` uses PyTorch Selective Activation
+Checkpointing (`create_selective_checkpoint_contexts` + a `CheckpointPolicy`) to
+keep matmul/SDPA outputs resident and recompute only cheap ops — less memory
+savings for substantially less recompute. The mode can also be passed at enable
+time: `model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"mode": "selective"})`.
+Both modes are `torch.compile`-compatible; the SAC policy is a module-level
+function so Dynamo can trace it through the checkpoint higher-order op.
 
 **Save/load round-trip.** `save_pretrained` writes `config.json` +
 `model.safetensors` (honoring tied weights); attaching and saving the tokenizer
@@ -642,8 +651,8 @@ pin every version for paper-grade numbers. Seeding is the trainer's job.
 registered buffers, extended via a wrap-aware method); `_no_split_modules =
 ["OplmBlock"]`; weight tying re-applied in `tie_weights()` post-load; no in-place
 ops on shared buffers; `gradient_checkpointing=True` wraps each block's forward in
-`torch.utils.checkpoint`. The model never calls `torch.compile` itself — that is
-the trainer's responsibility.
+`torch.utils.checkpoint` (selective mode adds an SAC `context_fn`). The model never
+calls `torch.compile` itself — that is the trainer's responsibility.
 
 ### 13.9 Parameter count & size presets
 

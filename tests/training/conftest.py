@@ -115,6 +115,7 @@ def tiny_train_cfg(
     num_hidden_layers: int = 2,
     max_position_embeddings: int = 64,
     gradient_checkpointing: bool = False,
+    gradient_checkpointing_mode: str = "full",
     num_workers: int = 0,
     pin_memory: bool = False,
     mask_prob: float = 0.15,
@@ -134,6 +135,7 @@ def tiny_train_cfg(
             num_hidden_layers=num_hidden_layers,
             max_position_embeddings=max_position_embeddings,
             gradient_checkpointing=gradient_checkpointing,
+            gradient_checkpointing_mode=gradient_checkpointing_mode,
         ),
         train=TrainConfig(
             max_steps=max_steps,

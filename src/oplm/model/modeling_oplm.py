@@ -29,7 +29,7 @@ from transformers.modeling_outputs import (
 # transformers.dynamic_module_utils.get_cached_module_file). `_REMOTE_CODE_DEPS`
 # references the otherwise-unused names so linters don't flag them.
 from .attention import OplmAttention
-from .configuration_oplm import OplmConfig
+from .configuration_oplm import _VALID_GRADIENT_CHECKPOINTING_MODES, OplmConfig
 from .conv import CanonConv
 from .embedding import cls_pool, mean_pool
 from .ffn import SwiGLU
@@ -109,17 +109,32 @@ class OplmPreTrainedModel(PreTrainedModel):
     # Gradient checkpointing — propagate the toggle to every OplmBlock.
     # ------------------------------------------------------------------
 
-    def _set_gradient_checkpointing(self, value: bool) -> None:
+    def _set_gradient_checkpointing(self, value: bool, mode: str | None = None) -> None:
         self.gradient_checkpointing = value
         for module in self.modules():
-            if isinstance(module, OplmBlock):
+            if isinstance(module, OplmBlock | OplmStack):
                 module.gradient_checkpointing = value
-            if isinstance(module, OplmStack):
-                module.gradient_checkpointing = value
+                if mode is not None:
+                    module.gradient_checkpointing_mode = mode
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
-        """Enable activation checkpointing on every transformer block."""
-        self._set_gradient_checkpointing(True)
+        """Enable activation checkpointing on every transformer block.
+
+        Honors an optional ``{"mode": "full" | "selective"}`` entry in
+        ``gradient_checkpointing_kwargs``; when absent, falls back to
+        ``config.gradient_checkpointing_mode`` (default ``"full"``). ``"selective"``
+        keeps matmul/SDPA outputs resident and recomputes only cheap ops, trading
+        less memory savings for substantially less recompute than ``"full"``.
+        """
+        mode = (gradient_checkpointing_kwargs or {}).get("mode")
+        if mode is None:
+            mode = getattr(self.config, "gradient_checkpointing_mode", "full")
+        if mode not in _VALID_GRADIENT_CHECKPOINTING_MODES:
+            raise ValueError(
+                f"gradient_checkpointing mode must be one of "
+                f"{_VALID_GRADIENT_CHECKPOINTING_MODES}; got {mode!r}."
+            )
+        self._set_gradient_checkpointing(True, mode=mode)
 
     def gradient_checkpointing_disable(self) -> None:
         """Disable activation checkpointing on every transformer block."""
@@ -294,7 +309,9 @@ class OplmMLMHead(nn.Module):
         self.norm = make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
         self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
         # The decoder writes to vocab space, NOT the residual stream: no 1/sqrt(2L) scaling.
-        self.decoder._is_residual_writer = False  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+        self.decoder._is_residual_writer = (
+            False  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.norm(self.act(self.dense(x))))
