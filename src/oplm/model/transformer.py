@@ -32,7 +32,7 @@ _CANON_POSITIONS = ("A", "B", "C", "D")
 try:
     from torch.utils.checkpoint import CheckpointPolicy as _CheckpointPolicy
 except ImportError:  # torch < 2.4
-    _CheckpointPolicy = None  # type: ignore[assignment]
+    _CheckpointPolicy = None  # ty: ignore[invalid-assignment]  # torch<2.4 fallback
 
 
 # Selective Activation Checkpointing (SAC) — ops whose outputs are FLOP-heavy to
@@ -314,13 +314,9 @@ class OplmStack(nn.Module):
         if mode is not None:
             self.gradient_checkpointing_mode = mode
         for block in self.layers:
-            block.gradient_checkpointing = (
-                enabled  # ty: ignore[unresolved-attribute]  # nn.Module setattr
-            )
+            block.gradient_checkpointing = enabled  # ty: ignore[unresolved-attribute]  # nn.Module setattr
             if mode is not None:
-                block.gradient_checkpointing_mode = (
-                    mode  # ty: ignore[unresolved-attribute]  # nn.Module setattr
-                )
+                block.gradient_checkpointing_mode = mode  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
     def forward(
         self,

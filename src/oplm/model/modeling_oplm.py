@@ -309,9 +309,7 @@ class OplmMLMHead(nn.Module):
         self.norm = make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
         self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
         # The decoder writes to vocab space, NOT the residual stream: no 1/sqrt(2L) scaling.
-        self.decoder._is_residual_writer = (
-            False  # ty: ignore[unresolved-attribute]  # nn.Module setattr
-        )
+        self.decoder._is_residual_writer = False  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.norm(self.act(self.dense(x))))
