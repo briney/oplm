@@ -75,24 +75,32 @@ larger model sizes. For 300M on NVLink it does not.
 
 ## Tests / validation
 
-- [ ] Guard test: with `compile=true` + `mode="selective"`, assert
+- [x] Guard test: with `compile=true` + `mode="selective"`, assert
       `torch._dynamo.config.optimize_ddp is False` after `Trainer.__init__`
       (CPU-safe; check the flag, no real compile needed).
-- [ ] Multi-GPU peak-memory check (slow, CUDA, ≥2 ranks): selective peak must be
+      → `tests/training/test_compile_ddp_optimizer.py::test_compile_selective_disables_ddp_optimizer`.
+- [x] Multi-GPU peak-memory check (slow, CUDA, ≥2 ranks): selective peak must be
       **strictly greater** than full peak (proves SAC saves matmul/SDPA outputs
       rather than collapsing to full). Mirror the single-process ordering test
       `test_sac_peak_memory_between_none_and_full` for the DDP path.
-- [ ] Confirm `full`/`none` runs are unaffected (`optimize_ddp` left at default).
+      → `test_ddp_compile_selective_peak_exceeds_full` (spawns 2 NCCL ranks,
+      compiles a DDP-wrapped model). **Written but not yet run on hardware**: skips
+      on this 1-GPU box; needs a ≥2-GPU run to confirm.
+- [x] Confirm `full`/`none` runs are unaffected (`optimize_ddp` left at default).
+      → `test_compile_full_mode_leaves_ddp_optimizer_default`.
 - [ ] Re-run the repro: 8-GPU selective → ~1.2× / ~55 GB (not 14.5 GB).
+      **Pending hardware** (needs the 8×B200 box).
 
 ## Docs
 
-- [ ] `docs/TRAIN.md`: note that `selective` + `compile` on multi-GPU disables
+- [x] `docs/TRAIN.md`: note that `selective` + `compile` on multi-GPU disables
       DDPOptimizer automatically (in the trainer) and the negligible overlap
       tradeoff.
-- [ ] Cross-reference in the `gradient_checkpointing_mode` config docs
-      (`docs/CONFIG.md` / `base.yaml` comment).
+- [x] Cross-reference in the `gradient_checkpointing_mode` config docs
+      (`docs/CONFIG.md` / `base.yaml` comment; also `docs/OVERVIEW.md`).
 
 ## Lint / type
 
-- [ ] `ruff check src/ && ruff format src/ && ty check src/` clean.
+- [x] `ruff check src/` clean; `ruff format`/`ty check` clean for the edited files
+      (`trainer.py`). Pre-existing format/`ty` drift remains in untouched
+      `model/transformer.py` and `model/modeling_oplm.py` — out of scope here.

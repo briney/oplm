@@ -48,5 +48,7 @@ model:
   # full      -> recompute the entire block on backward (max memory savings, ~+30% compute)
   # selective -> keep matmul/SDPA outputs resident, recompute only cheap ops
   #              (less memory savings, much less extra compute). Inert unless
-  #              gradient_checkpointing is true.
+  #              gradient_checkpointing is true. On multi-GPU + train.compile the
+  #              trainer auto-disables DDPOptimizer so SAC isn't collapsed to full
+  #              recompute (see docs/TRAIN.md).
   gradient_checkpointing_mode: full # full | selective

@@ -585,7 +585,10 @@ keep matmul/SDPA outputs resident and recompute only cheap ops — less memory
 savings for substantially less recompute. The mode can also be passed at enable
 time: `model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"mode": "selective"})`.
 Both modes are `torch.compile`-compatible; the SAC policy is a module-level
-function so Dynamo can trace it through the checkpoint higher-order op.
+function so Dynamo can trace it through the checkpoint higher-order op. Under
+multi-GPU DDP + compile, the trainer disables DDPOptimizer for `selective` so its
+graph-splitting doesn't fragment the SAC op into a full recompute (see
+[TRAIN.md](TRAIN.md)).
 
 **Save/load round-trip.** `save_pretrained` writes `config.json` +
 `model.safetensors` (honoring tied weights); attaching and saving the tokenizer

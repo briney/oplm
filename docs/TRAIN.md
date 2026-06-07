@@ -212,7 +212,16 @@ on backward for maximum memory savings (~+30% compute), while `selective` keeps
 matmul/SDPA outputs resident and recomputes only cheap ops — less memory savings
 for substantially less extra compute. The mode is inert unless
 `gradient_checkpointing` is true, and both modes compose with `train.compile`.
-For internals, see [TRAINER.md](TRAINER.md).
+
+On multi-GPU with `train.compile=true`, `selective` requires disabling PyTorch's
+DDPOptimizer (it splits the compiled graph at gradient-bucket boundaries, which
+fragments each block's activation-checkpoint op so the SAC policy is dropped and
+`selective` silently collapses to `full` recompute). The trainer detects this
+case and sets `torch._dynamo.config.optimize_ddp = False` automatically before
+compiling; `full`/`none` are left untouched so they keep DDP comm/compute
+overlap. The only cost is that lost overlap — a few ms of allreduce on a ~500 ms
+step over NVLink, negligible next to the recompute SAC saves back. For internals,
+see [TRAINER.md](TRAINER.md).
 
 ---
 

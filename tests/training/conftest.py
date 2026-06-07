@@ -212,3 +212,20 @@ def reset_dynamo() -> Generator[None, None, None]:
     torch._dynamo.reset()
     yield
     torch._dynamo.reset()
+
+
+@pytest.fixture
+def restore_optimize_ddp() -> Generator[None, None, None]:
+    """Save/restore the process-global ``torch._dynamo.config.optimize_ddp`` flag.
+
+    The trainer flips ``optimize_ddp`` off for ``selective`` checkpointing + compile.
+    It is process-global, so restore the original value afterward to keep the change
+    from leaking into later compile tests.
+    """
+    import torch._dynamo
+
+    original = torch._dynamo.config.optimize_ddp
+    try:
+        yield
+    finally:
+        torch._dynamo.config.optimize_ddp = original
