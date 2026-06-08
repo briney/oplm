@@ -30,6 +30,7 @@ _VALID_MLM_HEAD_ACTIVATIONS = ("gelu", "silu", "relu")
 _VALID_CANON_ACTIVATIONS = ("none", "silu", "gelu")
 _VALID_CLASSIFIER_POOLS = ("mean", "cls")
 _VALID_CANON_POSITIONS = frozenset({"A", "B", "C", "D"})
+_VALID_GRADIENT_CHECKPOINTING_MODES = ("full", "selective")
 
 _DEFAULT_VOCAB_SIZE = 33
 
@@ -80,6 +81,7 @@ class OplmConfig(PretrainedConfig):
         num_labels: int = 2,
         pre_head_norm: bool = False,
         gradient_checkpointing: bool = False,
+        gradient_checkpointing_mode: str = "full",
         pad_token_id: int = 1,
         bos_token_id: int = 0,
         eos_token_id: int = 2,
@@ -123,6 +125,7 @@ class OplmConfig(PretrainedConfig):
         # instead of assigning here.
         self.pre_head_norm = bool(pre_head_norm)
         self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.gradient_checkpointing_mode = str(gradient_checkpointing_mode)
         self.unk_token_id = int(unk_token_id)
         self.mask_token_id = int(mask_token_id)
 
@@ -229,6 +232,12 @@ class OplmConfig(PretrainedConfig):
             raise ValueError(
                 f"classifier_pool must be one of {_VALID_CLASSIFIER_POOLS}; "
                 f"got {self.classifier_pool!r}."
+            )
+        if self.gradient_checkpointing_mode not in _VALID_GRADIENT_CHECKPOINTING_MODES:
+            raise ValueError(
+                f"gradient_checkpointing_mode must be one of "
+                f"{_VALID_GRADIENT_CHECKPOINTING_MODES}; "
+                f"got {self.gradient_checkpointing_mode!r}."
             )
 
         if self.canon_enabled:

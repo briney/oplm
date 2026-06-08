@@ -73,3 +73,44 @@ def test_gradient_checkpointing_matches_plain_run(
     assert on_losses[1] == pytest.approx(off_losses[1], abs=1e-6)
     for step in range(1, 6):
         assert on_losses[step] == pytest.approx(off_losses[step], rel=1e-4, abs=1e-4)
+
+
+def test_selective_gradient_checkpointing_matches_plain_run(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selective (SAC) checkpointing matches the non-checkpointed loss trajectory."""
+    configure_accelerator_device("cpu", monkeypatch)
+
+    on_cb = FullRecordingCallback()
+    on_losses = _run_losses(
+        tiny_train_cfg(
+            tmp_path / "sac",
+            training_parquet,
+            max_steps=5,
+            batch_size=4,
+            log_every=1,
+            gradient_checkpointing=True,
+            gradient_checkpointing_mode="selective",
+        ),
+        on_cb,
+    )
+
+    off_cb = FullRecordingCallback()
+    off_losses = _run_losses(
+        tiny_train_cfg(
+            tmp_path / "off",
+            training_parquet,
+            max_steps=5,
+            batch_size=4,
+            log_every=1,
+            gradient_checkpointing=False,
+        ),
+        off_cb,
+    )
+
+    assert sorted(on_losses) == sorted(off_losses) == [1, 2, 3, 4, 5]
+    assert all(math.isfinite(v) for v in on_losses.values())
+
+    assert on_losses[1] == pytest.approx(off_losses[1], abs=1e-6)
+    for step in range(1, 6):
+        assert on_losses[step] == pytest.approx(off_losses[step], rel=1e-4, abs=1e-4)

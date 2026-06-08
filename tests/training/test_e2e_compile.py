@@ -28,8 +28,8 @@ def test_compile_aot_eager_forward_cpu(reset_dynamo: None) -> None:
     This previously broke with DDP+compile because OplmBlock.alpha was a plain float
     that got lifted as a graph input and placed in subgraph outputs by DDPOptimizer.
     """
-    from oplm.model import OplmForMaskedLM
     from oplm.model import OplmConfig as OplmModelConfig
+    from oplm.model import OplmForMaskedLM
 
     config = OplmModelConfig(
         hidden_size=32,
@@ -48,9 +48,43 @@ def test_compile_aot_eager_forward_cpu(reset_dynamo: None) -> None:
     assert output.loss is not None
     assert torch.isfinite(output.loss)
 
-_REQUIRES_CUDA = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
-)
+
+def test_compile_selective_checkpointing_aot_eager_forward_cpu(reset_dynamo: None) -> None:
+    """torch.compile must trace a model using selective activation checkpointing.
+
+    Selective checkpointing inserts a create_selective_checkpoint_contexts
+    context_fn into torch.utils.checkpoint; this exercises that the SAC policy
+    composes with AOT autograd (aot_eager) and that no graph output regresses to
+    a plain Python float (the alpha-buffer invariant).
+    """
+    from oplm.model import OplmConfig as OplmModelConfig
+    from oplm.model import OplmForMaskedLM
+
+    config = OplmModelConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        max_position_embeddings=64,
+        gradient_checkpointing=True,
+        gradient_checkpointing_mode="selective",
+    )
+    model = OplmForMaskedLM(config).train()
+    # Checkpointing only fires in training mode; make the mode explicit in case the
+    # HF auto-enable path defaulted it to "full" during __init__.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"mode": "selective"})
+    compiled = torch.compile(model, dynamic=True, backend="aot_eager")
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    attention_mask = torch.ones(2, 8, dtype=torch.long)
+    labels = torch.randint(0, config.vocab_size, (2, 8))
+
+    output = compiled(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+    output.loss.backward()
+    assert output.loss is not None
+    assert torch.isfinite(output.loss)
+
+
+_REQUIRES_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
 @_REQUIRES_CUDA

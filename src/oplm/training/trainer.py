@@ -125,6 +125,25 @@ class Trainer:
         # leaving self.model = DDP(model) with no _orig_mod — and unwrap_model then
         # fails with KeyError: '_orig_mod' at the first eval call.
         if cfg.train.compile:
+            # Selective activation checkpointing (SAC) is incompatible with the
+            # default DDPOptimizer: it splits the compiled graph at gradient-bucket
+            # boundaries to overlap allreduce with backward, which fragments each
+            # block's activation-checkpoint higher-order op across subgraphs. AOT
+            # autograd's min-cut partitioner then can't honor the SAC MUST_SAVE set,
+            # so `selective` silently collapses to full recompute under DDP+compile
+            # (single-GPU is unaffected — DDPOptimizer never engages). Disabling
+            # graph-splitting keeps SAC intact; the only cost is the lost comm/compute
+            # overlap (a few ms of allreduce on a ~500 ms step over NVLink — negligible
+            # next to the recompute SAC saves back). Gate on `selective` only so
+            # `full`/`none` keep the default overlap. The flag is a process-global
+            # dynamo config, set once before compile, and is numerically transparent.
+            if getattr(cfg.model, "gradient_checkpointing_mode", "full") == "selective":
+                # `from torch import _dynamo` (not `import torch._dynamo`) so the local
+                # binding is `_dynamo`, not `torch` — the latter would shadow the
+                # module-level `torch` and break the `torch.compile` call just below.
+                from torch import _dynamo
+
+                _dynamo.config.optimize_ddp = False
             _status("[dim]Compiling model (torch.compile)...[/dim]")
             # torch.compile stubs return Callable; cast to nn.Module so downstream
             # calls are well-typed — OptimizedModule IS an nn.Module at runtime.
