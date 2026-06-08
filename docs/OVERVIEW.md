@@ -74,10 +74,12 @@ evaluate it. Four subsystems compose cleanly along stable contracts:
 7. **Accelerate is the only distribution layer.** No manual `torch.distributed`
    wiring in the trainer.
 
-**Packaging.** Python ≥ 3.11; `torch ≥ 2.11` (pinned for the FlashAttention-4
-backend on Blackwell — reached via `scaled_dot_product_attention` — and
-`torch.optim.Muon`). Single `pip install oplm` installs everything — **no
-optional dependency groups**. Build backend: `hatchling`, single `pyproject.toml`.
+**Packaging.** Python ≥ 3.11; `torch ≥ 2.10` (which ships `torch.optim.Muon`).
+torch 2.11 adds the FlashAttention-4 backend on Blackwell — reached via
+`scaled_dot_product_attention` — but it is a perf gain, not a requirement: on 2.10
+SDPA falls back to the cuDNN/efficient/flash kernels. Single `pip install oplm`
+installs everything — **no optional dependency groups**. Build backend:
+`hatchling`, single `pyproject.toml`.
 
 ---
 
@@ -1356,7 +1358,7 @@ weights). `build_optimizers` returns `[AdamW]` (two groups: decay with
 `weight_decay`, no-decay with 0.0) or `[Muon, auxiliary AdamW]`. The head-exclusion
 prefix is `lm_head.` (the MLM head is `OplmForMaskedLM.lm_head`); the tied decoder
 weight already lands in no-decay via the `"embed"` rule. `torch.optim.Muon` is
-available (torch ≥ 2.11).
+available (torch ≥ 2.10).
 
 **LR schedules** (`get_schedule_fn`): a three-phase multiplier — warmup (linear
 0→1) → optional stable plateau (WSD only) → decay (linear or cosine to

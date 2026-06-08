@@ -29,7 +29,7 @@ of sequences, and get back per-residue logits and embeddings.
 
 ## Installation
 
-**Requirements:** Python ≥ 3.11 and PyTorch ≥ 2.11.
+**Requirements:** Python ≥ 3.11 and PyTorch ≥ 2.10.
 
 ```bash
 pip install oplm

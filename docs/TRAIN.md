@@ -26,7 +26,7 @@ pip install -e ".[train]"
 ```
 
 The `train` extra adds Accelerate, Weights & Biases, `datasets`, and BioPython
-on top of the core dependency (`torch ≥ 2.11`). Muon (`torch.optim.Muon`) ships
+on top of the core dependency (`torch ≥ 2.10`). Muon (`torch.optim.Muon`) ships
 with PyTorch, so no extra install is needed to use it.
 
 ---

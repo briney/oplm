@@ -26,7 +26,11 @@ dependencies = [
     # and transformers >=5.4 shifts PretrainedConfig attribute typing so `ty`
     # reports resolved-Optional config fields (head_dim, intermediate_size, ...) as
     # errors. Bump deliberately after re-running `ty check src/` + the test suite.
-    "torch>=2.11.0,<2.12",  # FlashAttention-4 backend on Blackwell (via SDPA) + torch.optim.Muon need >=2.11
+    # Floor is 2.10 (verified in production training runs, incl. torch.optim.Muon,
+    # which ships in 2.10). torch 2.11 only adds the FlashAttention-4 SDPA backend on
+    # Blackwell — a perf gain, not a correctness requirement: on 2.10 SDPA falls back
+    # to the cuDNN/efficient/flash kernels. Raise the floor only if FA-4 becomes required.
+    "torch>=2.10.0,<2.12",
     "transformers>=4.45,<5.4",
     "omegaconf>=2.3",
     "typer>=0.9",
