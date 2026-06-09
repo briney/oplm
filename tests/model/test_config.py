@@ -30,7 +30,13 @@ def test_defaults_match_architecture_spec():
     assert cfg.norm_type == "layernorm"
     assert cfg.norm_strategy == "pre"
     assert cfg.qk_norm is True
+    assert cfg.qk_norm_mode == "channel"
+    assert cfg.qk_norm_l2_scale_init is None
+    assert cfg.mask_dropout is False
+    assert cfg.mask_dropout_reference_ratio == 0.12
     assert cfg.residual_scaling == "sqrt_num_layers"
+    assert cfg.residual_gate == "none"
+    assert cfg.residual_gate_init == 1.0
     assert cfg.init_scale_output_projections is True
     assert cfg.ffn_activation == "swiglu"
     assert cfg.ffn_bias is False
@@ -144,7 +150,9 @@ def test_rejects_negative_rope_dim():
     [
         ("norm_type", "zorm", "norm_type must be one of"),
         ("norm_strategy", "preprost", "norm_strategy must be one of"),
+        ("qk_norm_mode", "cosine", "qk_norm_mode must be one of"),
         ("residual_scaling", "linear", "residual_scaling must be one of"),
+        ("residual_gate", "vector", "residual_gate must be one of"),
         ("ffn_activation", "relu", "ffn_activation must be one of"),
         ("mlm_head_activation", "swiglu", "mlm_head_activation must be one of"),
         ("canon_activation", "tanh", "canon_activation must be one of"),
@@ -154,6 +162,49 @@ def test_rejects_negative_rope_dim():
 def test_rejects_unknown_categorical_values(field, bad_value, expected_match):
     with pytest.raises(ValueError, match=expected_match):
         OplmConfig(**{field: bad_value})
+
+
+# --- Architecture-ablation toggles (mask dropout, L2 QKNorm, residual gates) ---
+
+
+@pytest.mark.parametrize("ratio", [-0.01, 1.0, 1.5])
+def test_rejects_mask_dropout_reference_ratio_out_of_range(ratio):
+    with pytest.raises(ValueError, match="mask_dropout_reference_ratio must satisfy"):
+        OplmConfig(mask_dropout_reference_ratio=ratio)
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.12, 0.99])
+def test_accepts_mask_dropout_reference_ratio_in_range(ratio):
+    cfg = OplmConfig(mask_dropout_reference_ratio=ratio)
+    assert cfg.mask_dropout_reference_ratio == ratio
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0])
+def test_rejects_non_positive_qk_norm_l2_scale_init(scale):
+    with pytest.raises(ValueError, match="qk_norm_l2_scale_init must be positive"):
+        OplmConfig(qk_norm_mode="l2", qk_norm_l2_scale_init=scale)
+
+
+def test_accepts_positive_qk_norm_l2_scale_init():
+    cfg = OplmConfig(qk_norm_mode="l2", qk_norm_l2_scale_init=8.0)
+    assert cfg.qk_norm_l2_scale_init == 8.0
+
+
+def test_qk_norm_l2_scale_init_none_is_preserved():
+    cfg = OplmConfig(qk_norm_mode="l2")
+    assert cfg.qk_norm_l2_scale_init is None
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_rejects_non_finite_residual_gate_init(value):
+    with pytest.raises(ValueError, match="residual_gate_init must be finite"):
+        OplmConfig(residual_gate_init=value)
+
+
+@pytest.mark.parametrize("gate", ["none", "scalar", "channel"])
+def test_accepts_valid_residual_gate_modes(gate):
+    cfg = OplmConfig(residual_gate=gate)
+    assert cfg.residual_gate == gate
 
 
 def test_canon_enabled_requires_non_empty_positions():
@@ -258,6 +309,12 @@ def test_save_and_from_pretrained_roundtrip_preserves_fields(tmp_path: Path):
         num_attention_heads=8,
         norm_type="rmsnorm",
         norm_strategy="hybrid",
+        qk_norm_mode="l2",
+        qk_norm_l2_scale_init=8.0,
+        mask_dropout=True,
+        mask_dropout_reference_ratio=0.1,
+        residual_gate="channel",
+        residual_gate_init=0.5,
         canon_enabled=True,
         canon_positions=["A", "D"],
         canon_kernel_sizes={"schedule": "linear", "min": 3, "max": 9},
@@ -278,6 +335,12 @@ def test_save_and_from_pretrained_roundtrip_preserves_fields(tmp_path: Path):
     assert restored.head_dim == 64
     assert restored.norm_type == "rmsnorm"
     assert restored.norm_strategy == "hybrid"
+    assert restored.qk_norm_mode == "l2"
+    assert restored.qk_norm_l2_scale_init == 8.0
+    assert restored.mask_dropout is True
+    assert restored.mask_dropout_reference_ratio == 0.1
+    assert restored.residual_gate == "channel"
+    assert restored.residual_gate_init == 0.5
     assert restored.canon_enabled is True
     assert restored.canon_positions == ["A", "D"]
     assert restored.canon_kernel_sizes == [3, 5, 7, 9]

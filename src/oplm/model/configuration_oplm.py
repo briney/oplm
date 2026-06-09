@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Any
 
@@ -24,7 +25,9 @@ __all__ = ["OplmConfig"]
 
 _VALID_NORM_TYPES = ("layernorm", "rmsnorm")
 _VALID_NORM_STRATEGIES = ("pre", "sandwich", "hybrid", "post_sdpa")
+_VALID_QK_NORM_MODES = ("channel", "l2")
 _VALID_RESIDUAL_SCALINGS = ("sqrt_num_layers", "none")
+_VALID_RESIDUAL_GATES = ("none", "scalar", "channel")
 _VALID_FFN_ACTIVATIONS = ("swiglu", "geglu")
 _VALID_MLM_HEAD_ACTIVATIONS = ("gelu", "silu", "relu")
 _VALID_CANON_ACTIVATIONS = ("none", "silu", "gelu")
@@ -62,8 +65,14 @@ class OplmConfig(PretrainedConfig):
         norm_eps: float = 1e-6,
         norm_strategy: str = "pre",
         qk_norm: bool = True,
+        qk_norm_mode: str = "channel",
+        qk_norm_l2_scale_init: float | None = None,
         post_embed_norm: bool = False,
+        mask_dropout: bool = False,
+        mask_dropout_reference_ratio: float = 0.12,
         residual_scaling: str = "sqrt_num_layers",
+        residual_gate: str = "none",
+        residual_gate_init: float = 1.0,
         init_scale_output_projections: bool = True,
         ffn_activation: str = "swiglu",
         ffn_bias: bool = False,
@@ -105,8 +114,16 @@ class OplmConfig(PretrainedConfig):
         self.norm_eps = float(norm_eps)
         self.norm_strategy = norm_strategy
         self.qk_norm = bool(qk_norm)
+        self.qk_norm_mode = qk_norm_mode
+        self.qk_norm_l2_scale_init = (
+            qk_norm_l2_scale_init if qk_norm_l2_scale_init is None else float(qk_norm_l2_scale_init)
+        )
         self.post_embed_norm = bool(post_embed_norm)
+        self.mask_dropout = bool(mask_dropout)
+        self.mask_dropout_reference_ratio = float(mask_dropout_reference_ratio)
         self.residual_scaling = residual_scaling
+        self.residual_gate = residual_gate
+        self.residual_gate_init = float(residual_gate_init)
         self.init_scale_output_projections = bool(init_scale_output_projections)
         self.ffn_activation = ffn_activation
         self.ffn_bias = bool(ffn_bias)
@@ -208,11 +225,31 @@ class OplmConfig(PretrainedConfig):
                 f"norm_strategy must be one of {_VALID_NORM_STRATEGIES}; "
                 f"got {self.norm_strategy!r}."
             )
+        if self.qk_norm_mode not in _VALID_QK_NORM_MODES:
+            raise ValueError(
+                f"qk_norm_mode must be one of {_VALID_QK_NORM_MODES}; got {self.qk_norm_mode!r}."
+            )
+        if self.qk_norm_l2_scale_init is not None and self.qk_norm_l2_scale_init <= 0:
+            raise ValueError(
+                f"qk_norm_l2_scale_init must be positive when set; "
+                f"got {self.qk_norm_l2_scale_init}."
+            )
+        if not 0 <= self.mask_dropout_reference_ratio < 1:
+            raise ValueError(
+                f"mask_dropout_reference_ratio must satisfy 0 <= ratio < 1; "
+                f"got {self.mask_dropout_reference_ratio}."
+            )
         if self.residual_scaling not in _VALID_RESIDUAL_SCALINGS:
             raise ValueError(
                 f"residual_scaling must be one of {_VALID_RESIDUAL_SCALINGS}; "
                 f"got {self.residual_scaling!r}."
             )
+        if self.residual_gate not in _VALID_RESIDUAL_GATES:
+            raise ValueError(
+                f"residual_gate must be one of {_VALID_RESIDUAL_GATES}; got {self.residual_gate!r}."
+            )
+        if not math.isfinite(self.residual_gate_init):
+            raise ValueError(f"residual_gate_init must be finite; got {self.residual_gate_init}.")
         if self.ffn_activation not in _VALID_FFN_ACTIVATIONS:
             raise ValueError(
                 f"ffn_activation must be one of {_VALID_FFN_ACTIVATIONS}; "

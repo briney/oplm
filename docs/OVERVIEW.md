@@ -321,7 +321,10 @@ site), e.g. `["A","C","D"]`. See §11.
 | `norm_type` | global | `layernorm` (default) / `rmsnorm` |
 | `norm_strategy` | global | one enum, uniform |
 | `qk_norm` | global | per-head Norm on Q,K |
+| `qk_norm_mode`/`qk_norm_l2_scale_init` | global | `channel` (default) / `l2`; `l2` adds a learned per-head scale |
+| `mask_dropout`/`mask_dropout_reference_ratio` | global | `<mask>`-embedding dropout on the `input_ids` path |
 | `residual_scaling` | global | `sqrt_num_layers` / `none` |
+| `residual_gate`/`residual_gate_init` | global | `none` (default) / `scalar` / `channel` per-block residual gate |
 | `rope_dim`/`nope_dim` | global | same split across all heads/layers |
 | `canon_enabled`/`canon_positions` | global | master switch / insertion sites |
 | `canon_kernel_sizes` | per-layer | scalar broadcasts; list must match `num_hidden_layers` |
@@ -519,8 +522,14 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `norm_eps` | 1e-6 | |
 | `norm_strategy` | `pre` | `pre`/`sandwich`/`hybrid`/`post_sdpa` |
 | `qk_norm` | `True` | per-head Norm on Q,K |
+| `qk_norm_mode` | `channel` | `channel` (LayerNorm/RMSNorm + `1/√head_dim` scale) / `l2` (L2-normalize + learned per-head scale); inert if `qk_norm=False` |
+| `qk_norm_l2_scale_init` | `None` | `l2` mode per-head scale init; `None` → `√head_dim`; positive if set |
 | `post_embed_norm` | `False` | |
+| `mask_dropout` | `False` | zero `<mask>` embeddings + rescale by `(1−ref)/(1−obs)`; `input_ids` path only |
+| `mask_dropout_reference_ratio` | `0.12` | expected `<mask>` fraction of real tokens (`mask_prob·mask_token_prob`); `0 ≤ ratio < 1` |
 | `residual_scaling` | `sqrt_num_layers` | / `none` |
+| `residual_gate` | `none` | learnable gate on residual writes: `none`/`scalar`/`channel` |
+| `residual_gate_init` | `1.0` | init for gate params; finite |
 | `init_scale_output_projections` | `True` | divide init std of `W_o`,`W_d` by `sqrt(2L)` (GPT-2 style) |
 | `ffn_activation` | `swiglu` | / `geglu` (reserved) |
 | `ffn_bias` | `False` | |
@@ -542,8 +551,10 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 **Validation rules** (raise `ValueError`): `hidden_size % num_attention_heads ==
 0`; `head_dim·H == hidden_size` (if set); `rope_dim+nope_dim==head_dim`,
 `rope_dim,nope_dim ≥ 0`, `rope_dim` even; `norm_type`/`norm_strategy`/
-`residual_scaling`/`ffn_activation`/`mlm_head_activation`/`classifier_pool` in
-their enums; if `canon_enabled` then `canon_positions` non-empty ⊆ `{A,B,C,D}` and
+`qk_norm_mode`/`residual_scaling`/`residual_gate`/`ffn_activation`/
+`mlm_head_activation`/`classifier_pool` in their enums; `0 ≤
+mask_dropout_reference_ratio < 1`; `qk_norm_l2_scale_init` positive if set;
+`residual_gate_init` finite; if `canon_enabled` then `canon_positions` non-empty ⊆ `{A,B,C,D}` and
 resolved `canon_kernel_sizes` is a length-`num_hidden_layers` list of values ≥ 2.
 `vocab_size != 33` warns only. Deprecation policy: a deprecated field is readable
 for one minor version with a `DeprecationWarning`, then removed (currently none).
