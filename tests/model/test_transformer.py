@@ -33,6 +33,9 @@ def _config(
     attention_dropout: float = 0.0,
     hidden_dropout: float = 0.0,
     post_embed_norm: bool = False,
+    mask_dropout: bool = False,
+    mask_dropout_reference_ratio: float = 0.12,
+    mask_token_id: int = 32,
     residual_scaling: str = "sqrt_num_layers",
     gradient_checkpointing: bool = False,
     canon_enabled: bool = False,
@@ -65,6 +68,9 @@ def _config(
         attention_dropout=attention_dropout,
         hidden_dropout=hidden_dropout,
         post_embed_norm=post_embed_norm,
+        mask_dropout=mask_dropout,
+        mask_dropout_reference_ratio=mask_dropout_reference_ratio,
+        mask_token_id=mask_token_id,
         residual_scaling=residual_scaling,
         gradient_checkpointing=gradient_checkpointing,
         canon_enabled=canon_enabled,
@@ -435,6 +441,45 @@ def test_stack_runs_with_canon_enabled():
     input_ids = torch.randint(0, cfg.vocab_size, (2, 6))
     last_hidden, _, _ = stack(input_ids)
     assert last_hidden.shape == (2, 6, cfg.hidden_size)
+
+
+# ---------------------------------------------------------------------------
+# OplmStack — mask dropout plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_stack_mask_dropout_zeros_mask_positions_post_embedding():
+    """With mask dropout on, the post-embedding hidden state zeros <mask> rows."""
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2, mask_dropout=True, mask_token_id=32)
+    stack = OplmStack(cfg).eval()
+    input_ids = torch.tensor([[5, 32, 7, 9]])
+
+    with torch.no_grad():
+        _, hidden_states, _ = stack(input_ids, output_hidden_states=True)
+    # First hidden state is the post-embedding tensor (mask dropout applied).
+    assert hidden_states is not None
+    assert torch.allclose(hidden_states[0][0, 1], torch.zeros(cfg.hidden_size))
+
+
+def test_stack_inputs_embeds_bypasses_mask_dropout():
+    """The inputs_embeds path must not apply mask dropout (IDs are gone)."""
+    torch.manual_seed(0)
+    cfg_on = _config(num_hidden_layers=2, mask_dropout=True, mask_token_id=32)
+    cfg_off = _config(num_hidden_layers=2, mask_dropout=False, mask_token_id=32)
+    stack_on = OplmStack(cfg_on).eval()
+    stack_off = OplmStack(cfg_off).eval()
+    # Mask dropout adds no parameters, so the state dicts are interchangeable.
+    stack_off.load_state_dict(stack_on.state_dict())
+
+    input_ids = torch.tensor([[5, 32, 7, 9]])
+    raw_embeds = stack_on.embed_tokens.embed_tokens(input_ids)
+
+    with torch.no_grad():
+        out_embeds, _, _ = stack_on(inputs_embeds=raw_embeds)
+        # mask_dropout=False fed input_ids reproduces the raw-embedding forward.
+        out_ids_off, _, _ = stack_off(input_ids=input_ids)
+    assert torch.allclose(out_embeds, out_ids_off, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

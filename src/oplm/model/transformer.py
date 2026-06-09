@@ -333,16 +333,23 @@ class OplmStack(nn.Module):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Provide exactly one of `input_ids` or `inputs_embeds`.")
 
+        # Materialize/validate the pad mask before the embedding lookup so it can
+        # be threaded into mask dropout (which needs per-row real-token counts).
         if inputs_embeds is not None:
+            batch_size, seq_len, _ = inputs_embeds.shape
+            attention_mask = prepare_attention_mask(
+                attention_mask, batch_size, seq_len, inputs_embeds.device
+            )
+            # The inputs_embeds path bypasses mask dropout: <mask> positions
+            # cannot be inferred once token IDs are gone.
             x = inputs_embeds
-            batch_size, seq_len, _ = x.shape
         else:
             assert input_ids is not None  # guaranteed by the exactly-one check above
             batch_size, seq_len = input_ids.shape
-            x = self.embed_tokens(input_ids)
-
-        device = x.device
-        attention_mask = prepare_attention_mask(attention_mask, batch_size, seq_len, device)
+            attention_mask = prepare_attention_mask(
+                attention_mask, batch_size, seq_len, input_ids.device
+            )
+            x = self.embed_tokens(input_ids, attention_mask)
 
         hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
         attentions: tuple[torch.Tensor | None, ...] | None = () if output_attentions else None

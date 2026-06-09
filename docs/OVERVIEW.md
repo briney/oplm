@@ -449,6 +449,20 @@ intermediate norm (`D`), optional pre-head norm (`D`). QK-norm gains are 2L tota
 truncated-normal `std = initializer_range` (0.02), `<pad>` row not zeroed (HF
 convention).
 
+**Mask dropout** (`mask_dropout`, off by default): on the `input_ids` path only,
+every `<mask>` embedding row is zeroed and the surviving rows are rescaled per
+sequence by `(1 − mask_dropout_reference_ratio) / (1 − observed_mask_ratio)`,
+where `observed_mask_ratio = count(<mask>) / count(real tokens)` for that row.
+`mask_dropout_reference_ratio` (0.12) is the **expected fraction of real tokens
+that are `<mask>`** under the training masking policy (`mask_prob · mask_token_prob`
+= 0.15 · 0.8) — *not* a fraction of mask tokens to drop. This is inverted-dropout-style
+magnitude compensation, applied deterministically in both train and eval, before
+`post_embed_norm`. Ratios are computed in fp32 and the denominator / real-token
+count are clamped so all-pad and all-`<mask>` rows stay finite. The `inputs_embeds`
+path bypasses it entirely (the `<mask>` positions can't be recovered once token IDs
+are gone). `OplmStack` materializes the pad mask before the embedding lookup so the
+per-row real-token counts are available.
+
 **MLM head** (BERT/RoBERTa two-layer MLP, `self.lm_head`):
 
 ```python
