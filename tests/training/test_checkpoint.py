@@ -135,9 +135,7 @@ def test_hf_export_round_trips_with_compile(tmp_path: Path, reset_dynamo: None) 
     model = torch.compile(model, dynamic=True)
     model = accelerator.prepare(model)
 
-    original_bias = (
-        accelerator.unwrap_model(model)._orig_mod.lm_head.decoder.bias.detach().clone()
-    )
+    original_bias = accelerator.unwrap_model(model)._orig_mod.lm_head.decoder.bias.detach().clone()
 
     save_checkpoint(
         accelerator=accelerator,
