@@ -189,6 +189,23 @@ class Trainer:
                         "compile and will thrash Dynamo recompiles. "
                         "Set pad_to_multiple_of or compile_dynamic=True.",
                     )
+            # torch 2.10/2.11 enable Inductor's mix-order-reduction pass by
+            # default. It produces FusedMixOrderReductions scheduler nodes that
+            # crash the combo-kernel fusion path during backward compilation:
+            #   scheduler.py: assert not isinstance(node1, FusedMixOrderReductions)
+            # (pytorch/pytorch#169811). The crash is build/cache-sensitive — it
+            # surfaces on a cold Inductor cache (e.g. ephemeral SUNK/CoreWeave
+            # pods) but is masked by a warm cache on-prem. Disable the pass; it's
+            # a fusion-throughput optimization, not a correctness feature. Set
+            # unconditionally (the bug is independent of SAC mode and
+            # compile_mode) and guarded so torch versions lacking the flag won't
+            # raise (the inductor config module raises AttributeError on unknown
+            # attributes). Remove once #169811 is fixed and the torch floor is
+            # raised past the fix.
+            from torch._inductor import config as _inductor_config
+
+            if hasattr(_inductor_config.triton, "mix_order_reduction"):
+                _inductor_config.triton.mix_order_reduction = False
             _status(
                 f"[dim]Compiling model (torch.compile, dynamic={cfg.train.compile_dynamic})"
                 "...[/dim]"
