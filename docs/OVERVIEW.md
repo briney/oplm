@@ -453,8 +453,9 @@ RoPE). No YaRN/NTK extrapolation — beyond `max_position_embeddings` is best-ef
 Default `ffn_activation="swiglu"`: `y = W_d(silu(W_g(x)) * W_u(x))` — three
 linears, no bias by default (`ffn_bias=False`). Hidden dim `F = round_up(8/3·D,
 256)` (≈ 8/3 multiplier, rounded up to a multiple of 256 for matmul-friendly
-shapes); set `intermediate_size` explicitly to override. `geglu` is reserved as a
-future gated variant (also 3 projections). Params per FFN: `3·D·F`. The
+shapes); set `intermediate_size` explicitly to override. `geglu` is an alternative
+gated variant — `y = W_d(gelu(W_g(x)) * W_u(x))`, same 3 projections and `ffn_bias`
+handling, differing only in the GELU gate nonlinearity. Params per FFN: `3·D·F`. The
 `ffn_activation` enum is the single extension point — new activations add an enum
 value + a small class; the block is untouched.
 
@@ -579,7 +580,7 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `residual_gate` | `none` | learnable gate on residual writes: `none`/`scalar`/`channel` |
 | `residual_gate_init` | `1.0` | init for gate params; finite |
 | `init_scale_output_projections` | `True` | divide init std of `W_o`,`W_d` by `sqrt(2L)` (GPT-2 style) |
-| `ffn_activation` | `swiglu` | / `geglu` (reserved) |
+| `ffn_activation` | `swiglu` | / `geglu` (both gated, 3 projections) |
 | `ffn_bias` | `False` | |
 | `attention_dropout` | 0.0 | any >0 forces fallback path |
 | `hidden_dropout` | 0.0 | after attn/FFN output projections |
@@ -1615,7 +1616,6 @@ large fixtures session-scoped. Tests mirror the source tree.
   sites); revisit a rename to `RunConfig` later.
 - **Long-context RoPE** — no YaRN/NTK scaling yet; extrapolation beyond
   `max_position_embeddings` is best-effort.
-- **`geglu`** FFN variant — reserved enum value, not yet implemented.
 - **Variant / downstream eval tasks** (`proteingym`, `everest`, `tape`,
   `proteinglue`) — registered stubs that raise `NotImplementedError`; their data
   loaders exist, so the remaining work is metric implementation.

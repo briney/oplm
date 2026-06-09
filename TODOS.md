@@ -83,14 +83,14 @@ is evaluated.
 
 ## Phase 5: Implement GEGLU
 
-- [ ] Add a `GEGLU` FFN class parallel to `SwiGLU`, with the same projection
+- [x] Add a `GEGLU` FFN class parallel to `SwiGLU`, with the same projection
   shapes and `ffn_bias` handling.
-- [ ] Implement `GEGLU.forward()` as `down(gelu(gate(x)) * up(x))`.
-- [ ] Mark `GEGLU.down_proj._is_residual_writer = True` so residual-writer init
+- [x] Implement `GEGLU.forward()` as `down(gelu(gate(x)) * up(x))`.
+- [x] Mark `GEGLU.down_proj._is_residual_writer = True` so residual-writer init
   scaling matches SwiGLU.
-- [ ] Update `make_ffn()` so `ffn_activation="geglu"` constructs `GEGLU` instead
+- [x] Update `make_ffn()` so `ffn_activation="geglu"` constructs `GEGLU` instead
   of raising.
-- [ ] Update model exports and HuggingFace remote-code dependency imports if needed.
+- [x] Update model exports and HuggingFace remote-code dependency imports if needed.
 
 ## Phase 6: Tests And Validation
 
@@ -103,7 +103,7 @@ is evaluated.
 - [ ] Add transformer tests for residual-gate absence, scalar/channel shapes,
   initialization, state-dict persistence, output effect when edited, and gradient
   flow.
-- [ ] Replace the GEGLU-not-implemented test with GEGLU factory, formula, bias,
+- [x] Replace the GEGLU-not-implemented test with GEGLU factory, formula, bias,
   residual-writer marker, shape, and gradient tests.
 - [ ] Add a targeted integration test covering representative combinations of
   `mask_dropout`, L2 QKNorm, residual gates, GEGLU, sandwich norm, and optimizer
