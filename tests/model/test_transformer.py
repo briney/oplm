@@ -37,6 +37,8 @@ def _config(
     mask_dropout_reference_ratio: float = 0.12,
     mask_token_id: int = 32,
     residual_scaling: str = "sqrt_num_layers",
+    residual_gate: str = "none",
+    residual_gate_init: float = 1.0,
     gradient_checkpointing: bool = False,
     canon_enabled: bool = False,
     canon_positions: list[str] | None = None,
@@ -72,6 +74,8 @@ def _config(
         mask_dropout_reference_ratio=mask_dropout_reference_ratio,
         mask_token_id=mask_token_id,
         residual_scaling=residual_scaling,
+        residual_gate=residual_gate,
+        residual_gate_init=residual_gate_init,
         gradient_checkpointing=gradient_checkpointing,
         canon_enabled=canon_enabled,
         canon_positions=canon_positions,
@@ -131,6 +135,117 @@ def test_block_rejects_unknown_residual_scaling():
 def test_block_rejects_unknown_norm_strategy():
     cfg = _config(norm_strategy="zzz")
     with pytest.raises(ValueError, match="norm_strategy"):
+        OplmBlock(cfg, layer_idx=0)
+
+
+# ---------------------------------------------------------------------------
+# OplmBlock — residual gates
+# ---------------------------------------------------------------------------
+
+
+def test_block_no_residual_gate_by_default():
+    """residual_gate='none' (default) adds no gate parameters."""
+    block = OplmBlock(_config(residual_gate="none"), layer_idx=0)
+    assert block.residual_gate == "none"
+    assert not hasattr(block, "attn_gate")
+    assert not hasattr(block, "ffn_gate")
+    # Exact top-level keys (SwiGLU's gate_proj.* must not be confused for these).
+    assert "attn_gate" not in block.state_dict()
+    assert "ffn_gate" not in block.state_dict()
+
+
+def test_block_scalar_residual_gate_shapes():
+    block = OplmBlock(_config(residual_gate="scalar"), layer_idx=0)
+    assert isinstance(block.attn_gate, torch.nn.Parameter)
+    assert isinstance(block.ffn_gate, torch.nn.Parameter)
+    assert block.attn_gate.shape == (1,)
+    assert block.ffn_gate.shape == (1,)
+
+
+def test_block_channel_residual_gate_shapes():
+    cfg = _config(hidden_size=32, residual_gate="channel")
+    block = OplmBlock(cfg, layer_idx=0)
+    assert block.attn_gate.shape == (32,)
+    assert block.ffn_gate.shape == (32,)
+
+
+@pytest.mark.parametrize("gate", ["scalar", "channel"])
+def test_block_residual_gate_init_value(gate: str):
+    block = OplmBlock(_config(residual_gate=gate, residual_gate_init=0.25), layer_idx=0)
+    assert torch.allclose(block.attn_gate, torch.full_like(block.attn_gate, 0.25))
+    assert torch.allclose(block.ffn_gate, torch.full_like(block.ffn_gate, 0.25))
+
+
+@pytest.mark.parametrize("gate", ["scalar", "channel"])
+def test_block_residual_gates_are_one_dimensional(gate: str):
+    """Gate params must be 1D so optimizer grouping routes them to the no-decay group."""
+    block = OplmBlock(_config(residual_gate=gate), layer_idx=0)
+    assert block.attn_gate.ndim == 1
+    assert block.ffn_gate.ndim == 1
+
+
+@pytest.mark.parametrize("gate", ["scalar", "channel"])
+def test_block_residual_gates_persist_in_state_dict(gate: str):
+    block = OplmBlock(_config(residual_gate=gate), layer_idx=0)
+    keys = block.state_dict()
+    assert "attn_gate" in keys
+    assert "ffn_gate" in keys
+
+
+def test_block_residual_gate_init_one_matches_ungated_output():
+    """A gate initialized to 1.0 is the identity refinement at init."""
+    torch.manual_seed(0)
+    cfg_gated = _config(num_hidden_layers=2, residual_gate="channel", residual_gate_init=1.0)
+    cfg_plain = _config(num_hidden_layers=2, residual_gate="none")
+    gated = OplmBlock(cfg_gated, layer_idx=0)
+    plain = OplmBlock(cfg_plain, layer_idx=0)
+    # Copy the shared parameters so only the residual gate differs (filter the
+    # exact gate keys, not substring "gate" which also matches SwiGLU's gate_proj).
+    plain.load_state_dict(
+        {k: v for k, v in gated.state_dict().items() if k not in ("attn_gate", "ffn_gate")},
+        strict=False,
+    )
+    x = torch.randn(2, 5, cfg_gated.hidden_size)
+    mask = _ones_mask(2, 5)
+    gated.eval()
+    plain.eval()
+    with torch.no_grad():
+        out_gated, _ = gated(x, mask)
+        out_plain, _ = plain(x, mask)
+    assert torch.allclose(out_gated, out_plain, atol=1e-6)
+
+
+@pytest.mark.parametrize("gate", ["scalar", "channel"])
+def test_block_editing_residual_gate_changes_output(gate: str):
+    """Mutating the gate parameter perturbs the block output."""
+    torch.manual_seed(0)
+    block = OplmBlock(_config(residual_gate=gate), layer_idx=0).eval()
+    x = torch.randn(2, 5, 32)
+    mask = _ones_mask(2, 5)
+    with torch.no_grad():
+        before, _ = block(x, mask)
+        block.attn_gate.mul_(2.0)
+        block.ffn_gate.mul_(2.0)
+        after, _ = block(x, mask)
+    assert not torch.allclose(before, after)
+
+
+@pytest.mark.parametrize("gate", ["scalar", "channel"])
+def test_block_residual_gates_receive_gradient(gate: str):
+    torch.manual_seed(0)
+    block = OplmBlock(_config(residual_gate=gate), layer_idx=0)
+    x = torch.randn(2, 5, 32)
+    out, _ = block(x, _ones_mask(2, 5))
+    out.sum().backward()
+    assert block.attn_gate.grad is not None
+    assert block.attn_gate.grad.abs().sum() > 0
+    assert block.ffn_gate.grad is not None
+    assert block.ffn_gate.grad.abs().sum() > 0
+
+
+def test_block_rejects_unknown_residual_gate():
+    cfg = _config(residual_gate="bogus")
+    with pytest.raises(ValueError, match="residual_gate"):
         OplmBlock(cfg, layer_idx=0)
 
 

@@ -277,6 +277,25 @@ load-bearing stability tool for deep models (target depths up to ~80 layers). Th
 spec uses `sqrt(L)` (owner preference); `sqrt(2L)` is an equally defensible
 alternative differing only by `sqrt(2)`, revisitable at scale-up.
 
+**Residual gates** (`residual_gate`, off by default). An optional *learnable*
+multiplicative refinement applied on top of the fixed `α`, with a separate gate
+for each sublayer write:
+
+```
+h = x + α · attn_gate · Attn(Norm(x))
+y = h + α · ffn_gate  · FFN(Norm(h))
+```
+
+`scalar` adds one parameter per write (shape `(1,)`); `channel` adds a
+`(hidden_size,)` vector (per-feature gating). Both are initialized directly to
+`residual_gate_init` (default `1.0`, i.e. an identity refinement at init — so a
+fresh `channel`/`scalar` model matches the ungated block numerically) and are 1D,
+so they land in the no-decay AdamW group (including the auxiliary AdamW under
+Muon). `residual_gate="none"` adds no parameters and preserves checkpoint
+compatibility. Gates refine the existing `residual_scaling`; they do not replace
+`α`. The gate composes with every `norm_strategy` (it multiplies the
+post-`Norm₂`/`Norm₄` sublayer output under `sandwich`).
+
 ### 5.1 Normalization placement (`norm_strategy`, global)
 
 Residual scaling composes orthogonally with placement.
