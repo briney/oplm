@@ -60,3 +60,6 @@ def test_wandb_offline_run_completes(
     assert callback.train_start_count == 1
     assert callback.train_end_count == 1
     assert callback.train_log_steps  # metrics were logged through the wandb tracker
+
+    # wandb logs are consolidated under output_dir (dir=output_dir), not ./wandb.
+    assert (tmp_path / "wandb").is_dir()

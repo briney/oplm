@@ -26,7 +26,11 @@ NameOpt = Annotated[
     typer.Option(
         "--name",
         "-n",
-        help="W&B run name. Ignored if train.wandb_run_name is set in the YAML or an override.",
+        help=(
+            "Run name. Sets the W&B run name and the output directory (./<name>). "
+            "Each is ignored if train.wandb_run_name / train.output_dir is set in "
+            "the YAML or an override."
+        ),
     ),
 ]
 OverridesOpt = Annotated[

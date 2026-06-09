@@ -71,6 +71,34 @@ def test_run_name_without_flag() -> None:
     assert cfg.train.wandb_run_name == "from_cli"
 
 
+# --- --name → train.output_dir propagation -------------------------------------
+
+
+def test_name_flag_sets_output_dir() -> None:
+    """``--name`` seeds ``train.output_dir`` to ``./<name>`` when nothing else sets it."""
+    cfg = load_config(["--name", "myrun"])
+    assert cfg.train.output_dir == "myrun"
+
+
+def test_output_dir_defaults_without_name() -> None:
+    """With neither ``--name`` nor an explicit value, output_dir keeps the default."""
+    cfg = load_config([])
+    assert cfg.train.output_dir == "outputs"
+
+
+def test_cli_output_dir_beats_name_flag() -> None:
+    """An explicit ``train.output_dir`` CLI override wins over ``--name``."""
+    cfg = load_config(["--name", "myrun", "train.output_dir=explicit"])
+    assert cfg.train.output_dir == "explicit"
+
+
+def test_yaml_output_dir_beats_name_flag(tmp_path: Path) -> None:
+    """An explicit ``train.output_dir`` in YAML wins over ``--name``."""
+    config_path = _write_yaml(tmp_path, "train:\n  output_dir: from_yaml\n")
+    cfg = load_config(["--name", "myrun", "--config", config_path])
+    assert cfg.train.output_dir == "from_yaml"
+
+
 # --- model config: type, presets, derived fields, unknown keys -----------------
 
 

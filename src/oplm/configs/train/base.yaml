@@ -42,6 +42,7 @@ train:
   # Checkpointing
   save_every: 10_000
   save_total_limit: 3
+  save_final: true            # write a final checkpoint on completion (skips if last step already saved)
   resume_from: null
 
   # Infrastructure

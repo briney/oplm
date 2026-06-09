@@ -75,6 +75,10 @@ class TrainConfig:
     # Checkpointing
     save_every: int = 10_000
     save_total_limit: int = 3
+    # Always write a checkpoint when training completes, even if the final step
+    # is not a multiple of save_every. The save is skipped only when the final
+    # step already triggered a periodic save (avoids a redundant re-write).
+    save_final: bool = True
     resume_from: str | None = None
 
     # Infrastructure
@@ -368,7 +372,9 @@ def load_config(argv: list[str]) -> OplmConfig:
         ``cfg.train.config_path`` is populated with its absolute path. ``--name``
         sets ``cfg.train.wandb_run_name`` unless that field was explicitly set in
         the YAML or via a CLI override (an explicit value always wins); when both
-        are unset it stays ``None`` (W&B assigns a random name).
+        are unset it stays ``None`` (W&B assigns a random name). ``--name`` also
+        seeds ``cfg.train.output_dir`` to ``./<name>`` unless ``train.output_dir``
+        was explicitly set in the YAML or via a CLI override.
     """
     base: DictConfig = OmegaConf.structured(OplmConfig)
 
@@ -421,6 +427,13 @@ def load_config(argv: list[str]) -> OplmConfig:
         for ov in override_dicts
     )
 
+    # Whether the user explicitly set the output directory (YAML or CLI override).
+    # An explicit value wins over the ``--name``-derived default below.
+    user_set_output_dir = any(
+        _lookup_nested_mapping_value(ov, ("train", "output_dir")) is not _NESTED_VALUE_MISSING
+        for ov in override_dicts
+    )
+
     # Merge all overrides into base
     for ov in overrides:
         base = cast("DictConfig", OmegaConf.merge(base, ov))
@@ -445,4 +458,26 @@ def load_config(argv: list[str]) -> OplmConfig:
     if run_name is not None and not user_set_run_name:
         cfg.train.wandb_run_name = run_name
 
+    # Propagate --name to the output directory (./<name>) unless explicitly set.
+    if run_name is not None and not user_set_output_dir:
+        cfg.train.output_dir = run_name
+
     return cfg
+
+
+def serialize_config(cfg: OplmConfig) -> str:
+    """Serialize a resolved :class:`OplmConfig` to reloadable YAML text.
+
+    The ``model`` subtree is an HF ``OplmConfig`` (serialized via ``to_dict``);
+    ``train`` and ``data`` are dataclasses. The result round-trips through
+    ``load_config(["--config", <path>])``. Shared by the top-level run config dump
+    and the per-checkpoint ``config.yaml``.
+    """
+    from dataclasses import asdict
+
+    config_dict = {
+        "model": cfg.model.to_dict(),
+        "train": asdict(cfg.train),
+        "data": asdict(cfg.data),
+    }
+    return OmegaConf.to_yaml(OmegaConf.create(config_dict))
