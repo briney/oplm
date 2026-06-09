@@ -23,6 +23,8 @@ def _config(
     norm_type: str = "layernorm",
     norm_eps: float = 1e-6,
     qk_norm: bool = True,
+    qk_norm_mode: str = "channel",
+    qk_norm_l2_scale_init: float | None = None,
     attention_dropout: float = 0.0,
     hidden_dropout: float = 0.0,
     norm_strategy: str = "pre",
@@ -39,6 +41,8 @@ def _config(
         norm_type=norm_type,
         norm_eps=norm_eps,
         qk_norm=qk_norm,
+        qk_norm_mode=qk_norm_mode,
+        qk_norm_l2_scale_init=qk_norm_l2_scale_init,
         attention_dropout=attention_dropout,
         hidden_dropout=hidden_dropout,
         norm_strategy=norm_strategy,
@@ -286,3 +290,99 @@ def test_sdpa_and_manual_paths_agree():
     assert w_sdpa is None
     assert w_manual is not None
     assert torch.allclose(out_sdpa, out_manual, rtol=1e-4, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# L2 QK-norm mode
+# ---------------------------------------------------------------------------
+
+
+def test_channel_mode_uses_canonical_kernel_scale():
+    """Default (channel) QK norm keeps the 1/sqrt(head_dim) attention scale."""
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4))  # head_dim 8
+    assert attn.qk_l2 is False
+    assert attn.attn_scale == pytest.approx(1.0 / (8**0.5))
+    assert not hasattr(attn, "qk_l2_scale")
+
+
+def test_disabled_qk_norm_uses_canonical_kernel_scale():
+    """qk_norm=False (even with mode='l2') keeps Identity norms and 1/sqrt(d) scale."""
+    attn = OplmAttention(_config(qk_norm=False, qk_norm_mode="l2", hidden_size=32))
+    assert attn.qk_l2 is False
+    assert attn.attn_scale == pytest.approx(1.0 / (8**0.5))
+    assert isinstance(attn.q_norm, nn.Identity)
+    assert isinstance(attn.k_norm, nn.Identity)
+    assert not hasattr(attn, "qk_l2_scale")
+
+
+def test_l2_mode_builds_per_head_scale_and_identity_norms():
+    """L2 mode replaces the channel norms with a learned per-head scale param."""
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4, qk_norm_mode="l2"))
+    assert attn.qk_l2 is True
+    assert attn.attn_scale == 1.0
+    assert isinstance(attn.q_norm, nn.Identity)
+    assert isinstance(attn.k_norm, nn.Identity)
+    assert isinstance(attn.qk_l2_scale, nn.Parameter)
+    assert attn.qk_l2_scale.shape == (4,)
+
+
+def test_l2_scale_defaults_to_sqrt_head_dim():
+    """With qk_norm_l2_scale_init unset, qk_l2_scale initializes to sqrt(head_dim)."""
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4, qk_norm_mode="l2"))
+    # head_dim = 8
+    assert torch.allclose(attn.qk_l2_scale, torch.full((4,), 8.0**0.5))
+
+
+def test_l2_scale_respects_explicit_init():
+    """An explicit qk_norm_l2_scale_init sets every per-head entry."""
+    attn = OplmAttention(
+        _config(num_attention_heads=4, qk_norm_mode="l2", qk_norm_l2_scale_init=3.5)
+    )
+    assert torch.allclose(attn.qk_l2_scale, torch.full((4,), 3.5))
+
+
+def test_l2_norm_unit_normalizes_k_and_scales_q():
+    """_qk_l2_norm yields unit-norm K rows and Q rows scaled by the per-head value."""
+    torch.manual_seed(0)
+    attn = OplmAttention(
+        _config(hidden_size=32, num_attention_heads=4, qk_norm_mode="l2", qk_norm_l2_scale_init=2.0)
+    )
+    q = torch.randn(2, 4, 6, 8)  # (B, H, T, d_head)
+    k = torch.randn(2, 4, 6, 8)
+    q_hat, k_hat = attn._qk_l2_norm(q, k)
+    k_norms = k_hat.float().norm(dim=-1)
+    q_norms = q_hat.float().norm(dim=-1)
+    assert torch.allclose(k_norms, torch.ones_like(k_norms), atol=1e-5)
+    assert torch.allclose(q_norms, torch.full_like(q_norms, 2.0), atol=1e-5)
+
+
+def test_l2_mode_forward_shape_and_finite():
+    torch.manual_seed(0)
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4, qk_norm_mode="l2"))
+    x = torch.randn(2, 7, 32)
+    out, _ = attn(x, _ones_mask(2, 7))
+    assert out.shape == (2, 7, 32)
+    assert torch.isfinite(out).all()
+
+
+def test_l2_mode_sdpa_and_manual_paths_agree():
+    """Under L2 mode both kernels use scale 1.0 and agree in fp32."""
+    torch.manual_seed(0)
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4, qk_norm_mode="l2")).eval()
+    x = torch.randn(2, 8, 32)
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.long)
+    with torch.no_grad():
+        out_sdpa, _ = attn(x, mask, output_attentions=False)
+        out_manual, _ = attn(x, mask, output_attentions=True)
+    assert torch.allclose(out_sdpa, out_manual, rtol=1e-4, atol=1e-5)
+
+
+def test_l2_scale_receives_gradient():
+    """Gradients flow into qk_l2_scale through the attention logits."""
+    torch.manual_seed(0)
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4, qk_norm_mode="l2"))
+    x = torch.randn(2, 5, 32)
+    out, _ = attn(x, _ones_mask(2, 5))
+    out.sum().backward()
+    assert attn.qk_l2_scale.grad is not None
+    assert attn.qk_l2_scale.grad.abs().sum() > 0

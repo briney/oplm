@@ -344,12 +344,25 @@ Shapes: `x (B,T,D)` → Q/K/V projections `(B,T,D)` → reshape to heads `(B,H,T
 with `d = D/H` → QK-norm `(B,H,T,d)` → RoPE on Q,K → attention out `(B,H,T,d)` →
 reshape `(B,T,D)` → output projection `(B,T,D)`.
 
-**QK-norm / QKV-norm.** Q and K each pass through a separate Norm over the
-`d_head` channel dim; gain (and bias under LayerNorm) is shape `(d_head,)`,
-**shared across heads**. Computed in **fp32** regardless of autocast. V is not
-normed — *except* under `norm_strategy="hybrid"`, where an independent `v_norm`
-`(d_head,)` is added (the "QKV-norm" formulation) and the block-level attention
-pre-norm is suppressed. Under all other strategies `v_norm` is `nn.Identity()`.
+**QK-norm / QKV-norm.** Two modes, selected by `qk_norm_mode` (only active when
+`qk_norm=True`):
+
+* **`channel`** (default): Q and K each pass through a separate Norm over the
+  `d_head` channel dim; gain (and bias under LayerNorm) is shape `(d_head,)`,
+  **shared across heads**. Computed in **fp32** regardless of autocast. The
+  attention kernel uses the canonical `1/sqrt(d_head)` score scale.
+* **`l2`** (true L2 QK-norm): Q and K are L2-normalized over `d_head` in **fp32**
+  (each logit becomes a scaled cosine similarity), then Q is multiplied by a
+  **learned per-head scale** `qk_l2_scale` of shape `(num_attention_heads,)` —
+  initialized to `qk_norm_l2_scale_init` or `sqrt(d_head)`. The kernel score
+  scale is then `1.0` (the temperature is folded into `qk_l2_scale`). The 1D
+  scale lands in the no-decay optimizer group.
+
+When `qk_norm=False`, Q and K are unnormalized (`nn.Identity`) and the kernel
+keeps the `1/sqrt(d_head)` scale. V is not normed — *except* under
+`norm_strategy="hybrid"`, where an independent `v_norm` `(d_head,)` is added (the
+"QKV-norm" formulation) and the block-level attention pre-norm is suppressed.
+Under all other strategies `v_norm` is `nn.Identity()`.
 
 **RoPE** applies to `Q_norm`, `K_norm` (after QK-norm, before scoring); not to V.
 Partial RoPE rotates only the first `rope_dim` channels (see §7).
@@ -384,12 +397,14 @@ out = self._output_projection(out)
 **bidirectional** — no causal mask, only the padding mask. Masking only keys keeps
 every query row non-empty, so no row is all-masked and the softmax cannot NaN.
 `dropout_p` is the configured `attention_dropout` during training (0 in eval), and
-SDPA's default scale (`1/sqrt(d_head)`) matches the manual path. On CUDA this
+the explicit `scale=self.attn_scale` matches the manual path (`1/sqrt(d_head)` in
+channel/disabled modes, `1.0` in L2 mode). On CUDA this
 dispatches to a fused FlashAttention / memory-efficient kernel (FlashAttention-4 on
 Blackwell + torch ≥ 2.11); on CPU it uses the math backend. It returns no weights.
 
-**Manual path** (`output_attentions=True`, manual matmul): `scores = (q @ kᵀ)/sqrt(d)`,
-mask pad KV columns to `-inf`, `softmax(..., dtype=fp32)`, dropout, `@ v`. The
+**Manual path** (`output_attentions=True`, manual matmul): `scores = (q @ kᵀ) *
+attn_scale` (same mode-dependent scale as SDPA), mask pad KV columns to `-inf`,
+`softmax(..., dtype=fp32)`, dropout, `@ v`. The
 returned `attn` is the full fp32 softmax (for precision@L, attention rollout,
 head-pruning). It is slower and `O(B·H·T²)` in memory — for inspection, not training.
 
