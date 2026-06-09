@@ -1,106 +1,127 @@
-# TODOS: Fix selective activation checkpointing under DDP + `torch.compile`
+# TODO: Implement OPLM Architecture Ablation Best Bets
 
-**Branch:** `feature/selective-activation-checkpointing`
-**Scope:** Trainer-only change. No model/SAC code changes — the SAC implementation
-in `src/oplm/model/transformer.py` is correct (verified on single GPU).
+Implement four behavior-preserving architecture toggles: mask-token embedding
+dropout, true L2 QKNorm with learned per-head scale, learnable residual branch
+gates, and GEGLU. Defaults must preserve current model behavior and checkpoint
+compatibility; attention logit soft-capping remains deferred until learned QKNorm
+is evaluated.
 
-## Problem (diagnosed, reproduced on 8×B200 / torch 2.10)
+## Phase 1: Config Surface And Compatibility
 
-With `gradient_checkpointing_mode="selective"` + `train.compile=true` on multi-GPU
-(DDP), selective checkpointing **silently collapses to `full` recompute**: identical
-peak memory and step time to `mode="full"`, with none of its intended ~1.2× /
-partial-memory tradeoff. Single-GPU is unaffected and works as designed.
+- [ ] Add new `OplmConfig` fields with defaults:
+  - `mask_dropout: bool = False`
+  - `mask_dropout_reference_ratio: float = 0.12`
+  - `qk_norm_mode: str = "channel"` with valid values `channel | l2`
+  - `qk_norm_l2_scale_init: float | None = None`
+  - `residual_gate: str = "none"` with valid values `none | scalar | channel`
+  - `residual_gate_init: float = 1.0`
+- [ ] Preserve existing semantics:
+  - `qk_norm=True, qk_norm_mode="channel"` keeps current LayerNorm/RMSNorm QK norm.
+  - `residual_gate="none"` keeps current fixed `alpha` residual writes.
+  - `mask_dropout=False` keeps exact current embedding lookup.
+  - `ffn_activation="swiglu"` remains default.
+- [ ] Add validation:
+  - `mask_dropout_reference_ratio >= 0` and `< 1`.
+  - `qk_norm_mode` and `residual_gate` must match enums.
+  - `qk_norm_l2_scale_init`, when set, must be positive.
+  - `residual_gate_init` must be finite.
+- [ ] Update `src/oplm/configs/model/base.yaml`, `docs/CONFIG.md`, and
+  `docs/OVERVIEW.md` so new knobs match the existing config style and are not
+  hidden implementation details.
+- [ ] Update config default, validation, CLI override, YAML typo-guard, and
+  save/load round-trip tests for all new fields.
 
-**Measured (bs=64, seq=1024):**
+## Phase 2: Implement Mask Dropout
 
-| config | selective step | selective peak |
-|---|---|---|
-| 1 GPU | 554 ms (1.24×) | 54 GB ✓ |
-| 8-GPU DDP, default | 678 ms (== full) | 14.5 GB ✗ |
-| 8-GPU DDP, `optimize_ddp=False` | 566 ms (1.20×) | 55.6 GB ✓ |
+- [ ] Extend embedding forward plumbing so `OplmStack` validates/materializes
+  `attention_mask` before embedding lookup and passes it to `OplmEmbedding`.
+- [ ] Implement `mask_dropout=True` only for the `input_ids` path; leave
+  `inputs_embeds` unchanged because `<mask>` positions cannot be inferred.
+- [ ] When enabled:
+  - zero every embedding row whose ID equals `mask_token_id`,
+  - compute `observed_mask_ratio = count(<mask>) / count(real tokens)` per row,
+  - scale embeddings by
+    `(1 - mask_dropout_reference_ratio) / (1 - observed_mask_ratio)`,
+  - clamp denominators/counts so all-pad or all-mask edge cases remain finite.
+- [ ] Apply mask dropout before optional post-embedding norm.
+- [ ] Document `mask_dropout_reference_ratio` as the expected fraction of real
+  tokens that are `<mask>` under the training masking policy, not as a fraction
+  of mask tokens to drop.
 
-**Root cause:** `torch._dynamo.config.optimize_ddp="ddp_optimizer"` (default) splits
-the compiled graph into ~48 bucket-sized subgraphs (25 MB default) to overlap
-allreduce with backward. This fragments each `OplmBlock`'s activation-checkpoint
-higher-order op across subgraphs, so AOT autograd's min-cut partitioner can't honor
-the SAC `MUST_SAVE` set → every op recomputed → `selective` == `full`. No DDP on a
-single GPU, so `optimize_ddp` never engages and SAC works.
+## Phase 3: Implement True L2 QKNorm
 
----
+- [ ] Refactor attention Q/K normalization into explicit modes:
+  - `channel`: current `make_norm(norm_type, head_dim)` path plus fixed
+    `1/sqrt(head_dim)` attention scaling.
+  - `l2`: fp32 L2-normalize Q and K over `d_head`, then apply learned per-head
+    scale.
+- [ ] Add `qk_l2_scale: nn.Parameter` with shape `(num_attention_heads,)` when
+  `qk_norm=True` and `qk_norm_mode="l2"`.
+- [ ] Initialize `qk_l2_scale` to `qk_norm_l2_scale_init` when set, otherwise
+  `sqrt(head_dim)`.
+- [ ] In L2 mode, multiply Q by the per-head scale and use attention kernel scale
+  `1.0` in both SDPA and manual attention paths.
+- [ ] Keep `qk_norm=False` as the existing no-QK-normalization path with fixed
+  attention scaling.
 
-## Fix (recommended): disable DDPOptimizer graph-splitting for selective + compile
+## Phase 4: Implement Residual Gates
 
-**File:** `src/oplm/training/trainer.py`, immediately before the `torch.compile`
-call (currently ~line 127, inside the `if cfg.train.compile:` block, after
-`accelerator.prepare`).
+- [ ] Keep the current persistent scalar `alpha` buffer as the base residual scale
+  from `residual_scaling`.
+- [ ] Add optional learnable gates per block:
+  - `none`: no new parameters.
+  - `scalar`: separate scalar parameters for attention and FFN residual writes.
+  - `channel`: separate `(hidden_size,)` parameters for attention and FFN residual
+    writes.
+- [ ] Initialize gate parameters directly to `residual_gate_init`; do not route
+  them through generic weight init.
+- [ ] Apply gates as multiplicative refinements on residual writes:
+  - `x + alpha * attn_gate * attn_out`
+  - `h + alpha * ffn_gate * ffn_out`
+- [ ] Rely on existing optimizer grouping so 1D gates land in no-decay AdamW
+  groups, including the auxiliary AdamW path under Muon.
 
-Gate it so only the affected configuration pays the cost (`full`/`none` keep
-comm/compute overlap):
+## Phase 5: Implement GEGLU
 
-```python
-if cfg.train.compile:
-    # Selective activation checkpointing (SAC) is incompatible with the default
-    # DDPOptimizer: graph-splitting at gradient-bucket boundaries fragments the
-    # per-block activation-checkpoint HOP, so AOT's partitioner drops the SAC
-    # MUST_SAVE policy and `selective` silently degrades to full recompute.
-    # Disabling graph-splitting keeps SAC intact; the only cost is lost
-    # comm/compute overlap (~2-3 ms allreduce on a ~500 ms step for a 300M model
-    # on NVLink — negligible vs. the ~20% recompute SAC saves back).
-    if getattr(cfg.model, "gradient_checkpointing_mode", "full") == "selective":
-        import torch._dynamo
-        torch._dynamo.config.optimize_ddp = False
-    _status("[dim]Compiling model (torch.compile)...[/dim]")
-    self.model = cast(
-        "nn.Module",
-        torch.compile(self.model, dynamic=True, mode=cfg.train.compile_mode),
-    )
-```
+- [ ] Add a `GEGLU` FFN class parallel to `SwiGLU`, with the same projection
+  shapes and `ffn_bias` handling.
+- [ ] Implement `GEGLU.forward()` as `down(gelu(gate(x)) * up(x))`.
+- [ ] Mark `GEGLU.down_proj._is_residual_writer = True` so residual-writer init
+  scaling matches SwiGLU.
+- [ ] Update `make_ffn()` so `ffn_activation="geglu"` constructs `GEGLU` instead
+  of raising.
+- [ ] Update model exports and HuggingFace remote-code dependency imports if needed.
 
-**Notes:**
-- `optimize_ddp` is a process-global dynamo config flag, set once before compile.
-- Numerically transparent — only affects graph partitioning for comm overlap, not
-  math. Existing SAC transparency tests (`test_gradient_checkpointing.py`,
-  `test_e2e_gradckpt.py`) remain valid.
-- Only meaningful under DDP+compile; harmless to set on single GPU.
-- Gate on `mode == "selective"` only — `full`/`none` should keep the default
-  `ddp_optimizer` so they retain comm/compute overlap.
+## Phase 6: Tests And Validation
 
-### Alternative (defer): `optimize_ddp="python_reducer"`
-Preserves comm/compute overlap *and* SAC (no graph split), but requires wrapping
-the backward in `torch._dynamo.compiled_autograd` — non-trivial with
-`accelerator.backward()`. Revisit only if the lost overlap proves material at
-larger model sizes. For 300M on NVLink it does not.
+- [ ] Add embedding tests for disabled/default behavior, `<mask>` zeroing,
+  expected per-row scaling, attention-mask length accounting, `inputs_embeds`
+  bypass, and degenerate finite outputs.
+- [ ] Add attention tests for channel-mode parity, L2 parameter shape/init,
+  manual/SDPA agreement, `qk_norm=False` behavior, and gradient flow into
+  `qk_l2_scale`.
+- [ ] Add transformer tests for residual-gate absence, scalar/channel shapes,
+  initialization, state-dict persistence, output effect when edited, and gradient
+  flow.
+- [ ] Replace the GEGLU-not-implemented test with GEGLU factory, formula, bias,
+  residual-writer marker, shape, and gradient tests.
+- [ ] Add a targeted integration test covering representative combinations of
+  `mask_dropout`, L2 QKNorm, residual gates, GEGLU, sandwich norm, and optimizer
+  parameter grouping without exploding the existing full toggle matrix.
+- [ ] Run focused tests:
+  - `pytest tests/model/test_config.py tests/model/test_embedding.py tests/model/test_attention.py tests/model/test_ffn.py tests/model/test_transformer.py tests/model/test_toggles.py tests/model/test_save_load.py tests/training/test_config.py tests/training/test_optim.py`
+- [ ] Run final gates:
+  - `ruff format src/ tests/`
+  - `ruff check src/ tests/`
+  - `ty check src/`
+  - `pytest -m "not slow"`
 
----
+## Assumptions
 
-## Tests / validation
-
-- [x] Guard test: with `compile=true` + `mode="selective"`, assert
-      `torch._dynamo.config.optimize_ddp is False` after `Trainer.__init__`
-      (CPU-safe; check the flag, no real compile needed).
-      → `tests/training/test_compile_ddp_optimizer.py::test_compile_selective_disables_ddp_optimizer`.
-- [x] Multi-GPU peak-memory check (slow, CUDA, ≥2 ranks): selective peak must be
-      **strictly greater** than full peak (proves SAC saves matmul/SDPA outputs
-      rather than collapsing to full). Mirror the single-process ordering test
-      `test_sac_peak_memory_between_none_and_full` for the DDP path.
-      → `test_ddp_compile_selective_peak_exceeds_full` (spawns 2 NCCL ranks,
-      compiles a DDP-wrapped model). **Written but not yet run on hardware**: skips
-      on this 1-GPU box; needs a ≥2-GPU run to confirm.
-- [x] Confirm `full`/`none` runs are unaffected (`optimize_ddp` left at default).
-      → `test_compile_full_mode_leaves_ddp_optimizer_default`.
-- [ ] Re-run the repro: 8-GPU selective → ~1.2× / ~55 GB (not 14.5 GB).
-      **Pending hardware** (needs the 8×B200 box).
-
-## Docs
-
-- [x] `docs/TRAIN.md`: note that `selective` + `compile` on multi-GPU disables
-      DDPOptimizer automatically (in the trainer) and the negligible overlap
-      tradeoff.
-- [x] Cross-reference in the `gradient_checkpointing_mode` config docs
-      (`docs/CONFIG.md` / `base.yaml` comment; also `docs/OVERVIEW.md`).
-
-## Lint / type
-
-- [x] `ruff check src/` clean; `ruff format`/`ty check` clean for the edited files
-      (`trainer.py`). Pre-existing format/`ty` drift remains in untouched
-      `model/transformer.py` and `model/modeling_oplm.py` — out of scope here.
+- [ ] `mask_dropout_reference_ratio=0.12` matches the current default masking
+  policy: `mask_prob=0.15` times `mask_token_prob=0.8`.
+- [ ] `qk_norm_mode="l2"` is the only QK mode that introduces a learned per-head
+  scale.
+- [ ] Residual gates refine the existing residual scaling rather than replacing
+  `residual_scaling`.
+- [ ] No attention logit soft-capping fields, docs, or tests are added in this pass.
