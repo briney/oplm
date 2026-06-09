@@ -105,6 +105,13 @@ def test_compile_default_mode_trains(
     cb = FullRecordingCallback()
     Trainer(cfg, callbacks=[cb]).train()
 
+    # The compile path disables Inductor's mix-order-reduction pass to dodge the
+    # FusedMixOrderReductions backward-compile crash (pytorch/pytorch#169811).
+    from torch._inductor import config as inductor_config
+
+    if hasattr(inductor_config.triton, "mix_order_reduction"):
+        assert inductor_config.triton.mix_order_reduction is False
+
     assert len(cb.train_logs) == 5
     for _, metrics in cb.train_logs:
         assert torch.isfinite(torch.tensor(metrics["train/loss"]))
