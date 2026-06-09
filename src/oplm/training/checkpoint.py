@@ -8,8 +8,6 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from omegaconf import OmegaConf
-
 if TYPE_CHECKING:
     import torch
     from accelerate import Accelerator
@@ -50,8 +48,7 @@ def save_checkpoint(
         tokens_seen: Cumulative training tokens processed.
         save_total_limit: Maximum number of checkpoints to keep.
     """
-    from dataclasses import asdict
-
+    from oplm.config import serialize_config
     from oplm.data import get_tokenizer
 
     checkpoint_dir = Path(output_dir) / f"checkpoint-{global_step}"
@@ -69,13 +66,8 @@ def save_checkpoint(
         state_path.write_text(json.dumps(state, indent=2))
 
         # Save config (model is the HF OplmConfig; train/data are dataclasses)
-        config_dict = {
-            "model": cfg.model.to_dict(),
-            "train": asdict(cfg.train),
-            "data": asdict(cfg.data),
-        }
         config_path = checkpoint_dir / "config.yaml"
-        config_path.write_text(OmegaConf.to_yaml(OmegaConf.create(config_dict)))
+        config_path.write_text(serialize_config(cfg))
 
         # HuggingFace export for from_pretrained-style downstream loading
         hf_dir = checkpoint_dir / "hf"

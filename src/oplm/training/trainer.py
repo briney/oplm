@@ -69,17 +69,31 @@ class Trainer:
             if self.accelerator.is_main_process:
                 _console.print(msg)
 
+        # Consolidate all run artifacts (checkpoints, config copy, wandb logs)
+        # under output_dir. Create it up front so wandb can log into it.
+        if self.accelerator.is_main_process:
+            Path(cfg.train.output_dir).mkdir(parents=True, exist_ok=True)
+
         # Init wandb early so login prompt appears before slow setup steps
         if cfg.train.wandb_enabled:
             _status("[dim]Initializing wandb...[/dim]")
-            init_kwargs: dict[str, Any] = {}
+            # accelerate's WandBTracker ignores project_dir (requires_logging_directory
+            # is False), so point wandb's local logs into output_dir explicitly via
+            # `dir` -> they land in output_dir/wandb/ instead of ./wandb.
+            wandb_kwargs: dict[str, Any] = {"dir": cfg.train.output_dir}
             if cfg.train.wandb_run_name is not None:
-                init_kwargs["wandb"] = {"name": cfg.train.wandb_run_name}
+                wandb_kwargs["name"] = cfg.train.wandb_run_name
             self.accelerator.init_trackers(
                 project_name=cfg.train.wandb_project,
                 config=_config_to_flat_dict(cfg),
-                init_kwargs=init_kwargs,
+                init_kwargs={"wandb": wandb_kwargs},
             )
+
+        # Drop a top-level copy of the fully resolved config alongside the run.
+        if self.accelerator.is_main_process:
+            from oplm.config import serialize_config
+
+            (Path(cfg.train.output_dir) / "config.yaml").write_text(serialize_config(cfg))
 
         # Build evaluator from config if eval datasets are specified
         self.evaluator: Evaluator | None = None
@@ -287,7 +301,7 @@ class Trainer:
                     self._emit_eval_end(eval_metrics)
 
                 # Checkpointing
-                if self.global_step % cfg.save_every == 0:
+                if cfg.save_every > 0 and self.global_step % cfg.save_every == 0:
                     self._save_checkpoint()
 
                 # Update progress bar
@@ -302,8 +316,11 @@ class Trainer:
                         metrics=f"loss={current_loss:.4f} eval={eval_str}",
                     )
 
-            # Final checkpoint
-            self._save_checkpoint()
+            # Final checkpoint — guaranteed unless disabled. Skip when the last
+            # step already triggered a periodic save (avoids a redundant re-write).
+            last_step_saved = cfg.save_every > 0 and self.global_step % cfg.save_every == 0
+            if cfg.save_final and not last_step_saved:
+                self._save_checkpoint()
 
         finally:
             if progress is not None:

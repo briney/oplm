@@ -53,8 +53,12 @@ def test_rotation_and_checkpoint_artifacts(training_parquet: Path, tmp_path: Pat
     callback = FullRecordingCallback()
     Trainer(cfg, callbacks=[callback]).train()
 
-    # Saves fire on the cadence (2, 4, 6) plus the unconditional final save at 6.
-    assert callback.checkpoint_steps == [2, 4, 6, 6]
+    # Saves fire on the cadence (2, 4, 6); the final save is de-duplicated because
+    # the last step (6) already triggered a periodic save.
+    assert callback.checkpoint_steps == [2, 4, 6]
+
+    # The fully resolved config is dropped at the top level of the run directory.
+    assert (tmp_path / "config.yaml").exists()
 
     # Rotation keeps only the two newest checkpoint directories.
     assert _checkpoint_names(tmp_path) == ["checkpoint-4", "checkpoint-6"]
@@ -69,6 +73,43 @@ def test_rotation_and_checkpoint_artifacts(training_parquet: Path, tmp_path: Pat
         # Tokenizer round-trip files for from_pretrained.
         assert (hf / "tokenizer_config.json").exists()
         assert (hf / "tokenizer.json").exists()
+
+
+def test_save_final_writes_unaligned_final_checkpoint(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """``save_final`` guarantees a final checkpoint even when the last step is off-cadence."""
+    from oplm.training.trainer import Trainer
+
+    # save_every=4 over max_steps=6 -> periodic save only at step 4. The final
+    # checkpoint at step 6 comes solely from the save_final path.
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=_BATCH_SIZE,
+        save_every=4,
+    )
+    callback = FullRecordingCallback()
+    Trainer(cfg, callbacks=[callback]).train()
+    assert callback.checkpoint_steps == [4, 6]
+
+
+def test_save_final_disabled_skips_final_checkpoint(training_parquet: Path, tmp_path: Path) -> None:
+    """``save_final=False`` leaves only the periodic saves; no off-cadence final save."""
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=_BATCH_SIZE,
+        save_every=4,
+        save_final=False,
+    )
+    callback = FullRecordingCallback()
+    Trainer(cfg, callbacks=[callback]).train()
+    assert callback.checkpoint_steps == [4]
 
 
 def test_resume_restores_state_and_continues(training_parquet: Path, tmp_path: Path) -> None:
