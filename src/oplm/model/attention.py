@@ -46,6 +46,15 @@ class OplmAttention(nn.Module):
       `d_head` — this realises the paper's "QKV-norm" main method.
     * Under every other strategy, `v_norm` is `nn.Identity()`.
 
+    Output gating (controlled by `config.attn_output_gate`): when `"sigmoid"` or
+    `"silu"`, a `gate_proj` linear computes an elementwise, head-specific gate
+    from the attention input — the post-SDPA G1 multiplicative gate of "Gated
+    Attention for Large Language Models" (arXiv:2505.06708) — and the merged
+    attention output is multiplied by `act(gate_proj(x))` before `o_proj`.
+    `gate_proj` uses the standard trunc-normal init (as in the paper), so at
+    init the gate sits near `act(0)` (0.5 for sigmoid, 0.0 for SiLU) and
+    attenuates the attention write. `"none"` (default) adds no parameters.
+
     The output projection (`o_proj`) is marked `_is_residual_writer = True` so
     the `OplmPreTrainedModel._init_weights` hook can apply the
     `1/sqrt(2L)` residual-stream scaling defined in §15.1 of the architecture
@@ -87,6 +96,19 @@ class OplmAttention(nn.Module):
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         # Picked up by OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling.
         self.o_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+
+        # Post-SDPA output gate (arXiv:2505.06708, G1): elementwise multiplicative
+        # gate on the merged attention output, computed from the attention input.
+        # `gate_proj` is a plain Linear (generic trunc-normal init, regular Muon
+        # matrix); `o_proj` remains the sole residual writer.
+        self.attn_output_gate = getattr(config, "attn_output_gate", "none")
+        if self.attn_output_gate not in {"none", "sigmoid", "silu"}:
+            raise ValueError(
+                f"Unknown attn_output_gate {self.attn_output_gate!r}; "
+                "expected one of 'none', 'sigmoid', 'silu'."
+            )
+        if self.attn_output_gate != "none":
+            self.gate_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
         # Channel-mode QK norm installs per-head norm modules; L2 mode and the
         # disabled path leave them as Identity (L2 normalization is functional).
@@ -168,10 +190,19 @@ class OplmAttention(nn.Module):
     def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.rotary.apply_rotary(q, k)
 
-    def _output_projection(self, attn_out: torch.Tensor) -> torch.Tensor:
-        """Reshape `(B, H, T, d_head)` back to `(B, T, D)` and project."""
+    def _output_projection(self, attn_out: torch.Tensor, gate_input: torch.Tensor) -> torch.Tensor:
+        """Reshape `(B, H, T, d_head)` back to `(B, T, D)`, gate (optional), project.
+
+        `gate_input` is the `(B, T, D)` attention input; with the output gate
+        enabled, the merged attention output is multiplied elementwise by
+        `act(gate_proj(gate_input))` before `o_proj` (head-specific G1 gating,
+        since `D = H * d_head`).
+        """
         batch, _, seq_len, _ = attn_out.shape
         merged = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, self.hidden_size)
+        if self.attn_output_gate != "none":
+            act = torch.sigmoid if self.attn_output_gate == "sigmoid" else F.silu
+            merged = merged * act(self.gate_proj(gate_input))  # (B, T, D)
         return self.o_proj(merged)
 
     # ------------------------------------------------------------------
@@ -252,6 +283,6 @@ class OplmAttention(nn.Module):
             out = self._sdpa_attention(q, k, v, attention_mask)
             attn = None
 
-        out = self._output_projection(out)
+        out = self._output_projection(out, x)
         out = F.dropout(out, p=self.hidden_dropout, training=self.training)
         return out, attn

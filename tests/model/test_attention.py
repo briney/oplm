@@ -28,6 +28,7 @@ def _config(
     attention_dropout: float = 0.0,
     hidden_dropout: float = 0.0,
     norm_strategy: str = "pre",
+    attn_output_gate: str = "none",
 ) -> SimpleNamespace:
     head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
     rope_dim = rope_dim if rope_dim is not None else head_dim
@@ -46,6 +47,7 @@ def _config(
         attention_dropout=attention_dropout,
         hidden_dropout=hidden_dropout,
         norm_strategy=norm_strategy,
+        attn_output_gate=attn_output_gate,
     )
 
 
@@ -386,3 +388,106 @@ def test_l2_scale_receives_gradient():
     out.sum().backward()
     assert attn.qk_l2_scale.grad is not None
     assert attn.qk_l2_scale.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# Attention output gate (gated attention, arXiv:2505.06708 G1)
+# ---------------------------------------------------------------------------
+
+
+def test_output_gate_disabled_by_default_adds_no_params():
+    attn = OplmAttention(_config())
+    assert attn.attn_output_gate == "none"
+    assert not hasattr(attn, "gate_proj")
+
+
+@pytest.mark.parametrize("activation", ["sigmoid", "silu"])
+def test_output_gate_builds_elementwise_projection(activation: str):
+    """Enabling the gate adds a bias-free D x D projection that is not a residual writer."""
+    attn = OplmAttention(_config(hidden_size=32, attn_output_gate=activation))
+    assert attn.gate_proj.weight.shape == (32, 32)
+    assert attn.gate_proj.bias is None
+    assert getattr(attn.gate_proj, "_is_residual_writer", False) is False
+
+
+def test_output_gate_constructor_rejects_unknown_activation():
+    with pytest.raises(ValueError, match="attn_output_gate"):
+        OplmAttention(_config(attn_output_gate="tanh"))
+
+
+@pytest.mark.parametrize("activation", ["sigmoid", "silu"])
+def test_output_gate_forward_shape_and_finite(activation: str):
+    torch.manual_seed(0)
+    attn = OplmAttention(
+        _config(hidden_size=32, num_attention_heads=4, attn_output_gate=activation)
+    )
+    x = torch.randn(2, 7, 32)
+    out, _ = attn(x, _ones_mask(2, 7))
+    assert out.shape == (2, 7, 32)
+    assert torch.isfinite(out).all()
+
+
+def test_output_gate_changes_output():
+    """With identical Q/K/V/O weights, enabling the gate changes the output."""
+    torch.manual_seed(0)
+    base = OplmAttention(_config(hidden_size=32, num_attention_heads=4)).eval()
+    # Same seed: q/k/v/o draw the same init values; gate_proj draws afterwards.
+    torch.manual_seed(0)
+    gated = OplmAttention(
+        _config(hidden_size=32, num_attention_heads=4, attn_output_gate="sigmoid")
+    ).eval()
+    assert torch.equal(base.o_proj.weight, gated.o_proj.weight)
+
+    torch.manual_seed(1)
+    x = torch.randn(2, 6, 32)
+    with torch.no_grad():
+        out_base, _ = base(x, _ones_mask(2, 6))
+        out_gated, _ = gated(x, _ones_mask(2, 6))
+    assert not torch.allclose(out_base, out_gated)
+
+
+def test_output_gate_sigmoid_and_silu_differ():
+    """Identical weights, different gate activation: outputs must differ."""
+    torch.manual_seed(0)
+    sig = OplmAttention(
+        _config(hidden_size=32, num_attention_heads=4, attn_output_gate="sigmoid")
+    ).eval()
+    torch.manual_seed(0)
+    silu = OplmAttention(
+        _config(hidden_size=32, num_attention_heads=4, attn_output_gate="silu")
+    ).eval()
+    assert torch.equal(sig.gate_proj.weight, silu.gate_proj.weight)
+
+    torch.manual_seed(1)
+    x = torch.randn(2, 6, 32)
+    with torch.no_grad():
+        out_sig, _ = sig(x, _ones_mask(2, 6))
+        out_silu, _ = silu(x, _ones_mask(2, 6))
+    assert not torch.allclose(out_sig, out_silu)
+
+
+def test_output_gate_sdpa_and_manual_paths_agree():
+    """The gate sits after the kernel, so both compute paths still agree."""
+    torch.manual_seed(0)
+    attn = OplmAttention(
+        _config(hidden_size=32, num_attention_heads=4, attn_output_gate="sigmoid")
+    ).eval()
+    x = torch.randn(2, 8, 32)
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.long)
+    with torch.no_grad():
+        out_sdpa, _ = attn(x, mask, output_attentions=False)
+        out_manual, _ = attn(x, mask, output_attentions=True)
+    assert torch.allclose(out_sdpa, out_manual, rtol=1e-4, atol=1e-5)
+
+
+def test_output_gate_receives_gradient():
+    """Gradients flow into gate_proj alongside the standard projections."""
+    torch.manual_seed(0)
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4, attn_output_gate="silu"))
+    x = torch.randn(2, 5, 32, requires_grad=True)
+    out, _ = attn(x, _ones_mask(2, 5))
+    out.sum().backward()
+    for proj in (attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj, attn.gate_proj):
+        assert proj.weight.grad is not None
+        assert proj.weight.grad.abs().sum() > 0
+    assert x.grad is not None

@@ -37,6 +37,7 @@ def test_defaults_match_architecture_spec():
     assert cfg.residual_scaling == "sqrt_num_layers"
     assert cfg.residual_gate == "none"
     assert cfg.residual_gate_init == 1.0
+    assert cfg.attn_output_gate == "none"
     assert cfg.init_scale_output_projections is True
     assert cfg.ffn_activation == "swiglu"
     assert cfg.ffn_bias is False
@@ -153,6 +154,7 @@ def test_rejects_negative_rope_dim():
         ("qk_norm_mode", "cosine", "qk_norm_mode must be one of"),
         ("residual_scaling", "linear", "residual_scaling must be one of"),
         ("residual_gate", "vector", "residual_gate must be one of"),
+        ("attn_output_gate", "tanh", "attn_output_gate must be one of"),
         ("ffn_activation", "relu", "ffn_activation must be one of"),
         ("mlm_head_activation", "swiglu", "mlm_head_activation must be one of"),
         ("canon_activation", "tanh", "canon_activation must be one of"),

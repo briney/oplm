@@ -92,23 +92,26 @@ def test_toggle_combination_trains_one_step(combo) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Ablation-feature integration (Phases 2-5): mask dropout + L2 QKNorm +
-# residual gates + GEGLU + sandwich norm exercised together, plus optimizer
-# partitioning of the new 1-D params. Kept to a few representative combos
-# rather than folded into the matrix above (which would multiply its size).
+# Ablation-feature integration (Phases 2-5 + gated attention): mask dropout +
+# L2 QKNorm + residual gates + GEGLU + attention output gate + sandwich norm
+# exercised together, plus optimizer partitioning of the new params. Kept to a
+# few representative combos rather than folded into the matrix above (which
+# would multiply its size).
 # ---------------------------------------------------------------------------
 
 _INTEGRATION_COMBOS = [
-    ("scalar", "adamw"),
-    ("scalar", "muon"),
-    ("channel", "adamw"),
-    ("channel", "muon"),
+    ("scalar", "sigmoid", "adamw"),
+    ("scalar", "silu", "muon"),
+    ("channel", "silu", "adamw"),
+    ("channel", "sigmoid", "muon"),
 ]
 
 
-@pytest.mark.parametrize("residual_gate,optimizer", _INTEGRATION_COMBOS)
-def test_ablation_features_train_and_partition_together(residual_gate, optimizer) -> None:
-    """All Phase 2-5 toggles on at once: train one step, then check optim grouping."""
+@pytest.mark.parametrize("residual_gate,attn_output_gate,optimizer", _INTEGRATION_COMBOS)
+def test_ablation_features_train_and_partition_together(
+    residual_gate, attn_output_gate, optimizer
+) -> None:
+    """All ablation toggles on at once: train one step, then check optim grouping."""
     torch.manual_seed(0)
     config = OplmConfig(
         hidden_size=_HIDDEN,
@@ -120,6 +123,7 @@ def test_ablation_features_train_and_partition_together(residual_gate, optimizer
         qk_norm=True,
         qk_norm_mode="l2",
         residual_gate=residual_gate,
+        attn_output_gate=attn_output_gate,
         ffn_activation="geglu",
     )
     model = OplmForMaskedLM(config).train()
@@ -158,6 +162,16 @@ def test_ablation_features_train_and_partition_together(residual_gate, optimizer
         if name in new_1d:
             assert id(param) in no_decay_ids, f"{name} should be AdamW-no-decay"
             assert id(param) not in muon_ids, f"{name} leaked into Muon"
+
+    # The attention output-gate projection is a regular 2-D hidden matrix: under
+    # Muon it must join the Muon group, never the no-decay group.
+    gate_proj_names = {n for n in id_to_name.values() if "gate_proj" in n and "attention" in n}
+    assert gate_proj_names, "expected attention gate_proj params to exist"
+    if optimizer == "muon":
+        for name, param in model.named_parameters():
+            if name in gate_proj_names:
+                assert id(param) in muon_ids, f"{name} should be in Muon"
+                assert id(param) not in no_decay_ids, f"{name} should not be AdamW-no-decay"
 
     grouped_ids = [
         id(p)

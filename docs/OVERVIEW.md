@@ -344,6 +344,7 @@ site), e.g. `["A","C","D"]`. See §11.
 | `mask_dropout`/`mask_dropout_reference_ratio` | global | `<mask>`-embedding dropout on the `input_ids` path |
 | `residual_scaling` | global | `sqrt_num_layers` / `none` |
 | `residual_gate`/`residual_gate_init` | global | `none` (default) / `scalar` / `channel` per-block residual gate |
+| `attn_output_gate` | global | `none` (default) / `sigmoid` / `silu` post-SDPA output gate (arXiv:2505.06708 G1) |
 | `rope_dim`/`nope_dim` | global | same split across all heads/layers |
 | `canon_enabled`/`canon_positions` | global | master switch / insertion sites |
 | `canon_kernel_sizes` | per-layer | scalar broadcasts; list must match `num_hidden_layers` |
@@ -382,6 +383,23 @@ keeps the `1/sqrt(d_head)` scale. V is not normed — *except* under
 `norm_strategy="hybrid"`, where an independent `v_norm` `(d_head,)` is added (the
 "QKV-norm" formulation) and the block-level attention pre-norm is suppressed.
 Under all other strategies `v_norm` is `nn.Identity()`.
+
+**Output gating** (`attn_output_gate`, off by default). The post-SDPA G1 gate of
+"Gated Attention for Large Language Models" (arXiv:2505.06708): a `gate_proj`
+linear `(D, D)` computes an elementwise, head-specific gate from the attention
+input `x`, and the merged attention output is multiplied by it before `o_proj`:
+
+```
+out = o_proj(merge(SDPA(q, k, v)) ⊙ act(gate_proj(x)))
+```
+
+`act` is selected by the toggle value: `sigmoid` (the paper's best variant) or
+`silu`. `gate_proj` is bias-free, uses the standard trunc-normal init (per the
+paper — so at init the gate sits near `act(0)` and attenuates the attention
+write), is *not* a residual writer (the `1/sqrt(2L)` shrink stays on `o_proj`),
+and as a regular 2-D hidden matrix it joins the Muon group under Muon. The gate
+sits after the attention kernel, so the SDPA and manual paths share it.
+`"none"` adds no parameters and preserves checkpoint compatibility.
 
 **RoPE** applies to `Q_norm`, `K_norm` (after QK-norm, before scoring); not to V.
 Partial RoPE rotates only the first `rope_dim` channels (see §7).
@@ -579,6 +597,7 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `residual_scaling` | `sqrt_num_layers` | / `none` |
 | `residual_gate` | `none` | learnable gate on residual writes: `none`/`scalar`/`channel` |
 | `residual_gate_init` | `1.0` | init for gate params; finite |
+| `attn_output_gate` | `none` | post-SDPA elementwise output gate: `none`/`sigmoid`/`silu`; adds a `(D,D)` `gate_proj` per layer |
 | `init_scale_output_projections` | `True` | divide init std of `W_o`,`W_d` by `sqrt(2L)` (GPT-2 style) |
 | `ffn_activation` | `swiglu` | / `geglu` (both gated, 3 projections) |
 | `ffn_bias` | `False` | |
