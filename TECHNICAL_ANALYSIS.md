@@ -282,16 +282,16 @@ Apply this principle to:
 - C on FFN pre-norm input;
 - D on FFN intermediate activation branch.
 
-If non-residual Canon remains useful as a research knob, expose it under an explicit
-name such as:
+If non-residual Canon remains useful as a research knob, expose it only through an
+explicit residual toggle:
 
 ```yaml
 model.canon_residual: true
-model.canon_variant: paper_exact_encoder
 ```
 
-Do not let the old replacement behavior silently share the same config label as
-paper-exact residual Canon.
+Do not retain the old replacement behavior as a legacy Canon variant. This library
+is still in active development; Phase 2 should replace the incorrect Canon
+implementation in place rather than preserving it behind a compatibility switch.
 
 ## Finding 4: The Bidirectional Encoder Convolution Needs a Pinned Definition
 
@@ -588,16 +588,24 @@ Before changing code, write the intended Canon spec in one place.
 
 Minimum decisions:
 
-- Canon mode name: `paper_exact_encoder`.
+- Config surface: keep the existing Canon options (`canon_enabled`,
+  `canon_positions`, `canon_kernel_sizes`, `canon_activation`) and add only
+  `canon_residual`, defaulting to `true`. Do not add `canon_mode` or
+  `canon_variant`.
 - Convolution: centered bidirectional same-length, not causal.
 - Kernel default: decide whether to preserve `k=4` with documented half-token
   alignment or use an odd kernel for exact symmetry.
-- Residual behavior: enabled by default for paper-exact Canon.
+- Residual behavior: enabled by default with `canon_residual=true`.
 - Supported norm strategies: likely `norm_strategy="pre"` first.
 - B ordering relative to QK/V norm: decide and test.
 - D placement for SwiGLU/GEGLU/relu2.
 
-### Phase 2: Implement paper-exact encoder Canon
+### Phase 2: Replace Canon with paper-exact encoder Canon
+
+Phase 2 should fully excise the current legacy Canon-inspired implementation.
+There should be one Canon implementation, controlled by the existing Canon config
+keys plus `canon_residual`; no `canon_mode`, no `canon_variant`, and no retained
+compatibility branch for the old A/C/D placements or replacement behavior.
 
 Implementation tasks:
 
@@ -605,27 +613,34 @@ Implementation tasks:
    - Accept arbitrary channel count, not just hidden size.
    - Keep pad zeroing.
    - Pin and test centered alignment.
-   - Remove activation from paper-exact mode.
+   - Preserve `canon_activation` as an explicit research knob, with `none` as the
+     paper-comparable/default setting.
 
 2. Refactor `OplmBlock`.
    - A: after attention pre-norm, residual into attention input.
    - C: after FFN pre-norm, residual into FFN input.
    - Remove C from attention-output path.
    - Remove D from block-level hidden-size FFN input.
+   - Remove the old pre-norm/raw-stream A path; do not keep a legacy branch.
 
 3. Refactor `OplmAttention`.
    - Keep B after Q/K/V projection.
-   - Switch B to residual form in paper-exact mode.
+   - Switch B to residual form when `canon_residual=true`.
    - Pin order relative to QK/V norm and RoPE.
+   - Remove replacement-style B as the default behavior.
 
 4. Refactor FFN modules.
    - Add optional D inside each FFN implementation.
    - D should operate at `intermediate_size`.
    - Pass `attention_mask` through FFN forward.
+   - Remove hidden-size block-level D entirely.
 
 5. Update config.
-   - Add explicit Canon variant or mode fields if old behavior must remain.
-   - Reject incompatible paper-exact settings.
+   - Remove any `canon_mode`/`canon_variant` plan or implementation.
+   - Add `canon_residual: bool = true` to `OplmConfig`, packaged YAML, docs,
+     CLI display, and tests.
+   - Keep `canon_enabled`, `canon_positions`, `canon_kernel_sizes`, and
+     `canon_activation` as the only other Canon config fields.
    - Strictly validate unknown run-config keys.
 
 ### Phase 3: Add semantic tests

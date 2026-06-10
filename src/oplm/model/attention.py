@@ -71,7 +71,8 @@ class OplmAttention(nn.Module):
     Language Models 4.1" (arXiv:2512.17351), equivalent to Primer's multi-DConv-
     head attention (arXiv:2109.08668). One depthwise `CanonConv` per stream
     (`conv_b_q`/`conv_b_k`/`conv_b_v`) runs on the projected, normed Q/K/V —
-    after QK/V-norm and before the value residual and RoPE. `"none"` (the
+    after QK/V-norm and before the value residual and RoPE. The conv output is
+    added back to its stream when `canon_residual=True` (default). `"none"` (the
     default empty `canon_positions`) adds no parameters.
 
     The output projection (`o_proj`) is marked `_is_residual_writer = True` so
@@ -184,15 +185,14 @@ class OplmAttention(nn.Module):
         )
 
         # Canon-B (Physics of LM 4.1, arXiv:2512.17351): depthwise convs on Q/K/V
-        # after the norms and before RoPE. One CanonConv per stream — equivalent
-        # to a single conv over the concatenated 3*hidden_size channels since the
-        # conv is depthwise (no cross-channel mixing). Constructed here (not in
-        # OplmBlock) because it must see the projected Q/K/V; OplmAttention is
-        # built before OplmBlock's own Canon validation, so the resolved
-        # per-layer kernel-size list is re-checked here too.
+        # after the norms and before RoPE, residual by default. One CanonConv per
+        # stream is equivalent to a single conv over concatenated 3*hidden_size
+        # channels since the conv is depthwise (no cross-channel mixing).
+        # Constructed here (not in OplmBlock) because it must see projected Q/K/V.
         self.canon_b_enabled = bool(getattr(config, "canon_enabled", False)) and (
             "B" in set(config.canon_positions or [])
         )
+        self.canon_residual = bool(getattr(config, "canon_residual", True))
         if self.canon_b_enabled:
             kernel_sizes = config.canon_kernel_sizes
             if not isinstance(kernel_sizes, list) or len(kernel_sizes) != config.num_hidden_layers:
@@ -272,7 +272,8 @@ class OplmAttention(nn.Module):
         def conv(t: torch.Tensor, layer: CanonConv) -> torch.Tensor:
             # (B, H, T, d) -> (B, T, D) -> conv -> (B, H, T, d)
             merged = t.transpose(1, 2).reshape(batch, seq_len, self.hidden_size)
-            merged = layer(merged, attention_mask)
+            convolved = layer(merged, attention_mask)
+            merged = merged + convolved if self.canon_residual else convolved
             return merged.view(batch, seq_len, heads, head_dim).transpose(1, 2)
 
         return conv(q, self.conv_b_q), conv(k, self.conv_b_k), conv(v, self.conv_b_v)

@@ -34,6 +34,7 @@ def _config(
     value_residual_lambda_init: float = 0.5,
     num_hidden_layers: int = 2,
     canon_enabled: bool = False,
+    canon_residual: bool = True,
     canon_positions: list[str] | None = None,
     canon_kernel_sizes: list[int] | None = None,
     canon_activation: str = "none",
@@ -64,6 +65,7 @@ def _config(
         value_residual_lambda_init=value_residual_lambda_init,
         num_hidden_layers=num_hidden_layers,
         canon_enabled=canon_enabled,
+        canon_residual=canon_residual,
         canon_positions=canon_positions,
         canon_kernel_sizes=canon_kernel_sizes,
         canon_activation=canon_activation,
@@ -647,6 +649,12 @@ def _set_delta_kernel(conv: CanonConv) -> None:
         conv.conv.weight[:, 0, conv.kernel_size // 2] = 1.0
 
 
+def _set_zero_kernel(conv: CanonConv) -> None:
+    """Make a depthwise CanonConv return zeros."""
+    with torch.no_grad():
+        conv.conv.weight.zero_()
+
+
 def test_canon_b_modules_created_when_enabled():
     attn = OplmAttention(
         _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3]),
@@ -714,20 +722,42 @@ def test_canon_b_forward_shape_and_grad():
     assert attn.conv_b_q.conv.weight.grad.abs().sum() > 0
 
 
-def test_canon_b_delta_kernel_matches_no_canon():
-    """A centered-delta conv is an identity, so Canon-B output == no-canon output.
+def test_canon_b_replacement_delta_kernel_matches_no_canon():
+    """In replacement mode, a centered-delta conv is an identity.
 
     Proves Canon-B is wired onto the Q/K/V path (not dropped or misordered):
     with the conv reduced to identity the result is bit-for-bit the plain path.
     """
     torch.manual_seed(0)
-    cfg_b = _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3])
+    cfg_b = _config(
+        canon_enabled=True,
+        canon_residual=False,
+        canon_positions=["B"],
+        canon_kernel_sizes=[3, 3],
+    )
     attn_b = OplmAttention(cfg_b, layer_idx=0).eval()
     attn_plain = OplmAttention(_config(), layer_idx=0).eval()
     # Share the projection/norm weights; strict=False skips the conv_b_* keys.
     attn_b.load_state_dict(attn_plain.state_dict(), strict=False)
     for conv in (attn_b.conv_b_q, attn_b.conv_b_k, attn_b.conv_b_v):
         _set_delta_kernel(conv)
+
+    x = torch.randn(2, 7, 32)
+    with torch.no_grad():
+        out_b, _ = attn_b(x, _ones_mask(2, 7))
+        out_plain, _ = attn_plain(x, _ones_mask(2, 7))
+    assert torch.allclose(out_b, out_plain, rtol=1e-5, atol=1e-6)
+
+
+def test_canon_b_residual_zero_kernel_matches_no_canon():
+    """With residual Canon, a zero conv preserves the Q/K/V identity path."""
+    torch.manual_seed(0)
+    cfg_b = _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3])
+    attn_b = OplmAttention(cfg_b, layer_idx=0).eval()
+    attn_plain = OplmAttention(_config(), layer_idx=0).eval()
+    attn_b.load_state_dict(attn_plain.state_dict(), strict=False)
+    for conv in (attn_b.conv_b_q, attn_b.conv_b_k, attn_b.conv_b_v):
+        _set_zero_kernel(conv)
 
     x = torch.randn(2, 7, 32)
     with torch.no_grad():

@@ -100,6 +100,7 @@ class OplmBlock(nn.Module):
         self.num_hidden_layers = config.num_hidden_layers
         self.norm_strategy = config.norm_strategy
         self.residual_scaling = config.residual_scaling
+        self.canon_residual = bool(getattr(config, "canon_residual", True))
         self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
         self.gradient_checkpointing_mode = str(
             getattr(config, "gradient_checkpointing_mode", "full")
@@ -167,7 +168,7 @@ class OplmBlock(nn.Module):
         self.ffn_norm: nn.Module = make_norm(
             config.norm_type, config.hidden_size, eps=config.norm_eps
         )
-        self.ffn = make_ffn(config)
+        self.ffn = make_ffn(config, layer_idx)
 
         # Strategy-specific post-norms.
         if config.norm_strategy == "sandwich":
@@ -199,14 +200,15 @@ class OplmBlock(nn.Module):
                 )
             kernel_size = kernel_sizes[layer_idx]
             activation = getattr(config, "canon_activation", "none")
+            # A acts on the attention pre-norm stream, C on the FFN pre-norm
+            # stream (paper-exact insertion sites; see docs/MODEL_ARCHITECTURE.md).
             if "A" in positions:
                 self.conv_a = CanonConv(config.hidden_size, kernel_size, activation=activation)
-            # Canon-B lives inside OplmAttention (it convolves the projected
-            # Q/K/V); it is instantiated there, not here.
             if "C" in positions:
                 self.conv_c = CanonConv(config.hidden_size, kernel_size, activation=activation)
-            if "D" in positions:
-                self.conv_d = CanonConv(config.hidden_size, kernel_size, activation=activation)
+            # Canon-B lives inside OplmAttention (it convolves the projected
+            # Q/K/V); Canon-D lives inside the FFN (it convolves the activation
+            # branch at intermediate_size). Neither is instantiated here.
 
     def _gate_attn(self, attn_out: torch.Tensor) -> torch.Tensor:
         """Apply the learned attention residual gate (no-op when `residual_gate="none"`)."""
@@ -230,25 +232,27 @@ class OplmBlock(nn.Module):
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
     ):
-        # Canon A: additive into the residual stream (preserves the residual identity).
-        if hasattr(self, "conv_a"):
-            x = x + self.conv_a(x, attention_mask)
-
         # Attention sublayer. Hybrid feeds raw `x` (QKV-norm lives inside the
         # attention module); every other strategy applies the outer pre-norm.
+        # Canon is restricted to norm_strategy="pre", so when conv_a exists
+        # `attn_base` is always the normed stream.
+        attn_base = x if self.norm_strategy == "hybrid" else self.attn_norm(x)
+
+        # Canon-A: residual conv on the attention pre-norm stream (paper-exact);
         # Canon-B (the conv on Q/K/V) is applied inside the attention module.
-        a_in = x if self.norm_strategy == "hybrid" else self.attn_norm(x)
+        attn_in = attn_base
+        if hasattr(self, "conv_a"):
+            conv_a = self.conv_a(attn_base, attention_mask)
+            attn_in = attn_base + conv_a if self.canon_residual else conv_a
 
         attn_result = self.attention(
-            a_in, attention_mask, output_attentions, value_residual=value_residual
+            attn_in, attention_mask, output_attentions, value_residual=value_residual
         )
         if self.value_residual_enabled:
             attn_out, attn_weights, v1 = attn_result
         else:
             attn_out, attn_weights = attn_result
             v1 = None
-        if hasattr(self, "conv_c"):
-            attn_out = self.conv_c(attn_out, attention_mask)
 
         if self.norm_strategy in {"sandwich", "post_sdpa"}:
             attn_out = self.attn_post_norm(attn_out)
@@ -256,10 +260,14 @@ class OplmBlock(nn.Module):
 
         # FFN sublayer.
         h_norm = self.ffn_norm(h)
-        f_in = h_norm
-        if hasattr(self, "conv_d"):
-            f_in = self.conv_d(f_in, attention_mask)
-        ffn_out = self.ffn(f_in)
+        # Canon-C: residual conv on the FFN pre-norm stream (paper-exact);
+        # Canon-D runs inside the FFN on the activation branch at intermediate
+        # width and is applied by the FFN module itself.
+        mlp_in = h_norm
+        if hasattr(self, "conv_c"):
+            conv_c = self.conv_c(h_norm, attention_mask)
+            mlp_in = h_norm + conv_c if self.canon_residual else conv_c
+        ffn_out = self.ffn(mlp_in, attention_mask)
 
         if self.norm_strategy == "sandwich":
             ffn_out = self.ffn_post_norm(ffn_out)

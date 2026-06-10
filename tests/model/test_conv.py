@@ -14,7 +14,7 @@ from oplm.model.conv import CanonConv, resolve_canon_kernel_sizes
 
 @pytest.mark.parametrize("kernel_size", [2, 3, 4, 5, 8])
 def test_canon_conv_preserves_shape(kernel_size: int):
-    conv = CanonConv(hidden_size=16, kernel_size=kernel_size)
+    conv = CanonConv(channels=16, kernel_size=kernel_size)
     x = torch.randn(2, 7, 16)
     mask = torch.ones(2, 7, dtype=torch.long)
     out = conv(x, mask)
@@ -22,7 +22,7 @@ def test_canon_conv_preserves_shape(kernel_size: int):
 
 
 def test_canon_conv_is_depthwise():
-    conv = CanonConv(hidden_size=12, kernel_size=3)
+    conv = CanonConv(channels=12, kernel_size=3)
     # Depthwise: groups == in_channels == out_channels; weight has shape (D, 1, k).
     assert conv.conv.groups == 12
     assert conv.conv.weight.shape == (12, 1, 3)
@@ -31,12 +31,12 @@ def test_canon_conv_is_depthwise():
 
 def test_canon_conv_rejects_kernel_one():
     with pytest.raises(ValueError, match="kernel_size"):
-        CanonConv(hidden_size=4, kernel_size=1)
+        CanonConv(channels=4, kernel_size=1)
 
 
 def test_canon_conv_rejects_unknown_activation():
     with pytest.raises(ValueError, match="activation"):
-        CanonConv(hidden_size=4, kernel_size=3, activation="tanh")
+        CanonConv(channels=4, kernel_size=3, activation="tanh")
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ def test_canon_conv_zeros_pad_inputs_before_conv():
     pad rows; the two outputs should be bit-identical.
     """
     torch.manual_seed(0)
-    conv = CanonConv(hidden_size=8, kernel_size=3)
+    conv = CanonConv(channels=8, kernel_size=3)
     x = torch.randn(1, 6, 8)
     mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.long)
 
@@ -65,7 +65,7 @@ def test_canon_conv_zeros_pad_inputs_before_conv():
 
 
 def test_canon_conv_even_kernel_runs_and_preserves_length():
-    conv = CanonConv(hidden_size=8, kernel_size=4)
+    conv = CanonConv(channels=8, kernel_size=4)
     x = torch.randn(2, 5, 8)
     mask = torch.ones(2, 5, dtype=torch.long)
     out = conv(x, mask)
@@ -73,14 +73,14 @@ def test_canon_conv_even_kernel_runs_and_preserves_length():
 
 
 def test_canon_conv_odd_kernel_uses_symmetric_padding():
-    conv = CanonConv(hidden_size=8, kernel_size=3)
+    conv = CanonConv(channels=8, kernel_size=3)
     # Symmetric padding: conv's own padding is k//2 == 1; we add no manual pad.
     assert conv.conv.padding == (1,)
     assert conv._even_kernel is False  # type: ignore[attr-defined]
 
 
 def test_canon_conv_even_kernel_disables_builtin_padding():
-    conv = CanonConv(hidden_size=8, kernel_size=4)
+    conv = CanonConv(channels=8, kernel_size=4)
     # Even kernels: conv padding is 0; we pad manually before the conv runs.
     assert conv.conv.padding == (0,)
     assert conv._even_kernel is True  # type: ignore[attr-defined]
@@ -94,7 +94,7 @@ def test_canon_conv_even_kernel_disables_builtin_padding():
 def test_canon_conv_no_activation_by_default():
     """With activation='none', a linear conv equals the raw conv output."""
     torch.manual_seed(1)
-    conv = CanonConv(hidden_size=8, kernel_size=3, activation="none")
+    conv = CanonConv(channels=8, kernel_size=3, activation="none")
     x = torch.randn(2, 4, 8)
     mask = torch.ones(2, 4, dtype=torch.long)
 
@@ -106,7 +106,7 @@ def test_canon_conv_no_activation_by_default():
 
 def test_canon_conv_silu_activation_applied():
     torch.manual_seed(2)
-    conv = CanonConv(hidden_size=8, kernel_size=3, activation="silu")
+    conv = CanonConv(channels=8, kernel_size=3, activation="silu")
     x = torch.randn(1, 4, 8)
     mask = torch.ones(1, 4, dtype=torch.long)
 
@@ -117,7 +117,7 @@ def test_canon_conv_silu_activation_applied():
 
 def test_canon_conv_gelu_activation_applied():
     torch.manual_seed(3)
-    conv = CanonConv(hidden_size=8, kernel_size=3, activation="gelu")
+    conv = CanonConv(channels=8, kernel_size=3, activation="gelu")
     x = torch.randn(1, 4, 8)
     mask = torch.ones(1, 4, dtype=torch.long)
 
@@ -132,7 +132,7 @@ def test_canon_conv_gelu_activation_applied():
 
 
 def test_canon_conv_grad_flows_to_weight_and_input():
-    conv = CanonConv(hidden_size=8, kernel_size=3)
+    conv = CanonConv(channels=8, kernel_size=3)
     x = torch.randn(2, 4, 8, requires_grad=True)
     mask = torch.ones(2, 4, dtype=torch.long)
     conv(x, mask).sum().backward()

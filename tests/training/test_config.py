@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from omegaconf import OmegaConf
 
-from oplm.config import DataConfig, TrainConfig, load_config
+from oplm.config import AVAILABLE_PRESETS, DataConfig, TrainConfig, load_config, serialize_config
 from oplm.model import OplmConfig as OplmModelConfig
 
 if TYPE_CHECKING:
@@ -148,6 +148,14 @@ def test_ablation_toggle_defaults_preserve_current_behavior() -> None:
     assert cfg.model.mask_dropout_reference_ratio == 0.12
     assert cfg.model.residual_gate == "none"
     assert cfg.model.residual_gate_init == 1.0
+    assert cfg.model.canon_residual is True
+
+
+def test_canon_residual_cli_override_applies() -> None:
+    """The residual Canon toggle remains a simple boolean model field."""
+    cfg = load_config(["model.canon_residual=false"])
+    assert cfg.model.canon_enabled is False
+    assert cfg.model.canon_residual is False
 
 
 def test_derived_fields_resolve_when_omitted() -> None:
@@ -168,10 +176,44 @@ def test_relu2_intermediate_size_derives_iso_param() -> None:
     assert 2 * relu2.model.intermediate_size == 3 * gated.model.intermediate_size
 
 
-def test_unknown_model_key_is_absorbed_not_raised() -> None:
-    """Unknown ``model.*`` keys flow into PretrainedConfig kwargs (documented caveat)."""
-    cfg = load_config(["model.bogus_key=1"])
-    assert cfg.model.bogus_key == 1
+def test_unknown_model_key_raises() -> None:
+    """Unknown ``model.*`` keys are rejected, not silently absorbed into kwargs."""
+    with pytest.raises(ValueError, match="Unknown model config key"):
+        load_config(["model.bogus_key=1"])
+
+
+def test_misspelled_canon_key_raises() -> None:
+    """A typo'd ablation key (``cannon_enabled``) raises instead of silently no-op'ing."""
+    with pytest.raises(ValueError, match="cannon_enabled"):
+        load_config(["model.cannon_enabled=true"])
+
+
+def test_misspelled_dimension_key_raises() -> None:
+    """A typo'd dimension key (``hidden_dimm``) is rejected at load time."""
+    with pytest.raises(ValueError, match="Unknown model config key"):
+        load_config(["model.hidden_dimm=1024"])
+
+
+@pytest.mark.parametrize("preset", AVAILABLE_PRESETS)
+def test_all_presets_pass_strict_validation(preset: str) -> None:
+    """Every packaged size preset loads cleanly under strict key validation."""
+    cfg = load_config(["--preset", preset])
+    assert isinstance(cfg.model, OplmModelConfig)
+
+
+def test_serialized_config_roundtrips_through_load_config(tmp_path: Path) -> None:
+    """A serialized run config (HF ``to_dict`` metadata included) reloads via ``--config``.
+
+    Strict validation must allow the HF metadata keys (``model_type``,
+    ``transformers_version``, ``architectures``, ...) that ``serialize_config``
+    emits, or every saved config would fail to reload.
+    """
+    cfg = load_config(["model.canon_enabled=true", "model.canon_positions=[A,D]"])
+    path = tmp_path / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    restored = load_config(["--config", str(path)])
+    assert restored.model.canon_enabled is True
+    assert restored.model.canon_positions == ["A", "D"]
 
 
 def test_removed_max_length_alias_raises() -> None:
@@ -217,8 +259,8 @@ def test_data_base_yaml_matches_dataclass(key: str) -> None:
 def test_model_base_yaml_has_no_typos(key: str) -> None:
     """Every ``model/base.yaml`` key is a recognized HF ``OplmConfig`` field.
 
-    Unknown keys are silently absorbed into PretrainedConfig kwargs at runtime, so
-    this is the only guard against a misspelled model default.
+    ``load_config`` now rejects unknown ``model.*`` keys at runtime, but this
+    guards the packaged default itself (which is merged in before any override).
     """
     assert key in set(OplmModelConfig().to_dict())
 

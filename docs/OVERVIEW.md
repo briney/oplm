@@ -316,28 +316,33 @@ normed) is always on by default and orthogonal to `norm_strategy`; disable with
 ### 5.2 Canon insertion points
 
 When `canon_enabled=True`, depthwise 1D convs are inserted at any of four labeled
-positions (Canon paper, arXiv 2512.17351):
+positions (Canon paper, arXiv 2512.17351). The paper-exact encoder contract is
+specified in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). Phase 2 of
+`TECHNICAL_ANALYSIS.md` replaces the older Canon-inspired wiring in place rather
+than retaining it as a separate legacy mode. Canon is supported under
+`norm_strategy` in `{pre, sandwich, post_sdpa}` (all have an outer attention
+pre-norm; their post-norms are downstream of the Canon insertion points). It is
+rejected with `hybrid`, which has no outer attention pre-norm for Canon-A.
 
-- **A** — pre-block, on the residual-stream input.
+- **A** — after the attention pre-norm, residual into the attention input.
 - **B** — *inside* attention, on the projected and normed Q/K/V (after QK/V-norm,
   before the value residual and RoPE). One depthwise conv per stream
   (`conv_b_q`/`conv_b_k`/`conv_b_v`), living on `OplmAttention`. This is the
   paper's "inside attention" Canon and matches Primer's multi-DConv-head
   attention (arXiv:2109.08668).
-- **C** — on the attention output before the residual add.
-- **D** — between the FFN pre-norm and the FFN (most common positive result).
+- **C** — after the FFN pre-norm, residual into the FFN input.
+- **D** — inside the FFN before activation at intermediate width.
 
 ```
               ┌────────── OplmAttention ──────────┐
-x ─► [Conv_A] ─► Norm ─► QKV ─► [Conv_B on Q/K/V] ─► RoPE ─► SDPA ─► Oproj ─► [Conv_C] ─► (+) ─► h
-                                                                                                 │
-h ─► Norm ─► [Conv_D] ─► SwiGLU FFN ───────────────────────────────────────────────────► (+) ─► y
+x ─► Norm ─► [Conv_A residual] ─► QKV ─► [Conv_B residual on Q/K/V] ─► RoPE ─► SDPA ─► Oproj ─► (+) ─► h
+                                                                                                      │
+h ─► Norm ─► [Conv_C residual] ─► SwiGLU/GEGLU/relu2 with [Conv_D residual before activation] ─► (+) ─► y
 ```
 
 `canon_positions` is a global list (order irrelevant; each is an independent
-site), e.g. `["A","C","D"]`. Unlike A/C/D (which convolve the `(B,T,D)`
-residual/MLP streams in `OplmBlock`), B is applied inside `OplmAttention`. See
-§11.
+site), e.g. `["A","C","D"]`. B is applied inside `OplmAttention`; D is applied
+inside the FFN module at intermediate width. See §11.
 
 ### 5.3 Per-knob scope
 
@@ -354,6 +359,7 @@ residual/MLP streams in `OplmBlock`), B is applied inside `OplmAttention`. See
 | `value_residual`/`value_residual_lambda_init` | global | `none` (default) / `fixed` / `learnable` ResFormer value residual (arXiv:2410.17897) |
 | `rope_dim`/`nope_dim` | global | same split across all heads/layers |
 | `canon_enabled`/`canon_positions` | global | master switch / insertion sites |
+| `canon_residual` | global | `true` by default |
 | `canon_kernel_sizes` | per-layer | scalar broadcasts; list must match `num_hidden_layers` |
 | `ffn_activation`, `tie_word_embeddings`, `mlm_head_activation`, `classifier_pool` | global | |
 
@@ -599,16 +605,21 @@ caller's.
 `{schedule:"constant", value}` resolved at config-load. Every kernel ≥ 2; even
 kernels allowed. Cost per conv: `params = k·D`, `flops ≈ 2·k·D·T`.
 
-**Insertion sites.** A, C, and D convolve the `(B,T,D)` residual / attention-out
-/ MLP-input streams and are wired in `OplmBlock`. **B is different:** it is the
-"inside attention" Canon (= Primer multi-DConv-head attention, arXiv:2109.08668)
-and lives on `OplmAttention` as three independent depthwise convs
-(`conv_b_q`/`conv_b_k`/`conv_b_v`), applied to the projected, QK/V-normed Q/K/V
-*after* the norms and *before* the value residual and RoPE. The conv runs on a
-`(B,T,D)` view of each head-split stream; because it is depthwise (per-channel)
-and acts only along time, this is identical to convolving the flat projection
-output and to a single conv over the concatenated `3·D` channels — three modules
-are used to fit OPLM's separate Q/K/V projections and give self-documenting keys.
+**Residual form.** `canon_residual=true` by default and applies Canon as
+`z + Canon(z)`. There is no legacy Canon mode; Phase 2 replaces the older wiring
+in place with the paper-exact encoder implementation in
+[MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md).
+
+**Insertion sites.** A applies to the attention pre-norm stream before Q/K/V
+projection. **B** is the "inside attention" Canon (= Primer multi-DConv-head
+attention, arXiv:2109.08668) and lives on `OplmAttention` as three independent
+depthwise convs (`conv_b_q`/`conv_b_k`/`conv_b_v`) on the projected,
+QK/V-normed Q/K/V streams before value residual and RoPE. C applies to the FFN
+pre-norm stream before the FFN. D lives inside the FFN module at
+`intermediate_size`, before the activation branch nonlinearity (the gate branch
+for SwiGLU/GEGLU, the up branch for relu2). Canon is supported under
+`norm_strategy` in `{pre, sandwich, post_sdpa}` and rejected under `hybrid`
+(no outer attention pre-norm for Canon-A).
 
 ## 12. Configuration schema (`OplmConfig`)
 
@@ -652,6 +663,7 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `tie_word_embeddings` | `False` | |
 | `mlm_head_activation` | `gelu` | `gelu`/`silu`/`relu` |
 | `canon_enabled` | `False` | |
+| `canon_residual` | `True` | residual Canon updates |
 | `canon_positions` | `[]` | subset of `{A,B,C,D}` |
 | `canon_kernel_sizes` | 4 | int / list / dict schedule |
 | `canon_activation` | `none` | `none`/`silu`/`gelu` |

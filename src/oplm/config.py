@@ -5,6 +5,7 @@ Uses OmegaConf for YAML serialization, CLI overrides, and type-safe merging.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
@@ -356,6 +357,42 @@ def _reject_removed_sequence_length_alias(override_dicts: list[Any]) -> None:
         )
 
 
+def _reject_unknown_model_keys(model_dict: dict[str, Any], model_config_cls: type) -> None:
+    """Raise on `model.*` keys that no `OplmConfig` field or HF metadata accepts.
+
+    `PretrainedConfig.__init__` silently absorbs unknown `**kwargs`, so a typo
+    like `model.cannon_enabled=true` would otherwise be retained while the real
+    `canon_enabled` stays at its default — silently disabling an ablation. The
+    allowed set is the constructor signature plus the HF metadata keys a default
+    instance emits via `to_dict()` (so serialized configs still round-trip).
+
+    Args:
+        model_dict: The merged `model` subtree about to construct the HF config.
+        model_config_cls: The `OplmConfig` (HF `PretrainedConfig`) class.
+
+    Raises:
+        ValueError: If `model_dict` contains any key outside the allowed set.
+    """
+    params = inspect.signature(model_config_cls.__init__).parameters
+    allowed = {
+        name
+        for name, p in params.items()
+        if name != "self" and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+    }
+    # HF metadata keys (model_type, transformers_version, architectures, dtype,
+    # id2label, ...) are not constructor params but round-trip through a
+    # serialized config; a default instance enumerates exactly that set.
+    allowed |= set(model_config_cls().to_dict())
+
+    unknown = sorted(set(model_dict) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Unknown model config key(s): {unknown}. Check for typos "
+            "(e.g. 'canon_enabled', not 'cannon_enabled'); valid keys come from "
+            "OplmConfig.__init__ and HuggingFace PretrainedConfig metadata."
+        )
+
+
 def load_config(argv: list[str]) -> OplmConfig:
     """Load config from defaults, optional preset, optional YAML file, and CLI overrides.
 
@@ -445,12 +482,15 @@ def load_config(argv: list[str]) -> OplmConfig:
     # Instantiate the HF model config from the merged `model` subtree. HF owns
     # derivation (head_dim, intermediate_size, rope_dim/nope_dim) and validation.
     # Derived fields are omitted unless set, resolving to None → derived inside
-    # OplmModelConfig.__init__. Unknown / old / mistyped `model.*` keys flow into
-    # **model_dict → PretrainedConfig **kwargs and are silently retained.
+    # OplmModelConfig.__init__. Unknown / mistyped `model.*` keys are rejected
+    # here (run-config path) rather than silently absorbed into
+    # PretrainedConfig **kwargs; from_pretrained() stays permissive for
+    # checkpoint compatibility.
     from oplm.model import OplmConfig as OplmModelConfig
 
-    model_dict = OmegaConf.to_container(base.model, resolve=True) or {}
-    cfg.model = OplmModelConfig(**model_dict)  # ty: ignore[invalid-argument-type]  # OmegaConf union
+    model_dict = cast("dict[str, Any]", OmegaConf.to_container(base.model, resolve=True) or {})
+    _reject_unknown_model_keys(model_dict, OplmModelConfig)
+    cfg.model = OplmModelConfig(**model_dict)
 
     cfg.train.config_path = config_path
 

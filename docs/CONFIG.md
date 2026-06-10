@@ -148,8 +148,9 @@ from `configs/model/base.yaml`.
 
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
-| `model.canon_enabled` | `bool` | `false` | Master switch for Canon conv sublayers. |
-| `model.canon_positions` | `list[str]` | `[]` | Subset of `{A, B, C, D}`; required and non-empty when `canon_enabled=true`. A/C/D convolve the `(B,T,D)` residual/MLP streams in the block; **B** is the "inside attention" conv on Q/K/V (after QK/V-norm, before the value residual and RoPE), living on `OplmAttention`. |
+| `model.canon_enabled` | `bool` | `false` | Master switch for Canon conv sublayers. Supported under `norm_strategy` in `{pre, sandwich, post_sdpa}`; `hybrid` raises at validation (no outer attention pre-norm for Canon-A). |
+| `model.canon_residual` | `bool` | `true` | Use residual Canon updates (`z + Canon(z)`) by default. |
+| `model.canon_positions` | `list[str]` | `[]` | Subset of `{A, B, C, D}`; required and non-empty when `canon_enabled=true`. The intended paper-exact encoder placements are specified in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). |
 | `model.canon_kernel_sizes` | `int \| list[int] \| dict` | `4` | `int` broadcasts to every layer; a `list[int]` must have length `num_hidden_layers`; a `dict` uses `schedule: linear` (`min`, `max`) or `schedule: constant` (`value`). All entries must be `≥ 2`. |
 | `model.canon_activation` | `str` | `none` | `none`, `silu`, or `gelu`. |
 
