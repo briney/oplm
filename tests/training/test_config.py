@@ -119,6 +119,35 @@ def test_preset_and_cli_override_apply() -> None:
     assert cfg.model.hidden_size == 512  # from the `50M` preset
 
 
+def test_ablation_toggle_cli_overrides_apply() -> None:
+    """CLI dotlist overrides reach the new architecture-ablation knobs."""
+    cfg = load_config(
+        [
+            "model.qk_norm_mode=l2",
+            "model.qk_norm_l2_scale_init=8.0",
+            "model.mask_dropout=true",
+            "model.residual_gate=channel",
+            "model.residual_gate_init=0.5",
+        ]
+    )
+    assert cfg.model.qk_norm_mode == "l2"
+    assert cfg.model.qk_norm_l2_scale_init == 8.0
+    assert cfg.model.mask_dropout is True
+    assert cfg.model.residual_gate == "channel"
+    assert cfg.model.residual_gate_init == 0.5
+
+
+def test_ablation_toggle_defaults_preserve_current_behavior() -> None:
+    """With no overrides the new knobs resolve to behavior-preserving defaults."""
+    cfg = load_config([])
+    assert cfg.model.qk_norm_mode == "channel"
+    assert cfg.model.qk_norm_l2_scale_init is None
+    assert cfg.model.mask_dropout is False
+    assert cfg.model.mask_dropout_reference_ratio == 0.12
+    assert cfg.model.residual_gate == "none"
+    assert cfg.model.residual_gate_init == 1.0
+
+
 def test_derived_fields_resolve_when_omitted() -> None:
     """Omitted ``head_dim`` / ``intermediate_size`` resolve from the source dims."""
     cfg = load_config(["model.hidden_size=256", "model.num_attention_heads=4"])

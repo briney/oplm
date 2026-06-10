@@ -20,8 +20,14 @@ model:
   norm_eps: 1.0e-6
   norm_strategy: pre # pre | sandwich | hybrid | post_sdpa
   qk_norm: true
+  qk_norm_mode: channel # channel (LayerNorm/RMSNorm + 1/sqrt(d) scale) | l2 (L2-normalize + learned per-head scale)
+  qk_norm_l2_scale_init: null # l2 mode only; per-head scale init (null -> sqrt(head_dim))
   post_embed_norm: false
+  mask_dropout: false # zero <mask> embeddings and rescale by expected/observed mask ratio
+  mask_dropout_reference_ratio: 0.12 # expected fraction of real tokens that are <mask> (mask_prob * mask_token_prob)
   residual_scaling: sqrt_num_layers # sqrt_num_layers | none
+  residual_gate: none # none | scalar | channel (learnable multiplicative refinement on residual writes)
+  residual_gate_init: 1.0 # initial value for residual gate parameters
   init_scale_output_projections: true
 
   # Feed-forward

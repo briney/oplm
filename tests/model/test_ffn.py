@@ -1,4 +1,4 @@
-"""Tests for `oplm.model.ffn` — SwiGLU, round_up_to, make_ffn."""
+"""Tests for `oplm.model.ffn` — SwiGLU, GEGLU, round_up_to, make_ffn."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from oplm.model.ffn import SwiGLU, make_ffn, round_up_to
+from oplm.model.ffn import GEGLU, SwiGLU, make_ffn, round_up_to
 
 
 def _config(
@@ -85,6 +85,70 @@ def test_swiglu_grad_flows_to_input():
 
 
 # ---------------------------------------------------------------------------
+# GEGLU
+# ---------------------------------------------------------------------------
+
+
+def test_geglu_output_shape_matches_input():
+    ffn = GEGLU(hidden_size=16, intermediate_size=32)
+    x = torch.randn(2, 5, 16)
+    out = ffn(x)
+    assert out.shape == x.shape
+
+
+def test_geglu_no_bias_by_default():
+    ffn = GEGLU(hidden_size=8, intermediate_size=16)
+    assert ffn.gate_proj.bias is None
+    assert ffn.up_proj.bias is None
+    assert ffn.down_proj.bias is None
+
+
+def test_geglu_with_bias():
+    ffn = GEGLU(hidden_size=8, intermediate_size=16, bias=True)
+    assert ffn.gate_proj.bias is not None
+    assert ffn.up_proj.bias is not None
+    assert ffn.down_proj.bias is not None
+
+
+def test_geglu_linear_shapes():
+    ffn = GEGLU(hidden_size=12, intermediate_size=24)
+    assert ffn.gate_proj.weight.shape == (24, 12)
+    assert ffn.up_proj.weight.shape == (24, 12)
+    assert ffn.down_proj.weight.shape == (12, 24)
+
+
+def test_geglu_matches_reference_formula():
+    """Forward must equal `down(gelu(gate(x)) * up(x))` exactly."""
+    ffn = GEGLU(hidden_size=8, intermediate_size=16)
+    x = torch.randn(3, 4, 8)
+    expected = ffn.down_proj(F.gelu(ffn.gate_proj(x)) * ffn.up_proj(x))
+    assert torch.allclose(ffn(x), expected, atol=1e-6)
+
+
+def test_geglu_down_proj_marked_residual_writer():
+    """`down_proj` must carry the residual-writer marker so init scaling matches SwiGLU."""
+    ffn = GEGLU(hidden_size=8, intermediate_size=16)
+    assert getattr(ffn.down_proj, "_is_residual_writer", False) is True
+
+
+def test_geglu_grad_flows_through_all_three_linears():
+    ffn = GEGLU(hidden_size=8, intermediate_size=16)
+    x = torch.randn(2, 3, 8, requires_grad=True)
+    ffn(x).sum().backward()
+    for proj in (ffn.gate_proj, ffn.up_proj, ffn.down_proj):
+        assert proj.weight.grad is not None
+        assert proj.weight.grad.abs().sum() > 0
+
+
+def test_geglu_grad_flows_to_input():
+    ffn = GEGLU(hidden_size=8, intermediate_size=16)
+    x = torch.randn(2, 3, 8, requires_grad=True)
+    ffn(x).sum().backward()
+    assert x.grad is not None
+    assert x.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
 # round_up_to
 # ---------------------------------------------------------------------------
 
@@ -135,9 +199,20 @@ def test_make_ffn_forwards_bias_setting():
     assert ffn.gate_proj.bias is None
 
 
-def test_make_ffn_geglu_raises_not_implemented():
-    with pytest.raises(NotImplementedError, match="geglu"):
-        make_ffn(_config(ffn_activation="geglu"))
+def test_make_ffn_geglu():
+    ffn = make_ffn(_config(ffn_activation="geglu"))
+    assert isinstance(ffn, GEGLU)
+
+
+def test_make_ffn_geglu_forwards_sizes_and_bias():
+    ffn = make_ffn(
+        _config(hidden_size=12, intermediate_size=24, ffn_activation="geglu", ffn_bias=True)
+    )
+    assert isinstance(ffn, GEGLU)
+    assert ffn.hidden_size == 12
+    assert ffn.intermediate_size == 24
+    assert ffn.gate_proj.weight.shape == (24, 12)
+    assert ffn.gate_proj.bias is not None
 
 
 def test_make_ffn_unknown_activation_raises_value_error():

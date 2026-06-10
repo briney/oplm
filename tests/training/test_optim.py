@@ -88,3 +88,30 @@ def test_adamw_leaves_muon_group_empty() -> None:
     model = _model()
     groups = partition_optimizer_params(model, TrainConfig(optimizer="adamw"))
     assert groups.muon_params == []
+
+
+def test_residual_gates_land_in_no_decay_group() -> None:
+    """1-D residual-gate params route to AdamW-no-decay under both adamw and muon.
+
+    Under Muon the no-decay group is consumed by the auxiliary AdamW optimizer, so
+    this also confirms the gates never leak into Muon (which claims only 2-D weights).
+    """
+    model = OplmForMaskedLM(
+        OplmModelConfig(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            max_position_embeddings=64,
+            residual_gate="channel",
+        )
+    )
+    id_to_name = {id(p): n for n, p in model.named_parameters()}
+    gate_names = {n for n in id_to_name.values() if n.endswith(("attn_gate", "ffn_gate"))}
+    assert len(gate_names) == 4, "expected attn_gate + ffn_gate per layer (2 layers)"
+
+    for optimizer in ("adamw", "muon"):
+        groups = partition_optimizer_params(model, TrainConfig(optimizer=optimizer))
+        no_decay = _names_of(groups.adamw_no_decay_params, id_to_name)
+        muon = _names_of(groups.muon_params, id_to_name)
+        assert gate_names <= no_decay, f"gates missing from no-decay under {optimizer}"
+        assert not (gate_names & muon), f"gates leaked into Muon under {optimizer}"

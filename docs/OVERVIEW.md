@@ -277,6 +277,25 @@ load-bearing stability tool for deep models (target depths up to ~80 layers). Th
 spec uses `sqrt(L)` (owner preference); `sqrt(2L)` is an equally defensible
 alternative differing only by `sqrt(2)`, revisitable at scale-up.
 
+**Residual gates** (`residual_gate`, off by default). An optional *learnable*
+multiplicative refinement applied on top of the fixed `α`, with a separate gate
+for each sublayer write:
+
+```
+h = x + α · attn_gate · Attn(Norm(x))
+y = h + α · ffn_gate  · FFN(Norm(h))
+```
+
+`scalar` adds one parameter per write (shape `(1,)`); `channel` adds a
+`(hidden_size,)` vector (per-feature gating). Both are initialized directly to
+`residual_gate_init` (default `1.0`, i.e. an identity refinement at init — so a
+fresh `channel`/`scalar` model matches the ungated block numerically) and are 1D,
+so they land in the no-decay AdamW group (including the auxiliary AdamW under
+Muon). `residual_gate="none"` adds no parameters and preserves checkpoint
+compatibility. Gates refine the existing `residual_scaling`; they do not replace
+`α`. The gate composes with every `norm_strategy` (it multiplies the
+post-`Norm₂`/`Norm₄` sublayer output under `sandwich`).
+
 ### 5.1 Normalization placement (`norm_strategy`, global)
 
 Residual scaling composes orthogonally with placement.
@@ -321,7 +340,11 @@ site), e.g. `["A","C","D"]`. See §11.
 | `norm_type` | global | `layernorm` (default) / `rmsnorm` |
 | `norm_strategy` | global | one enum, uniform |
 | `qk_norm` | global | per-head Norm on Q,K |
+| `qk_norm_mode`/`qk_norm_l2_scale_init` | global | `channel` (default) / `l2`; `l2` adds a learned per-head scale |
+| `mask_dropout`/`mask_dropout_reference_ratio` | global | `<mask>`-embedding dropout on the `input_ids` path |
 | `residual_scaling` | global | `sqrt_num_layers` / `none` |
+| `residual_gate`/`residual_gate_init` | global | `none` (default) / `scalar` / `channel` per-block residual gate |
+| `attn_output_gate` | global | `none` (default) / `sigmoid` / `silu` post-SDPA output gate (arXiv:2505.06708 G1) |
 | `rope_dim`/`nope_dim` | global | same split across all heads/layers |
 | `canon_enabled`/`canon_positions` | global | master switch / insertion sites |
 | `canon_kernel_sizes` | per-layer | scalar broadcasts; list must match `num_hidden_layers` |
@@ -341,12 +364,42 @@ Shapes: `x (B,T,D)` → Q/K/V projections `(B,T,D)` → reshape to heads `(B,H,T
 with `d = D/H` → QK-norm `(B,H,T,d)` → RoPE on Q,K → attention out `(B,H,T,d)` →
 reshape `(B,T,D)` → output projection `(B,T,D)`.
 
-**QK-norm / QKV-norm.** Q and K each pass through a separate Norm over the
-`d_head` channel dim; gain (and bias under LayerNorm) is shape `(d_head,)`,
-**shared across heads**. Computed in **fp32** regardless of autocast. V is not
-normed — *except* under `norm_strategy="hybrid"`, where an independent `v_norm`
-`(d_head,)` is added (the "QKV-norm" formulation) and the block-level attention
-pre-norm is suppressed. Under all other strategies `v_norm` is `nn.Identity()`.
+**QK-norm / QKV-norm.** Two modes, selected by `qk_norm_mode` (only active when
+`qk_norm=True`):
+
+* **`channel`** (default): Q and K each pass through a separate Norm over the
+  `d_head` channel dim; gain (and bias under LayerNorm) is shape `(d_head,)`,
+  **shared across heads**. Computed in **fp32** regardless of autocast. The
+  attention kernel uses the canonical `1/sqrt(d_head)` score scale.
+* **`l2`** (true L2 QK-norm): Q and K are L2-normalized over `d_head` in **fp32**
+  (each logit becomes a scaled cosine similarity), then Q is multiplied by a
+  **learned per-head scale** `qk_l2_scale` of shape `(num_attention_heads,)` —
+  initialized to `qk_norm_l2_scale_init` or `sqrt(d_head)`. The kernel score
+  scale is then `1.0` (the temperature is folded into `qk_l2_scale`). The 1D
+  scale lands in the no-decay optimizer group.
+
+When `qk_norm=False`, Q and K are unnormalized (`nn.Identity`) and the kernel
+keeps the `1/sqrt(d_head)` scale. V is not normed — *except* under
+`norm_strategy="hybrid"`, where an independent `v_norm` `(d_head,)` is added (the
+"QKV-norm" formulation) and the block-level attention pre-norm is suppressed.
+Under all other strategies `v_norm` is `nn.Identity()`.
+
+**Output gating** (`attn_output_gate`, off by default). The post-SDPA G1 gate of
+"Gated Attention for Large Language Models" (arXiv:2505.06708): a `gate_proj`
+linear `(D, D)` computes an elementwise, head-specific gate from the attention
+input `x`, and the merged attention output is multiplied by it before `o_proj`:
+
+```
+out = o_proj(merge(SDPA(q, k, v)) ⊙ act(gate_proj(x)))
+```
+
+`act` is selected by the toggle value: `sigmoid` (the paper's best variant) or
+`silu`. `gate_proj` is bias-free, uses the standard trunc-normal init (per the
+paper — so at init the gate sits near `act(0)` and attenuates the attention
+write), is *not* a residual writer (the `1/sqrt(2L)` shrink stays on `o_proj`),
+and as a regular 2-D hidden matrix it joins the Muon group under Muon. The gate
+sits after the attention kernel, so the SDPA and manual paths share it.
+`"none"` adds no parameters and preserves checkpoint compatibility.
 
 **RoPE** applies to `Q_norm`, `K_norm` (after QK-norm, before scoring); not to V.
 Partial RoPE rotates only the first `rope_dim` channels (see §7).
@@ -381,12 +434,14 @@ out = self._output_projection(out)
 **bidirectional** — no causal mask, only the padding mask. Masking only keys keeps
 every query row non-empty, so no row is all-masked and the softmax cannot NaN.
 `dropout_p` is the configured `attention_dropout` during training (0 in eval), and
-SDPA's default scale (`1/sqrt(d_head)`) matches the manual path. On CUDA this
+the explicit `scale=self.attn_scale` matches the manual path (`1/sqrt(d_head)` in
+channel/disabled modes, `1.0` in L2 mode). On CUDA this
 dispatches to a fused FlashAttention / memory-efficient kernel (FlashAttention-4 on
 Blackwell + torch ≥ 2.11); on CPU it uses the math backend. It returns no weights.
 
-**Manual path** (`output_attentions=True`, manual matmul): `scores = (q @ kᵀ)/sqrt(d)`,
-mask pad KV columns to `-inf`, `softmax(..., dtype=fp32)`, dropout, `@ v`. The
+**Manual path** (`output_attentions=True`, manual matmul): `scores = (q @ kᵀ) *
+attn_scale` (same mode-dependent scale as SDPA), mask pad KV columns to `-inf`,
+`softmax(..., dtype=fp32)`, dropout, `@ v`. The
 returned `attn` is the full fp32 softmax (for precision@L, attention rollout,
 head-pruning). It is slower and `O(B·H·T²)` in memory — for inspection, not training.
 
@@ -416,8 +471,9 @@ RoPE). No YaRN/NTK extrapolation — beyond `max_position_embeddings` is best-ef
 Default `ffn_activation="swiglu"`: `y = W_d(silu(W_g(x)) * W_u(x))` — three
 linears, no bias by default (`ffn_bias=False`). Hidden dim `F = round_up(8/3·D,
 256)` (≈ 8/3 multiplier, rounded up to a multiple of 256 for matmul-friendly
-shapes); set `intermediate_size` explicitly to override. `geglu` is reserved as a
-future gated variant (also 3 projections). Params per FFN: `3·D·F`. The
+shapes); set `intermediate_size` explicitly to override. `geglu` is an alternative
+gated variant — `y = W_d(gelu(W_g(x)) * W_u(x))`, same 3 projections and `ffn_bias`
+handling, differing only in the GELU gate nonlinearity. Params per FFN: `3·D·F`. The
 `ffn_activation` enum is the single extension point — new activations add an enum
 value + a small class; the block is untouched.
 
@@ -445,6 +501,20 @@ intermediate norm (`D`), optional pre-head norm (`D`). QK-norm gains are 2L tota
 (RoPE handles position); optional `post_embed_norm` off by default; init
 truncated-normal `std = initializer_range` (0.02), `<pad>` row not zeroed (HF
 convention).
+
+**Mask dropout** (`mask_dropout`, off by default): on the `input_ids` path only,
+every `<mask>` embedding row is zeroed and the surviving rows are rescaled per
+sequence by `(1 − mask_dropout_reference_ratio) / (1 − observed_mask_ratio)`,
+where `observed_mask_ratio = count(<mask>) / count(real tokens)` for that row.
+`mask_dropout_reference_ratio` (0.12) is the **expected fraction of real tokens
+that are `<mask>`** under the training masking policy (`mask_prob · mask_token_prob`
+= 0.15 · 0.8) — *not* a fraction of mask tokens to drop. This is inverted-dropout-style
+magnitude compensation, applied deterministically in both train and eval, before
+`post_embed_norm`. Ratios are computed in fp32 and the denominator / real-token
+count are clamped so all-pad and all-`<mask>` rows stay finite. The `inputs_embeds`
+path bypasses it entirely (the `<mask>` positions can't be recovered once token IDs
+are gone). `OplmStack` materializes the pad mask before the embedding lookup so the
+per-row real-token counts are available.
 
 **MLM head** (BERT/RoBERTa two-layer MLP, `self.lm_head`):
 
@@ -519,10 +589,17 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `norm_eps` | 1e-6 | |
 | `norm_strategy` | `pre` | `pre`/`sandwich`/`hybrid`/`post_sdpa` |
 | `qk_norm` | `True` | per-head Norm on Q,K |
+| `qk_norm_mode` | `channel` | `channel` (LayerNorm/RMSNorm + `1/√head_dim` scale) / `l2` (L2-normalize + learned per-head scale); inert if `qk_norm=False` |
+| `qk_norm_l2_scale_init` | `None` | `l2` mode per-head scale init; `None` → `√head_dim`; positive if set |
 | `post_embed_norm` | `False` | |
+| `mask_dropout` | `False` | zero `<mask>` embeddings + rescale by `(1−ref)/(1−obs)`; `input_ids` path only |
+| `mask_dropout_reference_ratio` | `0.12` | expected `<mask>` fraction of real tokens (`mask_prob·mask_token_prob`); `0 ≤ ratio < 1` |
 | `residual_scaling` | `sqrt_num_layers` | / `none` |
+| `residual_gate` | `none` | learnable gate on residual writes: `none`/`scalar`/`channel` |
+| `residual_gate_init` | `1.0` | init for gate params; finite |
+| `attn_output_gate` | `none` | post-SDPA elementwise output gate: `none`/`sigmoid`/`silu`; adds a `(D,D)` `gate_proj` per layer |
 | `init_scale_output_projections` | `True` | divide init std of `W_o`,`W_d` by `sqrt(2L)` (GPT-2 style) |
-| `ffn_activation` | `swiglu` | / `geglu` (reserved) |
+| `ffn_activation` | `swiglu` | / `geglu` (both gated, 3 projections) |
 | `ffn_bias` | `False` | |
 | `attention_dropout` | 0.0 | any >0 forces fallback path |
 | `hidden_dropout` | 0.0 | after attn/FFN output projections |
@@ -542,8 +619,10 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 **Validation rules** (raise `ValueError`): `hidden_size % num_attention_heads ==
 0`; `head_dim·H == hidden_size` (if set); `rope_dim+nope_dim==head_dim`,
 `rope_dim,nope_dim ≥ 0`, `rope_dim` even; `norm_type`/`norm_strategy`/
-`residual_scaling`/`ffn_activation`/`mlm_head_activation`/`classifier_pool` in
-their enums; if `canon_enabled` then `canon_positions` non-empty ⊆ `{A,B,C,D}` and
+`qk_norm_mode`/`residual_scaling`/`residual_gate`/`ffn_activation`/
+`mlm_head_activation`/`classifier_pool` in their enums; `0 ≤
+mask_dropout_reference_ratio < 1`; `qk_norm_l2_scale_init` positive if set;
+`residual_gate_init` finite; if `canon_enabled` then `canon_positions` non-empty ⊆ `{A,B,C,D}` and
 resolved `canon_kernel_sizes` is a length-`num_hidden_layers` list of values ≥ 2.
 `vocab_size != 33` warns only. Deprecation policy: a deprecated field is readable
 for one minor version with a `DeprecationWarning`, then removed (currently none).
@@ -1556,7 +1635,6 @@ large fixtures session-scoped. Tests mirror the source tree.
   sites); revisit a rename to `RunConfig` later.
 - **Long-context RoPE** — no YaRN/NTK scaling yet; extrapolation beyond
   `max_position_embeddings` is best-effort.
-- **`geglu`** FFN variant — reserved enum value, not yet implemented.
 - **Variant / downstream eval tasks** (`proteingym`, `everest`, `tape`,
   `proteinglue`) — registered stubs that raise `NotImplementedError`; their data
   loaders exist, so the remaining work is metric implementation.

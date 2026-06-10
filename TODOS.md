@@ -83,34 +83,34 @@ is evaluated.
 
 ## Phase 5: Implement GEGLU
 
-- [ ] Add a `GEGLU` FFN class parallel to `SwiGLU`, with the same projection
+- [x] Add a `GEGLU` FFN class parallel to `SwiGLU`, with the same projection
   shapes and `ffn_bias` handling.
-- [ ] Implement `GEGLU.forward()` as `down(gelu(gate(x)) * up(x))`.
-- [ ] Mark `GEGLU.down_proj._is_residual_writer = True` so residual-writer init
+- [x] Implement `GEGLU.forward()` as `down(gelu(gate(x)) * up(x))`.
+- [x] Mark `GEGLU.down_proj._is_residual_writer = True` so residual-writer init
   scaling matches SwiGLU.
-- [ ] Update `make_ffn()` so `ffn_activation="geglu"` constructs `GEGLU` instead
+- [x] Update `make_ffn()` so `ffn_activation="geglu"` constructs `GEGLU` instead
   of raising.
-- [ ] Update model exports and HuggingFace remote-code dependency imports if needed.
+- [x] Update model exports and HuggingFace remote-code dependency imports if needed.
 
 ## Phase 6: Tests And Validation
 
-- [ ] Add embedding tests for disabled/default behavior, `<mask>` zeroing,
+- [x] Add embedding tests for disabled/default behavior, `<mask>` zeroing,
   expected per-row scaling, attention-mask length accounting, `inputs_embeds`
   bypass, and degenerate finite outputs.
-- [ ] Add attention tests for channel-mode parity, L2 parameter shape/init,
+- [x] Add attention tests for channel-mode parity, L2 parameter shape/init,
   manual/SDPA agreement, `qk_norm=False` behavior, and gradient flow into
   `qk_l2_scale`.
-- [ ] Add transformer tests for residual-gate absence, scalar/channel shapes,
+- [x] Add transformer tests for residual-gate absence, scalar/channel shapes,
   initialization, state-dict persistence, output effect when edited, and gradient
   flow.
-- [ ] Replace the GEGLU-not-implemented test with GEGLU factory, formula, bias,
+- [x] Replace the GEGLU-not-implemented test with GEGLU factory, formula, bias,
   residual-writer marker, shape, and gradient tests.
-- [ ] Add a targeted integration test covering representative combinations of
+- [x] Add a targeted integration test covering representative combinations of
   `mask_dropout`, L2 QKNorm, residual gates, GEGLU, sandwich norm, and optimizer
   parameter grouping without exploding the existing full toggle matrix.
-- [ ] Run focused tests:
+- [x] Run focused tests:
   - `pytest tests/model/test_config.py tests/model/test_embedding.py tests/model/test_attention.py tests/model/test_ffn.py tests/model/test_transformer.py tests/model/test_toggles.py tests/model/test_save_load.py tests/training/test_config.py tests/training/test_optim.py`
-- [ ] Run final gates:
+- [x] Run final gates:
   - `ruff format src/ tests/`
   - `ruff check src/ tests/`
   - `ty check src/`
@@ -118,10 +118,10 @@ is evaluated.
 
 ## Assumptions
 
-- [ ] `mask_dropout_reference_ratio=0.12` matches the current default masking
+- [x] `mask_dropout_reference_ratio=0.12` matches the current default masking
   policy: `mask_prob=0.15` times `mask_token_prob=0.8`.
-- [ ] `qk_norm_mode="l2"` is the only QK mode that introduces a learned per-head
+- [x] `qk_norm_mode="l2"` is the only QK mode that introduces a learned per-head
   scale.
-- [ ] Residual gates refine the existing residual scaling rather than replacing
+- [x] Residual gates refine the existing residual scaling rather than replacing
   `residual_scaling`.
-- [ ] No attention logit soft-capping fields, docs, or tests are added in this pass.
+- [x] No attention logit soft-capping fields, docs, or tests are added in this pass.

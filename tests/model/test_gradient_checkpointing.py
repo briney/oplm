@@ -51,9 +51,9 @@ def _assert_transparent(
     assert torch.allclose(logits_plain, logits_ckpt, atol=1e-5, rtol=1e-4)
     assert grads_plain.keys() == grads_ckpt.keys()
     for name in grads_plain:
-        assert torch.allclose(
-            grads_plain[name], grads_ckpt[name], atol=1e-5, rtol=1e-4
-        ), f"grad mismatch in {name}"
+        assert torch.allclose(grads_plain[name], grads_ckpt[name], atol=1e-5, rtol=1e-4), (
+            f"grad mismatch in {name}"
+        )
 
 
 def test_checkpointing_matches_plain_forward_and_grads() -> None:

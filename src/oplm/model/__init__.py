@@ -26,7 +26,7 @@ from .attention import OplmAttention
 from .configuration_oplm import OplmConfig
 from .conv import CanonConv, resolve_canon_kernel_sizes
 from .embedding import OplmEmbedding, cls_pool, mean_pool
-from .ffn import SwiGLU, make_ffn, round_up_to
+from .ffn import GEGLU, SwiGLU, make_ffn, round_up_to
 from .modeling_oplm import (
     EsmcCompatMixin,
     OplmForMaskedLM,
@@ -41,6 +41,7 @@ from .tokenization_oplm import OplmTokenizerFast
 from .transformer import OplmBlock, OplmStack
 
 __all__ = [
+    "GEGLU",
     "CanonConv",
     "EsmcCompatMixin",
     "LogitsConfig",

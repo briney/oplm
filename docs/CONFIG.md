@@ -115,8 +115,15 @@ from `configs/model/base.yaml`.
 | `model.norm_eps` | `float` | `1e-6` | Norm epsilon. |
 | `model.norm_strategy` | `str` | `pre` | `pre`, `sandwich`, `hybrid`, or `post_sdpa`. |
 | `model.qk_norm` | `bool` | `true` | Normalize Q and K before attention. |
+| `model.qk_norm_mode` | `str` | `channel` | `channel` (per-channel LayerNorm/RMSNorm + fixed `1/√head_dim` scale, the current behavior) or `l2` (fp32 L2-normalize over `head_dim` + a learned per-head scale). Inert when `qk_norm=false`. |
+| `model.qk_norm_l2_scale_init` | `float \| null` | `null` | `l2` mode only: initial value of the learned per-head scale. `null` initializes to `√head_dim`. Must be positive when set. |
 | `model.post_embed_norm` | `bool` | `false` | Apply a norm after the token-embedding lookup. |
+| `model.mask_dropout` | `bool` | `false` | Zero every `<mask>` embedding row and rescale surviving embeddings by `(1 − reference_ratio) / (1 − observed_ratio)`. `input_ids` path only; the `inputs_embeds` path is unchanged. |
+| `model.mask_dropout_reference_ratio` | `float` | `0.12` | Expected fraction of real tokens that are `<mask>` under the training masking policy (`mask_prob · mask_token_prob`), **not** a fraction of mask tokens to drop. Must satisfy `0 ≤ ratio < 1`. |
 | `model.residual_scaling` | `str` | `sqrt_num_layers` | `sqrt_num_layers` (scale each sublayer's residual write by `1/√L`) or `none`. |
+| `model.residual_gate` | `str` | `none` | Learnable multiplicative gate refining each residual write on top of `residual_scaling`: `none` (no new params), `scalar` (one param per attention/FFN write), or `channel` (`(hidden_size,)` param per write). |
+| `model.residual_gate_init` | `float` | `1.0` | Initial value for residual gate parameters. Must be finite. |
+| `model.attn_output_gate` | `str` | `none` | Post-SDPA attention output gate (arXiv:2505.06708, G1): `none` (no new params), `sigmoid`, or `silu`. Adds a bias-free `(hidden_size, hidden_size)` `gate_proj` per layer; the merged attention output is multiplied elementwise by `act(gate_proj(x))` before `o_proj`. |
 | `model.init_scale_output_projections` | `bool` | `true` | Shrink residual-writing projections by `1/√(2L)` at init. |
 
 ### Feed-forward and dropout
@@ -181,9 +188,11 @@ Config construction raises `ValueError` if any of these fail:
 - `num_attention_heads > 0` and `hidden_size % num_attention_heads == 0`
 - `head_dim · num_attention_heads == hidden_size`
 - `rope_dim + nope_dim == head_dim`, both `≥ 0`, and `rope_dim` even
-- enum fields (`norm_type`, `norm_strategy`, `residual_scaling`,
-  `ffn_activation`, `mlm_head_activation`, `canon_activation`,
-  `classifier_pool`) hold a valid value
+- enum fields (`norm_type`, `norm_strategy`, `qk_norm_mode`, `residual_scaling`,
+  `residual_gate`, `attn_output_gate`, `ffn_activation`, `mlm_head_activation`,
+  `canon_activation`, `classifier_pool`) hold a valid value
+- `0 ≤ mask_dropout_reference_ratio < 1`
+- `qk_norm_l2_scale_init`, when set, is positive; `residual_gate_init` is finite
 - when `canon_enabled`, `canon_positions` is a non-empty, duplicate-free subset
   of `{A, B, C, D}`
 

@@ -88,6 +88,11 @@ class OplmBlock(nn.Module):
     checkpoint dispatch.
     """
 
+    # `alpha` is registered as a persistent buffer in __init__ (via the string
+    # name, invisible to the type checker); declare its type so `self.alpha`
+    # resolves to Tensor rather than the `nn.Module.__getattr__` union.
+    alpha: torch.Tensor
+
     def __init__(self, config: OplmConfig, layer_idx: int) -> None:
         super().__init__()
 
@@ -122,6 +127,24 @@ class OplmBlock(nn.Module):
         # restores persistent buffers from the saved state dict. Non-persistent buffers
         # stay as garbage after loading, producing near-zero alpha and broken outputs.
         self.register_buffer("alpha", torch.tensor(alpha_val), persistent=True)
+
+        # Optional learnable residual gates: multiplicative refinements applied on
+        # top of the fixed `alpha` scale at each residual write. `scalar` adds one
+        # parameter per sublayer write; `channel` adds a `(hidden_size,)` vector.
+        # Initialized directly to `residual_gate_init` (not via _init_weights, which
+        # only matches Linear/Embedding/Conv1d/norm modules). 1D so they land in the
+        # no-decay AdamW group, including the auxiliary AdamW path under Muon.
+        self.residual_gate = getattr(config, "residual_gate", "none")
+        if self.residual_gate not in {"none", "scalar", "channel"}:
+            raise ValueError(
+                f"Unknown residual_gate {self.residual_gate!r}; "
+                "expected one of 'none', 'scalar', 'channel'."
+            )
+        if self.residual_gate != "none":
+            gate_init = float(getattr(config, "residual_gate_init", 1.0))
+            gate_shape = (1,) if self.residual_gate == "scalar" else (config.hidden_size,)
+            self.attn_gate = nn.Parameter(torch.full(gate_shape, gate_init))
+            self.ffn_gate = nn.Parameter(torch.full(gate_shape, gate_init))
 
         if config.norm_strategy not in {"pre", "sandwich", "hybrid", "post_sdpa"}:
             raise ValueError(
@@ -183,6 +206,18 @@ class OplmBlock(nn.Module):
             if "D" in positions:
                 self.conv_d = CanonConv(config.hidden_size, kernel_size, activation=activation)
 
+    def _gate_attn(self, attn_out: torch.Tensor) -> torch.Tensor:
+        """Apply the learned attention residual gate (no-op when `residual_gate="none"`)."""
+        if self.residual_gate == "none":
+            return attn_out
+        return self.attn_gate * attn_out
+
+    def _gate_ffn(self, ffn_out: torch.Tensor) -> torch.Tensor:
+        """Apply the learned FFN residual gate (no-op when `residual_gate="none"`)."""
+        if self.residual_gate == "none":
+            return ffn_out
+        return self.ffn_gate * ffn_out
+
     def _forward_impl(
         self,
         x: torch.Tensor,
@@ -205,7 +240,7 @@ class OplmBlock(nn.Module):
 
         if self.norm_strategy in {"sandwich", "post_sdpa"}:
             attn_out = self.attn_post_norm(attn_out)
-        h = x + self.alpha * attn_out
+        h = x + self.alpha * self._gate_attn(attn_out)
 
         # FFN sublayer.
         h_norm = self.ffn_norm(h)
@@ -216,12 +251,12 @@ class OplmBlock(nn.Module):
 
         if self.norm_strategy == "sandwich":
             ffn_out = self.ffn_post_norm(ffn_out)
-            y = h + self.alpha * ffn_out
+            y = h + self.alpha * self._gate_ffn(ffn_out)
         elif self.norm_strategy == "hybrid":
             # Hybrid reuses Norm(h) as both FFN input and FFN-side residual stream.
-            y = h_norm + self.alpha * ffn_out
+            y = h_norm + self.alpha * self._gate_ffn(ffn_out)
         else:  # "pre" or "post_sdpa"
-            y = h + self.alpha * ffn_out
+            y = h + self.alpha * self._gate_ffn(ffn_out)
 
         return y, attn_weights
 
@@ -333,16 +368,23 @@ class OplmStack(nn.Module):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Provide exactly one of `input_ids` or `inputs_embeds`.")
 
+        # Materialize/validate the pad mask before the embedding lookup so it can
+        # be threaded into mask dropout (which needs per-row real-token counts).
         if inputs_embeds is not None:
+            batch_size, seq_len, _ = inputs_embeds.shape
+            attention_mask = prepare_attention_mask(
+                attention_mask, batch_size, seq_len, inputs_embeds.device
+            )
+            # The inputs_embeds path bypasses mask dropout: <mask> positions
+            # cannot be inferred once token IDs are gone.
             x = inputs_embeds
-            batch_size, seq_len, _ = x.shape
         else:
             assert input_ids is not None  # guaranteed by the exactly-one check above
             batch_size, seq_len = input_ids.shape
-            x = self.embed_tokens(input_ids)
-
-        device = x.device
-        attention_mask = prepare_attention_mask(attention_mask, batch_size, seq_len, device)
+            attention_mask = prepare_attention_mask(
+                attention_mask, batch_size, seq_len, input_ids.device
+            )
+            x = self.embed_tokens(input_ids, attention_mask)
 
         hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
         attentions: tuple[torch.Tensor | None, ...] | None = () if output_attentions else None

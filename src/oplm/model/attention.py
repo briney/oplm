@@ -30,13 +30,30 @@ class OplmAttention(nn.Module):
     `output_attentions=True` the manual scaled-dot-product softmax runs instead,
     since SDPA does not expose the attention weights.
 
-    Norm wiring (controlled by `config.norm_strategy`):
+    Norm wiring (controlled by `config.norm_strategy`, `config.qk_norm`,
+    `config.qk_norm_mode`):
 
-    * `qk_norm=True` always installs `q_norm` and `k_norm` on the per-head
-      dimension (`d_head`).
+    * `qk_norm=True, qk_norm_mode="channel"` (default) installs per-head
+      `q_norm`/`k_norm` modules on `d_head` and uses the canonical
+      `1/sqrt(d_head)` attention-kernel scale.
+    * `qk_norm=True, qk_norm_mode="l2"` instead L2-normalizes Q and K over
+      `d_head` in fp32 and multiplies Q by a learned per-head scale
+      (`qk_l2_scale`, shape `(num_attention_heads,)`); the attention kernel then
+      runs with scale `1.0` (the score scale is folded into `qk_l2_scale`).
+    * `qk_norm=False` leaves Q and K unnormalized (Identity) with the
+      `1/sqrt(d_head)` kernel scale.
     * Under `norm_strategy == "hybrid"`, an additional `v_norm` is installed on
       `d_head` — this realises the paper's "QKV-norm" main method.
     * Under every other strategy, `v_norm` is `nn.Identity()`.
+
+    Output gating (controlled by `config.attn_output_gate`): when `"sigmoid"` or
+    `"silu"`, a `gate_proj` linear computes an elementwise, head-specific gate
+    from the attention input — the post-SDPA G1 multiplicative gate of "Gated
+    Attention for Large Language Models" (arXiv:2505.06708) — and the merged
+    attention output is multiplied by `act(gate_proj(x))` before `o_proj`.
+    `gate_proj` uses the standard trunc-normal init (as in the paper), so at
+    init the gate sits near `act(0)` (0.5 for sigmoid, 0.0 for SiLU) and
+    attenuates the attention write. `"none"` (default) adds no parameters.
 
     The output projection (`o_proj`) is marked `_is_residual_writer = True` so
     the `OplmPreTrainedModel._init_weights` hook can apply the
@@ -63,6 +80,15 @@ class OplmAttention(nn.Module):
         self.hidden_dropout = float(config.hidden_dropout)
         self.norm_strategy = config.norm_strategy
         self.qk_norm_enabled = bool(config.qk_norm)
+        self.qk_norm_mode = getattr(config, "qk_norm_mode", "channel")
+        # True L2 QK-norm: a learned per-head temperature replaces the channel
+        # norm + fixed score scale.
+        self.qk_l2 = self.qk_norm_enabled and self.qk_norm_mode == "l2"
+
+        # Attention-kernel score scale. L2 mode folds the scale into the learned
+        # per-head multiplier on Q, so the kernel runs at 1.0; every other path
+        # keeps the canonical 1/sqrt(head_dim).
+        self.attn_scale = 1.0 if self.qk_l2 else 1.0 / math.sqrt(head_dim)
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -71,12 +97,37 @@ class OplmAttention(nn.Module):
         # Picked up by OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling.
         self.o_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
-        if self.qk_norm_enabled:
+        # Post-SDPA output gate (arXiv:2505.06708, G1): elementwise multiplicative
+        # gate on the merged attention output, computed from the attention input.
+        # `gate_proj` is a plain Linear (generic trunc-normal init, regular Muon
+        # matrix); `o_proj` remains the sole residual writer.
+        self.attn_output_gate = getattr(config, "attn_output_gate", "none")
+        if self.attn_output_gate not in {"none", "sigmoid", "silu"}:
+            raise ValueError(
+                f"Unknown attn_output_gate {self.attn_output_gate!r}; "
+                "expected one of 'none', 'sigmoid', 'silu'."
+            )
+        if self.attn_output_gate != "none":
+            self.gate_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # Channel-mode QK norm installs per-head norm modules; L2 mode and the
+        # disabled path leave them as Identity (L2 normalization is functional).
+        if self.qk_norm_enabled and not self.qk_l2:
             self.q_norm: nn.Module = make_norm(config.norm_type, head_dim, eps=config.norm_eps)
             self.k_norm: nn.Module = make_norm(config.norm_type, head_dim, eps=config.norm_eps)
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
+
+        # L2 mode's learned per-head scale. Initialized directly (not through the
+        # generic _init_weights hook) to qk_norm_l2_scale_init or sqrt(head_dim);
+        # 1D so it lands in the no-decay AdamW group.
+        if self.qk_l2:
+            scale_init_cfg = getattr(config, "qk_norm_l2_scale_init", None)
+            scale_init = (
+                float(scale_init_cfg) if scale_init_cfg is not None else math.sqrt(head_dim)
+            )
+            self.qk_l2_scale = nn.Parameter(torch.full((num_heads,), scale_init))
 
         # Hybrid strategy ("QKV-norm") also norms V; every other strategy leaves V alone.
         if config.norm_strategy == "hybrid":
@@ -106,12 +157,32 @@ class OplmAttention(nn.Module):
         return split(self.q_proj(x)), split(self.k_proj(x)), split(self.v_proj(x))
 
     def _qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply per-head QK normalization (no-op when `qk_norm=False`).
+        """Apply QK normalization for the configured mode (no-op when `qk_norm=False`).
 
-        Norm internals already cast to fp32; we forward the result in the same
-        dtype the norm returns (matches the input dtype).
+        Channel mode uses the per-head `q_norm`/`k_norm` modules (their internals
+        already cast to fp32 and return the input dtype). L2 mode dispatches to
+        `_qk_l2_norm`. When `qk_norm=False`, both norms are `nn.Identity`.
         """
+        if self.qk_l2:
+            return self._qk_l2_norm(q, k)
         return self.q_norm(q), self.k_norm(k)
+
+    def _qk_l2_norm(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """L2-normalize Q,K over `d_head` in fp32, then scale Q per head.
+
+        Q and K are unit-normalized over the head dimension so each logit is a
+        scaled cosine similarity; Q is then multiplied by the learned per-head
+        scale `qk_l2_scale`. The accompanying attention kernel uses scale `1.0`.
+        Computed in fp32 for stability and returned in the inputs' dtype.
+
+        Shapes: q, k are `(B, H, T, d_head)`; `qk_l2_scale` is `(H,)` broadcast
+        as `(1, H, 1, 1)`.
+        """
+        q_hat = F.normalize(q.float(), p=2.0, dim=-1)
+        k_hat = F.normalize(k.float(), p=2.0, dim=-1)
+        scale = self.qk_l2_scale.to(torch.float32).view(1, -1, 1, 1)  # (1, H, 1, 1)
+        q_hat = q_hat * scale
+        return q_hat.to(q.dtype), k_hat.to(k.dtype)
 
     def _apply_v_norm(self, v: torch.Tensor) -> torch.Tensor:
         return self.v_norm(v)
@@ -119,10 +190,19 @@ class OplmAttention(nn.Module):
     def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.rotary.apply_rotary(q, k)
 
-    def _output_projection(self, attn_out: torch.Tensor) -> torch.Tensor:
-        """Reshape `(B, H, T, d_head)` back to `(B, T, D)` and project."""
+    def _output_projection(self, attn_out: torch.Tensor, gate_input: torch.Tensor) -> torch.Tensor:
+        """Reshape `(B, H, T, d_head)` back to `(B, T, D)`, gate (optional), project.
+
+        `gate_input` is the `(B, T, D)` attention input; with the output gate
+        enabled, the merged attention output is multiplied elementwise by
+        `act(gate_proj(gate_input))` before `o_proj` (head-specific G1 gating,
+        since `D = H * d_head`).
+        """
         batch, _, seq_len, _ = attn_out.shape
         merged = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, self.hidden_size)
+        if self.attn_output_gate != "none":
+            act = torch.sigmoid if self.attn_output_gate == "sigmoid" else F.silu
+            merged = merged * act(self.gate_proj(gate_input))  # (B, T, D)
         return self.o_proj(merged)
 
     # ------------------------------------------------------------------
@@ -142,12 +222,15 @@ class OplmAttention(nn.Module):
         (`True` = attend). Masking only keys keeps every query row non-empty —
         pad-query rows stay finite (and are discarded downstream) — so no row is
         all-masked and the softmax cannot produce NaNs. Dropout is applied inside
-        the kernel during training only; SDPA's default scale (`1/sqrt(d_head)`)
-        already matches the manual path.
+        the kernel during training only. The explicit `scale=self.attn_scale`
+        matches the manual path (`1/sqrt(d_head)` in channel/disabled modes, `1.0`
+        in L2 mode where the scale is folded into `qk_l2_scale`).
         """
         attn_mask = (attention_mask == 1)[:, None, None, :]  # (B, 1, 1, T) bool
         dropout_p = self.attention_dropout if self.training else 0.0
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=self.attn_scale
+        )
 
     def _manual_attention(
         self,
@@ -157,8 +240,7 @@ class OplmAttention(nn.Module):
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Manual scaled-dot-product attention. Returns `(out, attn_fp32)`."""
-        scale = 1.0 / math.sqrt(self.head_dim)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, T, T)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.attn_scale  # (B, H, T, T)
         # Pad positions: mask is (B, T) with 1 for real tokens; broadcast as KV mask.
         mask = (attention_mask == 0)[:, None, None, :]
         scores = scores.masked_fill(mask, float("-inf"))
@@ -201,6 +283,6 @@ class OplmAttention(nn.Module):
             out = self._sdpa_attention(q, k, v, attention_mask)
             attn = None
 
-        out = self._output_projection(out)
+        out = self._output_projection(out, x)
         out = F.dropout(out, p=self.hidden_dropout, training=self.training)
         return out, attn
