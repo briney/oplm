@@ -55,13 +55,23 @@ class OplmAttention(nn.Module):
     init the gate sits near `act(0)` (0.5 for sigmoid, 0.0 for SiLU) and
     attenuates the attention write. `"none"` (default) adds no parameters.
 
+    Value residual (controlled by `config.value_residual`): the ResFormer
+    cross-layer value residual of arXiv:2410.17897. Layer 0 exposes its
+    post-V-norm values v1 (third element of the forward return); every later
+    layer blends its own values toward them after the V projection:
+    `v' = lambda * v + (1 - lambda) * v1`. Under `"learnable"`, `lambda` is a
+    per-layer scalar parameter (`value_residual_lambda`, layers > 0 only)
+    initialized to `config.value_residual_lambda_init`; under `"fixed"` it is a
+    constant buffer. `"none"` (default) adds no parameters and keeps the
+    two-element forward return.
+
     The output projection (`o_proj`) is marked `_is_residual_writer = True` so
     the `OplmPreTrainedModel._init_weights` hook can apply the
     `1/sqrt(2L)` residual-stream scaling defined in §15.1 of the architecture
     doc.
     """
 
-    def __init__(self, config: OplmConfig) -> None:
+    def __init__(self, config: OplmConfig, layer_idx: int = 0) -> None:
         super().__init__()
 
         hidden_size = config.hidden_size
@@ -109,6 +119,28 @@ class OplmAttention(nn.Module):
             )
         if self.attn_output_gate != "none":
             self.gate_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # ResFormer value residual (arXiv:2410.17897): layer 0 exposes its values,
+        # later layers blend toward them. The mixing scalar lives only on layers
+        # > 0; "none" adds no parameters or buffers. Initialized directly at
+        # construction (like qk_l2_scale), not through _init_weights; 1D, so it
+        # lands in the no-decay AdamW group.
+        self.layer_idx = layer_idx
+        self.value_residual = getattr(config, "value_residual", "none")
+        if self.value_residual not in {"none", "fixed", "learnable"}:
+            raise ValueError(
+                f"Unknown value_residual {self.value_residual!r}; "
+                "expected one of 'none', 'fixed', 'learnable'."
+            )
+        self.value_residual_enabled = self.value_residual != "none"
+        if self.value_residual_enabled and layer_idx > 0:
+            lam_init = float(getattr(config, "value_residual_lambda_init", 0.5))
+            if self.value_residual == "learnable":
+                self.value_residual_lambda = nn.Parameter(torch.full((1,), lam_init))
+            else:  # "fixed" — persistent buffer (compile/DDP + HF fast-init safe)
+                self.register_buffer(
+                    "value_residual_lambda", torch.tensor(lam_init), persistent=True
+                )
 
         # Channel-mode QK norm installs per-head norm modules; L2 mode and the
         # disabled path leave them as Identity (L2 normalization is functional).
@@ -258,7 +290,11 @@ class OplmAttention(nn.Module):
         x: torch.Tensor,
         attention_mask: torch.Tensor,
         output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        value_residual: torch.Tensor | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+    ):
         """Run dual-path multi-head attention.
 
         Args:
@@ -266,15 +302,24 @@ class OplmAttention(nn.Module):
             attention_mask: `(B, T)` tensor with `1` at real tokens, `0` at pads.
             output_attentions: When `True`, return the fp32 attention weights;
                 selects the manual softmax path (SDPA exposes no weights).
+            value_residual: `(B, H, T, d_head)` layer-0 values v1 to blend into
+                this layer's values (`value_residual != "none"` and
+                `layer_idx > 0` only); `None` disables the blend.
 
         Returns:
             A `(output, attn_weights_or_None)` tuple. `output` has shape
             `(B, T, D)`; `attn_weights_or_None` has shape `(B, H, T, T)` in fp32
-            when requested, otherwise `None`.
+            when requested, otherwise `None`. When the value residual is
+            enabled, a third element carries this layer's post-V-norm values at
+            `layer_idx == 0` (`(B, H, T, d_head)`) and `None` on later layers.
         """
         q, k, v = self._project_qkv(x)
         q, k = self._qk_norm(q, k)
         v = self._apply_v_norm(v)
+        # ResFormer value residual: blend this layer's values toward layer 0's.
+        if value_residual is not None:
+            lam = self.value_residual_lambda
+            v = lam * v + (1.0 - lam) * value_residual
         q, k = self._apply_rope(q, k)
 
         if output_attentions:
@@ -285,4 +330,6 @@ class OplmAttention(nn.Module):
 
         out = self._output_projection(out, x)
         out = F.dropout(out, p=self.hidden_dropout, training=self.training)
+        if self.value_residual_enabled:
+            return out, attn, (v if self.layer_idx == 0 else None)
         return out, attn

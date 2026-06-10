@@ -345,6 +345,7 @@ site), e.g. `["A","C","D"]`. See §11.
 | `residual_scaling` | global | `sqrt_num_layers` / `none` |
 | `residual_gate`/`residual_gate_init` | global | `none` (default) / `scalar` / `channel` per-block residual gate |
 | `attn_output_gate` | global | `none` (default) / `sigmoid` / `silu` post-SDPA output gate (arXiv:2505.06708 G1) |
+| `value_residual`/`value_residual_lambda_init` | global | `none` (default) / `fixed` / `learnable` ResFormer value residual (arXiv:2410.17897) |
 | `rope_dim`/`nope_dim` | global | same split across all heads/layers |
 | `canon_enabled`/`canon_positions` | global | master switch / insertion sites |
 | `canon_kernel_sizes` | per-layer | scalar broadcasts; list must match `num_hidden_layers` |
@@ -401,15 +402,38 @@ and as a regular 2-D hidden matrix it joins the Muon group under Muon. The gate
 sits after the attention kernel, so the SDPA and manual paths share it.
 `"none"` adds no parameters and preserves checkpoint compatibility.
 
+**Value residual** (`value_residual`, off by default). The cross-layer value
+residual of "Value Residual Learning" / ResFormer (arXiv:2410.17897): layer 0
+exposes its post-V-norm values `v₁`, and every later layer blends its own values
+toward them immediately after the V projection (before RoPE and the kernel, so
+the SDPA and manual paths share the blend):
+
+```
+v' = λ · v + (1 − λ) · v₁
+```
+
+Under `"learnable"`, `λ` is a raw per-layer scalar `value_residual_lambda` of
+shape `(1,)` — layers 1..L−1 only, layer 0 has none — initialized to
+`value_residual_lambda_init` (default 0.5, the variant adopted by later work,
+e.g. the nanoGPT speedrun); as a 1D param it lands in the no-decay AdamW group
+and never enters Muon. Under `"fixed"`, `λ` is a constant persistent buffer
+(same layer restriction, no new parameters). `"none"` adds no
+parameters/buffers and keeps the two-element attention return. When enabled,
+`OplmAttention`/`OplmBlock` return a third element carrying `v₁` (`(B,H,T,d)`
+at layer 0, `None` elsewhere) and `OplmStack` threads it through the layer loop
+(and through both gradient-checkpointing paths); `v₁` never leaves the stack.
+
 **RoPE** applies to `Q_norm`, `K_norm` (after QK-norm, before scoring); not to V.
 Partial RoPE rotates only the first `rope_dim` channels (see §7).
 
 **Forward signature:**
 
 ```python
-def forward(self, x, attention_mask, output_attentions=False):
+def forward(self, x, attention_mask, output_attentions=False, value_residual=None):
     # x (B,T,D); attention_mask (B,T) {0,1} 1=real,0=pad
+    # value_residual: layer-0 values v1 (B,H,T,d) | None (value-residual layers > 0 only)
     # returns (out (B,T,D), attn_weights (B,H,T,T) fp32 | None)
+    # (+ a third element, v1 at layer 0 else None, when value_residual != "none")
 ```
 
 **Path selection:** `output_attentions=False` (the default, used for training)
@@ -601,6 +625,8 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `residual_gate` | `none` | learnable gate on residual writes: `none`/`scalar`/`channel` |
 | `residual_gate_init` | `1.0` | init for gate params; finite |
 | `attn_output_gate` | `none` | post-SDPA elementwise output gate: `none`/`sigmoid`/`silu`; adds a `(D,D)` `gate_proj` per layer |
+| `value_residual` | `none` | ResFormer value residual: `none`/`fixed`/`learnable`; blends later layers' V toward layer 0's `v₁` |
+| `value_residual_lambda_init` | `0.5` | constant λ (`fixed`) or λ init (`learnable`); finite |
 | `init_scale_output_projections` | `True` | divide init std of `W_o`,`W_d` by `sqrt(2L)` (GPT-2 style) |
 | `ffn_activation` | `swiglu` | / `geglu` (gated, 3 proj) / `relu2` (non-gated squared-ReLU, 2 proj; derives `F≈4·D`) |
 | `ffn_bias` | `False` | |
@@ -622,10 +648,12 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 **Validation rules** (raise `ValueError`): `hidden_size % num_attention_heads ==
 0`; `head_dim·H == hidden_size` (if set); `rope_dim+nope_dim==head_dim`,
 `rope_dim,nope_dim ≥ 0`, `rope_dim` even; `norm_type`/`norm_strategy`/
-`qk_norm_mode`/`residual_scaling`/`residual_gate`/`ffn_activation`/
+`qk_norm_mode`/`residual_scaling`/`residual_gate`/`attn_output_gate`/
+`value_residual`/`ffn_activation`/
 `mlm_head_activation`/`classifier_pool` in their enums; `0 ≤
 mask_dropout_reference_ratio < 1`; `qk_norm_l2_scale_init` positive if set;
-`residual_gate_init` finite; if `canon_enabled` then `canon_positions` non-empty ⊆ `{A,B,C,D}` and
+`residual_gate_init` and `value_residual_lambda_init` finite; if `canon_enabled`
+then `canon_positions` non-empty ⊆ `{A,B,C,D}` and
 resolved `canon_kernel_sizes` is a length-`num_hidden_layers` list of values ≥ 2.
 `vocab_size != 33` warns only. Deprecation policy: a deprecated field is readable
 for one minor version with a `DeprecationWarning`, then removed (currently none).
@@ -1413,9 +1441,11 @@ Field names migrated from the old dataclass `ModelConfig` to the HF config:
 `conv_positions` (`"ACD"`) → `canon_positions` (`["A","C","D"]`), the
 `pre_norm`/`post_norm`/`sandwich_norm`/`post_sdpa_norm` booleans → the single
 `norm_strategy` enum, and `partial_rope` → `rope_dim`/`nope_dim`. **Removed with no
-replacement:** `num_kv_heads`/`shared_kv`, `value_residual`(+lambda),
+replacement:** `num_kv_heads`/`shared_kv`,
 `num_value_embeds`/`value_embed_gate_dim`, `output_gate`/`query_dependent_gate`,
 `attn_residual`(+block_size), the `conv_kernel_*` schedule family, and `dtype`.
+(`value_residual`(+lambda) was also removed in the migration but has since been
+re-introduced as the `none`/`fixed`/`learnable` enum described in §6.)
 
 ## 29. Model construction, optimizer, schedules, FLOPs
 

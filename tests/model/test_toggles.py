@@ -92,26 +92,28 @@ def test_toggle_combination_trains_one_step(combo) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Ablation-feature integration (Phases 2-5 + gated attention): mask dropout +
-# L2 QKNorm + residual gates + FFN variants (GEGLU / squared-ReLU) + attention
-# output gate + sandwich norm exercised together, plus optimizer partitioning
-# of the new params. Kept to a few representative combos rather than folded
-# into the matrix above (which would multiply its size).
+# Ablation-feature integration (Phases 2-5 + gated attention + value residual):
+# mask dropout + L2 QKNorm + residual gates + FFN variants (GEGLU /
+# squared-ReLU) + attention output gate + ResFormer value residual + sandwich
+# norm exercised together, plus optimizer partitioning of the new params. Kept
+# to a few representative combos rather than folded into the matrix above
+# (which would multiply its size).
 # ---------------------------------------------------------------------------
 
 _INTEGRATION_COMBOS = [
-    ("scalar", "sigmoid", "adamw", "geglu"),
-    ("scalar", "silu", "muon", "relu2"),
-    ("channel", "silu", "adamw", "relu2"),
-    ("channel", "sigmoid", "muon", "geglu"),
+    ("scalar", "sigmoid", "adamw", "geglu", "learnable"),
+    ("scalar", "silu", "muon", "relu2", "fixed"),
+    ("channel", "silu", "adamw", "relu2", "learnable"),
+    ("channel", "sigmoid", "muon", "geglu", "none"),
 ]
 
 
 @pytest.mark.parametrize(
-    "residual_gate,attn_output_gate,optimizer,ffn_activation", _INTEGRATION_COMBOS
+    "residual_gate,attn_output_gate,optimizer,ffn_activation,value_residual",
+    _INTEGRATION_COMBOS,
 )
 def test_ablation_features_train_and_partition_together(
-    residual_gate, attn_output_gate, optimizer, ffn_activation
+    residual_gate, attn_output_gate, optimizer, ffn_activation, value_residual
 ) -> None:
     """All ablation toggles on at once: train one step, then check optim grouping."""
     torch.manual_seed(0)
@@ -127,6 +129,7 @@ def test_ablation_features_train_and_partition_together(
         residual_gate=residual_gate,
         attn_output_gate=attn_output_gate,
         ffn_activation=ffn_activation,
+        value_residual=value_residual,
     )
     model = OplmForMaskedLM(config).train()
 
@@ -148,18 +151,27 @@ def test_ablation_features_train_and_partition_together(
     for name, p in model.named_parameters():
         assert torch.isfinite(p.grad).all(), f"non-finite grad in {name}"
 
-    # The new 1-D params (qk_l2_scale + residual gates) must land in
-    # AdamW-no-decay and never leak into Muon, and the partition must still tile
-    # the trainable set exactly once.
+    # The new 1-D params (qk_l2_scale + residual gates + value-residual lambdas)
+    # must land in AdamW-no-decay and never leak into Muon, and the partition
+    # must still tile the trainable set exactly once.
     id_to_name = {id(p): n for n, p in model.named_parameters()}
     groups = partition_optimizer_params(model, TrainConfig(optimizer=optimizer))
     no_decay_ids = {id(p) for p in groups.adamw_no_decay_params}
     muon_ids = {id(p) for p in groups.muon_params}
 
     new_1d = {
-        n for n in id_to_name.values() if n.endswith(("qk_l2_scale", "attn_gate", "ffn_gate"))
+        n
+        for n in id_to_name.values()
+        if n.endswith(("qk_l2_scale", "attn_gate", "ffn_gate", "value_residual_lambda"))
     }
     assert new_1d, "expected qk_l2_scale and residual-gate params to exist"
+
+    # Only "learnable" adds lambda parameters; "fixed" uses a buffer, "none" nothing.
+    lam_names = {n for n in id_to_name.values() if n.endswith("value_residual_lambda")}
+    if value_residual == "learnable":
+        assert len(lam_names) == _LAYERS - 1, "expected one lambda per layer after the first"
+    else:
+        assert not lam_names, f"unexpected value_residual_lambda params: {lam_names}"
     for name, param in model.named_parameters():
         if name in new_1d:
             assert id(param) in no_decay_ids, f"{name} should be AdamW-no-decay"

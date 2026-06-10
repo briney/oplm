@@ -158,8 +158,10 @@ class OplmBlock(nn.Module):
                 config.norm_type, config.hidden_size, eps=config.norm_eps
             )
 
-        # Attention module self-configures v_norm under hybrid.
-        self.attention = OplmAttention(config)
+        # Attention module self-configures v_norm under hybrid; the layer index
+        # drives the ResFormer value-residual wiring (layer 0 exposes v1).
+        self.attention = OplmAttention(config, layer_idx)
+        self.value_residual_enabled = getattr(config, "value_residual", "none") != "none"
 
         # FFN pre-norm and FFN module are always present.
         self.ffn_norm: nn.Module = make_norm(
@@ -223,7 +225,11 @@ class OplmBlock(nn.Module):
         x: torch.Tensor,
         attention_mask: torch.Tensor,
         output_attentions: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        value_residual: torch.Tensor | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+    ):
         # Canon A: additive into the residual stream (preserves the residual identity).
         if hasattr(self, "conv_a"):
             x = x + self.conv_a(x, attention_mask)
@@ -234,7 +240,14 @@ class OplmBlock(nn.Module):
         if hasattr(self, "conv_b"):
             a_in = self.conv_b(a_in, attention_mask)
 
-        attn_out, attn_weights = self.attention(a_in, attention_mask, output_attentions)
+        attn_result = self.attention(
+            a_in, attention_mask, output_attentions, value_residual=value_residual
+        )
+        if self.value_residual_enabled:
+            attn_out, attn_weights, v1 = attn_result
+        else:
+            attn_out, attn_weights = attn_result
+            v1 = None
         if hasattr(self, "conv_c"):
             attn_out = self.conv_c(attn_out, attention_mask)
 
@@ -258,6 +271,8 @@ class OplmBlock(nn.Module):
         else:  # "pre" or "post_sdpa"
             y = h + self.alpha * self._gate_ffn(ffn_out)
 
+        if self.value_residual_enabled:
+            return y, attn_weights, v1
         return y, attn_weights
 
     def forward(
@@ -265,7 +280,11 @@ class OplmBlock(nn.Module):
         x: torch.Tensor,
         attention_mask: torch.Tensor,
         output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        value_residual: torch.Tensor | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+    ):
         """Run one transformer block.
 
         Args:
@@ -273,10 +292,14 @@ class OplmBlock(nn.Module):
             attention_mask: `(B, T)` mask with `1` at real tokens, `0` at pads.
             output_attentions: When `True`, return the per-block attention
                 weights from `OplmAttention` (forces the SDPA fallback).
+            value_residual: `(B, H, T, d_head)` layer-0 values v1 for the
+                ResFormer value residual (later layers only); `None` otherwise.
 
         Returns:
             `(y, attn_weights_or_None)` — `y` has shape `(B, T, D)`;
             `attn_weights_or_None` has shape `(B, H, T, T)` when requested.
+            When the value residual is enabled, a third element carries the
+            layer-0 values v1 (`layer_idx == 0` only, else `None`).
         """
         if self.gradient_checkpointing and self.training:
             if self.gradient_checkpointing_mode == "selective":
@@ -294,6 +317,7 @@ class OplmBlock(nn.Module):
                     x,
                     attention_mask,
                     output_attentions,
+                    value_residual,
                     use_reentrant=False,
                     context_fn=context_fn,
                 )
@@ -303,9 +327,10 @@ class OplmBlock(nn.Module):
                 x,
                 attention_mask,
                 output_attentions,
+                value_residual,
                 use_reentrant=False,
             )
-        return self._forward_impl(x, attention_mask, output_attentions)
+        return self._forward_impl(x, attention_mask, output_attentions, value_residual)
 
 
 class OplmStack(nn.Module):
@@ -329,6 +354,7 @@ class OplmStack(nn.Module):
         self.gradient_checkpointing_mode = str(
             getattr(config, "gradient_checkpointing_mode", "full")
         )
+        self.value_residual_enabled = getattr(config, "value_residual", "none") != "none"
 
         self.embed_tokens = OplmEmbedding(config)
         self.layers = nn.ModuleList(
@@ -389,8 +415,17 @@ class OplmStack(nn.Module):
         hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
         attentions: tuple[torch.Tensor | None, ...] | None = () if output_attentions else None
 
+        # ResFormer value residual: layer 0 returns its values v1, which are fed
+        # to every later block. Stays None (and unused) when disabled.
+        v1: torch.Tensor | None = None
         for block in self.layers:
-            x, attn = block(x, attention_mask, output_attentions)
+            result = block(x, attention_mask, output_attentions, value_residual=v1)
+            if self.value_residual_enabled:
+                x, attn, v = result
+                if v1 is None:
+                    v1 = v
+            else:
+                x, attn = result
             if hidden_states is not None:
                 hidden_states = hidden_states + (x,)
             if attentions is not None:

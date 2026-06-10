@@ -29,6 +29,8 @@ def _config(
     hidden_dropout: float = 0.0,
     norm_strategy: str = "pre",
     attn_output_gate: str = "none",
+    value_residual: str = "none",
+    value_residual_lambda_init: float = 0.5,
 ) -> SimpleNamespace:
     head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
     rope_dim = rope_dim if rope_dim is not None else head_dim
@@ -48,6 +50,8 @@ def _config(
         hidden_dropout=hidden_dropout,
         norm_strategy=norm_strategy,
         attn_output_gate=attn_output_gate,
+        value_residual=value_residual,
+        value_residual_lambda_init=value_residual_lambda_init,
     )
 
 
@@ -490,4 +494,126 @@ def test_output_gate_receives_gradient():
     for proj in (attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj, attn.gate_proj):
         assert proj.weight.grad is not None
         assert proj.weight.grad.abs().sum() > 0
+    assert x.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# Value residual (ResFormer, arXiv:2410.17897)
+# ---------------------------------------------------------------------------
+
+
+def _random_v1(batch: int, seq: int, heads: int = 4, head_dim: int = 8) -> torch.Tensor:
+    return torch.randn(batch, heads, seq, head_dim)
+
+
+def test_value_residual_disabled_by_default_adds_no_params():
+    attn = OplmAttention(_config(), layer_idx=1)
+    assert attn.value_residual == "none"
+    assert not hasattr(attn, "value_residual_lambda")
+    out = attn(torch.randn(2, 5, 32), _ones_mask(2, 5))
+    assert len(out) == 2
+
+
+def test_value_residual_learnable_creates_param_only_on_later_layers():
+    layer1 = OplmAttention(_config(value_residual="learnable"), layer_idx=1)
+    assert isinstance(layer1.value_residual_lambda, nn.Parameter)
+    assert layer1.value_residual_lambda.shape == (1,)
+    assert layer1.value_residual_lambda.item() == pytest.approx(0.5)
+
+    layer0 = OplmAttention(_config(value_residual="learnable"), layer_idx=0)
+    assert not hasattr(layer0, "value_residual_lambda")
+
+
+def test_value_residual_fixed_uses_buffer_not_param():
+    layer1 = OplmAttention(
+        _config(value_residual="fixed", value_residual_lambda_init=0.7), layer_idx=1
+    )
+    assert layer1.value_residual_lambda.item() == pytest.approx(0.7)
+    assert "value_residual_lambda" not in dict(layer1.named_parameters())
+    assert "value_residual_lambda" in dict(layer1.named_buffers())
+
+    layer0 = OplmAttention(_config(value_residual="fixed"), layer_idx=0)
+    assert not hasattr(layer0, "value_residual_lambda")
+
+
+def test_value_residual_constructor_rejects_unknown():
+    with pytest.raises(ValueError, match="value_residual"):
+        OplmAttention(_config(value_residual="blend"))
+
+
+def test_value_residual_layer0_returns_v_others_return_none():
+    torch.manual_seed(0)
+    x = torch.randn(2, 6, 32)
+
+    layer0 = OplmAttention(_config(value_residual="learnable"), layer_idx=0)
+    out0, _, v1 = layer0(x, _ones_mask(2, 6))
+    assert out0.shape == (2, 6, 32)
+    assert v1 is not None
+    assert v1.shape == (2, 4, 6, 8)  # (B, H, T, d_head)
+
+    layer1 = OplmAttention(_config(value_residual="learnable"), layer_idx=1)
+    _, _, v_later = layer1(x, _ones_mask(2, 6), value_residual=v1)
+    assert v_later is None
+
+
+def test_value_residual_lambda_one_is_identity():
+    """Fixed lambda = 1.0: blending toward v1 is a no-op."""
+    torch.manual_seed(0)
+    attn = OplmAttention(
+        _config(value_residual="fixed", value_residual_lambda_init=1.0), layer_idx=1
+    ).eval()
+    x = torch.randn(2, 6, 32)
+    with torch.no_grad():
+        out_blend, _, _ = attn(x, _ones_mask(2, 6), value_residual=_random_v1(2, 6))
+        out_plain, _, _ = attn(x, _ones_mask(2, 6))
+    assert torch.allclose(out_blend, out_plain, rtol=1e-5, atol=1e-6)
+
+
+def test_value_residual_lambda_zero_replaces_v():
+    """Fixed lambda = 0.0: this layer's values are fully replaced by v1."""
+    torch.manual_seed(0)
+    attn = OplmAttention(
+        _config(value_residual="fixed", value_residual_lambda_init=0.0), layer_idx=1
+    ).eval()
+    x = torch.randn(2, 6, 32)
+    v1 = _random_v1(2, 6)
+    with torch.no_grad():
+        out_a, _, _ = attn(x, _ones_mask(2, 6), value_residual=v1)
+        # Zeroing v_proj must not matter: V is fully substituted by v1.
+        attn.v_proj.weight.zero_()
+        out_b, _, _ = attn(x, _ones_mask(2, 6), value_residual=v1)
+    assert torch.allclose(out_a, out_b, rtol=1e-5, atol=1e-6)
+
+
+def test_value_residual_blend_changes_output():
+    torch.manual_seed(0)
+    attn = OplmAttention(_config(value_residual="learnable"), layer_idx=1).eval()
+    x = torch.randn(2, 6, 32)
+    with torch.no_grad():
+        out_blend, _, _ = attn(x, _ones_mask(2, 6), value_residual=_random_v1(2, 6))
+        out_plain, _, _ = attn(x, _ones_mask(2, 6))
+    assert not torch.allclose(out_blend, out_plain)
+
+
+def test_value_residual_sdpa_and_manual_paths_agree():
+    """The blend sits before the kernel, so both compute paths still agree."""
+    torch.manual_seed(0)
+    attn = OplmAttention(_config(value_residual="learnable"), layer_idx=1).eval()
+    x = torch.randn(2, 8, 32)
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.long)
+    v1 = _random_v1(2, 8)
+    with torch.no_grad():
+        out_sdpa, _, _ = attn(x, mask, output_attentions=False, value_residual=v1)
+        out_manual, _, _ = attn(x, mask, output_attentions=True, value_residual=v1)
+    assert torch.allclose(out_sdpa, out_manual, rtol=1e-4, atol=1e-5)
+
+
+def test_value_residual_learnable_receives_gradient():
+    torch.manual_seed(0)
+    attn = OplmAttention(_config(value_residual="learnable"), layer_idx=1)
+    x = torch.randn(2, 5, 32, requires_grad=True)
+    out, _, _ = attn(x, _ones_mask(2, 5), value_residual=_random_v1(2, 5))
+    out.sum().backward()
+    assert attn.value_residual_lambda.grad is not None
+    assert attn.value_residual_lambda.grad.abs().sum() > 0
     assert x.grad is not None
