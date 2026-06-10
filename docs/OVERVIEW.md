@@ -319,19 +319,25 @@ When `canon_enabled=True`, depthwise 1D convs are inserted at any of four labele
 positions (Canon paper, arXiv 2512.17351):
 
 - **A** — pre-block, on the residual-stream input.
-- **B** — between attention pre-norm and Q/K/V projection (*discouraged*, weakest
-  in the paper; accepted for ablation completeness).
+- **B** — *inside* attention, on the projected and normed Q/K/V (after QK/V-norm,
+  before the value residual and RoPE). One depthwise conv per stream
+  (`conv_b_q`/`conv_b_k`/`conv_b_v`), living on `OplmAttention`. This is the
+  paper's "inside attention" Canon and matches Primer's multi-DConv-head
+  attention (arXiv:2109.08668).
 - **C** — on the attention output before the residual add.
 - **D** — between the FFN pre-norm and the FFN (most common positive result).
 
 ```
-x ─► [Conv_A] ─► Norm ─► Attn ─► [Conv_C] ─► (+) ─► h
-                                                     │
-h ─► Norm ─► [Conv_D] ─► SwiGLU FFN ──────────► (+) ─► y
+              ┌────────── OplmAttention ──────────┐
+x ─► [Conv_A] ─► Norm ─► QKV ─► [Conv_B on Q/K/V] ─► RoPE ─► SDPA ─► Oproj ─► [Conv_C] ─► (+) ─► h
+                                                                                                 │
+h ─► Norm ─► [Conv_D] ─► SwiGLU FFN ───────────────────────────────────────────────────► (+) ─► y
 ```
 
 `canon_positions` is a global list (order irrelevant; each is an independent
-site), e.g. `["A","C","D"]`. See §11.
+site), e.g. `["A","C","D"]`. Unlike A/C/D (which convolve the `(B,T,D)`
+residual/MLP streams in `OplmBlock`), B is applied inside `OplmAttention`. See
+§11.
 
 ### 5.3 Per-knob scope
 
@@ -352,8 +358,7 @@ site), e.g. `["A","C","D"]`. See §11.
 | `ffn_activation`, `tie_word_embeddings`, `mlm_head_activation`, `classifier_pool` | global | |
 
 `post_sdpa` and `sandwich` are mutually exclusive enum values. Exotic
-combinations (e.g. Canon-B + sandwich; `qk_norm=false` + `hybrid`) are **warned,
-not errored**.
+combinations (e.g. `qk_norm=false` + `hybrid`) are **warned, not errored**.
 
 ## 6. Attention (`OplmAttention`)
 
@@ -362,8 +367,9 @@ paths share one set of parameters and pre-attention transforms; only the
 score→softmax→value kernel differs.
 
 Shapes: `x (B,T,D)` → Q/K/V projections `(B,T,D)` → reshape to heads `(B,H,T,d)`
-with `d = D/H` → QK-norm `(B,H,T,d)` → RoPE on Q,K → attention out `(B,H,T,d)` →
-reshape `(B,T,D)` → output projection `(B,T,D)`.
+with `d = D/H` → QK-norm `(B,H,T,d)` → optional Canon-B depthwise conv on Q/K/V
+→ optional value residual → RoPE on Q,K → attention out `(B,H,T,d)` → reshape
+`(B,T,D)` → output projection `(B,T,D)`.
 
 **QK-norm / QKV-norm.** Two modes, selected by `qk_norm_mode` (only active when
 `qk_norm=True`):
@@ -592,6 +598,17 @@ caller's.
 `num_hidden_layers`, or a dict `{schedule:"linear", min, max}` /
 `{schedule:"constant", value}` resolved at config-load. Every kernel ≥ 2; even
 kernels allowed. Cost per conv: `params = k·D`, `flops ≈ 2·k·D·T`.
+
+**Insertion sites.** A, C, and D convolve the `(B,T,D)` residual / attention-out
+/ MLP-input streams and are wired in `OplmBlock`. **B is different:** it is the
+"inside attention" Canon (= Primer multi-DConv-head attention, arXiv:2109.08668)
+and lives on `OplmAttention` as three independent depthwise convs
+(`conv_b_q`/`conv_b_k`/`conv_b_v`), applied to the projected, QK/V-normed Q/K/V
+*after* the norms and *before* the value residual and RoPE. The conv runs on a
+`(B,T,D)` view of each head-split stream; because it is depthwise (per-channel)
+and acts only along time, this is identical to convolving the flat projection
+output and to a single conv over the concatenated `3·D` channels — three modules
+are used to fit OPLM's separate Q/K/V projections and give self-documenting keys.
 
 ## 12. Configuration schema (`OplmConfig`)
 

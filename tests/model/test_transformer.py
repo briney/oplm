@@ -298,9 +298,13 @@ def test_block_no_canon_when_disabled():
     block = OplmBlock(cfg, layer_idx=0)
     for name in ("conv_a", "conv_b", "conv_c", "conv_d"):
         assert not hasattr(block, name)
+    # Canon-B lives on the attention module; it must be absent too.
+    assert not block.attention.canon_b_enabled
 
 
-@pytest.mark.parametrize("position", ["A", "B", "C", "D"])
+# Canon-B lives inside OplmAttention (conv_b_q/k/v), not on the block; A/C/D
+# stay on the block as conv_a/conv_c/conv_d.
+@pytest.mark.parametrize("position", ["A", "C", "D"])
 def test_block_creates_only_requested_canon_position(position: str):
     cfg = _config(
         canon_enabled=True,
@@ -310,8 +314,23 @@ def test_block_creates_only_requested_canon_position(position: str):
     block = OplmBlock(cfg, layer_idx=0)
     name = f"conv_{position.lower()}"
     assert isinstance(getattr(block, name), CanonConv)
-    for other in {"A", "B", "C", "D"} - {position}:
+    for other in {"A", "C", "D"} - {position}:
         assert not hasattr(block, f"conv_{other.lower()}")
+    # No block-level conv_b, and attention's Canon-B is off for A/C/D-only configs.
+    assert not hasattr(block, "conv_b")
+    assert not block.attention.canon_b_enabled
+
+
+def test_block_canon_b_lives_on_attention():
+    cfg = _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3])
+    block = OplmBlock(cfg, layer_idx=0)
+    assert not hasattr(block, "conv_b")
+    assert block.attention.canon_b_enabled
+    for name in ("conv_b_q", "conv_b_k", "conv_b_v"):
+        assert isinstance(getattr(block.attention, name), CanonConv)
+    # The block-level positions A/C/D were not requested.
+    for name in ("conv_a", "conv_c", "conv_d"):
+        assert not hasattr(block, name)
 
 
 def test_block_canon_kernel_size_comes_from_layer_idx():

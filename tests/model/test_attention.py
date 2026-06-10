@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from oplm.model.attention import OplmAttention
+from oplm.model.conv import CanonConv
 from oplm.model.norm import OplmLayerNorm, OplmRMSNorm
 
 
@@ -31,9 +32,18 @@ def _config(
     attn_output_gate: str = "none",
     value_residual: str = "none",
     value_residual_lambda_init: float = 0.5,
+    num_hidden_layers: int = 2,
+    canon_enabled: bool = False,
+    canon_positions: list[str] | None = None,
+    canon_kernel_sizes: list[int] | None = None,
+    canon_activation: str = "none",
 ) -> SimpleNamespace:
     head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
     rope_dim = rope_dim if rope_dim is not None else head_dim
+    if canon_positions is None:
+        canon_positions = []
+    if canon_kernel_sizes is None:
+        canon_kernel_sizes = [3] * num_hidden_layers
     return SimpleNamespace(
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
@@ -52,6 +62,11 @@ def _config(
         attn_output_gate=attn_output_gate,
         value_residual=value_residual,
         value_residual_lambda_init=value_residual_lambda_init,
+        num_hidden_layers=num_hidden_layers,
+        canon_enabled=canon_enabled,
+        canon_positions=canon_positions,
+        canon_kernel_sizes=canon_kernel_sizes,
+        canon_activation=canon_activation,
     )
 
 
@@ -617,3 +632,157 @@ def test_value_residual_learnable_receives_gradient():
     assert attn.value_residual_lambda.grad is not None
     assert attn.value_residual_lambda.grad.abs().sum() > 0
     assert x.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# Canon-B — depthwise conv on Q/K/V (Physics of LM 4.1; Primer MDHA)
+# ---------------------------------------------------------------------------
+
+
+def _set_delta_kernel(conv: CanonConv) -> None:
+    """Make a depthwise CanonConv an identity (odd kernel, centered delta tap)."""
+    assert conv.kernel_size % 2 == 1, "delta-identity requires an odd kernel"
+    with torch.no_grad():
+        conv.conv.weight.zero_()
+        conv.conv.weight[:, 0, conv.kernel_size // 2] = 1.0
+
+
+def test_canon_b_modules_created_when_enabled():
+    attn = OplmAttention(
+        _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3]),
+        layer_idx=0,
+    )
+    assert attn.canon_b_enabled
+    for name in ("conv_b_q", "conv_b_k", "conv_b_v"):
+        assert isinstance(getattr(attn, name), CanonConv)
+
+
+def test_canon_b_absent_when_disabled():
+    attn = OplmAttention(_config(), layer_idx=0)
+    assert not attn.canon_b_enabled
+    for name in ("conv_b_q", "conv_b_k", "conv_b_v"):
+        assert not hasattr(attn, name)
+
+
+def test_canon_b_absent_when_other_positions_selected():
+    attn = OplmAttention(
+        _config(canon_enabled=True, canon_positions=["A", "C", "D"], canon_kernel_sizes=[3, 3]),
+        layer_idx=0,
+    )
+    assert not attn.canon_b_enabled
+    for name in ("conv_b_q", "conv_b_k", "conv_b_v"):
+        assert not hasattr(attn, name)
+
+
+def test_canon_b_kernel_size_comes_from_layer_idx():
+    cfg = _config(
+        num_hidden_layers=3,
+        canon_enabled=True,
+        canon_positions=["B"],
+        canon_kernel_sizes=[2, 5, 7],
+    )
+    attn_1 = OplmAttention(cfg, layer_idx=1)
+    attn_2 = OplmAttention(cfg, layer_idx=2)
+    assert attn_1.conv_b_q.kernel_size == 5
+    assert attn_2.conv_b_v.kernel_size == 7
+
+
+def test_canon_b_rejects_unresolved_kernel_sizes():
+    cfg = _config(
+        num_hidden_layers=2,
+        canon_enabled=True,
+        canon_positions=["B"],
+        canon_kernel_sizes=[3],  # length mismatch vs num_hidden_layers
+    )
+    with pytest.raises(ValueError, match="canon_kernel_sizes"):
+        OplmAttention(cfg, layer_idx=0)
+
+
+def test_canon_b_forward_shape_and_grad():
+    torch.manual_seed(0)
+    attn = OplmAttention(
+        _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3]),
+        layer_idx=0,
+    )
+    x = torch.randn(2, 6, 32, requires_grad=True)
+    out, _ = attn(x, _ones_mask(2, 6))
+    assert out.shape == x.shape
+    out.sum().backward()
+    assert x.grad is not None and x.grad.abs().sum() > 0
+    # The conv weights receive gradient (the conv is on the active path).
+    assert attn.conv_b_q.conv.weight.grad is not None
+    assert attn.conv_b_q.conv.weight.grad.abs().sum() > 0
+
+
+def test_canon_b_delta_kernel_matches_no_canon():
+    """A centered-delta conv is an identity, so Canon-B output == no-canon output.
+
+    Proves Canon-B is wired onto the Q/K/V path (not dropped or misordered):
+    with the conv reduced to identity the result is bit-for-bit the plain path.
+    """
+    torch.manual_seed(0)
+    cfg_b = _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3])
+    attn_b = OplmAttention(cfg_b, layer_idx=0).eval()
+    attn_plain = OplmAttention(_config(), layer_idx=0).eval()
+    # Share the projection/norm weights; strict=False skips the conv_b_* keys.
+    attn_b.load_state_dict(attn_plain.state_dict(), strict=False)
+    for conv in (attn_b.conv_b_q, attn_b.conv_b_k, attn_b.conv_b_v):
+        _set_delta_kernel(conv)
+
+    x = torch.randn(2, 7, 32)
+    with torch.no_grad():
+        out_b, _ = attn_b(x, _ones_mask(2, 7))
+        out_plain, _ = attn_plain(x, _ones_mask(2, 7))
+    assert torch.allclose(out_b, out_plain, rtol=1e-5, atol=1e-6)
+
+
+def test_canon_b_nontrivial_kernel_changes_output():
+    """With a real (random) kernel, Canon-B changes the attention output."""
+    torch.manual_seed(0)
+    cfg_b = _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3])
+    attn_b = OplmAttention(cfg_b, layer_idx=0).eval()
+    attn_plain = OplmAttention(_config(), layer_idx=0).eval()
+    attn_b.load_state_dict(attn_plain.state_dict(), strict=False)  # match projections
+
+    x = torch.randn(2, 7, 32)
+    with torch.no_grad():
+        out_b, _ = attn_b(x, _ones_mask(2, 7))
+        out_plain, _ = attn_plain(x, _ones_mask(2, 7))
+    assert not torch.allclose(out_b, out_plain)
+
+
+def test_canon_b_sdpa_and_manual_paths_agree():
+    """Canon-B sits before the attention kernel, so both compute paths agree."""
+    torch.manual_seed(0)
+    attn = OplmAttention(
+        _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3]),
+        layer_idx=0,
+    ).eval()
+    x = torch.randn(2, 8, 32)
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.long)
+    with torch.no_grad():
+        out_sdpa, _ = attn(x, mask, output_attentions=False)
+        out_manual, _ = attn(x, mask, output_attentions=True)
+    assert torch.allclose(out_sdpa, out_manual, rtol=1e-4, atol=1e-5)
+
+
+def test_canon_b_no_pad_leakage_into_real_tokens():
+    """Canon-B zeros pads before the conv, so pad inputs cannot reach real tokens.
+
+    The kernel spans the real/pad boundary; changing only the pad-position inputs
+    must leave the real-token outputs unchanged.
+    """
+    torch.manual_seed(0)
+    attn = OplmAttention(
+        _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3]),
+        layer_idx=0,
+    ).eval()
+    mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.long)
+    real = mask[0].bool()
+    x1 = torch.randn(1, 6, 32)
+    x2 = x1.clone()
+    x2[:, ~real, :] = torch.randn(1, int((~real).sum()), 32)  # perturb only pad rows
+    with torch.no_grad():
+        out1, _ = attn(x1, mask)
+        out2, _ = attn(x2, mask)
+    assert torch.allclose(out1[:, real, :], out2[:, real, :], rtol=1e-5, atol=1e-6)

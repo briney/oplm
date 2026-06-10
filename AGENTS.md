@@ -54,8 +54,8 @@ src/oplm/                      # main package (src layout)
     ├── rope.py                # RoPE / partial RoPE applied to Q and K
     ├── embedding.py           # token embedding + mean / CLS pooling
     ├── ffn.py                 # SwiGLU / GEGLU / squared-ReLU feed-forward + make_ffn factory
-    ├── conv.py                # Canon depthwise 1D convolution
-    ├── attention.py           # attention (SDPA + manual softmax for weights)
+    ├── conv.py                # Canon depthwise 1D convolution (A/C/D in block; B on Q/K/V in attention)
+    ├── attention.py           # attention (SDPA + manual softmax for weights); hosts Canon-B convs on Q/K/V
     ├── transformer.py         # OplmBlock + OplmStack
     ├── configuration_oplm.py  # OplmConfig (PretrainedConfig)
     ├── tokenization_oplm.py   # OplmTokenizerFast (33-token ESM-C-compatible)

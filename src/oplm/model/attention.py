@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .conv import CanonConv
 from .norm import make_norm
 from .rope import RotaryEmbedding
 
@@ -64,6 +65,14 @@ class OplmAttention(nn.Module):
     initialized to `config.value_residual_lambda_init`; under `"fixed"` it is a
     constant buffer. `"none"` (default) adds no parameters and keeps the
     two-element forward return.
+
+    Canon-B (controlled by `config.canon_enabled` + `"B" in
+    config.canon_positions`): the "inside attention" Canon conv of "Physics of
+    Language Models 4.1" (arXiv:2512.17351), equivalent to Primer's multi-DConv-
+    head attention (arXiv:2109.08668). One depthwise `CanonConv` per stream
+    (`conv_b_q`/`conv_b_k`/`conv_b_v`) runs on the projected, normed Q/K/V —
+    after QK/V-norm and before the value residual and RoPE. `"none"` (the
+    default empty `canon_positions`) adds no parameters.
 
     The output projection (`o_proj`) is marked `_is_residual_writer = True` so
     the `OplmPreTrainedModel._init_weights` hook can apply the
@@ -174,6 +183,30 @@ class OplmAttention(nn.Module):
             base=config.rope_theta,
         )
 
+        # Canon-B (Physics of LM 4.1, arXiv:2512.17351): depthwise convs on Q/K/V
+        # after the norms and before RoPE. One CanonConv per stream — equivalent
+        # to a single conv over the concatenated 3*hidden_size channels since the
+        # conv is depthwise (no cross-channel mixing). Constructed here (not in
+        # OplmBlock) because it must see the projected Q/K/V; OplmAttention is
+        # built before OplmBlock's own Canon validation, so the resolved
+        # per-layer kernel-size list is re-checked here too.
+        self.canon_b_enabled = bool(getattr(config, "canon_enabled", False)) and (
+            "B" in set(config.canon_positions or [])
+        )
+        if self.canon_b_enabled:
+            kernel_sizes = config.canon_kernel_sizes
+            if not isinstance(kernel_sizes, list) or len(kernel_sizes) != config.num_hidden_layers:
+                raise ValueError(
+                    "config.canon_kernel_sizes must be a list of length num_hidden_layers; "
+                    "resolve it via resolve_canon_kernel_sizes() before instantiating "
+                    "OplmAttention."
+                )
+            kernel_size = kernel_sizes[layer_idx]
+            activation = getattr(config, "canon_activation", "none")
+            self.conv_b_q = CanonConv(hidden_size, kernel_size, activation=activation)
+            self.conv_b_k = CanonConv(hidden_size, kernel_size, activation=activation)
+            self.conv_b_v = CanonConv(hidden_size, kernel_size, activation=activation)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -218,6 +251,31 @@ class OplmAttention(nn.Module):
 
     def _apply_v_norm(self, v: torch.Tensor) -> torch.Tensor:
         return self.v_norm(v)
+
+    def _apply_canon_b(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply the per-stream Canon-B depthwise conv to Q/K/V.
+
+        Each tensor is `(B, H, T, d_head)`; `CanonConv` operates on a
+        `(B, T, D)` view, so the heads are merged before the conv and split back
+        after. The conv runs along the time axis per channel, which commutes
+        with the head reshape, so this is identical to convolving the flat
+        `(B, T, D)` projection output.
+        """
+        batch, heads, seq_len, head_dim = q.shape
+
+        def conv(t: torch.Tensor, layer: CanonConv) -> torch.Tensor:
+            # (B, H, T, d) -> (B, T, D) -> conv -> (B, H, T, d)
+            merged = t.transpose(1, 2).reshape(batch, seq_len, self.hidden_size)
+            merged = layer(merged, attention_mask)
+            return merged.view(batch, seq_len, heads, head_dim).transpose(1, 2)
+
+        return conv(q, self.conv_b_q), conv(k, self.conv_b_k), conv(v, self.conv_b_v)
 
     def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.rotary.apply_rotary(q, k)
@@ -316,6 +374,11 @@ class OplmAttention(nn.Module):
         q, k, v = self._project_qkv(x)
         q, k = self._qk_norm(q, k)
         v = self._apply_v_norm(v)
+        # Canon-B: depthwise conv on the projected, normed Q/K/V before RoPE.
+        # Applied before the value residual so layer 0 exposes (and later layers
+        # blend toward) the conv'd values.
+        if self.canon_b_enabled:
+            q, k, v = self._apply_canon_b(q, k, v, attention_mask)
         # ResFormer value residual: blend this layer's values toward layer 0's.
         if value_residual is not None:
             lam = self.value_residual_lambda

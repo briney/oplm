@@ -67,7 +67,7 @@ def test_toggle_combination_trains_one_step(combo) -> None:
         norm_type=norm_type,
         norm_strategy=norm_strategy,
         canon_enabled=canon,
-        canon_positions=["A", "C", "D"] if canon else None,
+        canon_positions=["A", "B", "C", "D"] if canon else None,
         rope_dim=rope_dim,
         nope_dim=_HEAD_DIM - rope_dim,
         qk_norm=qk_norm,

@@ -149,7 +149,7 @@ from `configs/model/base.yaml`.
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
 | `model.canon_enabled` | `bool` | `false` | Master switch for Canon conv sublayers. |
-| `model.canon_positions` | `list[str]` | `[]` | Subset of `{A, B, C, D}`; required and non-empty when `canon_enabled=true`. |
+| `model.canon_positions` | `list[str]` | `[]` | Subset of `{A, B, C, D}`; required and non-empty when `canon_enabled=true`. A/C/D convolve the `(B,T,D)` residual/MLP streams in the block; **B** is the "inside attention" conv on Q/K/V (after QK/V-norm, before the value residual and RoPE), living on `OplmAttention`. |
 | `model.canon_kernel_sizes` | `int \| list[int] \| dict` | `4` | `int` broadcasts to every layer; a `list[int]` must have length `num_hidden_layers`; a `dict` uses `schedule: linear` (`min`, `max`) or `schedule: constant` (`value`). All entries must be `≥ 2`. |
 | `model.canon_activation` | `str` | `none` | `none`, `silu`, or `gelu`. |
 

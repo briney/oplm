@@ -201,8 +201,8 @@ class OplmBlock(nn.Module):
             activation = getattr(config, "canon_activation", "none")
             if "A" in positions:
                 self.conv_a = CanonConv(config.hidden_size, kernel_size, activation=activation)
-            if "B" in positions:
-                self.conv_b = CanonConv(config.hidden_size, kernel_size, activation=activation)
+            # Canon-B lives inside OplmAttention (it convolves the projected
+            # Q/K/V); it is instantiated there, not here.
             if "C" in positions:
                 self.conv_c = CanonConv(config.hidden_size, kernel_size, activation=activation)
             if "D" in positions:
@@ -236,9 +236,8 @@ class OplmBlock(nn.Module):
 
         # Attention sublayer. Hybrid feeds raw `x` (QKV-norm lives inside the
         # attention module); every other strategy applies the outer pre-norm.
+        # Canon-B (the conv on Q/K/V) is applied inside the attention module.
         a_in = x if self.norm_strategy == "hybrid" else self.attn_norm(x)
-        if hasattr(self, "conv_b"):
-            a_in = self.conv_b(a_in, attention_mask)
 
         attn_result = self.attention(
             a_in, attention_mask, output_attentions, value_residual=value_residual
