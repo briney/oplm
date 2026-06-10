@@ -9,7 +9,7 @@ This is the *how-to*. Related references:
 - [CONFIG.md](CONFIG.md) — every `model.*` / `train.*` / `data.*` field.
 - [EVAL_HARNESS.md](EVAL_HARNESS.md) — evaluation during training.
 - [DATA_TOOLING.md](DATA_TOOLING.md) — dataset formats and the masking scheme.
-- [TRAINER.md](TRAINER.md) — the trainer's internal design.
+- [OVERVIEW.md](OVERVIEW.md) — Part IV documents the trainer's internal design.
 - [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md) — the model itself.
 
 > Training builds a **fresh, randomly initialized** `OplmForMaskedLM` from
@@ -70,7 +70,7 @@ scheme and [CONFIG.md](CONFIG.md#data-fields-data) for the masking knobs
 The smallest useful run — a size preset, one parquet file, and a few overrides:
 
 ```bash
-oplm train --preset small \
+oplm train --preset 50M \
   data.train=/data/train.parquet \
   train.max_steps=10_000 \
   train.wandb_enabled=false
@@ -206,7 +206,8 @@ The trainer is a custom loop built on Accelerate (not the HuggingFace
 
 Mixed precision is set by `train.mixed_precision` (`bf16` default, `fp16`, or
 `no`). Activation checkpointing is enabled when `model.gradient_checkpointing`
-is true (preset `large` and `xlarge` set it). `model.gradient_checkpointing_mode`
+is true (the `1B`+ preset recipes carry a commented-out block you can enable).
+`model.gradient_checkpointing_mode`
 picks the memory/compute tradeoff: `full` (default) recomputes the entire block
 on backward for maximum memory savings (~+30% compute), while `selective` keeps
 matmul/SDPA outputs resident and recomputes only cheap ops — less memory savings
@@ -221,7 +222,7 @@ case and sets `torch._dynamo.config.optimize_ddp = False` automatically before
 compiling; `full`/`none` are left untouched so they keep DDP comm/compute
 overlap. The only cost is that lost overlap — a few ms of allreduce on a ~500 ms
 step over NVLink, negligible next to the recompute SAC saves back. For internals,
-see [TRAINER.md](TRAINER.md).
+see [OVERVIEW.md](OVERVIEW.md) Part IV.
 
 ---
 
@@ -406,5 +407,5 @@ torchrun --nproc_per_node=8 -m oplm.train --config my_run.yaml train.compile=tru
 - [CONFIG.md](CONFIG.md) — full configuration reference.
 - [EVAL_HARNESS.md](EVAL_HARNESS.md) — evaluation tasks and metrics.
 - [DATA_TOOLING.md](DATA_TOOLING.md) — data formats and masking.
-- [TRAINER.md](TRAINER.md) — trainer internals and design rationale.
+- [OVERVIEW.md](OVERVIEW.md) — Part IV: trainer internals and design rationale.
 - [README](../README.md) — installation and inference.

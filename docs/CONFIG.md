@@ -20,17 +20,20 @@ A run config has three top-level blocks, each mapping to a different object:
 Only the `model.*` block travels with a saved model. `train.*` and `data.*`
 describe a *run* and are not part of a published checkpoint.
 
-> **Unknown `model.*` keys are silently absorbed.** `PretrainedConfig` accepts
-> arbitrary `**kwargs`, so a misspelled `model.*` key (e.g. `model.hidden_dimm`)
-> is retained without error. Double-check model overrides. `train.*` and
-> `data.*`, by contrast, are validated against their dataclasses.
+> **Unknown `model.*` keys are rejected.** `load_config()` validates `model.*`
+> keys against the `OplmConfig` constructor signature (plus the HuggingFace
+> metadata keys a serialized config carries), so a misspelled key such as
+> `model.hidden_dimm` or `model.cannon_enabled` raises at load time rather than
+> being silently retained. `train.*` and `data.*` are likewise validated against
+> their dataclasses. (`OplmConfig.from_pretrained()` stays permissive so saved
+> checkpoints with extra metadata still load.)
 
 ## Merge order
 
 Config sources are merged in this order; later sources win:
 
 1. In-package defaults — `src/oplm/configs/{model,train,data}/base.yaml`
-2. Optional size preset — `--preset {small,medium,base,large,xlarge}`
+2. Optional size preset — `--preset {50M,170M,400M,800M,1B,3B,6B,12B}`
 3. Optional YAML file — `--config path.yaml`
 4. Dotlist overrides — e.g. `model.num_hidden_layers=24 train.lr=3e-4`
 
@@ -47,11 +50,11 @@ Notes:
 
 ```bash
 # bare key=value positional overrides (train, info)
-oplm train --preset base \
+oplm train --preset 170M \
   train.max_steps=100_000 \
   data.train=/data/train.parquet
 
-oplm info --preset large model.num_hidden_layers=40
+oplm info --preset 1B model.num_hidden_layers=40
 
 # encode keeps --override, since its positional slot holds the sequences
 oplm encode SEQ1 SEQ2 --model outputs/base-run/checkpoint-10000 \
@@ -70,15 +73,20 @@ Flags: `--preset/-p` (size preset), `--config/-c` (YAML file), `--name/-n`
 `--preset <name>` loads `src/oplm/configs/model/presets/<name>.yaml`, which sets
 only the core dimensions; everything else inherits the defaults below.
 
-| Preset   | Parameters | Layers | Hidden | Heads | Head dim |
-|----------|-----------:|-------:|-------:|------:|---------:|
-| `small`  |       5.2M |      6 |    256 |     4 |       64 |
-| `medium` |      85.6M |     12 |    768 |    12 |       64 |
-| `base`   |     309.5M |     24 |   1024 |    16 |       64 |
-| `large`  |       2.5B |     32 |   2560 |    32 |       80 |
-| `xlarge` |      12.7B |     40 |   5120 |    40 |      128 |
+| Preset  | Parameters | Layers | Hidden | Heads | Head dim |
+|---------|-----------:|-------:|-------:|------:|---------:|
+| `50M`   |      ~50M   |     16 |    512 |     8 |       64 |
+| `170M`  |     ~170M   |     24 |    768 |    12 |       64 |
+| `400M`  |     ~400M   |     32 |   1024 |    16 |       64 |
+| `800M`  |     ~800M   |     40 |   1280 |    16 |       80 |
+| `1B`    |     ~1.6B   |     50 |   1600 |    25 |       64 |
+| `3B`    |     ~3.3B   |     64 |   2048 |    32 |       64 |
+| `6B`    |       ~6B   |     80 |   2560 |    40 |       64 |
+| `12B`   |     ~12.5B  |    100 |   3200 |    50 |       64 |
 
-`large` and `xlarge` also enable `model.gradient_checkpointing`. Run
+The recipes set only the core dimensions. The `1B`/`3B`/`6B`/`12B` YAMLs also
+carry a commented-out `gradient_checkpointing` block you can uncomment for the
+larger sizes; no preset enables it automatically. Run
 `oplm info --preset <name>` to print the resolved architecture and exact
 parameter count.
 

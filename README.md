@@ -63,7 +63,7 @@ and attaches the matching tokenizer, so `.logits()` takes raw sequences directly
 import torch
 from oplm import OplmForMaskedLM, LogitsConfig
 
-model = OplmForMaskedLM.from_pretrained("brineylab/oplm-base").eval()
+model = OplmForMaskedLM.from_pretrained("brineylab/oplm-170M").eval()
 
 sequences = [
     "MSHHWGYGKHNGPEHWHKDFPIAKGERQSPVDIDTHTAKYDPSLKPLSVSYDQATSLRIL",
@@ -93,7 +93,7 @@ import torch
 from oplm import OplmModel
 from oplm.model import mean_pool
 
-model = OplmModel.from_pretrained("brineylab/oplm-base").eval()
+model = OplmModel.from_pretrained("brineylab/oplm-170M").eval()
 
 batch = model.tokenize(sequences)            # BatchEncoding on the model's device
 with torch.no_grad():
@@ -117,8 +117,8 @@ so the standard `Auto*` classes work too:
 import oplm  # registers OPLM with transformers' Auto* classes
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("brineylab/oplm-base")
-model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-base").eval()
+tokenizer = AutoTokenizer.from_pretrained("brineylab/oplm-170M")
+model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-170M").eval()
 
 batch = tokenizer(sequences, return_tensors="pt", padding=True)
 with torch.no_grad():
@@ -132,7 +132,7 @@ Each model repo also bundles its modeling code, so consumers who don't have
 `oplm` installed can load it with `trust_remote_code=True`:
 
 ```python
-model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-base", trust_remote_code=True)
+model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-170M", trust_remote_code=True)
 ```
 
 ### Coming from ESM-C?
@@ -152,18 +152,23 @@ live in `output.sequence_logits`.
 
 ---
 
-## Pretrained models
+## Model sizes
 
-Checkpoints are published on the HuggingFace Hub under the `brineylab` org and
-selectable on the command line via `--preset`.
+OPLM ships eight size presets, selected on the command line with
+`--preset <name>`. A preset is an **architecture recipe** (it sets the core
+dimensions only); it does not download weights. To load pretrained weights, pass
+a Hub id or a local checkpoint directory to `--model` (see below).
 
-| Preset / Hub id          | Parameters | Layers | Hidden | Heads |
-|--------------------------|-----------:|-------:|-------:|------:|
-| `brineylab/oplm-small`   |       5.2M |      6 |    256 |     4 |
-| `brineylab/oplm-medium`  |      85.6M |     12 |    768 |    12 |
-| `brineylab/oplm-base`    |     309.5M |     24 |   1024 |    16 |
-| `brineylab/oplm-large`   |       2.5B |     32 |   2560 |    32 |
-| `brineylab/oplm-xlarge`  |      12.7B |     40 |   5120 |    40 |
+| Preset | Parameters | Layers | Hidden | Heads |
+|--------|-----------:|-------:|-------:|------:|
+| `50M`  |     ~50M    |     16 |    512 |     8 |
+| `170M` |    ~170M    |     24 |    768 |    12 |
+| `400M` |    ~400M    |     32 |   1024 |    16 |
+| `800M` |    ~800M    |     40 |   1280 |    16 |
+| `1B`   |    ~1.6B    |     50 |   1600 |    25 |
+| `3B`   |    ~3.3B    |     64 |   2048 |    32 |
+| `6B`   |      ~6B    |     80 |   2560 |    40 |
+| `12B`  |    ~12.5B   |    100 |   3200 |    50 |
 
 All sizes share the 33-token tokenizer and a 1024-position context window.
 
@@ -177,7 +182,7 @@ All sizes share the 33-token tokenizer and a 1024-position context window.
 
 ```bash
 oplm encode MKWVTFISLLLLFSSAYS MLPGLALLLLAAWTARA \
-  --model brineylab/oplm-base \
+  --model brineylab/oplm-170M \
   --output embeddings.pt
 ```
 
@@ -188,15 +193,15 @@ checkpoint directory. The saved tensor holds the per-residue embeddings,
 ### Inspect a model
 
 ```bash
-oplm info --preset base
+oplm info --preset 400M
 ```
 
 ```
 ──────────────── OPLM Model Info ────────────────
                 Architecture
- Parameters        309.5M (309,507,105)
+ Parameters        412.3M (412,302,369)
  Hidden size       1024
- Layers            24
+ Layers            32
  Attention heads   16
  Head dim          64
  Intermediate size 2816
@@ -213,7 +218,7 @@ checkpointing, optional Muon optimizer) over parquet sequence datasets, with a
 built-in eval harness for MLM metrics and structure-based contact prediction.
 
 ```bash
-oplm train --preset base --config configs/my_run.yaml
+oplm train --preset 400M --config configs/my_run.yaml
 ```
 
 See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide.
