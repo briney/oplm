@@ -4,8 +4,7 @@ These tests go beyond module-existence and shape checks (covered in
 ``test_conv.py`` / ``test_attention.py`` / ``test_transformer.py``): they prove
 that each Canon position acts on the intended tensor stream, at the intended
 point in the block dataflow, with the intended residual semantics, and that the
-bidirectional convolution window has the pinned centered alignment. See
-TECHNICAL_ANALYSIS.md Finding 7 / Phase 3.
+bidirectional convolution window has the pinned centered alignment.
 
 Test categories:
 

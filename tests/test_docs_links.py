@@ -1,10 +1,10 @@
 """Link check for repository markdown docs.
 
-Guards against the silent-doc-rot failure mode from TECHNICAL_ANALYSIS.md
-Finding 8: a doc referencing a file that does not exist (e.g. the
-``EVAL_HARNESS.md`` / ``DATA_TOOLING.md`` / ``TESTING_E2E.md`` links that were
-dangling before Phase 4). Every relative markdown link to a repo path must
-resolve to an existing file or directory.
+Guards against the silent-doc-rot failure mode where a doc references a file
+that does not exist (e.g. the ``EVAL_HARNESS.md`` / ``DATA_TOOLING.md`` /
+``TESTING_E2E.md`` links that were dangling before they were written). Every
+relative markdown link to a repo path must resolve to an existing file or
+directory.
 
 External links (``http(s)://``, ``mailto:``), pure in-page anchors (``#frag``),
 and links inside fenced code blocks are ignored — only on-disk repo links are

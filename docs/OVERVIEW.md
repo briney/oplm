@@ -317,8 +317,8 @@ normed) is always on by default and orthogonal to `norm_strategy`; disable with
 
 When `canon_enabled=True`, depthwise 1D convs are inserted at any of four labeled
 positions (Canon paper, arXiv 2512.17351). The paper-exact encoder contract is
-specified in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). Phase 2 of
-`TECHNICAL_ANALYSIS.md` replaces the older Canon-inspired wiring in place rather
+specified in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). The paper-exact
+encoder implementation replaced the older Canon-inspired wiring in place rather
 than retaining it as a separate legacy mode. Canon is supported under
 `norm_strategy` in `{pre, sandwich, post_sdpa}` (all have an outer attention
 pre-norm; their post-norms are downstream of the Canon insertion points). It is

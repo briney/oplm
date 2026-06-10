@@ -1,16 +1,15 @@
 # OPLM Model Architecture
 
 This document is the source of truth for model semantics that are not obvious
-from tensor shapes alone. `TECHNICAL_ANALYSIS.md` should be treated as the audit
-trail; this file carries the intended architecture contract.
+from tensor shapes alone; it carries the intended architecture contract.
 
 ## Canon Semantics
 
 Canon is controlled by `canon_enabled`, `canon_positions`,
 `canon_kernel_sizes`, `canon_activation`, and `canon_residual`. There is no
-legacy Canon mode: Phase 2 of `TECHNICAL_ANALYSIS.md` replaces the current
-Canon-inspired tensor paths with the paper-exact encoder implementation rather
-than retaining old behavior behind a compatibility switch.
+legacy Canon mode: the paper-exact encoder implementation replaced the earlier
+Canon-inspired tensor paths in place, rather than retaining old behavior behind a
+compatibility switch.
 
 The intended encoder target keeps the Canon paper's layer insertion semantics
 and adapts only the local convolution window for an encoder MLM. Canon is
