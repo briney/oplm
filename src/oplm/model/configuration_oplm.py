@@ -29,6 +29,7 @@ _VALID_QK_NORM_MODES = ("channel", "l2")
 _VALID_RESIDUAL_SCALINGS = ("sqrt_num_layers", "none")
 _VALID_RESIDUAL_GATES = ("none", "scalar", "channel")
 _VALID_ATTN_OUTPUT_GATES = ("none", "sigmoid", "silu")
+_VALID_VALUE_RESIDUALS = ("none", "fixed", "learnable")
 _VALID_FFN_ACTIVATIONS = ("swiglu", "geglu", "relu2")
 _VALID_MLM_HEAD_ACTIVATIONS = ("gelu", "silu", "relu")
 _VALID_CANON_ACTIVATIONS = ("none", "silu", "gelu")
@@ -75,6 +76,8 @@ class OplmConfig(PretrainedConfig):
         residual_gate: str = "none",
         residual_gate_init: float = 1.0,
         attn_output_gate: str = "none",
+        value_residual: str = "none",
+        value_residual_lambda_init: float = 0.5,
         init_scale_output_projections: bool = True,
         ffn_activation: str = "swiglu",
         ffn_bias: bool = False,
@@ -127,6 +130,8 @@ class OplmConfig(PretrainedConfig):
         self.residual_gate = residual_gate
         self.residual_gate_init = float(residual_gate_init)
         self.attn_output_gate = attn_output_gate
+        self.value_residual = value_residual
+        self.value_residual_lambda_init = float(value_residual_lambda_init)
         self.init_scale_output_projections = bool(init_scale_output_projections)
         self.ffn_activation = ffn_activation
         self.ffn_bias = bool(ffn_bias)
@@ -263,6 +268,15 @@ class OplmConfig(PretrainedConfig):
             raise ValueError(
                 f"attn_output_gate must be one of {_VALID_ATTN_OUTPUT_GATES}; "
                 f"got {self.attn_output_gate!r}."
+            )
+        if self.value_residual not in _VALID_VALUE_RESIDUALS:
+            raise ValueError(
+                f"value_residual must be one of {_VALID_VALUE_RESIDUALS}; "
+                f"got {self.value_residual!r}."
+            )
+        if not math.isfinite(self.value_residual_lambda_init):
+            raise ValueError(
+                f"value_residual_lambda_init must be finite; got {self.value_residual_lambda_init}."
             )
         if self.ffn_activation not in _VALID_FFN_ACTIVATIONS:
             raise ValueError(

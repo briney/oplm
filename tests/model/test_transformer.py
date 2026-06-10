@@ -40,6 +40,8 @@ def _config(
     residual_gate: str = "none",
     residual_gate_init: float = 1.0,
     gradient_checkpointing: bool = False,
+    value_residual: str = "none",
+    value_residual_lambda_init: float = 0.5,
     canon_enabled: bool = False,
     canon_positions: list[str] | None = None,
     canon_kernel_sizes: list[int] | None = None,
@@ -77,6 +79,8 @@ def _config(
         residual_gate=residual_gate,
         residual_gate_init=residual_gate_init,
         gradient_checkpointing=gradient_checkpointing,
+        value_residual=value_residual,
+        value_residual_lambda_init=value_residual_lambda_init,
         canon_enabled=canon_enabled,
         canon_positions=canon_positions,
         canon_kernel_sizes=canon_kernel_sizes,
@@ -626,6 +630,79 @@ def test_stack_gradient_checkpoint_matches_plain_forward():
     stack.set_gradient_checkpointing(True)
     out_ckpt, _, _ = stack(input_ids)
 
+    assert torch.allclose(out_plain, out_ckpt, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# OplmStack — value residual (ResFormer, arXiv:2410.17897)
+# ---------------------------------------------------------------------------
+
+
+def test_stack_value_residual_lambda_count():
+    """Learnable mode adds exactly one lambda per layer after the first."""
+    cfg = _config(num_hidden_layers=4, value_residual="learnable")
+    stack = OplmStack(cfg)
+    lam_names = [n for n, _ in stack.named_parameters() if "value_residual_lambda" in n]
+    assert len(lam_names) == cfg.num_hidden_layers - 1
+    assert not any(n.startswith("layers.0.") for n in lam_names)
+
+
+def test_stack_value_residual_fixed_lambda_one_matches_disabled():
+    """Fixed lambda = 1.0 is a no-op blend: outputs match the disabled model."""
+    torch.manual_seed(0)
+    base = OplmStack(_config(num_hidden_layers=3)).eval()
+    torch.manual_seed(0)
+    blended = OplmStack(
+        _config(num_hidden_layers=3, value_residual="fixed", value_residual_lambda_init=1.0)
+    ).eval()
+
+    input_ids = torch.randint(0, 33, (2, 6))
+    with torch.no_grad():
+        out_base, _, _ = base(input_ids)
+        out_blended, _, _ = blended(input_ids)
+    assert torch.allclose(out_base, out_blended, atol=1e-6)
+
+
+def test_stack_value_residual_changes_output():
+    """Fixed lambda < 1 actually changes the stack output vs disabled."""
+    torch.manual_seed(0)
+    base = OplmStack(_config(num_hidden_layers=3)).eval()
+    torch.manual_seed(0)
+    blended = OplmStack(
+        _config(num_hidden_layers=3, value_residual="fixed", value_residual_lambda_init=0.5)
+    ).eval()
+
+    input_ids = torch.randint(0, 33, (2, 6))
+    with torch.no_grad():
+        out_base, _, _ = base(input_ids)
+        out_blended, _, _ = blended(input_ids)
+    assert not torch.allclose(out_base, out_blended)
+
+
+def test_block_value_residual_threads_through_checkpointing():
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2, value_residual="learnable", gradient_checkpointing=True)
+    stack = OplmStack(cfg).train()
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 5))
+
+    out, _, _ = stack(input_ids)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    lam = stack.layers[1].attention.value_residual_lambda
+    assert lam.grad is not None
+    assert lam.grad.abs().sum() > 0
+
+
+def test_stack_value_residual_checkpoint_matches_plain_forward():
+    torch.manual_seed(0)
+    cfg = _config(num_hidden_layers=2, value_residual="learnable")
+    stack = OplmStack(cfg).train()
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 5))
+
+    stack.set_gradient_checkpointing(False)
+    out_plain, _, _ = stack(input_ids)
+    stack.set_gradient_checkpointing(True)
+    out_ckpt, _, _ = stack(input_ids)
     assert torch.allclose(out_plain, out_ckpt, atol=1e-5)
 
 

@@ -38,6 +38,8 @@ def test_defaults_match_architecture_spec():
     assert cfg.residual_gate == "none"
     assert cfg.residual_gate_init == 1.0
     assert cfg.attn_output_gate == "none"
+    assert cfg.value_residual == "none"
+    assert cfg.value_residual_lambda_init == 0.5
     assert cfg.init_scale_output_projections is True
     assert cfg.ffn_activation == "swiglu"
     assert cfg.ffn_bias is False
@@ -155,6 +157,7 @@ def test_rejects_negative_rope_dim():
         ("residual_scaling", "linear", "residual_scaling must be one of"),
         ("residual_gate", "vector", "residual_gate must be one of"),
         ("attn_output_gate", "tanh", "attn_output_gate must be one of"),
+        ("value_residual", "blend", "value_residual must be one of"),
         ("ffn_activation", "relu", "ffn_activation must be one of"),
         ("mlm_head_activation", "swiglu", "mlm_head_activation must be one of"),
         ("canon_activation", "tanh", "canon_activation must be one of"),
@@ -207,6 +210,18 @@ def test_rejects_non_finite_residual_gate_init(value):
 def test_accepts_valid_residual_gate_modes(gate):
     cfg = OplmConfig(residual_gate=gate)
     assert cfg.residual_gate == gate
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_rejects_non_finite_value_residual_lambda_init(value):
+    with pytest.raises(ValueError, match="value_residual_lambda_init must be finite"):
+        OplmConfig(value_residual_lambda_init=value)
+
+
+@pytest.mark.parametrize("mode", ["none", "fixed", "learnable"])
+def test_accepts_valid_value_residual_modes(mode):
+    cfg = OplmConfig(value_residual=mode)
+    assert cfg.value_residual == mode
 
 
 def test_canon_enabled_requires_non_empty_positions():

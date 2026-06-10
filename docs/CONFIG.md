@@ -124,6 +124,8 @@ from `configs/model/base.yaml`.
 | `model.residual_gate` | `str` | `none` | Learnable multiplicative gate refining each residual write on top of `residual_scaling`: `none` (no new params), `scalar` (one param per attention/FFN write), or `channel` (`(hidden_size,)` param per write). |
 | `model.residual_gate_init` | `float` | `1.0` | Initial value for residual gate parameters. Must be finite. |
 | `model.attn_output_gate` | `str` | `none` | Post-SDPA attention output gate (arXiv:2505.06708, G1): `none` (no new params), `sigmoid`, or `silu`. Adds a bias-free `(hidden_size, hidden_size)` `gate_proj` per layer; the merged attention output is multiplied elementwise by `act(gate_proj(x))` before `o_proj`. |
+| `model.value_residual` | `str` | `none` | ResFormer value residual (arXiv:2410.17897): `none` (no new params), `fixed` (constant λ buffer, no new params), or `learnable` (one scalar λ per layer after the first). Layer 0 exposes its post-V-norm values `v₁`; every later layer blends `v' = λ·v + (1 − λ)·v₁` right after the V projection. |
+| `model.value_residual_lambda_init` | `float` | `0.5` | Constant λ under `fixed`; initial value of the learnable λ under `learnable`. Must be finite. Inert when `value_residual=none`. |
 | `model.init_scale_output_projections` | `bool` | `true` | Shrink residual-writing projections by `1/√(2L)` at init. |
 
 ### Feed-forward and dropout
@@ -189,10 +191,11 @@ Config construction raises `ValueError` if any of these fail:
 - `head_dim · num_attention_heads == hidden_size`
 - `rope_dim + nope_dim == head_dim`, both `≥ 0`, and `rope_dim` even
 - enum fields (`norm_type`, `norm_strategy`, `qk_norm_mode`, `residual_scaling`,
-  `residual_gate`, `attn_output_gate`, `ffn_activation`, `mlm_head_activation`,
-  `canon_activation`, `classifier_pool`) hold a valid value
+  `residual_gate`, `attn_output_gate`, `value_residual`, `ffn_activation`,
+  `mlm_head_activation`, `canon_activation`, `classifier_pool`) hold a valid value
 - `0 ≤ mask_dropout_reference_ratio < 1`
-- `qk_norm_l2_scale_init`, when set, is positive; `residual_gate_init` is finite
+- `qk_norm_l2_scale_init`, when set, is positive; `residual_gate_init` and
+  `value_residual_lambda_init` are finite
 - when `canon_enabled`, `canon_positions` is a non-empty, duplicate-free subset
   of `{A, B, C, D}`
 
