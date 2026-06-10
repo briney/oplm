@@ -31,7 +31,7 @@ model:
   init_scale_output_projections: true
 
   # Feed-forward
-  ffn_activation: swiglu # swiglu | geglu (both gated, 3 projections)
+  ffn_activation: swiglu # swiglu | geglu (gated, 3 proj) | relu2 (non-gated squared-ReLU, 2 proj)
   ffn_bias: false
 
   # Dropout

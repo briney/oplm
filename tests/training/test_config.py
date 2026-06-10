@@ -128,6 +128,7 @@ def test_ablation_toggle_cli_overrides_apply() -> None:
             "model.mask_dropout=true",
             "model.residual_gate=channel",
             "model.residual_gate_init=0.5",
+            "model.ffn_activation=relu2",
         ]
     )
     assert cfg.model.qk_norm_mode == "l2"
@@ -135,6 +136,7 @@ def test_ablation_toggle_cli_overrides_apply() -> None:
     assert cfg.model.mask_dropout is True
     assert cfg.model.residual_gate == "channel"
     assert cfg.model.residual_gate_init == 0.5
+    assert cfg.model.ffn_activation == "relu2"
 
 
 def test_ablation_toggle_defaults_preserve_current_behavior() -> None:
@@ -154,6 +156,16 @@ def test_derived_fields_resolve_when_omitted() -> None:
     assert cfg.model.head_dim == 64  # 256 / 4
     assert cfg.model.intermediate_size > 0
     assert cfg.model.intermediate_size % 256 == 0  # rounded to a tensor-core multiple
+
+
+def test_relu2_intermediate_size_derives_iso_param() -> None:
+    """relu2 (2 projections) derives ~4*D so FFN params match the gated ~8/3*D variants."""
+    gated = load_config(["model.hidden_size=768"])
+    assert gated.model.intermediate_size == 2048  # round_up(8/3 * 768, 256)
+    relu2 = load_config(["model.hidden_size=768", "model.ffn_activation=relu2"])
+    assert relu2.model.intermediate_size == 3072  # round_up(4 * 768, 256)
+    # Iso-param: 2 projections * 3072 == 3 projections * 2048.
+    assert 2 * relu2.model.intermediate_size == 3 * gated.model.intermediate_size
 
 
 def test_unknown_model_key_is_absorbed_not_raised() -> None:

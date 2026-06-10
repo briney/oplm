@@ -37,3 +37,12 @@ def test_wider_hidden_increases_estimate() -> None:
     assert estimate_flops_per_token(_config(hidden_size=512)) > estimate_flops_per_token(
         _config(hidden_size=256)
     )
+
+
+def test_relu2_counts_two_ffn_projections() -> None:
+    """At a pinned ``intermediate_size``, relu2 (2 proj) saves exactly one FFN matmul vs gated."""
+    gated = estimate_flops_per_token(_config(intermediate_size=1024))
+    relu2 = estimate_flops_per_token(_config(intermediate_size=1024, ffn_activation="relu2"))
+    # One fewer h x intermediate projection per layer, fwd+bwd (3x) included.
+    per_layer_proj = 2 * 256 * 1024
+    assert gated - relu2 == 3 * 6 * per_layer_proj

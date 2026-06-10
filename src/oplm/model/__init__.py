@@ -26,7 +26,7 @@ from .attention import OplmAttention
 from .configuration_oplm import OplmConfig
 from .conv import CanonConv, resolve_canon_kernel_sizes
 from .embedding import OplmEmbedding, cls_pool, mean_pool
-from .ffn import GEGLU, SwiGLU, make_ffn, round_up_to
+from .ffn import GEGLU, SquaredReLU, SwiGLU, make_ffn, round_up_to
 from .modeling_oplm import (
     EsmcCompatMixin,
     OplmForMaskedLM,
@@ -58,6 +58,7 @@ __all__ = [
     "OplmPreTrainedModel",
     "OplmStack",
     "OplmTokenizerFast",
+    "SquaredReLU",
     "SwiGLU",
     "cls_pool",
     "make_ffn",

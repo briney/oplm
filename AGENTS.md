@@ -53,7 +53,7 @@ src/oplm/                      # main package (src layout)
     ├── masking.py             # pad-mask helpers, conv-input zeroing
     ├── rope.py                # RoPE / partial RoPE applied to Q and K
     ├── embedding.py           # token embedding + mean / CLS pooling
-    ├── ffn.py                 # SwiGLU feed-forward + make_ffn factory
+    ├── ffn.py                 # SwiGLU / GEGLU / squared-ReLU feed-forward + make_ffn factory
     ├── conv.py                # Canon depthwise 1D convolution
     ├── attention.py           # attention (SDPA + manual softmax for weights)
     ├── transformer.py         # OplmBlock + OplmStack

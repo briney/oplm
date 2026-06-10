@@ -473,7 +473,10 @@ linears, no bias by default (`ffn_bias=False`). Hidden dim `F = round_up(8/3·D,
 256)` (≈ 8/3 multiplier, rounded up to a multiple of 256 for matmul-friendly
 shapes); set `intermediate_size` explicitly to override. `geglu` is an alternative
 gated variant — `y = W_d(gelu(W_g(x)) * W_u(x))`, same 3 projections and `ffn_bias`
-handling, differing only in the GELU gate nonlinearity. Params per FFN: `3·D·F`. The
+handling, differing only in the GELU gate nonlinearity. Params per FFN: `3·D·F` for
+the gated variants. `relu2` is a non-gated Primer-style variant (arXiv 2109.08668) —
+`y = W_d(relu(W_u(x))²)`, two projections (`2·D·F` params); its derived hidden dim is
+`F = round_up(4·D, 256)` so total FFN params (~`8·D²`) match the gated variants. The
 `ffn_activation` enum is the single extension point — new activations add an enum
 value + a small class; the block is untouched.
 
@@ -599,7 +602,7 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `residual_gate_init` | `1.0` | init for gate params; finite |
 | `attn_output_gate` | `none` | post-SDPA elementwise output gate: `none`/`sigmoid`/`silu`; adds a `(D,D)` `gate_proj` per layer |
 | `init_scale_output_projections` | `True` | divide init std of `W_o`,`W_d` by `sqrt(2L)` (GPT-2 style) |
-| `ffn_activation` | `swiglu` | / `geglu` (both gated, 3 projections) |
+| `ffn_activation` | `swiglu` | / `geglu` (gated, 3 proj) / `relu2` (non-gated squared-ReLU, 2 proj; derives `F≈4·D`) |
 | `ffn_bias` | `False` | |
 | `attention_dropout` | 0.0 | any >0 forces fallback path |
 | `hidden_dropout` | 0.0 | after attn/FFN output projections |

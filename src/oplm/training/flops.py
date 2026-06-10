@@ -22,8 +22,10 @@ def estimate_flops_per_token(config: OplmModelConfig) -> int:
 
     # Attention projections: Q, K, V, O each h -> h  => 2 * h * (4h)
     attn_proj_flops = 2 * h * (4 * h)
-    # Gated FFN (swiglu/geglu): 3 projections of size h * intermediate
-    ffn_flops = 3 * 2 * h * intermediate
+    # Gated FFN (swiglu/geglu) has 3 projections of size h * intermediate;
+    # non-gated relu2 has 2.
+    num_ffn_proj = 2 if config.ffn_activation == "relu2" else 3
+    ffn_flops = num_ffn_proj * 2 * h * intermediate
 
     per_layer = attn_proj_flops + ffn_flops
     backbone_flops = num_hidden_layers * per_layer

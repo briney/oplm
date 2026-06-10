@@ -130,7 +130,7 @@ from `configs/model/base.yaml`.
 
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
-| `model.ffn_activation` | `str` | `swiglu` | `swiglu` or `geglu` (both gated, 3 projections). |
+| `model.ffn_activation` | `str` | `swiglu` | `swiglu` / `geglu` (gated, 3 projections) or `relu2` (non-gated squared-ReLU, 2 projections; derived `intermediate_size` uses ~4·D instead of ~8/3·D for param parity). |
 | `model.ffn_bias` | `bool` | `false` | Bias terms on FFN projections. |
 | `model.attention_dropout` | `float` | `0.0` | Dropout on attention probabilities. |
 | `model.hidden_dropout` | `float` | `0.0` | Dropout on hidden states. |

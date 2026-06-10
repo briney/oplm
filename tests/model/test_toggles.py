@@ -93,23 +93,25 @@ def test_toggle_combination_trains_one_step(combo) -> None:
 
 # ---------------------------------------------------------------------------
 # Ablation-feature integration (Phases 2-5 + gated attention): mask dropout +
-# L2 QKNorm + residual gates + GEGLU + attention output gate + sandwich norm
-# exercised together, plus optimizer partitioning of the new params. Kept to a
-# few representative combos rather than folded into the matrix above (which
-# would multiply its size).
+# L2 QKNorm + residual gates + FFN variants (GEGLU / squared-ReLU) + attention
+# output gate + sandwich norm exercised together, plus optimizer partitioning
+# of the new params. Kept to a few representative combos rather than folded
+# into the matrix above (which would multiply its size).
 # ---------------------------------------------------------------------------
 
 _INTEGRATION_COMBOS = [
-    ("scalar", "sigmoid", "adamw"),
-    ("scalar", "silu", "muon"),
-    ("channel", "silu", "adamw"),
-    ("channel", "sigmoid", "muon"),
+    ("scalar", "sigmoid", "adamw", "geglu"),
+    ("scalar", "silu", "muon", "relu2"),
+    ("channel", "silu", "adamw", "relu2"),
+    ("channel", "sigmoid", "muon", "geglu"),
 ]
 
 
-@pytest.mark.parametrize("residual_gate,attn_output_gate,optimizer", _INTEGRATION_COMBOS)
+@pytest.mark.parametrize(
+    "residual_gate,attn_output_gate,optimizer,ffn_activation", _INTEGRATION_COMBOS
+)
 def test_ablation_features_train_and_partition_together(
-    residual_gate, attn_output_gate, optimizer
+    residual_gate, attn_output_gate, optimizer, ffn_activation
 ) -> None:
     """All ablation toggles on at once: train one step, then check optim grouping."""
     torch.manual_seed(0)
@@ -124,7 +126,7 @@ def test_ablation_features_train_and_partition_together(
         qk_norm_mode="l2",
         residual_gate=residual_gate,
         attn_output_gate=attn_output_gate,
-        ffn_activation="geglu",
+        ffn_activation=ffn_activation,
     )
     model = OplmForMaskedLM(config).train()
 
