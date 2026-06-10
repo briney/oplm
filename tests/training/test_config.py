@@ -201,6 +201,33 @@ def test_all_presets_pass_strict_validation(preset: str) -> None:
     assert isinstance(cfg.model, OplmModelConfig)
 
 
+@pytest.mark.parametrize("preset", AVAILABLE_PRESETS)
+def test_all_presets_resolve_golden_canon_defaults(preset: str) -> None:
+    """Every preset resolves the paper-exact Canon defaults (Canon off, residual on)."""
+    cfg = load_config(["--preset", preset])
+    assert cfg.model.canon_enabled is False
+    assert cfg.model.canon_residual is True
+    assert cfg.model.canon_positions == []
+    assert cfg.model.canon_activation == "none"
+
+
+def test_canon_enabled_run_resolves_paper_exact_defaults() -> None:
+    """A Canon-enabled run resolves to the paper-exact encoder configuration.
+
+    Golden assertions for the ablation surface: residual Canon, no conv
+    activation, pre-norm strategy, and the base k=4 kernel broadcast across
+    every layer.
+    """
+    cfg = load_config(["model.canon_enabled=true", "model.canon_positions=[A,B,C,D]"])
+    assert cfg.model.canon_enabled is True
+    assert cfg.model.canon_residual is True
+    assert cfg.model.canon_positions == ["A", "B", "C", "D"]
+    assert cfg.model.canon_activation == "none"
+    assert cfg.model.norm_strategy == "pre"
+    # base.yaml's k=4 resolves to a per-layer list of the right length.
+    assert cfg.model.canon_kernel_sizes == [4] * cfg.model.num_hidden_layers
+
+
 def test_serialized_config_roundtrips_through_load_config(tmp_path: Path) -> None:
     """A serialized run config (HF ``to_dict`` metadata included) reloads via ``--config``.
 
