@@ -28,6 +28,7 @@ model:
   residual_scaling: sqrt_num_layers # sqrt_num_layers | none
   residual_gate: none # none | scalar | channel (learnable multiplicative refinement on residual writes)
   residual_gate_init: 1.0 # initial value for residual gate parameters
+  attn_output_gate: none # none | sigmoid | silu (post-SDPA G1 output gate, arXiv:2505.06708)
   value_residual: none # none | fixed | learnable (ResFormer value residual, arXiv:2410.17897)
   value_residual_lambda_init: 0.5 # constant lambda (fixed) or init (learnable); layers > 0 only
   init_scale_output_projections: true
