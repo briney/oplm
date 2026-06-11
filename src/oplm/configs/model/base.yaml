@@ -47,6 +47,7 @@ model:
 
   # Canon depthwise convolution (off by default)
   canon_enabled: false
+  canon_residual: true # residual Canon updates by default
   canon_positions: [] # subset of {A, B, C, D}
   canon_kernel_sizes: 4
   canon_activation: none # none | silu | gelu

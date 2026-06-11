@@ -48,6 +48,7 @@ def test_defaults_match_architecture_spec():
     assert cfg.tie_word_embeddings is False
     assert cfg.mlm_head_activation == "gelu"
     assert cfg.canon_enabled is False
+    assert cfg.canon_residual is True
     assert cfg.canon_positions == []
     assert cfg.canon_activation == "none"
     assert cfg.classifier_pool == "mean"
@@ -229,6 +230,11 @@ def test_canon_enabled_requires_non_empty_positions():
         OplmConfig(canon_enabled=True, canon_positions=[])
 
 
+def test_canon_residual_can_be_disabled_explicitly():
+    cfg = OplmConfig(canon_residual=False)
+    assert cfg.canon_residual is False
+
+
 def test_canon_rejects_unknown_position():
     with pytest.raises(ValueError, match="canon_positions entries must be a subset"):
         OplmConfig(canon_enabled=True, canon_positions=["A", "Z"], canon_kernel_sizes=3)
@@ -237,6 +243,29 @@ def test_canon_rejects_unknown_position():
 def test_canon_rejects_duplicate_positions():
     with pytest.raises(ValueError, match="must not contain duplicates"):
         OplmConfig(canon_enabled=True, canon_positions=["A", "A"], canon_kernel_sizes=3)
+
+
+def test_canon_rejects_hybrid_norm_strategy():
+    """hybrid has no outer attention pre-norm, so Canon-A has no insertion point."""
+    with pytest.raises(ValueError, match="not supported with norm_strategy='hybrid'"):
+        OplmConfig(
+            canon_enabled=True,
+            canon_positions=["A"],
+            canon_kernel_sizes=3,
+            norm_strategy="hybrid",
+        )
+
+
+@pytest.mark.parametrize("strategy", ["pre", "sandwich", "post_sdpa"])
+def test_canon_allowed_under_pre_sandwich_post_sdpa(strategy: str):
+    """Canon is valid under every strategy that keeps an outer attention pre-norm."""
+    cfg = OplmConfig(
+        canon_enabled=True,
+        canon_positions=["A", "B", "C", "D"],
+        canon_kernel_sizes=3,
+        norm_strategy=strategy,
+    )
+    assert cfg.norm_strategy == strategy
 
 
 def test_canon_resolved_kernel_sizes_cached_back_onto_field():
@@ -325,7 +354,7 @@ def test_save_and_from_pretrained_roundtrip_preserves_fields(tmp_path: Path):
         num_hidden_layers=4,
         num_attention_heads=8,
         norm_type="rmsnorm",
-        norm_strategy="hybrid",
+        norm_strategy="sandwich",  # Canon (below) is valid under sandwich
         qk_norm_mode="l2",
         qk_norm_l2_scale_init=8.0,
         mask_dropout=True,
@@ -351,7 +380,7 @@ def test_save_and_from_pretrained_roundtrip_preserves_fields(tmp_path: Path):
     assert restored.num_attention_heads == 8
     assert restored.head_dim == 64
     assert restored.norm_type == "rmsnorm"
-    assert restored.norm_strategy == "hybrid"
+    assert restored.norm_strategy == "sandwich"
     assert restored.qk_norm_mode == "l2"
     assert restored.qk_norm_l2_scale_init == 8.0
     assert restored.mask_dropout is True
@@ -359,6 +388,7 @@ def test_save_and_from_pretrained_roundtrip_preserves_fields(tmp_path: Path):
     assert restored.residual_gate == "channel"
     assert restored.residual_gate_init == 0.5
     assert restored.canon_enabled is True
+    assert restored.canon_residual is True
     assert restored.canon_positions == ["A", "D"]
     assert restored.canon_kernel_sizes == [3, 5, 7, 9]
     assert restored.post_embed_norm is True

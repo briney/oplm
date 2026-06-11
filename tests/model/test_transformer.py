@@ -43,6 +43,7 @@ def _config(
     value_residual: str = "none",
     value_residual_lambda_init: float = 0.5,
     canon_enabled: bool = False,
+    canon_residual: bool = True,
     canon_positions: list[str] | None = None,
     canon_kernel_sizes: list[int] | None = None,
     canon_activation: str = "none",
@@ -82,6 +83,7 @@ def _config(
         value_residual=value_residual,
         value_residual_lambda_init=value_residual_lambda_init,
         canon_enabled=canon_enabled,
+        canon_residual=canon_residual,
         canon_positions=canon_positions,
         canon_kernel_sizes=canon_kernel_sizes,
         canon_activation=canon_activation,
@@ -298,9 +300,14 @@ def test_block_no_canon_when_disabled():
     block = OplmBlock(cfg, layer_idx=0)
     for name in ("conv_a", "conv_b", "conv_c", "conv_d"):
         assert not hasattr(block, name)
+    # Canon-B lives on the attention module and Canon-D on the FFN; both off.
+    assert not block.attention.canon_b_enabled
+    assert block.ffn.conv_d is None
 
 
-@pytest.mark.parametrize("position", ["A", "B", "C", "D"])
+# Only A and C are block-level convs (conv_a/conv_c). Canon-B lives inside
+# OplmAttention (conv_b_q/k/v); Canon-D lives inside the FFN (conv_d).
+@pytest.mark.parametrize("position", ["A", "C"])
 def test_block_creates_only_requested_canon_position(position: str):
     cfg = _config(
         canon_enabled=True,
@@ -310,8 +317,39 @@ def test_block_creates_only_requested_canon_position(position: str):
     block = OplmBlock(cfg, layer_idx=0)
     name = f"conv_{position.lower()}"
     assert isinstance(getattr(block, name), CanonConv)
-    for other in {"A", "B", "C", "D"} - {position}:
+    for other in {"A", "C"} - {position}:
         assert not hasattr(block, f"conv_{other.lower()}")
+    # B is off (on attention), D is off (on FFN) for an A/C-only config.
+    assert not hasattr(block, "conv_b")
+    assert not hasattr(block, "conv_d")
+    assert not block.attention.canon_b_enabled
+    assert block.ffn.conv_d is None
+
+
+def test_block_canon_b_lives_on_attention():
+    cfg = _config(canon_enabled=True, canon_positions=["B"], canon_kernel_sizes=[3, 3])
+    block = OplmBlock(cfg, layer_idx=0)
+    assert not hasattr(block, "conv_b")
+    assert block.attention.canon_b_enabled
+    for name in ("conv_b_q", "conv_b_k", "conv_b_v"):
+        assert isinstance(getattr(block.attention, name), CanonConv)
+    # A/C (block-level) and D (FFN) were not requested.
+    for name in ("conv_a", "conv_c"):
+        assert not hasattr(block, name)
+    assert block.ffn.conv_d is None
+
+
+def test_block_canon_d_lives_on_ffn_at_intermediate_width():
+    """Canon-D is a conv inside the FFN at intermediate_size, not on the block."""
+    cfg = _config(canon_enabled=True, canon_positions=["D"], canon_kernel_sizes=[3, 3])
+    block = OplmBlock(cfg, layer_idx=0)
+    assert not hasattr(block, "conv_d")  # not block-level
+    assert isinstance(block.ffn.conv_d, CanonConv)
+    assert block.ffn.conv_d.channels == cfg.intermediate_size
+    # A/C absent, B off.
+    for name in ("conv_a", "conv_c"):
+        assert not hasattr(block, name)
+    assert not block.attention.canon_b_enabled
 
 
 def test_block_canon_kernel_size_comes_from_layer_idx():
@@ -382,6 +420,63 @@ def test_block_forward_with_all_canon_positions_runs():
     x = torch.randn(2, 6, cfg.hidden_size)
     out, _ = block(x, _ones_mask(2, 6))
     assert out.shape == x.shape
+
+
+@pytest.mark.parametrize("strategy", ["pre", "sandwich", "post_sdpa"])
+def test_block_canon_residual_zero_kernels_match_no_canon(strategy: str):
+    """Residual Canon with zeroed convs is an identity at every position.
+
+    A/C (block-level) and D (inside the FFN) all use ``z + conv(z)``; a zero
+    kernel makes each a no-op, so the block output must match a no-canon block
+    that shares its other weights. Proves no position destroys the identity path,
+    under every norm strategy that supports Canon.
+    """
+    torch.manual_seed(0)
+    cfg = _config(
+        norm_strategy=strategy,
+        canon_enabled=True,
+        canon_positions=["A", "C", "D"],
+        canon_kernel_sizes=[3, 3],
+    )
+    block = OplmBlock(cfg, layer_idx=0).eval()
+    plain = OplmBlock(_config(norm_strategy=strategy), layer_idx=0).eval()
+    block.load_state_dict(plain.state_dict(), strict=False)
+    with torch.no_grad():
+        block.conv_a.conv.weight.zero_()
+        block.conv_c.conv.weight.zero_()
+        block.ffn.conv_d.conv.weight.zero_()
+    x = torch.randn(2, 7, cfg.hidden_size)
+    mask = _ones_mask(2, 7)
+    with torch.no_grad():
+        out, _ = block(x, mask)
+        out_plain, _ = plain(x, mask)
+    assert torch.allclose(out, out_plain, rtol=1e-5, atol=1e-6)
+
+
+def test_block_canon_c_feeds_ffn_input_not_residual_path():
+    """Canon-C feeds the FFN pre-norm input, not the attention-output residual.
+
+    With the FFN's ``down_proj`` zeroed the FFN contributes nothing, so the block
+    output collapses to the attention-side residual ``h``. Under the paper-exact
+    placement C only touches the FFN input, so ``h`` (and the output) is identical
+    to a no-canon block even with a non-trivial C kernel. If C still modified
+    ``attn_out`` (the old placement) it would change ``h`` and the test would fail.
+    """
+    torch.manual_seed(0)
+    cfg_c = _config(canon_enabled=True, canon_positions=["C"], canon_kernel_sizes=[3, 3])
+    block_c = OplmBlock(cfg_c, layer_idx=0).eval()
+    plain = OplmBlock(_config(), layer_idx=0).eval()
+    block_c.load_state_dict(plain.state_dict(), strict=False)
+    with torch.no_grad():
+        block_c.conv_c.conv.weight.normal_()  # non-identity: would perturb attn_out if misplaced
+        block_c.ffn.down_proj.weight.zero_()
+        plain.ffn.down_proj.weight.zero_()
+    x = torch.randn(2, 7, cfg_c.hidden_size)
+    mask = _ones_mask(2, 7)
+    with torch.no_grad():
+        out_c, _ = block_c(x, mask)
+        out_plain, _ = plain(x, mask)
+    assert torch.allclose(out_c, out_plain, atol=1e-6)
 
 
 def test_block_forward_grad_flows_to_input():

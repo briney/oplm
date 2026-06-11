@@ -201,6 +201,7 @@ def info(
     features.add_row("Residual scaling", cfg.model.residual_scaling)
     features.add_row("MLM head act", cfg.model.mlm_head_activation)
     features.add_row("Canon", _status(cfg.model.canon_enabled))
+    features.add_row("Canon residual", _status(cfg.model.canon_residual))
     canon_str = (
         ", ".join(cfg.model.canon_positions) if cfg.model.canon_positions else "[dim]none[/dim]"
     )

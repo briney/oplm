@@ -142,8 +142,8 @@ thin **ESM-C-style convenience layer** (sugar on top).
 
 ```python
 from transformers import AutoModelForMaskedLM, AutoTokenizer
-model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-base")
-tok   = AutoTokenizer.from_pretrained("brineylab/oplm-base")
+model = AutoModelForMaskedLM.from_pretrained("brineylab/oplm-170M")
+tok   = AutoTokenizer.from_pretrained("brineylab/oplm-170M")
 inputs = tok(["MEEPQSDPSVEPPLSQ"], return_tensors="pt", padding=True)
 out = model(**inputs, output_hidden_states=True)   # out.logits (B,T,V); out.hidden_states tuple
 ```
@@ -160,7 +160,7 @@ correctly; `encode` exists only for ESM-C call-site parity:
 
 ```python
 from oplm import OplmForMaskedLM, LogitsConfig
-model = OplmForMaskedLM.from_pretrained("brineylab/oplm-base")  # auto-attaches saved tokenizer
+model = OplmForMaskedLM.from_pretrained("brineylab/oplm-170M")  # auto-attaches saved tokenizer
 out = model.logits(["MEEPQSDPSVEPPLSQ", "GAGTRWPVQ"],
                    LogitsConfig(sequence=True, return_embeddings=True))
 # out.sequence_logits (B,T,V)|None ; out.embeddings (B,T,D)|None (last hidden state)
@@ -316,22 +316,33 @@ normed) is always on by default and orthogonal to `norm_strategy`; disable with
 ### 5.2 Canon insertion points
 
 When `canon_enabled=True`, depthwise 1D convs are inserted at any of four labeled
-positions (Canon paper, arXiv 2512.17351):
+positions (Canon paper, arXiv 2512.17351). The paper-exact encoder contract is
+specified in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). The paper-exact
+encoder implementation replaced the older Canon-inspired wiring in place rather
+than retaining it as a separate legacy mode. Canon is supported under
+`norm_strategy` in `{pre, sandwich, post_sdpa}` (all have an outer attention
+pre-norm; their post-norms are downstream of the Canon insertion points). It is
+rejected with `hybrid`, which has no outer attention pre-norm for Canon-A.
 
-- **A** — pre-block, on the residual-stream input.
-- **B** — between attention pre-norm and Q/K/V projection (*discouraged*, weakest
-  in the paper; accepted for ablation completeness).
-- **C** — on the attention output before the residual add.
-- **D** — between the FFN pre-norm and the FFN (most common positive result).
+- **A** — after the attention pre-norm, residual into the attention input.
+- **B** — *inside* attention, on the projected and normed Q/K/V (after QK/V-norm,
+  before the value residual and RoPE). One depthwise conv per stream
+  (`conv_b_q`/`conv_b_k`/`conv_b_v`), living on `OplmAttention`. This is the
+  paper's "inside attention" Canon and matches Primer's multi-DConv-head
+  attention (arXiv:2109.08668).
+- **C** — after the FFN pre-norm, residual into the FFN input.
+- **D** — inside the FFN before activation at intermediate width.
 
 ```
-x ─► [Conv_A] ─► Norm ─► Attn ─► [Conv_C] ─► (+) ─► h
-                                                     │
-h ─► Norm ─► [Conv_D] ─► SwiGLU FFN ──────────► (+) ─► y
+              ┌────────── OplmAttention ──────────┐
+x ─► Norm ─► [Conv_A residual] ─► QKV ─► [Conv_B residual on Q/K/V] ─► RoPE ─► SDPA ─► Oproj ─► (+) ─► h
+                                                                                                      │
+h ─► Norm ─► [Conv_C residual] ─► SwiGLU/GEGLU/relu2 with [Conv_D residual before activation] ─► (+) ─► y
 ```
 
 `canon_positions` is a global list (order irrelevant; each is an independent
-site), e.g. `["A","C","D"]`. See §11.
+site), e.g. `["A","C","D"]`. B is applied inside `OplmAttention`; D is applied
+inside the FFN module at intermediate width. See §11.
 
 ### 5.3 Per-knob scope
 
@@ -348,12 +359,12 @@ site), e.g. `["A","C","D"]`. See §11.
 | `value_residual`/`value_residual_lambda_init` | global | `none` (default) / `fixed` / `learnable` ResFormer value residual (arXiv:2410.17897) |
 | `rope_dim`/`nope_dim` | global | same split across all heads/layers |
 | `canon_enabled`/`canon_positions` | global | master switch / insertion sites |
+| `canon_residual` | global | `true` by default |
 | `canon_kernel_sizes` | per-layer | scalar broadcasts; list must match `num_hidden_layers` |
 | `ffn_activation`, `tie_word_embeddings`, `mlm_head_activation`, `classifier_pool` | global | |
 
 `post_sdpa` and `sandwich` are mutually exclusive enum values. Exotic
-combinations (e.g. Canon-B + sandwich; `qk_norm=false` + `hybrid`) are **warned,
-not errored**.
+combinations (e.g. `qk_norm=false` + `hybrid`) are **warned, not errored**.
 
 ## 6. Attention (`OplmAttention`)
 
@@ -362,8 +373,9 @@ paths share one set of parameters and pre-attention transforms; only the
 score→softmax→value kernel differs.
 
 Shapes: `x (B,T,D)` → Q/K/V projections `(B,T,D)` → reshape to heads `(B,H,T,d)`
-with `d = D/H` → QK-norm `(B,H,T,d)` → RoPE on Q,K → attention out `(B,H,T,d)` →
-reshape `(B,T,D)` → output projection `(B,T,D)`.
+with `d = D/H` → QK-norm `(B,H,T,d)` → optional Canon-B depthwise conv on Q/K/V
+→ optional value residual → RoPE on Q,K → attention out `(B,H,T,d)` → reshape
+`(B,T,D)` → output projection `(B,T,D)`.
 
 **QK-norm / QKV-norm.** Two modes, selected by `qk_norm_mode` (only active when
 `qk_norm=True`):
@@ -593,6 +605,22 @@ caller's.
 `{schedule:"constant", value}` resolved at config-load. Every kernel ≥ 2; even
 kernels allowed. Cost per conv: `params = k·D`, `flops ≈ 2·k·D·T`.
 
+**Residual form.** `canon_residual=true` by default and applies Canon as
+`z + Canon(z)`. There is no legacy Canon mode; Phase 2 replaces the older wiring
+in place with the paper-exact encoder implementation in
+[MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md).
+
+**Insertion sites.** A applies to the attention pre-norm stream before Q/K/V
+projection. **B** is the "inside attention" Canon (= Primer multi-DConv-head
+attention, arXiv:2109.08668) and lives on `OplmAttention` as three independent
+depthwise convs (`conv_b_q`/`conv_b_k`/`conv_b_v`) on the projected,
+QK/V-normed Q/K/V streams before value residual and RoPE. C applies to the FFN
+pre-norm stream before the FFN. D lives inside the FFN module at
+`intermediate_size`, before the activation branch nonlinearity (the gate branch
+for SwiGLU/GEGLU, the up branch for relu2). Canon is supported under
+`norm_strategy` in `{pre, sandwich, post_sdpa}` and rejected under `hybrid`
+(no outer attention pre-norm for Canon-A).
+
 ## 12. Configuration schema (`OplmConfig`)
 
 `OplmConfig` subclasses `PretrainedConfig`; the YAML `model:` block maps 1:1 to
@@ -635,6 +663,7 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `tie_word_embeddings` | `False` | |
 | `mlm_head_activation` | `gelu` | `gelu`/`silu`/`relu` |
 | `canon_enabled` | `False` | |
+| `canon_residual` | `True` | residual Canon updates |
 | `canon_positions` | `[]` | subset of `{A,B,C,D}` |
 | `canon_kernel_sizes` | 4 | int / list / dict schedule |
 | `canon_activation` | `none` | `none`/`silu`/`gelu` |
@@ -782,23 +811,29 @@ Parameter count (`n_norm = 2` LayerNorm / `1` RMSNorm; residual scaling is
 parameter-free): `embedding V·D` + `final norm n_norm·D` + `MLM head (D·D+D) +
 n_norm·D + (D·V+V untied | V tied)` + per layer `[attn 4·D·D + QK-norm 2·n_norm·d
 + pre-norm n_norm·D (+ extra norms per strategy)]` + `[FFN 3·D·F + pre-norm
-n_norm·D]` + per Canon conv `k_l·D`. Worked: D=768, L=12, H=12, F=2048, V=33,
-LayerNorm, untied, pre-norm → ≈ **85.6 M**.
+n_norm·D]` + per Canon conv `k_l·D`. Worked: D=768, L=24, H=12, F=2048, V=33,
+LayerNorm, untied, pre-norm → ≈ **170 M** (the `170M` preset).
 
-Published presets (`--preset`; full recipes in
+Size presets (`--preset`; full recipes in
 `src/oplm/configs/model/presets/*.yaml`; all share the 33-token tokenizer and a
-1024-position context):
+1024-position context). A preset sets the core dimensions only — it is an
+architecture recipe, not a weights download:
 
-| Preset / Hub id | Params | Layers | Hidden | Heads | Head dim |
+| Preset | Params | Layers | Hidden | Heads | Head dim |
 | --- | --: | --: | --: | --: | --: |
-| `oplm-small` | 5.2M | 6 | 256 | 4 | 64 |
-| `oplm-medium` | 85.6M | 12 | 768 | 12 | 64 |
-| `oplm-base` | 309.5M | 24 | 1024 | 16 | 64 |
-| `oplm-large` | 2.5B | 32 | 2560 | 32 | 80 |
-| `oplm-xlarge` | 12.7B | 40 | 5120 | 40 | 128 |
+| `50M` | ~50M | 16 | 512 | 8 | 64 |
+| `170M` | ~170M | 24 | 768 | 12 | 64 |
+| `400M` | ~400M | 32 | 1024 | 16 | 64 |
+| `800M` | ~800M | 40 | 1280 | 16 | 80 |
+| `1B` | ~1.6B | 50 | 1600 | 25 | 64 |
+| `3B` | ~3.3B | 64 | 2048 | 32 | 64 |
+| `6B` | ~6B | 80 | 2560 | 40 | 64 |
+| `12B` | ~12.5B | 100 | 3200 | 50 | 64 |
 
-`large`/`xlarge` additionally enable `gradient_checkpointing`. `oplm info --preset
-<name>` prints the resolved architecture and exact parameter count.
+The `1B`/`3B`/`6B`/`12B` recipes carry a commented-out `gradient_checkpointing`
+block you can uncomment for the larger sizes; no preset enables it
+automatically. `oplm info --preset <name>` prints the resolved architecture and
+exact parameter count.
 
 ---
 

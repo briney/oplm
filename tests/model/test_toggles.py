@@ -32,8 +32,9 @@ _RESIDUAL_SCALING = ("sqrt_num_layers", "none")
 _TIE = (False, True)
 _POST_EMBED_NORM = (False, True)
 
-_COMBOS = list(
-    itertools.product(
+_COMBOS = [
+    combo
+    for combo in itertools.product(
         _NORM_TYPES,
         _NORM_STRATEGIES,
         _CANON,
@@ -43,7 +44,11 @@ _COMBOS = list(
         _TIE,
         _POST_EMBED_NORM,
     )
-)
+    # Canon is rejected only under hybrid (no outer attention pre-norm for
+    # Canon-A); pre/sandwich/post_sdpa are all valid. The hybrid rejection is
+    # covered in tests/model/test_config.py.
+    if not (combo[2] and combo[1] == "hybrid")
+]
 
 
 def _combo_id(combo) -> str:
@@ -67,7 +72,7 @@ def test_toggle_combination_trains_one_step(combo) -> None:
         norm_type=norm_type,
         norm_strategy=norm_strategy,
         canon_enabled=canon,
-        canon_positions=["A", "C", "D"] if canon else None,
+        canon_positions=["A", "B", "C", "D"] if canon else None,
         rope_dim=rope_dim,
         nope_dim=_HEAD_DIM - rope_dim,
         qk_norm=qk_norm,

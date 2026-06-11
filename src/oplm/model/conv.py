@@ -24,10 +24,14 @@ _ACTIVATIONS = {
 class CanonConv(nn.Module):
     """Per-channel 1D conv along the sequence axis for Canon insertion sites.
 
-    The conv is depthwise (`groups == hidden_size`) and bidirectional: the
-    encoder sees both past and future tokens. Pad positions are zeroed before
-    the kernel runs so that pad content cannot leak into real-token channels
-    via the receptive field.
+    The conv is depthwise (`groups == channels`) and bidirectional: the encoder
+    sees both past and future tokens. Pad positions are zeroed before the kernel
+    runs so that pad content cannot leak into real-token channels via the
+    receptive field.
+
+    `channels` is the operand's channel count, not necessarily the model's
+    `hidden_size`: Canon-A/B/C run at `hidden_size` (residual-stream / Q/K/V
+    width) while Canon-D runs at `intermediate_size` (the FFN activation branch).
 
     For odd `kernel_size`, `nn.Conv1d`'s symmetric `padding=k//2` already
     produces a same-length output. For even `kernel_size`, `padding` is fixed
@@ -38,7 +42,7 @@ class CanonConv(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int,
+        channels: int,
         kernel_size: int,
         activation: str = "none",
     ) -> None:
@@ -50,7 +54,7 @@ class CanonConv(nn.Module):
                 f"Unknown activation {activation!r}; expected one of {sorted(_ACTIVATIONS)}."
             )
 
-        self.hidden_size = hidden_size
+        self.channels = channels
         self.kernel_size = kernel_size
         self.activation_name = activation
         self._activation = _ACTIVATIONS[activation]
@@ -60,10 +64,10 @@ class CanonConv(nn.Module):
         # Even kernels: pad manually below — F.pad with (k//2, k//2 - 1).
         conv_padding = 0 if self._even_kernel else kernel_size // 2
         self.conv = nn.Conv1d(
-            in_channels=hidden_size,
-            out_channels=hidden_size,
+            in_channels=channels,
+            out_channels=channels,
             kernel_size=kernel_size,
-            groups=hidden_size,
+            groups=channels,
             padding=conv_padding,
             bias=False,
         )

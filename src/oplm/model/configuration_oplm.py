@@ -86,6 +86,7 @@ class OplmConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         mlm_head_activation: str = "gelu",
         canon_enabled: bool = False,
+        canon_residual: bool = True,
         canon_positions: list[str] | None = None,
         canon_kernel_sizes: int | list[int] | dict[str, Any] = 4,
         canon_activation: str = "none",
@@ -139,6 +140,7 @@ class OplmConfig(PretrainedConfig):
         self.hidden_dropout = float(hidden_dropout)
         self.mlm_head_activation = mlm_head_activation
         self.canon_enabled = bool(canon_enabled)
+        self.canon_residual = bool(canon_residual)
         self.canon_positions = list(canon_positions) if canon_positions is not None else []
         self.canon_kernel_sizes = canon_kernel_sizes
         self.canon_activation = canon_activation
@@ -308,6 +310,17 @@ class OplmConfig(PretrainedConfig):
         if self.canon_enabled:
             if not self.canon_positions:
                 raise ValueError("canon_positions must be non-empty when canon_enabled=True.")
+            # Canon-A acts on the attention pre-norm stream, which exists under
+            # pre/sandwich/post_sdpa (their post-norms sit downstream of every
+            # Canon insertion point and leave A/C unchanged). hybrid suppresses
+            # the outer attention pre-norm (QKV-norm moves inside attention), so
+            # Canon-A has no defined insertion point there.
+            if self.norm_strategy == "hybrid":
+                raise ValueError(
+                    "Canon is not supported with norm_strategy='hybrid' (it has no "
+                    "outer attention pre-norm for Canon-A); use 'pre', 'sandwich', "
+                    "or 'post_sdpa'. See docs/MODEL_ARCHITECTURE.md."
+                )
             bad_positions = [p for p in self.canon_positions if p not in _VALID_CANON_POSITIONS]
             if bad_positions:
                 raise ValueError(
