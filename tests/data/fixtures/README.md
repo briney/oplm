@@ -13,6 +13,16 @@ subdirectories below; tests `pytest.skip` when a required fixture is absent.
   small (a head slice of an assay is fine). Provided:
   `variant/A0A2Z5U3Z0_9INFA_Wu_2014.csv` (influenza HA, Wu 2014; head slice).
   The `test_real_proteingym_fixture` test loads this fixture directly.
+- `variant_clinical/<assay>.csv` — a real ProteinGym **clinical**-substitution
+  CSV for the clinical-variant loader and eval tests. Kept in a **separate**
+  directory from `variant/` on purpose: a clinical CSV has `protein_sequence`
+  (the constant wild-type), `mutant`, `mutated_sequence`, and `DMS_bin_score`
+  (the categorical label `Pathogenic`/`Benign`) but **no** `DMS_score` column, so
+  it would break the DMS `variant/` glob in `test_real_proteingym_fixture`. Must
+  contain both `Pathogenic` and `Benign` rows so AUROC is computable. Provided:
+  `variant_clinical/NP_000008.1.csv` (ACADM; 412-aa WT, 20 Pathogenic / 6 Benign).
+  `test_real_clinical_fixture` and the slow `test_clinical_eval_auroc_*` tests
+  load it directly.
 - `downstream/` — *(no dropped files required)*. The downstream-loader tests
   (Phase 8) build their own per-residue and sequence-level fixtures at test time
   from real protein sequences (the shared `real_records` fixture); only the task

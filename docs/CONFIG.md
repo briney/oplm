@@ -302,8 +302,8 @@ data:
 Shared keys on every entry:
 
 - `path` — file or directory consumed by the task.
-- `type` — one of `sequence`, `structure`, `proteingym`, `tape`, `proteinglue`,
-  `everest`.
+- `type` — one of `sequence`, `structure`, `proteingym`, `proteingym_clinical`,
+  `tape`, `proteinglue`, `everest`.
 - `every` — optional per-dataset cadence: exactly one of `{steps: N}` /
   `{tokens: N}`, plus optional `at_start` (default `false`) and `at_end`
   (default `true`). Datasets that omit `every` inherit `train.eval_every`.
@@ -333,6 +333,18 @@ categorical Jacobian over PDB/CIF structures.
 | `categorical_jacobian_sample_seed` | `int` | `42` | Seed for subset sampling. |
 | `categorical_jacobian_mutation_batch_size` | `int` | `20` | Mutant sequences per Jacobian forward pass. |
 | `max_structures` | `int \| null` | `null` | Optional cap on structures loaded. |
+
+### proteingym_clinical
+
+Zero-shot clinical-variant pathogenicity — `auroc` (Pathogenic vs Benign),
+macro-averaged across per-protein assays. Reads a directory of one-protein
+clinical-substitution CSVs (`protein_sequence`, `mutant`, `DMS_bin_score`).
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `scoring` | `str` | `masked_marginals` | `masked_marginals` (mask each mutated position) or `wt_marginals` (single wild-type forward). |
+| `mask_batch_size` | `int` | `64` | Masked sequences per forward pass (`masked_marginals` only); must be in `[1, 1024]`. |
+| `max_assays` | `int \| null` | `null` | Optional cap on assays (CSV files) loaded. |
 
 ### proteingym, tape, proteinglue, everest
 

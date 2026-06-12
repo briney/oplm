@@ -17,7 +17,11 @@ from oplm.data.sequence.loaders import (
 )
 from oplm.data.structure.loader import StructureData, load_structures
 from oplm.data.tokenizer import get_tokenizer
-from oplm.data.variant.loader import VariantAssay, load_variant_assays
+from oplm.data.variant.loader import (
+    VariantAssay,
+    load_clinical_variant_assays,
+    load_variant_assays,
+)
 
 __all__ = [
     "InterleavedDataset",
@@ -28,6 +32,7 @@ __all__ = [
     "build_sequence_eval_dataloader",
     "build_train_dataloader",
     "get_tokenizer",
+    "load_clinical_variant_assays",
     "load_structures",
     "load_variant_assays",
     "parse_eval_configs",

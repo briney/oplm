@@ -8,7 +8,15 @@ import oplm.eval.tasks  # noqa: F401  -- import triggers @register_eval_task for
 from oplm.eval import EvalTask, register_eval_task
 from oplm.eval.registry import get_eval_task_class
 
-_REAL_TYPES = ("sequence", "structure", "proteingym", "tape", "proteinglue", "everest")
+_REAL_TYPES = (
+    "sequence",
+    "structure",
+    "proteingym",
+    "proteingym_clinical",
+    "tape",
+    "proteinglue",
+    "everest",
+)
 
 
 def test_duplicate_registration_raises() -> None:
