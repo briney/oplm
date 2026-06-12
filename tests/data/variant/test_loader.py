@@ -6,9 +6,9 @@ vs. a ``wildtype`` column). The contract tests build temporary CSVs against a
 **real** reference sequence (human ubiquitin) — the loader only loads and
 validates structure/mutations, so the ``DMS_score`` values are opaque to it.
 
-A genuinely real ProteinGym assay CSV may be dropped at
-``tests/data/fixtures/variant/<assay>.csv`` (see that directory's README); the
-``test_real_proteingym_fixture`` test ``pytest.skip``s when it is absent.
+A real ProteinGym assay CSV is committed at
+``tests/data/fixtures/variant/<assay>.csv`` (see that directory's README) and the
+``test_real_proteingym_fixture`` test loads it directly.
 """
 
 from __future__ import annotations
@@ -250,12 +250,12 @@ def test_missing_directory_raises(tmp_path: Path) -> None:
 
 
 def _real_fixture_csvs() -> list[Path]:
-    """Return real ProteinGym fixture CSVs, or skip if the directory is empty."""
-    if not _FIXTURE_DIR.is_dir():
-        pytest.skip(f"variant fixture dir missing: {_FIXTURE_DIR} (see fixtures/README.md)")
+    """Return the committed real ProteinGym fixture CSVs."""
+    assert _FIXTURE_DIR.is_dir(), (
+        f"variant fixture dir missing: {_FIXTURE_DIR} (see fixtures/README.md)"
+    )
     csvs = sorted(_FIXTURE_DIR.glob("*.csv"))
-    if not csvs:
-        pytest.skip(f"no variant fixture CSVs in {_FIXTURE_DIR} (see fixtures/README.md)")
+    assert csvs, f"no variant fixture CSVs in {_FIXTURE_DIR} (see fixtures/README.md)"
     return csvs
 
 
@@ -268,9 +268,9 @@ def test_real_proteingym_fixture() -> None:
     """
     path = _real_fixture_csvs()[0]
     table = pa_csv.read_csv(str(path))
-    columns = table.column_names
-    if "mutated_sequence" not in columns:
-        pytest.skip(f"{path.name} has no 'mutated_sequence' column to reconstruct the WT")
+    assert "mutated_sequence" in table.column_names, (
+        f"{path.name} has no 'mutated_sequence' column to reconstruct the WT"
+    )
 
     mutants = [str(m) for m in table.column("mutant").to_pylist()]
     mutated_seqs = [str(s) for s in table.column("mutated_sequence").to_pylist()]
@@ -285,8 +285,7 @@ def test_real_proteingym_fixture() -> None:
         chars[mutation.pos - 1] = mutation.wt
         wildtype = "".join(chars)
         break
-    if wildtype is None:
-        pytest.skip(f"{path.name} has no single-substitution row to reconstruct the WT")
+    assert wildtype is not None, f"{path.name} has no single-substitution row to reconstruct the WT"
 
     assays = load_variant_assays(_FIXTURE_DIR, wildtypes={path.stem: wildtype})
     assay = next(a for a in assays if a.name == path.stem)

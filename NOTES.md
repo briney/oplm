@@ -5,29 +5,16 @@ or `AGENTS.md` (contributor instructions).
 
 ## Pending test fixtures
 
-### ProteinGym variant assay (Phase 7)
+_None currently._
 
-The variant-loader tests need a small **real ProteinGym substitution-assay CSV**
-dropped at:
+### ProteinGym variant assay (Phase 7) — resolved
 
-```
-tests/data/fixtures/variant/<assay>.csv
-```
-
-Until it is present, `tests/data/variant/test_loader.py::test_real_proteingym_fixture`
-`pytest.skip`s. (The rest of that file's contract tests run unconditionally on
-temporary CSVs built from a real human-ubiquitin reference sequence, so coverage
-is not blocked — only the genuine-ProteinGym smoke test is.)
-
-Requirements for the fixture:
-
-- A real ProteinGym substitution CSV with columns `mutant`, `DMS_score`, and
-  `mutated_sequence`. A **head slice** of a full assay (a few dozen rows) is fine
-  and keeps the repo small.
-- No separate wild-type reference file is needed: the test reconstructs the
-  wild-type by reverting a single-substitution row's `mutated_sequence`.
-- Source: ProteinGym substitution benchmark
-  (<https://proteingym.org>, DMS substitutions). Pick a short-protein assay so
-  the sequences stay small.
+A real ProteinGym substitution-assay CSV (a head slice of the influenza-HA
+Wu 2014 assay) is committed at
+`tests/data/fixtures/variant/A0A2Z5U3Z0_9INFA_Wu_2014.csv`. The CSV carries the
+`mutant`, `DMS_score`, and `mutated_sequence` columns;
+`tests/data/variant/test_loader.py::test_real_proteingym_fixture` now loads it
+directly (reconstructing the wild-type by reverting a single-substitution row's
+`mutated_sequence`), and no longer `pytest.skip`s.
 
 See `tests/data/fixtures/README.md` for the full fixture-directory layout.
