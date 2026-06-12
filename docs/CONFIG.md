@@ -334,6 +334,20 @@ categorical Jacobian over PDB/CIF structures.
 | `categorical_jacobian_mutation_batch_size` | `int` | `20` | Mutant sequences per Jacobian forward pass. |
 | `max_structures` | `int \| null` | `null` | Optional cap on structures loaded. |
 
+### proteingym
+
+Zero-shot DMS variant-effect prediction — `spearman`, `auroc` (vs
+`DMS_score_bin`), and `top_k_precision`, macro-averaged across assays. Reads a
+directory of DMS substitution CSVs (`mutant`, `DMS_score`, `mutated_sequence`;
+optional `DMS_score_bin`); the wild-type is reconstructed from `mutated_sequence`.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `scoring` | `str` | `masked_marginals` | `masked_marginals` (mask each mutated position) or `wt_marginals` (single wild-type forward). |
+| `mask_batch_size` | `int` | `64` | Masked sequences per forward pass (`masked_marginals` only); must be in `[1, 1024]`. |
+| `top_k_fraction` | `float` | `0.1` | Top fraction (by `DMS_score`) for `top_k_precision`; must be in `(0, 1]`. |
+| `max_assays` | `int \| null` | `null` | Optional cap on assays (CSV files) loaded. |
+
 ### proteingym_clinical
 
 Zero-shot clinical-variant pathogenicity — `auroc` (Pathogenic vs Benign),
@@ -346,7 +360,7 @@ clinical-substitution CSVs (`protein_sequence`, `mutant`, `DMS_bin_score`).
 | `mask_batch_size` | `int` | `64` | Masked sequences per forward pass (`masked_marginals` only); must be in `[1, 1024]`. |
 | `max_assays` | `int \| null` | `null` | Optional cap on assays (CSV files) loaded. |
 
-### proteingym, tape, proteinglue, everest
+### tape, proteinglue, everest
 
 Registered but currently documented stubs; they consume no task-specific keys
 yet. See [EVAL_HARNESS.md](EVAL_HARNESS.md) for status.

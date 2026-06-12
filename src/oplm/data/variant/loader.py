@@ -40,6 +40,12 @@ _MUTANT_COLUMN = "mutant"
 _SCORE_COLUMN = "DMS_score"
 _WILDTYPE_COLUMN = "wildtype"
 
+# DMS-substitution benchmark optional columns. ``DMS_score_bin`` is the binarized
+# fitness label (0/1) used for AUROC; ``mutated_sequence`` carries the full
+# variant sequence and lets us reconstruct the wild-type when none is supplied.
+_SCORE_BIN_COLUMN = "DMS_score_bin"
+_MUTATED_SEQUENCE_COLUMN = "mutated_sequence"
+
 # Clinical-substitution benchmark columns: the label lives in a (misleadingly
 # named) ``DMS_bin_score`` column as the categorical clinical significance, and
 # the wild-type is the constant ``protein_sequence`` column.
@@ -78,13 +84,18 @@ class VariantAssay:
         mutations: Raw ``mutant`` strings, one per CSV row (``:``-joined for
             multi-mutants). Kept verbatim; the eval harness parses them at
             scoring time, but every one is validated against ``wildtype`` here.
-        labels: ``DMS_score`` per row, aligned to ``mutations``.
+        labels: The per-row score, aligned to ``mutations`` (``DMS_score`` for DMS
+            assays; ``1.0``/``0.0`` for clinical Pathogenic/Benign).
+        bin_labels: Optional binarized fitness label per row (``DMS_score_bin``,
+            ``1.0``/``0.0``), aligned to ``mutations``. ``None`` when the source
+            CSV has no such column (e.g. clinical assays).
     """
 
     name: str
     wildtype: str
     mutations: list[str]
     labels: list[float]
+    bin_labels: list[float] | None = None
 
 
 def parse_mutation(token: str) -> Mutation:
@@ -145,6 +156,43 @@ def _validate_mutation(wildtype: str, mutation: Mutation, *, assay: str, token: 
         )
 
 
+def _reconstruct_wildtype(name: str, columns: list[str], table: Table) -> str | None:
+    """Reconstruct the wild-type from a ``mutated_sequence`` column, if possible.
+
+    Real ProteinGym DMS CSVs carry no standalone wild-type, but each row's
+    ``mutated_sequence`` is the wild-type with one (or more) substitutions
+    applied. Reverting the first single-substitution row's mutant residue
+    recovers the wild-type.
+
+    Args:
+        name: Assay name (unused except for symmetry; reserved for diagnostics).
+        columns: The CSV's column names.
+        table: The parsed pyarrow table.
+
+    Returns:
+        The reconstructed one-letter wild-type (upper-cased), or ``None`` if the
+        CSV lacks a ``mutated_sequence`` column or any usable single-substitution
+        row.
+    """
+    if _MUTATED_SEQUENCE_COLUMN not in columns or _MUTANT_COLUMN not in columns:
+        return None
+
+    mutants = table.column(_MUTANT_COLUMN).to_pylist()
+    sequences = table.column(_MUTATED_SEQUENCE_COLUMN).to_pylist()
+    for token, sequence in zip(mutants, sequences, strict=True):
+        token = str(token)
+        if _MULTI_MUTANT_SEP in token:
+            continue
+        mutation = parse_mutation(token)
+        chars = list(str(sequence))
+        idx = mutation.pos - 1
+        if not 0 <= idx < len(chars):
+            continue
+        chars[idx] = mutation.wt
+        return "".join(chars).upper()
+    return None
+
+
 def _resolve_wildtype(
     name: str,
     columns: list[str],
@@ -162,6 +210,8 @@ def _resolve_wildtype(
     2. Otherwise a wild-type column in the CSV (``wildtype`` for DMS assays,
        ``protein_sequence`` for clinical assays), which must hold a single
        constant sequence repeated across rows.
+    3. Otherwise, reconstruct it from a ``mutated_sequence`` column by reverting a
+       single-substitution row (real ProteinGym DMS CSVs carry no standalone WT).
 
     Args:
         name: Assay name (for error messages).
@@ -190,9 +240,14 @@ def _resolve_wildtype(
             )
         return values.pop().upper()
 
+    reconstructed = _reconstruct_wildtype(name, columns, table)
+    if reconstructed is not None:
+        return reconstructed
+
     raise ValueError(
         f"[{name}] no wild-type sequence available: pass it via the `wildtypes` mapping "
-        f"(e.g. EvalDatasetEntry.extra['wildtype']) or add a {wildtype_column!r} column"
+        f"(e.g. EvalDatasetEntry.extra['wildtype']), add a {wildtype_column!r} column, or "
+        f"include a {_MUTATED_SEQUENCE_COLUMN!r} column to reconstruct it from"
     )
 
 
@@ -225,6 +280,7 @@ def _load_single_assay(
     score_column: str = _SCORE_COLUMN,
     wildtype_column: str = _WILDTYPE_COLUMN,
     label_parser: Callable[[Any], float] = float,
+    bin_column: str | None = None,
 ) -> VariantAssay:
     """Parse and validate one assay CSV into a :class:`VariantAssay`.
 
@@ -238,6 +294,9 @@ def _load_single_assay(
         label_parser: Callable mapping a raw label cell to ``float`` (defaults to
             ``float`` for continuous DMS scores; clinical assays pass a
             categorical parser).
+        bin_column: Optional column holding a binarized fitness label; populated
+            into :attr:`VariantAssay.bin_labels` when present. Missing column ->
+            ``bin_labels`` stays ``None``.
 
     Returns:
         The parsed, WT-validated assay.
@@ -261,13 +320,23 @@ def _load_single_assay(
         name, columns, table, wildtype_override, wildtype_column=wildtype_column
     )
 
+    bin_labels: list[float] | None = None
+    if bin_column is not None and bin_column in columns:
+        bin_labels = [float(v) for v in table.column(bin_column).to_pylist()]
+
     # Validate every (possibly multi-) mutant against the wild-type up front so
     # the eval harness can trust the loaded assay. Scoring is done downstream.
     for token in mutations:
         for mutation in (parse_mutation(part) for part in _split_mutant(token)):
             _validate_mutation(wildtype, mutation, assay=name, token=token)
 
-    return VariantAssay(name=name, wildtype=wildtype, mutations=mutations, labels=labels)
+    return VariantAssay(
+        name=name,
+        wildtype=wildtype,
+        mutations=mutations,
+        labels=labels,
+        bin_labels=bin_labels,
+    )
 
 
 def _discover_variant_files(directory: Path) -> list[Path]:
@@ -292,6 +361,11 @@ def load_variant_assays(
     1. The ``wildtypes`` mapping keyed by assay name (the CSV filename stem) —
        the route for ``EvalDatasetEntry.extra["wildtype"]`` or a sidecar.
     2. A ``wildtype`` column in the CSV (a single constant sequence per file).
+    3. Reconstruction from a ``mutated_sequence`` column (the real ProteinGym DMS
+       layout) by reverting a single-substitution row.
+
+    A binarized fitness label is read into :attr:`VariantAssay.bin_labels` when a
+    ``DMS_score_bin`` column is present (used by the DMS eval task's AUROC).
 
     Every mutation is parsed and validated against the wild-type at load time;
     a position out of range or a wild-type-residue mismatch raises ``ValueError``.
@@ -299,7 +373,7 @@ def load_variant_assays(
     Args:
         directory: Directory of assay CSV files.
         wildtypes: Optional mapping ``{assay_name: wildtype_sequence}`` (assay
-            name = CSV filename stem). Takes precedence over a ``wildtype`` column.
+            name = CSV filename stem). Takes precedence over the other WT sources.
         max_assays: Optional cap on the number of assays returned (applied after
             sorting by filename). ``None`` loads all.
 
@@ -320,7 +394,9 @@ def load_variant_assays(
         files = files[:max_assays]
 
     overrides = wildtypes or {}
-    assays = [_load_single_assay(p, overrides.get(p.stem)) for p in files]
+    assays = [
+        _load_single_assay(p, overrides.get(p.stem), bin_column=_SCORE_BIN_COLUMN) for p in files
+    ]
     logger.info("loaded %d variant assays from %s", len(assays), directory)
     return assays
 

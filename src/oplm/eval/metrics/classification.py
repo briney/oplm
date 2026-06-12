@@ -9,37 +9,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from oplm.eval.metrics.ranking import average_ranks
+
 __all__ = ["roc_auc_score"]
-
-
-def _average_ranks(scores: np.ndarray) -> np.ndarray:
-    """Return 1-based average ("midrank") ranks of ``scores``.
-
-    Tied values all receive the mean of the ranks they span, so that tied
-    score pairs contribute 0.5 to the rank-sum statistic. Sorting is stable for
-    determinism.
-
-    Args:
-        scores: 1-D array of real-valued scores, shape ``(N,)``.
-
-    Returns:
-        Float array of shape ``(N,)`` with the average rank of each element,
-        aligned to the input order.
-    """
-    n = scores.shape[0]
-    order = np.argsort(scores, kind="mergesort")
-    sorted_scores = scores[order]
-
-    # Ordinal ranks 1..N, then replace each tied run with its mean rank.
-    ranks_sorted = np.arange(1, n + 1, dtype=np.float64)
-    # Group boundaries: a new group starts wherever the sorted value changes.
-    group_ids = np.concatenate(([0], np.cumsum(sorted_scores[1:] != sorted_scores[:-1])))
-    group_mean_rank = np.bincount(group_ids, weights=ranks_sorted) / np.bincount(group_ids)
-    ranks_sorted = group_mean_rank[group_ids]
-
-    ranks = np.empty(n, dtype=np.float64)
-    ranks[order] = ranks_sorted
-    return ranks
 
 
 def roc_auc_score(labels: np.ndarray, scores: np.ndarray) -> float:
@@ -84,7 +56,7 @@ def roc_auc_score(labels: np.ndarray, scores: np.ndarray) -> float:
             f"AUROC is undefined with a single class present (n_pos={n_pos}, n_neg={n_neg})"
         )
 
-    ranks = _average_ranks(scores)
+    ranks = average_ranks(scores)
     sum_ranks_pos = ranks[labels == 1.0].sum()
     auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
     return float(auc)

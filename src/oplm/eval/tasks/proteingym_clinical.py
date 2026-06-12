@@ -3,26 +3,31 @@
 Zero-shot pathogenicity prediction on ProteinGym's clinical-substitution
 benchmark. Each CSV is one protein; variants are labelled ``Pathogenic`` /
 ``Benign``. The model scores every variant by a per-position log-likelihood
-ratio; AUROC is computed per protein and averaged across proteins.
+ratio (see :mod:`oplm.eval.tasks.variant_scoring`); AUROC is computed per protein
+and averaged across proteins.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
-import torch
 
 from oplm.data import get_tokenizer, load_clinical_variant_assays
-from oplm.data.tokenizer import mask_token_id
-from oplm.data.variant.loader import parse_mutation
 from oplm.eval.metrics.classification import roc_auc_score
 from oplm.eval.registry import register_eval_task
 from oplm.eval.tasks.base import EvalTask
+from oplm.eval.tasks.variant_scoring import (
+    VALID_SCORING,
+    compute_variant_llrs,
+    gather_objects,
+    wildtype_fits,
+)
 
 if TYPE_CHECKING:
+    import torch
     from accelerate import Accelerator
 
     from oplm.config import EvalDatasetEntry, OplmConfig
@@ -30,10 +35,6 @@ if TYPE_CHECKING:
     from oplm.model import OplmForMaskedLM, OplmTokenizerFast
 
 logger = logging.getLogger(__name__)
-T = TypeVar("T")
-
-_VALID_SCORING = ("masked_marginals", "wt_marginals")
-_MULTI_MUTANT_SEP = ":"
 
 
 @dataclass(frozen=True)
@@ -61,8 +62,8 @@ class ProteinGymClinicalTaskConfig:
             max_assays=int(extra["max_assays"]) if "max_assays" in extra else None,
             mask_batch_size=int(extra.get("mask_batch_size", 64)),
         )
-        if cfg.scoring not in _VALID_SCORING:
-            raise ValueError(f"scoring must be one of {_VALID_SCORING}, got {cfg.scoring!r}")
+        if cfg.scoring not in VALID_SCORING:
+            raise ValueError(f"scoring must be one of {VALID_SCORING}, got {cfg.scoring!r}")
         if cfg.max_assays is not None and cfg.max_assays < 0:
             raise ValueError("max_assays must be >= 0 when provided")
         if not 1 <= cfg.mask_batch_size <= 1024:
@@ -81,8 +82,8 @@ class ProteinGymClinicalEvalTask(EvalTask):
 
     Evaluation protocol, per assay:
         1. Score each variant by the summed per-position log-likelihood ratio
-           ``LLR = log P(mut_aa | context) - log P(wt_aa | context)`` (over the
-           variant's substitutions), using ``masked_marginals`` or ``wt_marginals``.
+           ``LLR = log P(mut_aa | context) - log P(wt_aa | context)``, using
+           ``masked_marginals`` or ``wt_marginals``.
         2. A higher LLR means the substitution is more tolerated (Benign-like).
            Pathogenic is the positive class, so the **pathogenicity score is
            ``-LLR``**: a good model ranks Pathogenic variants higher and yields
@@ -136,13 +137,13 @@ class ProteinGymClinicalEvalTask(EvalTask):
         rank_assays = self._assays[rank::world_size]
 
         device = accelerator.device
-        local_aurocs: list[float] = []
-        for assay in rank_assays:
-            auroc = self._score_assay(assay, model, device)
-            if auroc is not None:
-                local_aurocs.append(auroc)
+        local_aurocs = [
+            auroc
+            for assay in rank_assays
+            if (auroc := self._score_assay(assay, model, device)) is not None
+        ]
 
-        all_aurocs = self._gather_data(local_aurocs, accelerator)
+        all_aurocs = gather_objects(local_aurocs, accelerator)
         if not all_aurocs:
             logger.warning("No scorable clinical assays (need both classes present)")
             return {m: 0.0 for m in self.metrics}
@@ -164,134 +165,27 @@ class ProteinGymClinicalEvalTask(EvalTask):
         """
         assert self._tokenizer is not None
 
-        wildtype = assay.wildtype
-        if len(wildtype) + 2 > self.cfg.model.max_position_embeddings:
+        if not wildtype_fits(assay.wildtype, self.cfg.model.max_position_embeddings):
             logger.debug(
                 "Skipping %s: wild-type length %d exceeds max context %d",
                 assay.name,
-                len(wildtype),
+                len(assay.wildtype),
                 self.cfg.model.max_position_embeddings - 2,
             )
             return None
 
-        # Parse each row into its constituent single substitutions (0-based pos).
-        parsed_rows = [
-            [parse_mutation(part) for part in token.split(_MULTI_MUTANT_SEP)]
-            for token in assay.mutations
-        ]
-        positions = sorted({m.pos - 1 for row in parsed_rows for m in row})
-
         try:
-            if self.tcfg.scoring == "wt_marginals":
-                pos_logprobs = self._wt_marginal_logprobs(wildtype, positions, model, device)
-            else:
-                pos_logprobs = self._masked_marginal_logprobs(wildtype, positions, model, device)
-            llr = self._variant_llrs(parsed_rows, pos_logprobs, assay.name)
+            llr = compute_variant_llrs(
+                assay,
+                model,
+                self._tokenizer,
+                device,
+                scoring=self.tcfg.scoring,
+                mask_batch_size=self.tcfg.mask_batch_size,
+            )
             labels = np.asarray(assay.labels, dtype=np.float64)
             # Pathogenic (label 1) should score high → use -LLR (tolerated = low).
             return roc_auc_score(labels, -llr)
         except ValueError as err:
             logger.warning("[%s] skipping: %s", assay.name, err)
             return None
-
-    def _variant_llrs(
-        self,
-        parsed_rows: list[list[Any]],
-        pos_logprobs: dict[int, torch.Tensor],
-        assay_name: str,
-    ) -> np.ndarray:
-        """Sum per-position log-likelihood ratios into one score per variant row."""
-        assert self._tokenizer is not None
-        tokenizer = self._tokenizer  # local narrowing so the closure sees a non-None tokenizer
-        unk_id = tokenizer.unk_token_id
-        aa_ids: dict[str, int] = {}
-
-        def token_id(aa: str) -> int:
-            if aa not in aa_ids:
-                tid = tokenizer.convert_tokens_to_ids(aa)  # single token -> int
-                if not isinstance(tid, int) or tid == unk_id:
-                    raise ValueError(
-                        f"[{assay_name}] amino acid {aa!r} maps to <unk>; cannot score"
-                    )
-                aa_ids[aa] = tid
-            return aa_ids[aa]
-
-        scores = np.empty(len(parsed_rows), dtype=np.float64)
-        for k, row in enumerate(parsed_rows):
-            total = 0.0
-            for mutation in row:
-                logprobs = pos_logprobs[mutation.pos - 1]
-                total += float(logprobs[token_id(mutation.mut)] - logprobs[token_id(mutation.wt)])
-            scores[k] = total
-        return scores
-
-    def _wt_marginal_logprobs(
-        self,
-        wildtype: str,
-        positions: list[int],
-        model: OplmForMaskedLM,
-        device: torch.device,
-    ) -> dict[int, torch.Tensor]:
-        """Log-softmax logits at each position from one wild-type forward pass.
-
-        Returns a mapping ``{residue_index_0based: (V,) log-prob tensor}``.
-        """
-        assert self._tokenizer is not None
-        input_ids = torch.tensor(self._tokenizer.encode(wildtype), dtype=torch.long).unsqueeze(0)
-        input_ids = input_ids.to(device)
-        attention_mask = torch.ones_like(input_ids)
-        with torch.no_grad():
-            logits = model(input_ids=input_ids, attention_mask=attention_mask)["logits"]
-        logprobs = torch.log_softmax(logits[0].float(), dim=-1).cpu()  # (T, V)
-        # Residue i (0-based) lives at token index i+1 (BOS at index 0).
-        return {i: logprobs[i + 1] for i in positions}
-
-    def _masked_marginal_logprobs(
-        self,
-        wildtype: str,
-        positions: list[int],
-        model: OplmForMaskedLM,
-        device: torch.device,
-    ) -> dict[int, torch.Tensor]:
-        """Log-softmax logits at each position with that position masked.
-
-        One masked forward per unique position, batched up to ``mask_batch_size``.
-        Returns a mapping ``{residue_index_0based: (V,) log-prob tensor}``.
-        """
-        assert self._tokenizer is not None
-        base = torch.tensor(self._tokenizer.encode(wildtype), dtype=torch.long)  # (T,)
-        mask_id = mask_token_id(self._tokenizer)
-
-        result: dict[int, torch.Tensor] = {}
-        batch_size = self.tcfg.mask_batch_size
-        for start in range(0, len(positions), batch_size):
-            chunk = positions[start : start + batch_size]
-            batch = base.unsqueeze(0).repeat(len(chunk), 1)  # (B, T)
-            for row_idx, pos in enumerate(chunk):
-                batch[row_idx, pos + 1] = mask_id  # BOS offset
-            input_ids = batch.to(device)
-            attention_mask = torch.ones_like(input_ids)
-            with torch.no_grad():
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)["logits"]
-            for row_idx, pos in enumerate(chunk):
-                result[pos] = torch.log_softmax(logits[row_idx, pos + 1].float(), dim=-1).cpu()
-            del logits, input_ids, attention_mask, batch
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-        return result
-
-    def _gather_data(self, local_data: list[T], accelerator: Accelerator) -> list[T]:
-        """Gather per-rank Python objects from all ranks into a flat list."""
-        if accelerator.num_processes == 1:
-            return local_data
-
-        import torch.distributed as dist
-
-        all_data_lists: list[list[T] | None] = [None] * accelerator.num_processes
-        dist.all_gather_object(all_data_lists, local_data)
-
-        gathered: list[T] = []
-        for rank_data in all_data_lists:
-            if rank_data is not None:
-                gathered.extend(rank_data)
-        return gathered

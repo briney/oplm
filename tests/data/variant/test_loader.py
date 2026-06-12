@@ -296,6 +296,53 @@ def test_real_proteingym_fixture() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Wild-type reconstruction and DMS_score_bin (DMS substitution layout)
+# --------------------------------------------------------------------------- #
+
+
+def test_reconstruct_wildtype_from_mutated_sequence(tmp_path: Path) -> None:
+    """With no WT column/mapping, the WT is reconstructed from ``mutated_sequence``."""
+    mutated = list(_UBQ)
+    mutated[5] = "R"  # apply K6R to the WT
+    path = tmp_path / "Recon.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["mutant", "DMS_score", "mutated_sequence"])
+        writer.writerow(["K6R", 1.0, "".join(mutated)])
+    assays = load_variant_assays(tmp_path)
+    assert assays[0].wildtype == _UBQ
+
+
+def test_dms_score_bin_loaded_into_bin_labels(tmp_path: Path) -> None:
+    """A ``DMS_score_bin`` column populates ``bin_labels`` as floats."""
+    path = tmp_path / "Bin.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["mutant", "DMS_score", "wildtype", "DMS_score_bin"])
+        writer.writerow(["M1A", 0.1, _UBQ, 0])
+        writer.writerow(["K6R", 0.9, _UBQ, 1])
+    assay = load_variant_assays(tmp_path)[0]
+    assert assay.bin_labels == pytest.approx([0.0, 1.0])
+    assert all(isinstance(x, float) for x in assay.bin_labels)
+
+
+def test_bin_labels_none_without_column(tmp_path: Path) -> None:
+    """No ``DMS_score_bin`` column leaves ``bin_labels`` as None."""
+    _write_assay_csv(tmp_path, "NoBin", [("M1A", 0.1)], wildtype_col=_UBQ)
+    assert load_variant_assays(tmp_path)[0].bin_labels is None
+
+
+def test_real_dms_fixture_reconstructs_and_binarizes() -> None:
+    """The real DMS fixture loads with no mapping: WT reconstructed, bin labels present."""
+    assays = load_variant_assays(_FIXTURE_DIR)
+    assert assays
+    assay = assays[0]
+    assert len(assay.wildtype) > 0
+    assert assay.bin_labels is not None
+    assert set(assay.bin_labels) == {0.0, 1.0}  # both fitness classes present
+
+
+# --------------------------------------------------------------------------- #
 # Clinical variant loader (Pathogenic/Benign + protein_sequence WT column)
 # --------------------------------------------------------------------------- #
 

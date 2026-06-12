@@ -21,7 +21,7 @@ task subclasses `EvalTask` (`src/oplm/eval/tasks/base.py`) and implements
 | `sequence` | **implemented** | `loss`, `accuracy`, `perplexity` | Masked-LM metrics over held-out parquet (same schema as training data). |
 | `structure` | **implemented** | `precision_at_L` | Unsupervised contact prediction from the model's categorical Jacobian over PDB/CIF structures. Also supports `precision_at_L_2`, `precision_at_L_5`. |
 | `tape` | stub | SS3/SS8, contact, homology, fluorescence, stability | TAPE benchmark — raises `NotImplementedError`. |
-| `proteingym` | stub | `spearman`, `ndcg` | ProteinGym DMS variant-effect prediction — raises `NotImplementedError`. |
+| `proteingym` | **implemented** | `spearman`, `auroc`, `top_k_precision` | ProteinGym DMS variant-effect prediction via per-position log-likelihood ratios; mean Spearman / AUROC / top-fraction precision across assays. |
 | `proteingym_clinical` | **implemented** | `auroc` | ProteinGym clinical-substitution pathogenicity (Pathogenic vs Benign) via per-position log-likelihood ratios; mean AUROC across per-protein assays. |
 | `proteinglue` | stub | fold/enzyme/GO | ProteinGlue benchmark — raises `NotImplementedError`. |
 | `everest` | stub | `spearman`, `auroc` | EVEREST clinical-variant benchmark — raises `NotImplementedError`. |
@@ -97,13 +97,13 @@ error).
 > `categorical_jacobian_sample_size` to evaluate a deterministic subset and
 > `max_structures` to cap how many are loaded.
 
-## ProteinGym clinical eval: variant scoring
+## Variant eval: scoring (ProteinGym DMS and clinical)
 
-The `proteingym_clinical` task reads a directory of one-protein clinical CSVs
-(`protein_sequence` = the constant wild-type, `mutant`, `DMS_bin_score` =
-`Pathogenic`/`Benign`) via `load_clinical_variant_assays`. The wild-type comes
-straight from the `protein_sequence` column — no reconstruction. Two scoring
-methods trade accuracy for cost:
+The `proteingym` (DMS) and `proteingym_clinical` tasks share one scoring core
+(`src/oplm/eval/tasks/variant_scoring.py`). Each variant is scored by the summed
+per-position log-likelihood ratio `LLR = log P(mut | ctx) − log P(wt | ctx)`; a
+higher LLR means the model finds the substitution more tolerated. Two methods
+trade accuracy for cost:
 
 - `masked_marginals` (default) — mask each unique mutated position and read its
   log-probabilities from that forward pass (the ESM-1v protocol; one batched
@@ -111,9 +111,17 @@ methods trade accuracy for cost:
 - `wt_marginals` — a single wild-type forward pass; read every mutation's
   log-probabilities from it. Cheapest, useful for frequent during-training eval.
 
-Assays whose wild-type exceeds the model context are skipped; so are assays
-without both classes (AUROC needs a positive and a negative). With no scorable
-assay the metric is `0.0` (finite, not an error).
+The tasks differ only in data and metrics. DMS reads CSVs with `mutant`,
+`DMS_score`, `mutated_sequence` (the wild-type is reconstructed from it) and an
+optional `DMS_score_bin`; metrics align with the LLR directly (higher fitness =
+higher score). Clinical reads one-protein CSVs with `protein_sequence` (the
+constant wild-type), `mutant`, and `DMS_bin_score` (`Pathogenic`/`Benign`); since
+a higher LLR is Benign-like, its pathogenicity score is `−LLR`.
+
+Per-assay metrics are macro-averaged across assays. Assays whose wild-type
+exceeds the model context are skipped, as are assays whose inputs are degenerate
+for a given metric (a single AUROC class, or a constant Spearman input). With no
+scorable assay the metric is `0.0` (finite, not an error).
 
 ## Metrics
 
@@ -125,14 +133,17 @@ namespaces them as `eval/<task_name>/<metric>`:
   capped at 1000) — see `src/oplm/eval/metrics/mlm.py`.
 - **structure** — `precision_at_L`, `precision_at_L_2`, `precision_at_L_5` (top
   `L`, `L/2`, `L/5` long-range contacts).
+- **proteingym** — `spearman` (rank correlation of model score vs `DMS_score`),
+  `auroc` (vs the binarized `DMS_score_bin`, when present), and `top_k_precision`
+  (overlap of the top `top_k_fraction` of variants by `DMS_score` and by model
+  score; equals the leaderboard's top-fraction recall). Each is macro-averaged
+  across assays. Spearman/top-k from `src/oplm/eval/metrics/ranking.py`, AUROC
+  from `src/oplm/eval/metrics/classification.py`. See the scoring section above.
 - **proteingym_clinical** — `auroc`: per-protein ROC-AUC of Pathogenic-vs-Benign
-  discrimination, macro-averaged across proteins. Each variant is scored by the
-  summed per-position log-likelihood ratio
-  `LLR = log P(mut | ctx) − log P(wt | ctx)`; since a higher LLR means a more
-  tolerated (Benign-like) substitution, the **pathogenicity score is `−LLR`** so a
-  good model yields AUROC > 0.5. Scoring uses `masked_marginals` (default) or
-  `wt_marginals`. Assays without both classes are skipped. AUROC is implemented in
-  NumPy in `src/oplm/eval/metrics/classification.py`.
+  discrimination, macro-averaged across proteins. The pathogenicity score is
+  `−LLR` (a higher LLR is Benign-like) so a good model yields AUROC > 0.5. AUROC
+  is implemented in NumPy in `src/oplm/eval/metrics/classification.py`. See the
+  scoring section above.
 
 Metrics are logged to W&B and passed to callbacks; there are no separate eval
 output files.
@@ -154,11 +165,17 @@ data:
       type: structure
       every: { steps: 20_000 }
       categorical_jacobian_sample_size: 12   # task-specific key, same level as path/type
+    dms_variants:
+      path: /data/proteingym_dms         # dir of DMS substitution CSVs
+      type: proteingym
+      every: { steps: 20_000 }
+      scoring: masked_marginals          # task-specific keys, same level as path/type
+      top_k_fraction: 0.1
     clinical_variants:
       path: /data/proteingym_clinical    # dir of one-protein CSVs
       type: proteingym_clinical
       every: { steps: 20_000 }
-      scoring: masked_marginals          # task-specific keys, same level as path/type
+      scoring: masked_marginals
       mask_batch_size: 64
 ```
 

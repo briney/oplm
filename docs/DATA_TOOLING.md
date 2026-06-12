@@ -156,10 +156,12 @@ the eval harness:
   eval task. See [OVERVIEW.md §17](OVERVIEW.md).
 - **Variant** (`src/oplm/data/variant/`) — zero-shot variant-effect assays loaded
   and validated from CSV. DMS-substitution assays (`mutant`, `DMS_score`) load via
-  `load_variant_assays`; ProteinGym **clinical**-substitution assays (`mutant`,
-  `DMS_bin_score` = `Pathogenic`/`Benign`, `protein_sequence`) load via
-  `load_clinical_variant_assays`, which takes the wild-type directly from the
-  constant `protein_sequence` column (no reconstruction) and maps labels to
+  `load_variant_assays`, which reconstructs the wild-type from `mutated_sequence`
+  when no explicit WT is given and reads the optional `DMS_score_bin` column into
+  `VariantAssay.bin_labels` (used for AUROC). ProteinGym **clinical**-substitution
+  assays (`mutant`, `DMS_bin_score` = `Pathogenic`/`Benign`, `protein_sequence`)
+  load via `load_clinical_variant_assays`, which takes the wild-type directly from
+  the constant `protein_sequence` column (no reconstruction) and maps labels to
   `1.0`/`0.0`. See [OVERVIEW.md §18](OVERVIEW.md).
 - **Downstream / embedding** (`src/oplm/data/downstream/`) — labeled sequences
   with per-residue or sequence-level labels for probing/fine-tuning. See
