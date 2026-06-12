@@ -6,9 +6,9 @@ vs. a ``wildtype`` column). The contract tests build temporary CSVs against a
 **real** reference sequence (human ubiquitin) — the loader only loads and
 validates structure/mutations, so the ``DMS_score`` values are opaque to it.
 
-A genuinely real ProteinGym assay CSV may be dropped at
-``tests/data/fixtures/variant/<assay>.csv`` (see that directory's README); the
-``test_real_proteingym_fixture`` test ``pytest.skip``s when it is absent.
+A real ProteinGym assay CSV is committed at
+``tests/data/fixtures/variant/<assay>.csv`` (see that directory's README) and the
+``test_real_proteingym_fixture`` test loads it directly.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import pytest
 from oplm.data.variant.loader import (
     Mutation,
     VariantAssay,
+    load_clinical_variant_assays,
     load_variant_assays,
     parse_mutation,
 )
@@ -250,12 +251,12 @@ def test_missing_directory_raises(tmp_path: Path) -> None:
 
 
 def _real_fixture_csvs() -> list[Path]:
-    """Return real ProteinGym fixture CSVs, or skip if the directory is empty."""
-    if not _FIXTURE_DIR.is_dir():
-        pytest.skip(f"variant fixture dir missing: {_FIXTURE_DIR} (see fixtures/README.md)")
+    """Return the committed real ProteinGym fixture CSVs."""
+    assert _FIXTURE_DIR.is_dir(), (
+        f"variant fixture dir missing: {_FIXTURE_DIR} (see fixtures/README.md)"
+    )
     csvs = sorted(_FIXTURE_DIR.glob("*.csv"))
-    if not csvs:
-        pytest.skip(f"no variant fixture CSVs in {_FIXTURE_DIR} (see fixtures/README.md)")
+    assert csvs, f"no variant fixture CSVs in {_FIXTURE_DIR} (see fixtures/README.md)"
     return csvs
 
 
@@ -268,9 +269,9 @@ def test_real_proteingym_fixture() -> None:
     """
     path = _real_fixture_csvs()[0]
     table = pa_csv.read_csv(str(path))
-    columns = table.column_names
-    if "mutated_sequence" not in columns:
-        pytest.skip(f"{path.name} has no 'mutated_sequence' column to reconstruct the WT")
+    assert "mutated_sequence" in table.column_names, (
+        f"{path.name} has no 'mutated_sequence' column to reconstruct the WT"
+    )
 
     mutants = [str(m) for m in table.column("mutant").to_pylist()]
     mutated_seqs = [str(s) for s in table.column("mutated_sequence").to_pylist()]
@@ -285,11 +286,188 @@ def test_real_proteingym_fixture() -> None:
         chars[mutation.pos - 1] = mutation.wt
         wildtype = "".join(chars)
         break
-    if wildtype is None:
-        pytest.skip(f"{path.name} has no single-substitution row to reconstruct the WT")
+    assert wildtype is not None, f"{path.name} has no single-substitution row to reconstruct the WT"
 
     assays = load_variant_assays(_FIXTURE_DIR, wildtypes={path.stem: wildtype})
     assay = next(a for a in assays if a.name == path.stem)
     assert assay.wildtype == wildtype
     assert len(assay.mutations) == len(mutants)
     assert len(assay.labels) == len(assay.mutations)
+
+
+# --------------------------------------------------------------------------- #
+# Wild-type reconstruction and DMS_score_bin (DMS substitution layout)
+# --------------------------------------------------------------------------- #
+
+
+def test_reconstruct_wildtype_from_mutated_sequence(tmp_path: Path) -> None:
+    """With no WT column/mapping, the WT is reconstructed from ``mutated_sequence``."""
+    mutated = list(_UBQ)
+    mutated[5] = "R"  # apply K6R to the WT
+    path = tmp_path / "Recon.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["mutant", "DMS_score", "mutated_sequence"])
+        writer.writerow(["K6R", 1.0, "".join(mutated)])
+    assays = load_variant_assays(tmp_path)
+    assert assays[0].wildtype == _UBQ
+
+
+def test_dms_score_bin_loaded_into_bin_labels(tmp_path: Path) -> None:
+    """A ``DMS_score_bin`` column populates ``bin_labels`` as floats."""
+    path = tmp_path / "Bin.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["mutant", "DMS_score", "wildtype", "DMS_score_bin"])
+        writer.writerow(["M1A", 0.1, _UBQ, 0])
+        writer.writerow(["K6R", 0.9, _UBQ, 1])
+    assay = load_variant_assays(tmp_path)[0]
+    assert assay.bin_labels == pytest.approx([0.0, 1.0])
+    assert all(isinstance(x, float) for x in assay.bin_labels)
+
+
+def test_bin_labels_none_without_column(tmp_path: Path) -> None:
+    """No ``DMS_score_bin`` column leaves ``bin_labels`` as None."""
+    _write_assay_csv(tmp_path, "NoBin", [("M1A", 0.1)], wildtype_col=_UBQ)
+    assert load_variant_assays(tmp_path)[0].bin_labels is None
+
+
+def test_real_dms_fixture_reconstructs_and_binarizes() -> None:
+    """The real DMS fixture loads with no mapping: WT reconstructed, bin labels present."""
+    assays = load_variant_assays(_FIXTURE_DIR)
+    assert assays
+    assay = assays[0]
+    assert len(assay.wildtype) > 0
+    assert assay.bin_labels is not None
+    assert set(assay.bin_labels) == {0.0, 1.0}  # both fitness classes present
+
+
+# --------------------------------------------------------------------------- #
+# Clinical variant loader (Pathogenic/Benign + protein_sequence WT column)
+# --------------------------------------------------------------------------- #
+
+_CLINICAL_FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "variant_clinical"
+
+
+def _write_clinical_csv(
+    directory: Path,
+    name: str,
+    rows: Sequence[tuple[str, str]],
+    *,
+    protein_sequence: str = _UBQ,
+) -> Path:
+    """Write a clinical-substitution ``<name>.csv`` (mutant/protein_sequence/DMS_bin_score).
+
+    Args:
+        directory: Destination directory.
+        name: Assay name (becomes the filename stem).
+        rows: ``(mutant, DMS_bin_score)`` pairs, e.g. ``("K6R", "Pathogenic")``.
+        protein_sequence: Constant wild-type written to every row.
+
+    Returns:
+        The written CSV path.
+    """
+    path = directory / f"{name}.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["mutant", "protein_sequence", "DMS_bin_score"])
+        for mutant, label in rows:
+            writer.writerow([mutant, protein_sequence, label])
+    return path
+
+
+def test_clinical_labels_mapped_to_floats(tmp_path: Path) -> None:
+    """Pathogenic/Benign map to 1.0/0.0 (case-insensitive) and WT comes from the column."""
+    _write_clinical_csv(
+        tmp_path,
+        "ACAD",
+        [("M1A", "Pathogenic"), ("K6R", "benign"), ("G76S", "PATHOGENIC")],
+    )
+    assays = load_clinical_variant_assays(tmp_path)
+    assert len(assays) == 1
+
+    assay = assays[0]
+    assert isinstance(assay, VariantAssay)
+    assert assay.name == "ACAD"
+    assert assay.wildtype == _UBQ
+    assert assay.mutations == ["M1A", "K6R", "G76S"]
+    assert assay.labels == pytest.approx([1.0, 0.0, 1.0])
+    assert all(isinstance(x, float) for x in assay.labels)
+
+
+def test_clinical_unknown_label_raises(tmp_path: Path) -> None:
+    """A label outside the Pathogenic/Benign vocabulary raises."""
+    _write_clinical_csv(tmp_path, "Bad", [("K6R", "Likely_pathogenic")])
+    with pytest.raises(ValueError, match="unknown clinical label"):
+        load_clinical_variant_assays(tmp_path)
+
+
+@pytest.mark.parametrize("drop", ["mutant", "protein_sequence", "DMS_bin_score"])
+def test_clinical_missing_required_column_raises(tmp_path: Path, drop: str) -> None:
+    """Dropping any required clinical column is an error."""
+    path = tmp_path / "Missing.csv"
+    all_cols = {"mutant": "M1A", "protein_sequence": _UBQ, "DMS_bin_score": "Benign"}
+    kept = [c for c in all_cols if c != drop]
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(kept)
+        writer.writerow([all_cols[c] for c in kept])
+    # Dropping the WT column surfaces as a "no wild-type" error; the others as
+    # a missing-required-column error.
+    expected = (
+        "no wild-type sequence available"
+        if drop == "protein_sequence"
+        else "missing required column"
+    )
+    with pytest.raises(ValueError, match=expected):
+        load_clinical_variant_assays(tmp_path)
+
+
+def test_clinical_wildtype_mismatch_raises(tmp_path: Path) -> None:
+    """Mutation validation against the protein_sequence WT is reused (position 1 is M)."""
+    _write_clinical_csv(tmp_path, "Mismatch", [("A1G", "Pathogenic")])
+    with pytest.raises(ValueError, match="expects wild-type"):
+        load_clinical_variant_assays(tmp_path)
+
+
+def test_clinical_position_out_of_range_raises(tmp_path: Path) -> None:
+    """A position beyond the WT length raises."""
+    _write_clinical_csv(tmp_path, "OOR", [("M999A", "Benign")])
+    with pytest.raises(ValueError, match="out of range"):
+        load_clinical_variant_assays(tmp_path)
+
+
+def test_clinical_multi_mutant_kept_and_validated(tmp_path: Path) -> None:
+    """A ``:``-joined multi-mutant is kept verbatim and each part validated."""
+    _write_clinical_csv(tmp_path, "Multi", [("M1A:K6R", "Pathogenic")])
+    assays = load_clinical_variant_assays(tmp_path)
+    assert assays[0].mutations == ["M1A:K6R"]
+
+
+def test_clinical_mapping_overrides_protein_sequence(tmp_path: Path) -> None:
+    """An explicit ``wildtypes`` entry takes precedence over the protein_sequence column."""
+    _write_clinical_csv(tmp_path, "Both", [("K6R", "Benign")], protein_sequence="MAAA")
+    assays = load_clinical_variant_assays(tmp_path, wildtypes={"Both": _UBQ})
+    assert assays[0].wildtype == _UBQ
+
+
+def test_clinical_max_assays_caps_count(tmp_path: Path) -> None:
+    """``max_assays`` caps the number returned, after filename sorting."""
+    for name in ("a", "b", "c"):
+        _write_clinical_csv(tmp_path, name, [("M1A", "Benign")])
+    assert [a.name for a in load_clinical_variant_assays(tmp_path, max_assays=2)] == ["a", "b"]
+
+
+def test_real_clinical_fixture() -> None:
+    """The committed real clinical fixture loads with both classes present."""
+    assert _CLINICAL_FIXTURE_DIR.is_dir(), (
+        f"clinical fixture dir missing: {_CLINICAL_FIXTURE_DIR} (see fixtures/README.md)"
+    )
+    csvs = sorted(_CLINICAL_FIXTURE_DIR.glob("*.csv"))
+    assert csvs, f"no clinical fixture CSVs in {_CLINICAL_FIXTURE_DIR}"
+
+    assays = load_clinical_variant_assays(_CLINICAL_FIXTURE_DIR)
+    assert assays
+    assay = assays[0]
+    assert set(assay.labels) == {0.0, 1.0}  # both Pathogenic and Benign present
+    assert len(assay.mutations) == len(assay.labels)
