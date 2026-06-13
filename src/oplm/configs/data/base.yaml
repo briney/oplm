@@ -23,13 +23,15 @@ data:
   #     heldout:    { path: /data/eval.parquet, type: sequence, every: { tokens: 20_000_000 } }
   #     structures: { path: /data/pdb, type: structure, every: { steps: 20_000 },
   #                   categorical_jacobian_sample_size: 12 }
+  #     proteingym: { path: /data/proteingym_dms_monitor, type: proteingym, every: { steps: 5_000 },
+  #                  scoring: wt_marginals, top_k_fraction: 0.1 }
   eval: null
 
   # Sequence masking
   mask_prob: 0.15
   mask_token_prob: 0.8
   random_token_prob: 0.1
-  weighted_masking: false     # set true to honor the masking_weights column
+  weighted_masking: false # set true to honor the masking_weights column
 
   # DataLoader settings
   num_workers: 4
