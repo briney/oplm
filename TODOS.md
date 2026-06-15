@@ -264,24 +264,39 @@ once at the proxy width and reuse the same number at every larger preset.
 
 ## Phase 7: LR Sweep Harness (multi-GPU node)
 
-- [ ] `scripts/mup_pilot_run.py` (new, `typer`): build one `OplmConfig` (μP on)
-  from CLI overrides + `TrainConfig`, then run
+- [x] `scripts/mup_pilot_run.py` (new, `typer`): builds one μP-on root
+  `OplmConfig` (model + `TrainConfig` + `DataConfig`) from CLI options, calls
+  `oplm.train._bootstrap_training_environment()` (DeepSpeed opt-out + Triton
+  cache, matching `oplm.train.main`), then runs
   `Trainer(cfg, callbacks=[SweepMetricsCallback(out/"metrics.json")]).train()`.
-  Single unit a sweep launches (in-process so the callback can capture loss).
-  Honors `CUDA_VISIBLE_DEVICES`.
-- [ ] `scripts/mup_sweep.py` (new, `typer`, orchestrator): inputs `--lrs` (grid),
-  `--widths` (hidden sizes for fixed-depth width transfer, **or** presets to scale
-  width+depth together and validate the preset ray, Finding 4), `--gpus N`,
-  `--steps`, `--data`, `--out`. Fan out one `python -m scripts.mup_pilot_run`
-  **subprocess per grid point**, each pinned via `CUDA_VISIBLE_DEVICES`, with a
-  GPU-sized concurrency pool (semaphore). Use `subprocess.run` with arg lists (no
-  `shell=True`).
-- [ ] On completion, call `summarize_sweep` + `best_lr_per_width`; print
-  `result.best_lr` per width, emit a loss-vs-LR plot, print the **transfer verdict**
-  (`result.transferred`).
-- [ ] Each pilot run: `wandb_enabled=false`, fixed `seed`, identical `batch_size`,
-  `warmup_steps`, `max_steps` across the grid (only `lr` and the width — plus
-  `num_hidden_layers` in preset-ray mode — vary).
+  `wandb_enabled=False`, eval left off (train-loss-only signal), `--no-save`
+  default (`save_final=False`, `save_every=steps+1`) so a sweep leaves no
+  checkpoints. Honors `CUDA_VISIBLE_DEVICES` (accelerate auto-detects). μP
+  geometry comes from `scripts._mup_common` (shared with the coord-check, so the
+  gate validates the same model the sweep trains).
+- [x] `scripts/mup_sweep.py` (new, `typer`, orchestrator): inputs `--lrs`,
+  `--widths` (hidden sizes; `--scaling width` fixes depth, `--scaling preset_ray`
+  co-scales depth with width to validate the preset ray, Finding 4), `--gpus N`,
+  `--steps`, `--data`, `--out`. Fans one `python -m scripts.mup_pilot_run`
+  subprocess per `(width, lr)` grid point via `subprocess.run` with arg lists (no
+  `shell=True`), pinned by a per-subprocess `CUDA_VISIBLE_DEVICES`. The GPU-sized
+  pool is a `ThreadPoolExecutor(max_workers=gpus)` over a `queue.Queue` of GPU ids
+  (the queue is the semaphore: each task borrows an id, runs, returns it). Failed
+  runs are collected (stderr tail surfaced), not fatal.
+- [x] On completion, calls `summarize_sweep` + `best_lr_per_width`; prints a
+  per-`(width, lr)` loss table, the argmin LR per width, the **transfer verdict**
+  (`result.transferred`), and writes a loss-vs-LR plot (`sweep_loss_vs_lr.png`,
+  one line per width, argmin starred).
+- [x] Each pilot run: `wandb_enabled=false`, and the orchestrator passes an
+  identical `seed`, `batch_size`, `warmup_steps`, and `steps` to every grid point
+  (a shared `common` argv); only `--width` and `--lr` vary (plus depth in
+  preset-ray mode, derived from width).
+- [x] Refactor: shared `scripts/_mup_common.py` (head_dim=64, preset aspect
+  ratio, `Scaling`/`Optimizer` enums, `parse_widths`/`parse_floats`,
+  `num_layers_for`) is the single source of width→geometry for both the
+  coord-check and the sweep. Verified on CPU/GPU: pilot trains and writes
+  `metrics.json`; a 2×2 sweep spawns 4 pinned subprocesses, summarizes, prints
+  the verdict, and emits the plot; coord-check regression still holds.
 
 ## Phase 8: Defaults, Preset, Docs
 

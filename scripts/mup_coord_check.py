@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -47,6 +46,15 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+
+from scripts._mup_common import (
+    HEAD_DIM,
+    PRESET_ASPECT_RATIO,
+    Optimizer,
+    Scaling,
+    num_layers_for,
+    parse_widths,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -59,12 +67,6 @@ if TYPE_CHECKING:
 app = typer.Typer(name="mup-coord-check", help=__doc__, add_completion=False)
 console = Console()
 
-# Head dim is fixed across OPLM presets (only the head *count* grows), so width
-# scaling keeps `head_dim=64` and every width must be a multiple of it.
-_HEAD_DIM = 64
-# Preset aspect ratio hidden/layers (the 50M preset is 512/16 = 32); used to
-# co-scale depth with width in "preset_ray" mode.
-_PRESET_ASPECT_RATIO = 32
 # Heuristic line for the printed growth table: μP should hold RMS roughly flat
 # across width (growth ~1); the control fans out well past this.
 _GROWTH_FLAG = 2.0
@@ -84,36 +86,6 @@ _DEFAULT_SEQUENCES = [
 ]
 
 
-class Scaling(StrEnum):
-    """How the per-width geometry is built."""
-
-    width = "width"  # μP gate: vary hidden_size only, depth fixed
-    preset_ray = "preset_ray"  # vary hidden_size AND depth at the preset ratio
-
-
-class Optimizer(StrEnum):
-    """Throwaway optimizer used to take the coord-check steps."""
-
-    muon = "muon"
-    adamw = "adamw"
-
-
-def _parse_widths(raw: str) -> list[int]:
-    """Parse a comma-separated width list and validate the head-dim constraint."""
-    try:
-        widths = [int(tok) for tok in raw.split(",") if tok.strip()]
-    except ValueError as exc:
-        raise typer.BadParameter(f"--widths must be comma-separated ints, got {raw!r}") from exc
-    if not widths:
-        raise typer.BadParameter("--widths must list at least one width")
-    bad = [w for w in widths if w % _HEAD_DIM != 0 or w // _HEAD_DIM < 1]
-    if bad:
-        raise typer.BadParameter(
-            f"each width must be a positive multiple of head_dim={_HEAD_DIM}; got {bad}"
-        )
-    return widths
-
-
 def _build_cfg_fn(
     *,
     depth: int,
@@ -126,19 +98,17 @@ def _build_cfg_fn(
 
     ``head_dim`` is held at 64 (only the head count grows). ``"width"`` keeps
     depth at ``depth``; ``"preset_ray"`` co-scales depth with width at the preset
-    aspect ratio (``--depth`` is then ignored).
+    aspect ratio (``--depth`` is then ignored). Shared with the sweep harness via
+    :func:`scripts._mup_common.num_layers_for` so the gate and the runs match.
     """
     from oplm.model import OplmConfig
 
     def build(width: int) -> OplmConfig:
-        num_layers = max(1, round(width / _PRESET_ASPECT_RATIO))
-        if scaling is Scaling.width:
-            num_layers = depth
         return OplmConfig(
             hidden_size=width,
-            num_hidden_layers=num_layers,
-            num_attention_heads=width // _HEAD_DIM,
-            head_dim=_HEAD_DIM,
+            num_hidden_layers=num_layers_for(width, depth, scaling),
+            num_attention_heads=width // HEAD_DIM,
+            head_dim=HEAD_DIM,
             mup_enable=mup,
             mup_base_width=base_width,
             mup_output_mult=output_mult,
@@ -327,7 +297,7 @@ def main(
 
     from oplm.training.mup import coord_check
 
-    width_list = _parse_widths(widths)
+    width_list = parse_widths(widths)
     run_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     console.print(
@@ -337,7 +307,7 @@ def main(
     )
     if scaling is Scaling.preset_ray:
         console.print(
-            f"[dim]preset_ray: depth co-scales with width at {_PRESET_ASPECT_RATIO}:1 "
+            f"[dim]preset_ray: depth co-scales with width at {PRESET_ASPECT_RATIO}:1 "
             f"(--depth ignored).[/dim]"
         )
 
