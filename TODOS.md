@@ -300,12 +300,17 @@ once at the proxy width and reuse the same number at every larger preset.
 
 ## Phase 8: Defaults, Preset, Docs
 
-- [ ] Add `src/oplm/configs/train/mup_muon.yaml`: `optimizer=muon`,
+- [x] Add `src/oplm/configs/train/mup_muon.yaml`: `optimizer=muon`,
   `muon_adjust_lr_fn=original`, and (model side) `mup_enable=true`,
-  `mup_base_width=512`.
-- [ ] Write `docs/MUP.md`: the recipe table, the "tune-once-reuse-`train.lr`"
-  workflow, coord-check + sweep commands, and the caveats below. Link from
-  `docs/TRAIN.md`.
+  `mup_base_width=512`. Implemented as a recipe **overlay** applied on top of a
+  size `--preset` (carries both `train:` and `model:` sections, since `--config`
+  merges at the root). Verified: merges with `--preset 400M`, round-trips through
+  `serialize_config`, and `build_optimizers` builds the two-optimizer μP+Muon path
+  (Muon `lr` constant + `adjust_lr_fn=original`; aux AdamW emits the `lr/m` group).
+- [x] Write `docs/MUP.md`: the recipe table, the multiplier-per-preset table, the
+  "tune-once-reuse-`train.lr`" workflow, coord-check + sweep commands, and the
+  caveats below. Linked from `docs/TRAIN.md` (top references + the optimizer
+  section) and `README.md` (Training section).
 
 ## Phase 9: Tests And Validation
 

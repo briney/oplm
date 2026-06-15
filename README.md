@@ -221,7 +221,9 @@ built-in eval harness for MLM metrics and structure-based contact prediction.
 oplm train --preset 400M --config configs/my_run.yaml
 ```
 
-See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide.
+See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide, and
+**[docs/MUP.md](docs/MUP.md)** for μP learning-rate transfer (tune `lr` once on a
+small model, reuse it at scale).
 
 ---
 

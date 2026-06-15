@@ -1,0 +1,25 @@
+# μP + Muon recipe overlay — opt-in learning-rate transfer across width.
+#
+# Pass this with --config on top of a size --preset. It flips on μP (model side)
+# and the Muon settings μP requires, leaving every other field at its base
+# default. With μP on, `train.lr` is the *base* LR: tune it once at the proxy
+# width (mup_base_width) and reuse the same number at every larger preset.
+#
+#   oplm train --preset 400M --config src/oplm/configs/train/mup_muon.yaml \
+#     data.train=/data/uniref50/ train.lr=<base-lr-from-the-pilot-sweep>
+#
+# See docs/MUP.md for the full recipe, the coord-check gate, and the pilot LR
+# sweep that produces the base LR. μP is a no-op at mup_base_width (m = 1), so
+# the base preset (50M, hidden_size=512) trains identically with or without it.
+train:
+  optimizer: muon
+  # μP+Muon REQUIRES the aspect-ratio-only "original" factor (√max(1, d_out/d_in)),
+  # which is ~constant across width so the base LR transfers. The default
+  # "match_rms_adamw" scales like √width and does NOT transfer — build_optimizers
+  # raises if it is left on with μP+Muon.
+  muon_adjust_lr_fn: original
+
+model:
+  mup_enable: true
+  mup_base_width: 512 # hidden_size of the proxy/base where the width multiplier m = 1
+  # mup_output_mult: 1.0  # tunable O(1) readout multiplier; tune alongside train.lr

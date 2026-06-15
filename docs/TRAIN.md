@@ -7,6 +7,7 @@ resume.
 This is the *how-to*. Related references:
 
 - [CONFIG.md](CONFIG.md) — every `model.*` / `train.*` / `data.*` field.
+- [MUP.md](MUP.md) — μP learning-rate transfer across width (tune `lr` once, reuse at scale).
 - [EVAL_HARNESS.md](EVAL_HARNESS.md) — evaluation during training.
 - [DATA_TOOLING.md](DATA_TOOLING.md) — dataset formats and the masking scheme.
 - [OVERVIEW.md](OVERVIEW.md) — Part IV documents the trainer's internal design.
@@ -244,6 +245,17 @@ once per optimizer step, reaching the floor at the final step.
 
 See [CONFIG.md](CONFIG.md#train-fields-train) for every optimizer and scheduler
 field.
+
+**μP learning-rate transfer** — to tune `train.lr` once at a small proxy width
+and reuse it unchanged at larger presets, apply the μP+Muon overlay:
+
+```bash
+oplm train --preset 400M --config src/oplm/configs/train/mup_muon.yaml \
+  data.train=/data/uniref50/ train.lr=<base-lr-from-the-pilot-sweep>
+```
+
+μP is opt-in and a no-op at the base width. See [MUP.md](MUP.md) for the full
+recipe, the coord-check gate, and the pilot LR sweep that produces the base LR.
 
 ---
 
