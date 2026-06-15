@@ -75,12 +75,12 @@ once at the proxy width and reuse the same number at every larger preset.
 
 ## Phase 1: Config Surface And Compatibility
 
-- [ ] Add new `OplmConfig` fields in `src/oplm/model/configuration_oplm.py`, with
+- [x] Add new `OplmConfig` fields in `src/oplm/model/configuration_oplm.py`, with
   defaults that make μP a no-op:
   - `mup_enable: bool = False`
   - `mup_base_width: int = 512`  (50M preset's `hidden_size`; the `m=1` reference)
   - `mup_output_mult: float = 1.0`  (tunable O(1) readout multiplier)
-- [ ] Add derived helper(s) on `OplmConfig`:
+- [x] Add derived helper(s) on `OplmConfig`:
   - `mup_width_mult(self) -> float` → `hidden_size / mup_base_width` when
     `mup_enable`, else `1.0`. The hidden-fan-in multiplier `m` (used by the readout
     output multiplier and by every hidden-fan-in matrix).
@@ -89,14 +89,14 @@ once at the proxy width and reuse the same number at every larger preset.
     `relu2` variant) at the base width, so `down_proj`'s fan-in multiplier
     `m_ffn = intermediate_size / base_intermediate_size` is computed once and not
     re-derived in several places.
-- [ ] Add validation (mirror existing `_resolve_derived_fields` / validation
+- [x] Add validation (mirror existing `_resolve_derived_fields` / validation
   style): `mup_base_width >= 1`; `mup_output_mult > 0`.
-- [ ] Confirm μP fields serialize into the HF model config (they live on
+- [x] Confirm μP fields serialize into the HF model config (they live on
   `OplmConfig` so they ride in `config.json`/checkpoints automatically) and are
   restored on load — cover in the config round-trip test.
-- [ ] Update `src/oplm/configs/model/base.yaml` and `docs/CONFIG.md` so the three
+- [x] Update `src/oplm/configs/model/base.yaml` and `docs/CONFIG.md` so the three
   `mup_*` knobs are documented in the existing config style (not hidden).
-- [ ] Update config default / validation / CLI-override / YAML-typo-guard /
+- [x] Update config default / validation / CLI-override / YAML-typo-guard /
   save-load round-trip tests for the new fields (mirror existing `OplmConfig`
   coverage).
 

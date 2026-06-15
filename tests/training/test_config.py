@@ -151,6 +151,32 @@ def test_ablation_toggle_defaults_preserve_current_behavior() -> None:
     assert cfg.model.canon_residual is True
 
 
+def test_mup_cli_overrides_apply() -> None:
+    """CLI dotlist overrides reach the μP knobs and the derived multiplier updates."""
+    cfg = load_config(
+        [
+            "--preset",
+            "400M",  # hidden_size = 1024
+            "model.mup_enable=true",
+            "model.mup_base_width=512",
+            "model.mup_output_mult=2.0",
+        ]
+    )
+    assert cfg.model.mup_enable is True
+    assert cfg.model.mup_base_width == 512
+    assert cfg.model.mup_output_mult == 2.0
+    assert cfg.model.mup_width_mult() == 2.0  # 1024 / 512
+
+
+def test_mup_defaults_are_noop() -> None:
+    """With no overrides μP is off and the width multiplier is a no-op."""
+    cfg = load_config([])
+    assert cfg.model.mup_enable is False
+    assert cfg.model.mup_base_width == 512
+    assert cfg.model.mup_output_mult == 1.0
+    assert cfg.model.mup_width_mult() == 1.0
+
+
 def test_canon_residual_cli_override_applies() -> None:
     """The residual Canon toggle remains a simple boolean model field."""
     cfg = load_config(["model.canon_residual=false"])

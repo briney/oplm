@@ -91,6 +91,9 @@ class OplmConfig(PretrainedConfig):
         canon_kernel_sizes: int | list[int] | dict[str, Any] = 4,
         canon_activation: str = "none",
         initializer_range: float = 0.02,
+        mup_enable: bool = False,
+        mup_base_width: int = 512,
+        mup_output_mult: float = 1.0,
         classifier_pool: str = "mean",
         classifier_dropout: float = 0.0,
         num_labels: int = 2,
@@ -145,6 +148,9 @@ class OplmConfig(PretrainedConfig):
         self.canon_kernel_sizes = canon_kernel_sizes
         self.canon_activation = canon_activation
         self.initializer_range = float(initializer_range)
+        self.mup_enable = bool(mup_enable)
+        self.mup_base_width = int(mup_base_width)
+        self.mup_output_mult = float(mup_output_mult)
         self.classifier_pool = classifier_pool
         self.classifier_dropout = float(classifier_dropout)
         # `num_labels` is a property on PretrainedConfig that derives from
@@ -184,19 +190,27 @@ class OplmConfig(PretrainedConfig):
             self.head_dim = self.hidden_size // self.num_attention_heads
 
         if self.intermediate_size is None:
-            if self.ffn_activation == "relu2":
-                # Non-gated 2-projection FFN: ~4*D keeps total FFN params
-                # (~8*D^2) at parity with the gated variants below.
-                self.intermediate_size = round_up_to(4 * self.hidden_size, 256)
-            else:
-                # Gated convention (swiglu/geglu): ~8/3 * D rounded up to a
-                # tensor-core friendly 256.
-                self.intermediate_size = round_up_to(int(8 * self.hidden_size / 3), 256)
+            self.intermediate_size = self._derive_intermediate_size(
+                self.hidden_size, self.ffn_activation
+            )
 
         if self.rope_dim is None:
             # Default to full RoPE on every head channel.
             self.rope_dim = self.head_dim
             self.nope_dim = 0
+
+    @staticmethod
+    def _derive_intermediate_size(hidden_size: int, ffn_activation: str) -> int:
+        """Default FFN inner width for a hidden size, rounded to a multiple of 256.
+
+        `relu2` (non-gated, 2 projections) uses ~4·D so total FFN params (~8·D²)
+        stay at parity with the gated `swiglu`/`geglu` variants (~8/3·D). Shared
+        by `_resolve_derived_fields` and `mup_base_intermediate_size` so the μP
+        base FFN fan-in follows the exact same rounding.
+        """
+        if ffn_activation == "relu2":
+            return round_up_to(4 * hidden_size, 256)
+        return round_up_to(int(8 * hidden_size / 3), 256)
 
     # ------------------------------------------------------------------
     # Validation
@@ -307,6 +321,11 @@ class OplmConfig(PretrainedConfig):
                 f"got {self.gradient_checkpointing_mode!r}."
             )
 
+        if self.mup_base_width < 1:
+            raise ValueError(f"mup_base_width must be >= 1; got {self.mup_base_width}.")
+        if self.mup_output_mult <= 0:
+            raise ValueError(f"mup_output_mult must be > 0; got {self.mup_output_mult}.")
+
         if self.canon_enabled:
             if not self.canon_positions:
                 raise ValueError("canon_positions must be non-empty when canon_enabled=True.")
@@ -344,3 +363,31 @@ class OplmConfig(PretrainedConfig):
                 UserWarning,
                 stacklevel=3,
             )
+
+    # ------------------------------------------------------------------
+    # μP (maximal update parametrization) helpers
+    # ------------------------------------------------------------------
+
+    def mup_width_mult(self) -> float:
+        """Hidden-fan-in width multiplier `m = hidden_size / mup_base_width`.
+
+        Returns `1.0` when μP is disabled (a no-op), so callers can multiply by
+        it unconditionally. This is the single quantity that every hidden-fan-in
+        matrix (attention/MLP/`lm_head.dense`) scales its init/LR by, and that the
+        readout output-logit multiplier divides by. `down_proj` uses
+        `intermediate_size / mup_base_intermediate_size()` instead — see
+        `docs/MUP.md` for the per-matrix fan-in rule.
+        """
+        if not self.mup_enable:
+            return 1.0
+        return self.hidden_size / self.mup_base_width
+
+    def mup_base_intermediate_size(self) -> int:
+        """FFN inner width of the μP base model (a model of width `mup_base_width`).
+
+        Derived from `mup_base_width` via the same rounding as the live
+        `intermediate_size` (`_derive_intermediate_size`), so `down_proj`'s fan-in
+        multiplier `intermediate_size / mup_base_intermediate_size()` absorbs the
+        `round_up_to` rounding exactly instead of approximating it with `m`.
+        """
+        return self._derive_intermediate_size(self.mup_base_width, self.ffn_activation)

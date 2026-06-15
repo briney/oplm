@@ -186,6 +186,19 @@ Consumed by `OplmForSequenceClassification` / `OplmForTokenClassification`.
 | `model.unk_token_id` | `int` | `3` | `<unk>`. |
 | `model.mask_token_id` | `int` | `32` | `<mask>`. |
 
+### μP (maximal update parametrization)
+
+Opt-in μP so a learning rate tuned on a small pilot model transfers to much larger
+models without re-sweeping at every scale. Disabled by default and a no-op at the
+base width, so existing runs, checkpoints, and tests are unchanged when off. See
+[MUP.md](MUP.md) for the full recipe and the tune-once-reuse-`train.lr` workflow.
+
+| Override | Type | Default | Valid values / notes |
+| --- | --- | --- | --- |
+| `model.mup_enable` | `bool` | `false` | Master switch. When `false`, init, forward multipliers, and per-group LRs are identical to non-μP runs. |
+| `model.mup_base_width` | `int` | `512` | `hidden_size` of the proxy/base model where the width multiplier `m = hidden_size / mup_base_width` equals 1 (the width the pilot LR sweep tunes at). Must be `≥ 1`. |
+| `model.mup_output_mult` | `float` | `1.0` | Tunable O(1) multiplier on the output logits (applied as `mup_output_mult / m` on the readout matmul path). Must be `> 0`. |
+
 ### Derived and validated fields
 
 When omitted, derived fields resolve from the core dimensions:
@@ -207,6 +220,7 @@ Config construction raises `ValueError` if any of these fail:
   `value_residual_lambda_init` are finite
 - when `canon_enabled`, `canon_positions` is a non-empty, duplicate-free subset
   of `{A, B, C, D}`
+- `mup_base_width ≥ 1` and `mup_output_mult > 0`
 
 ## Train fields (`train.*`)
 

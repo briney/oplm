@@ -52,6 +52,13 @@ model:
   canon_kernel_sizes: 4
   canon_activation: none # none | silu | gelu
 
+  # μP (maximal update parametrization) — opt-in LR transfer across width.
+  # No-op at these defaults (mup_enable=false): init, multipliers, and LR groups
+  # are identical to non-μP runs. See docs/MUP.md.
+  mup_enable: false
+  mup_base_width: 512 # hidden_size of the proxy/base model where the width multiplier m = 1
+  mup_output_mult: 1.0 # tunable O(1) readout (output-logit) multiplier
+
   # Init / checkpointing
   initializer_range: 0.02
   gradient_checkpointing: false
