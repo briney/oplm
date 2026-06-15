@@ -391,3 +391,27 @@ class OplmConfig(PretrainedConfig):
         `round_up_to` rounding exactly instead of approximating it with `m`.
         """
         return self._derive_intermediate_size(self.mup_base_width, self.ffn_activation)
+
+    def mup_fanin_mult(self, fan_in: int) -> float:
+        """Per-matrix μP fan-in multiplier `m_W = fan_in / fan_in_base`.
+
+        The single scaling quantity of the μP recipe (see `docs/MUP.md`): a
+        matrix's live `fan_in` divided by its fan-in at the base width
+        `mup_base_width`. Hidden-fan-in matrices (`q/k/v/o_proj`, `gate/up_proj`,
+        `lm_head.dense`, the readout) map to `mup_base_width`; `down_proj`
+        (fan-in = `intermediate_size`) maps to `mup_base_intermediate_size()`, so
+        FFN rounding is absorbed exactly rather than approximated by the hidden
+        multiplier `m`. Returns `1.0` when μP is disabled or at the base width (a
+        no-op). Single source of truth shared by width-aware init (model) and
+        per-group LR scaling (training).
+
+        Args:
+            fan_in: The matrix's input dimension (`nn.Linear.in_features`). For a
+                real config `intermediate_size != hidden_size`, so matching on
+                `intermediate_size` unambiguously selects `down_proj`.
+        """
+        if not self.mup_enable:
+            return 1.0
+        if fan_in == self.intermediate_size:
+            return fan_in / self.mup_base_intermediate_size()
+        return fan_in / self.mup_base_width

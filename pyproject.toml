@@ -46,6 +46,9 @@ train = [
     "wandb>=0.16",
     "datasets>=2.18",
     "biopython>=1.83",
+    # μP coord-check / LR-sweep tooling (oplm.training.mup): tidy frames + plots.
+    "pandas>=2.0",
+    "matplotlib>=3.7",
 ]
 dev = [
     "pytest>=8.0",

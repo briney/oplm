@@ -102,7 +102,7 @@ once at the proxy width and reuse the same number at every larger preset.
 
 ## Phase 2: Width-Aware Initialization
 
-- [ ] Edit `OplmPreTrainedModel._init_weights` in
+- [x] Edit `OplmPreTrainedModel._init_weights` in
   `src/oplm/model/modeling_oplm.py` (lines ~79–114). `_init_weights(module)`
   receives **no name**, so role must come from per-module flags (reuse the
   existing `_is_residual_writer` pattern; do not parse names). The `nn.Linear`
@@ -116,48 +116,60 @@ once at the proxy width and reuse the same number at every larger preset.
     `module_std = (σ / √(2·num_hidden_layers)) / √m_W`
   - **other hidden** (`q/k/v/o_proj`, `gate/up_proj`, `lm_head.dense`):
     `module_std = σ / √m_W`
-- [ ] Compute `m_W` per module from its **fan-in** via the canonical Phase-5 helper
+- [x] Compute `m_W` per module from its **fan-in** via the canonical helper
   (`fan_in = module.in_features`), not a single global `m`: `m_W = fan_in /
   fan_in_base`, where `fan_in_base` is that role's fan-in at `d0 = mup_base_width`
   (= `d0` for hidden-fan-in matrices; = base `intermediate_size` for `down_proj`).
-- [ ] Tag readouts at construction: set `_is_readout = True` on `lm_head.decoder`
+  Implemented as `OplmConfig.mup_fanin_mult(fan_in)` in the **model** package
+  (not `training/mup.py`) so init stays `trust_remote_code`-safe and avoids a
+  model→training import; the Phase-5 `mup_fanin_mult(module_or_param, config)`
+  will delegate to it (single source of truth).
+- [x] Tag readouts at construction: set `_is_readout = True` on `lm_head.decoder`
   (`OplmMLMHead.__init__`) and on the `classifier` linears in
   `OplmForSequenceClassification`/`OplmForTokenClassification`.
-- [ ] Leave the `nn.Embedding` branch unchanged (constant `σ`) — embeddings are μP
+- [x] Leave the `nn.Embedding` branch unchanged (constant `σ`) — embeddings are μP
   input weights with width-independent init.
-- [ ] Verify at `m_W=1` (base width or μP off) the produced std equals current init
+- [x] Verify at `m_W=1` (base width or μP off) the produced std equals current init
   exactly (regression safety), for every role including the readout and classifier.
+  Confirmed: μP-off ≡ μP-on@base is bit-identical; width-scaled ratios match
+  `1/√m` (hidden/`o_proj`/`lm_head.dense`), `1/√m_ffn` (`down_proj`), and `1.0`
+  (embed/decoder/classifier readouts).
 
 ## Phase 3: Output-Logit Multiplier (Readout)
 
-- [ ] In `OplmMLMHead.__init__` (`src/oplm/model/modeling_oplm.py` lines
+- [x] In `OplmMLMHead.__init__` (`src/oplm/model/modeling_oplm.py` lines
   ~309–322), compute and store
   `self.output_mult = config.mup_output_mult / config.mup_width_mult()`
   (equals `1.0` when μP is off; `mup_width_mult()` is the hidden-fan-in `m`, the
   decoder's fan-in). Tag `self.decoder._is_readout = True` — consumed by Phase 2
-  init **and** coord-check labeling.
-- [ ] In `OplmMLMHead.forward`, multiply the **input to the decoder** by
+  init **and** coord-check labeling. (Tag done in Phase 2.)
+- [x] In `OplmMLMHead.forward`, multiply the **input to the decoder** by
   `self.output_mult` — NOT the decoder output — so only the matmul path is scaled
   and `decoder.bias` (the layer has `bias=True`) is left untouched, matching
   `mup.MuReadout`:
   `return self.decoder(self.output_mult * self.norm(self.act(self.dense(x))))`.
-- [ ] Confirm logits stay `float()` (cast already happens in
+- [x] Confirm logits stay `float()` (cast already happens in
   `OplmForMaskedLM.forward`) and the loss path is unaffected when `output_mult=1`.
+  Verified: `output_mult` is 1.0 (off/base), 0.5 (m=2); matmul-only scaling leaves
+  `decoder.bias` untouched; `output_mult=1` ⇒ forward bit-identical to `decoder(z)`.
 
 ## Phase 4: Per-Group Learning-Rate Scaling
 
-- [ ] Use the canonical μP role/multiplier helper from `src/oplm/training/mup.py`
+- [x] Use the canonical μP role/multiplier helper from `src/oplm/training/mup.py`
   (Phase 5) inside `src/oplm/training/optim.py`:
   - `mup_lr_multiplier(name, param, config) -> float` → `1/m_W` (per-matrix
     fan-in multiplier) for hidden weight matrices: `1/m` for `q/k/v/o_proj`,
     `gate/up_proj`, `lm_head.dense.weight` (fan-in = hidden); `1/m_ffn` for
     `down_proj` (fan-in = intermediate). Returns `1.0` for embedding / **readout
     `lm_head.decoder`** / norms / biases, and `1.0` whenever `not config.mup_enable`.
-- [ ] Extend `partition_optimizer_params` (lines ~34–87): keep the Muon
+- [x] Extend `partition_optimizer_params` (lines ~34–87): keep the Muon
   eligibility rule (`param.ndim == 2 and not name.startswith("lm_head.")`).
   Additionally tag each AdamW-bound param with its `mup_lr_multiplier`, and group
-  AdamW params by `(weight_decay_class, lr_multiplier)`.
-- [ ] Update `_build_adamw_optimizer` / `build_optimizers` (lines ~90–160):
+  AdamW params by `(weight_decay_class, lr_multiplier)`. New `AdamwParamGroup`
+  dataclass `(params, weight_decay, lr_mult)`; `OptimizerParamGroups` now carries
+  `adamw_groups` with `adamw_decay_params`/`adamw_no_decay_params` kept as derived
+  properties so existing callers/tests are unchanged.
+- [x] Update `_build_adamw_optimizer` / `build_optimizers` (lines ~90–160):
   - Emit one AdamW param-group dict per distinct `(wd, mult)` with
     `lr = cfg.lr * mult`, `weight_decay = wd`.
   - Keep Muon at `lr = cfg.lr` (constant); pass `adjust_lr_fn=cfg.muon_adjust_lr_fn`.
@@ -165,23 +177,28 @@ once at the proxy width and reuse the same number at every larger preset.
     `group["adjust_lr_fn"]` per group; `LambdaLR` captures each group's
     `initial_lr` into `base_lrs` and multiplies *each* by the same schedule λ, so
     heterogeneous per-group base LRs compose correctly with the existing scheduler.
-- [ ] Add the **guard** in `build_optimizers`: raise `ValueError` when
+    Verified: μP-Muon base_lrs `[lr/m (dense), lr (decoder), lr (no-decay)]`.
+- [x] Add the **guard** in `build_optimizers`: raise `ValueError` when
   `model.config.mup_enable and cfg.optimizer == "muon" and
   cfg.muon_adjust_lr_fn == "match_rms_adamw"` (μP+Muon requires `"original"`).
-- [ ] Leave `build_schedulers` unchanged (one `LambdaLR` per optimizer; per-group
+- [x] Leave `build_schedulers` unchanged (one `LambdaLR` per optimizer; per-group
   base LRs carry the width scaling, the schedule scales them uniformly).
 
 ## Phase 5: μP Core Module (`src/oplm/training/mup.py`, new)
 
-- [ ] `mup_fanin_mult(module_or_param, config) -> float` — canonical per-matrix
+- [x] `mup_fanin_mult(module_or_param, config) -> float` — canonical per-matrix
   fan-in multiplier `m_W = fan_in / fan_in_base` (hidden-fan-in matrices → `m`;
   `down_proj` → `intermediate_size / base_intermediate_size`, base derived from
   `mup_base_width` via the existing `round_up_to` rounding). Single source of truth
-  shared by init (Phase 2) and LR (Phase 4).
-- [ ] `mup_lr_multiplier(name, param, config) -> float` — `1/mup_fanin_mult(...)`
+  shared by init (Phase 2) and LR (Phase 4). Implemented as a thin training-side
+  wrapper over `OplmConfig.mup_fanin_mult(fan_in)` (the model-package core, so init
+  stays `trust_remote_code`-safe); returns `1.0` for non-2-D tensors.
+- [x] `mup_lr_multiplier(name, param, config) -> float` — `1/mup_fanin_mult(...)`
   for hidden weight matrices, `1.0` for embedding / readout / norms / biases and
-  whenever `not config.mup_enable`. Imported by `optim.py` and tests.
-- [ ] `coord_check(build_cfg_fn, widths, batch, steps, optimizer, seed, scaling="width") -> pandas.DataFrame`:
+  whenever `not config.mup_enable`. Imported by `optim.py` and tests. Readouts
+  detected by name suffix (`lm_head.decoder.weight`, `classifier.weight`), mirroring
+  the Phase-2 `_is_readout` flags (init has no name; LR has no module flag).
+- [x] `coord_check(build_cfg_fn, widths, batch, steps, optimizer, seed, scaling="width") -> pandas.DataFrame`:
   - `scaling="width"` (default, the μP correctness gate): for each width build a
     model with **depth and every other dim fixed**, varying only `hidden_size`
     (and derived `num_attention_heads`, keeping `head_dim=64`).
@@ -193,36 +210,57 @@ once at the proxy width and reuse the same number at every larger preset.
     (`x.pow(2).mean().sqrt()`) at steps `t = 0..steps` on a fixed `batch` (include
     `t=0`/init so the oracle can exclude it where appropriate).
   - Return tidy frame with columns `(width, module, step, rms)`.
-- [ ] `SweepMetricsCallback(path)` — a `TrainerCallback`
+  - Note: the per-width config geometry (incl. depth-vs-width for `preset_ray`) is
+    owned by the caller's `build_cfg_fn(width)`; `scaling` is recorded in
+    `df.attrs`. Hooks fire on every `nn.Linear`/`nn.Embedding`; the throwaway
+    optimizer reuses `build_optimizers` and forces `adjust_lr_fn="original"`.
+    Verified on CPU (muon + adamw): μP keeps q_proj RMS flat across widths
+    (spread ≈1.05) while `--no-mup` fans out (≈3.4).
+- [x] `SweepMetricsCallback(path)` — a `TrainerCallback`
   (`src/oplm/training/callbacks.py` interface: `on_log`, `on_eval_end`,
   `on_train_end`). Capture EMA train loss from `on_log`, eval losses from
   `on_eval_end`, write `metrics.json`
   (`{final_train_loss, eval: {...}, lr, width, steps}`) on `on_train_end`. Needed
   because `trainer_state.json` carries no loss.
-- [ ] `summarize_sweep(run_dirs) -> pandas.DataFrame` — load each run's
+- [x] `summarize_sweep(run_dirs) -> pandas.DataFrame` — load each run's
   `metrics.json` into a frame keyed by `(width, lr)`.
-- [ ] `best_lr_per_width(df) -> MupTransferResult` — return a dataclass
+- [x] `best_lr_per_width(df) -> MupTransferResult` — return a dataclass
   `MupTransferResult(best_lr: dict[int, float], transferred: bool)` (argmin-loss LR
   per width plus a boolean **transfer verdict**: do the proxy widths agree on the
   argmin LR?). Not a bare `dict` — a `dict` cannot also carry the verdict.
 
 ## Phase 6: Coordinate-Check Script (`scripts/mup_coord_check.py`, new, `typer`)
 
-- [ ] Thin CLI over `mup.coord_check`. Options: `--widths` (default
+- [x] Thin CLI over `mup.coord_check`. Options: `--widths` (default
   `128,256,512,1024`), `--depth` (small, default 4), `--steps` (default 3),
   `--optimizer` (`muon|adamw`), `--data` (parquet), `--mup/--no-mup`,
-  `--scaling width|preset_ray` (default `width`), `--out`.
-- [ ] Output a CSV of `(width, module, step, rms)` and a per-module RMS-vs-width
-  plot.
-- [ ] Document the pass/fail oracle precisely (the implementation's correctness
-  gate — run before trusting any sweep):
+  `--scaling width|preset_ray` (default `width`), `--out`. Implemented as
+  `typer.run`-style single command in a new `scripts/` package (so
+  `python -m scripts.mup_coord_check` works); adds tuning knobs `--base-width`,
+  `--output-mult`, `--n-seqs`, `--max-length`, `--lr`, `--seed`, `--device`
+  (auto-detects CUDA). `head_dim=64` is held fixed; `width` keeps `--depth`,
+  `preset_ray` co-scales depth at the 32:1 preset ratio (`--depth` ignored).
+  When `--data` is omitted, falls back to a few built-in real protein sequences.
+- [x] Output a CSV of `(width, module, step, rms)` and a per-module RMS-vs-width
+  plot (one panel per step, one curve per module type, log-log). Files written
+  to `--out/coord_check_{scaling}_{optimizer}_{mup|nomup}.{csv,png}` so μP and
+  the control land side by side. Also prints a per-module RMS-growth table +
+  verdict (a heuristic eyeball aid; the authoritative gate is the slow test).
+- [x] Document the pass/fail oracle precisely (the implementation's correctness
+  gate — run before trusting any sweep): in the module docstring, the `--help`,
+  and a rich "oracle" panel printed after each run.
   - the oracle is **one-sided**: with μP, **no module's RMS grows with width** (the
     `--no-mup` control fans out / grows). State it as "does not grow", not
     "stays perfectly flat".
   - the **readout-logits module is allowed to shrink at init** (`Θ(1/√m)` by
     design): assess its cross-width behavior at steps `t ≥ 1` only, exclude `t=0`.
+    The growth summary is taken at the final step (`t = steps ≥ 1`), so `t=0` is
+    excluded by construction.
   - internal attention pre-softmax logits live inside SDPA and are **not** hooked
     as named-submodule outputs, so they need no separate exclusion.
+  - Verified on CPU: μP-on holds (worst growth ≈1.15× over widths 128→512), the
+    `--no-mup` control fans out (`down_proj` ≈7.2×, `o_proj` ≈5.4×), and the
+    `preset_ray`/`adamw`/`--data` paths all run.
 
 ## Phase 7: LR Sweep Harness (multi-GPU node)
 
