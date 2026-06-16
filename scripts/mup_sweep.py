@@ -212,7 +212,16 @@ def main(
     mup: Annotated[bool, typer.Option("--mup/--no-mup", help="Enable μP for every run.")] = True,
     base_width: Annotated[int, typer.Option("--base-width", help="μP base width.")] = 512,
     output_mult: Annotated[float, typer.Option("--output-mult", help="μP readout mult.")] = 1.0,
-    batch_size: Annotated[int, typer.Option("--batch-size", help="Per-step batch size.")] = 32,
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", help="Per-step micro-batch (per GPU).")
+    ] = 32,
+    grad_accum: Annotated[
+        int,
+        typer.Option(
+            "--grad-accum",
+            help="Gradient-accumulation steps; global batch = batch_size × grad_accum (per point).",
+        ),
+    ] = 1,
     warmup_steps: Annotated[int, typer.Option("--warmup-steps", help="Scheduler warmup.")] = 0,
     weight_decay: Annotated[float, typer.Option("--weight-decay", help="Weight decay.")] = 0.0,
     max_length: Annotated[int, typer.Option("--max-length", help="max_position_embeddings.")] = 512,
@@ -240,6 +249,7 @@ def main(
         "--base-width", str(base_width),
         "--output-mult", repr(output_mult),
         "--batch-size", str(batch_size),
+        "--grad-accum", str(grad_accum),
         "--warmup-steps", str(warmup_steps),
         "--weight-decay", repr(weight_decay),
         "--max-length", str(max_length),
@@ -252,6 +262,12 @@ def main(
     console.print(
         f"[bold]μP sweep[/bold] {len(grid)} runs "
         f"({len(width_list)} widths × {len(lr_list)} LRs) on {gpus} GPU(s) → {out}"
+    )
+    # Global batch is shared across every grid point (one GPU/point), so only width
+    # + lr vary — μP transfers LR across width, not batch size (see docs/MUP.md).
+    console.print(
+        f"[dim]global batch = {batch_size} × {grad_accum} = {batch_size * grad_accum} "
+        f"per optimizer step[/dim]"
     )
 
     gpu_pool: queue.Queue[int] = queue.Queue()

@@ -387,6 +387,10 @@ once at the proxy width and reuse the same number at every larger preset.
     --n-seqs 16 --max-length 256 --out "$OUT"
   ```
 
+  (`--max-length`/`--n-seqs` here are independent of the gate — the RMS-vs-width
+  oracle is sequence-length- and batch-independent — so they're kept small for
+  speed; they need not match the prod 512.)
+
   **Pass:** μP run prints "✓ μP oracle holds" (no module's RMS grows with width);
   the `--no-mup` run visibly fans out. If μP fails, **stop** — do not sweep.
 
@@ -403,15 +407,33 @@ once at the proxy width and reuse the same number at every larger preset.
 
 - [ ] **10.3 — Pilot LR sweep (8× B200).** Tune the base LR at the proxy widths.
   The 2×4 grid below is exactly 8 points → one wave on 8 GPUs (one single-GPU
-  pilot per point). Keep `batch_size`/`warmup_steps`/`steps`/`seed` shared (only
-  width and lr vary) — μP does **not** transfer across batch size or horizon.
+  pilot per point). Keep `batch_size`/`grad_accum`/`warmup_steps`/`steps`/`seed`
+  shared (only width and lr vary) — μP does **not** transfer across batch size or
+  horizon, so the pilot must tune at the **production global batch**.
+
+  Set the global batch to the production value (~8192) via gradient accumulation:
+  on one GPU `global batch = batch_size × grad_accum` (e.g. `128 × 64 = 8192`).
+  Raise the micro `--batch-size` and lower `--grad-accum` proportionally as memory
+  allows (fewer sequential micro-passes = faster per step); keep the product 8192.
+  Match the production sequence length too (`--max-length 512` for prod runs) —
+  seq length, like batch, is outside μP's width guarantee and sets the per-step
+  token (hence gradient-noise) count, so the pilot and prod must share it. The
+  sweep banner prints `global batch = … per optimizer step` — confirm it reads 8192.
 
   ```bash
   python -m scripts.mup_sweep --gpus 8 --data "$CORPUS" --out "$OUT/sweep" \
     --widths 256,512 --lrs 1e-3,3e-3,1e-2,3e-2 \
     --base-width 512 --scaling width \
-    --steps 1000 --warmup-steps 100 --batch-size 64 --max-length 512 --seed 0
+    --batch-size 128 --grad-accum 64 \
+    --steps 1000 --warmup-steps 100 --max-length 512 --seed 0
   ```
+
+  > **Horizon at batch 8192.** Each step is a full 8192-sequence update, so
+  > ~1000 steps (≈8M sequences/point) is a much larger, lower-noise signal than the
+  > 10k steps discussed earlier — that was for a *small* batch. Do **not** combine
+  > 10k steps with batch 8192. If the production horizon is very long, the optimal
+  > LR may drift slightly lower; absorb that in production with the WSD schedule /
+  > weight decay (see the caveats), not by re-tuning per scale.
 
   **Pass:** the printed loss-vs-LR minimum lands at the **same** `lr` for both
   proxy widths and `MupTransferResult.transferred == True`. Record that winning
@@ -430,7 +452,15 @@ once at the proxy width and reuse the same number at every larger preset.
   `mup_base_width=512`; the preset only changes width/depth, so `$BEST_LR` is the
   base LR. (1B = hidden 1600, `m ≈ 3.12`; use `--preset 400M` for a cheaper
   check.) Configure Accelerate for 8 processes once (`accelerate config`), or pass
-  the flags inline:
+  the flags inline.
+
+  **Match the same global batch (8192) AND sequence length (512) the pilot tuned
+  at** — μP only fixes width, not batch or seq length. On 8 GPUs: `global batch =
+  train.batch_size × 8 × train.gradient_accumulation_steps`, so pick
+  `batch_size`/`grad_accum` whose product with 8 is 8192 (e.g. `128 × 8 × 8 =
+  8192`). The 1B preset defaults to `max_position_embeddings=1024`, so override it
+  to 512 to match the pilot. (`oplm train` accepts these as plain overrides — no
+  script change needed.)
 
   ```bash
   accelerate launch --multi_gpu --num_processes 8 -m oplm.train \
@@ -439,6 +469,8 @@ once at the proxy width and reuse the same number at every larger preset.
     --name mup-confirm-1B \
     data.train="$CORPUS" \
     train.lr="$BEST_LR" \
+    train.batch_size=128 train.gradient_accumulation_steps=8 \
+    model.max_position_embeddings=512 \
     train.max_steps=20_000 train.warmup_steps=2_000 \
     train.compile=true train.compile_mode=max-autotune
   ```

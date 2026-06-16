@@ -191,13 +191,18 @@ fans one pilot subprocess per grid point, each pinned to a single GPU.
 
 ```bash
 python -m scripts.mup_sweep --widths 256,512 --lrs 1e-3,3e-3,1e-2,3e-2 \
-  --gpus 4 --steps 400 --data /data/corpus.parquet --out sweeps/run1
+  --gpus 4 --steps 400 --batch-size 128 --grad-accum 64 \
+  --data /data/corpus.parquet --out sweeps/run1
 ```
 
 - `--widths` are hidden sizes. `--scaling width` (default) fixes depth;
   `--scaling preset_ray` co-scales depth with width to validate the preset ray.
 - `--gpus N` is the concurrency (GPU ids `0..N-1`); every run shares `seed`,
-  `batch_size`, `warmup_steps`, and `steps` — only `lr` and width vary.
+  `batch_size`, `grad_accum`, `warmup_steps`, and `steps` — only `lr` and width vary.
+- **Tune at the production batch.** Set the global batch (`batch_size × grad_accum`
+  on one GPU) to the value production will use, via gradient accumulation — μP
+  fixes width, not batch size (§7). The banner prints the resulting global batch;
+  confirm it matches production. Match the sequence length (`--max-length`) too.
 
 On completion it loads each run's `metrics.json`, prints the per-`(width, lr)`
 loss table, the argmin LR per width, and the **transfer verdict**, then writes
@@ -226,9 +231,19 @@ and matplotlib.
   preset ray (the constant-aspect-ratio scaling the presets ship) is validated
   **empirically** — coord-check `preset_ray` mode plus a confirmation run — not
   asserted from theory.
-- **μP does not transfer across batch size or training horizon.** If batch size
-  changes with scale, apply `lr ∝ √(batch ratio)`; for the training horizon,
-  prefer WSD schedules / weight-decay adjustment.
+- **μP does not transfer across batch size, sequence length, or training horizon.**
+  Tune the pilot sweep at the **production global batch** *and* the production
+  **sequence length** (`--max-length`), reached via gradient accumulation on the
+  narrow proxy (`mup_sweep --grad-accum`, so `global = batch_size × grad_accum`) —
+  do *not* sweep at a small batch and extrapolate with `lr ∝ √(batch ratio)`. That
+  rule only holds in the small-batch (noise-dominated) regime; at the large batch
+  sizes used at scale (near/above the critical batch size) the optimal LR saturates
+  and the rule overshoots. Sequence length matters for the same reason batch does:
+  it sets the per-step (masked-)token count, i.e. the gradient-noise regime — but
+  it does **not** affect μP's width-transfer *correctness* (RoPE and the
+  `1/√head_dim` softmax scaling are width-driven and length-invariant, so the
+  coordinate-check oracle holds at any length). For the training horizon, prefer
+  WSD schedules / weight-decay adjustment rather than re-tuning per scale.
 - **`original` clips the Muon factor at 1 for `d_out < d_in` matrices** (e.g.
   `down_proj`). It is still ~scale-invariant modulo FFN rounding, so transfer
   holds — the coord-check validates this empirically.

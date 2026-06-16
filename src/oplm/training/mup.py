@@ -277,12 +277,21 @@ class SweepMetricsCallback(TrainerCallback):
                 self._eval[key] = float(value)
 
     def on_train_end(self, trainer: Trainer) -> None:
+        # Record the global batch (batch_size × grad_accum × num_processes) for
+        # provenance: μP transfers LR across width *at a fixed batch*, so a sweep
+        # is only valid if every width shared one batch — this makes that auditable.
+        global_batch = int(
+            trainer.cfg.train.batch_size
+            * trainer.cfg.train.gradient_accumulation_steps
+            * trainer.accelerator.num_processes
+        )
         payload = {
             "final_train_loss": self._ema_loss,
             "eval": dict(self._eval),
             "lr": trainer.cfg.train.lr,
             "width": trainer.cfg.model.hidden_size,
             "steps": getattr(trainer, "total_steps", trainer.cfg.train.max_steps),
+            "global_batch": global_batch,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(payload, indent=2))

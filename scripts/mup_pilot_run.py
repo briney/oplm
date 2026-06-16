@@ -88,7 +88,16 @@ def main(
     output_mult: Annotated[
         float, typer.Option("--output-mult", help="μP readout output multiplier.")
     ] = 1.0,
-    batch_size: Annotated[int, typer.Option("--batch-size", help="Per-step batch size.")] = 32,
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", help="Per-step micro-batch (per GPU).")
+    ] = 32,
+    grad_accum: Annotated[
+        int,
+        typer.Option(
+            "--grad-accum",
+            help="Gradient-accumulation steps; global batch = batch_size × grad_accum (one GPU).",
+        ),
+    ] = 1,
     warmup_steps: Annotated[int, typer.Option("--warmup-steps", help="Scheduler warmup.")] = 0,
     weight_decay: Annotated[float, typer.Option("--weight-decay", help="AdamW/Muon WD.")] = 0.0,
     muon_adjust_lr_fn: Annotated[
@@ -137,6 +146,7 @@ def main(
             max_steps=steps,
             warmup_steps=warmup_steps,
             batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum,
             seed=seed,
             log_every=max(1, min(log_every, steps)),
             wandb_enabled=False,
@@ -155,7 +165,8 @@ def main(
     layers = cfg.model.num_hidden_layers
     console.print(
         f"[bold]pilot[/bold] width={width} ({layers}L) lr={lr:g} optimizer={optimizer.value} "
-        f"steps={steps} μP={'on' if mup else 'OFF'}"
+        f"steps={steps} batch={batch_size}×{grad_accum}={batch_size * grad_accum} "
+        f"μP={'on' if mup else 'OFF'}"
     )
     metrics_path = out / "metrics.json"
     Trainer(cfg, callbacks=[SweepMetricsCallback(metrics_path)]).train()

@@ -10,6 +10,7 @@ working LR, so the argmin is deterministic.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -57,3 +58,24 @@ def test_sweep_selects_lower_loss_lr(training_parquet: Path, tmp_path: Path) -> 
     # One width was swept, so transfer is undecidable — but the verdict is populated.
     assert isinstance(result.transferred, bool)
     assert result.transferred is False
+
+
+def test_metrics_records_global_batch_with_grad_accum(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """``metrics.json`` records the global batch = batch_size × grad_accum × num_processes.
+
+    Also confirms single-GPU gradient accumulation runs end to end through the
+    trainer's ``accelerator.accumulate`` path (grad_accum micro-batches per step).
+    """
+    from oplm.training.trainer import Trainer
+
+    out = tmp_path / "ga"
+    cfg = tiny_train_cfg(
+        out, training_parquet, max_steps=4, batch_size=4, gradient_accumulation_steps=2, log_every=1
+    )
+    Trainer(cfg, callbacks=[SweepMetricsCallback(out / "metrics.json")]).train()
+
+    data = json.loads((out / "metrics.json").read_text())
+    # num_processes == 1 in the single-process test env, so global batch = 4 × 2.
+    assert data["global_batch"] == 4 * 2
