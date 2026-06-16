@@ -118,14 +118,27 @@ def _build_cfg_fn(
 
 
 def _load_sequences(data: Path | None, n_seqs: int) -> list[str]:
-    """Load up to ``n_seqs`` sequences from a parquet ``--data`` file, else built-ins."""
+    """Load up to ``n_seqs`` sequences from ``--data``, else the built-ins.
+
+    ``data`` may be a single ``.parquet`` file **or a directory of shards** — the
+    same inputs ``data.train`` accepts. Discovery reuses the training loader's
+    ``ShardedProteinDataset._discover_shards`` (one source of truth for the shard
+    suffix set and ordering); shards are read in order until ``n_seqs`` sequences
+    are collected, so only the first shard(s) are touched.
+    """
     if data is None:
         return _DEFAULT_SEQUENCES[:n_seqs]
     import pyarrow.parquet as pq
 
-    parquet_file = pq.ParquetFile(data)
-    batch = next(parquet_file.iter_batches(batch_size=n_seqs, columns=["sequence"]))
-    return batch.column("sequence").to_pylist()
+    from oplm.data import ShardedProteinDataset
+
+    sequences: list[str] = []
+    for shard in ShardedProteinDataset._discover_shards(data):
+        for rows in pq.ParquetFile(shard).iter_batches(batch_size=n_seqs, columns=["sequence"]):
+            sequences.extend(rows.column("sequence").to_pylist())
+            if len(sequences) >= n_seqs:
+                return sequences[:n_seqs]
+    return sequences[:n_seqs]
 
 
 def _build_batch(sequences: list[str], *, max_length: int, seed: int) -> dict[str, torch.Tensor]:
