@@ -314,43 +314,49 @@ once at the proxy width and reuse the same number at every larger preset.
 
 ## Phase 9: Tests And Validation
 
-- [ ] `tests/training/test_mup.py` (fast):
+- [x] `tests/training/test_mup.py` (fast): 13 tests covering
   - `mup_lr_multiplier` → `1/m` for hidden matrices with hidden fan-in, `1/m_ffn`
     for `down_proj` (intermediate fan-in), `1.0` for embedding/**readout**/norm/bias;
-    `1.0` when `mup_enable=False`.
+    `1.0` when `mup_enable=False`; plus `mup_fanin_mult` (incl. non-2-D → `1.0`).
   - Param-group assembly (Muon mode): `lm_head.dense` group `lr ≈ cfg.lr/m`,
     `lm_head.decoder` (readout) group `lr ≈ cfg.lr` (×1), embedding/norm groups
-    `lr ≈ cfg.lr`, Muon `lr == cfg.lr`.
+    `lr ≈ cfg.lr`, all Muon groups `lr == cfg.lr`.
   - Param-group assembly (AdamW-only mode): hidden matrices `lr ≈ cfg.lr/m`, and
     `down_proj` `lr ≈ cfg.lr/m_ffn` (a distinct group using the intermediate fan-in).
-  - Build model at two widths: hidden-weight std ratio ≈ `√(d0/d)`, `down_proj`
-    std ratio ≈ `√(i0/i)` (intermediate, not hidden), embedding std unchanged,
-    **readout `lm_head.decoder` std unchanged** (constant `σ`, not `σ/√m`),
-    **classifier-head std unchanged**, `lm_head.output_mult ≈ mup_output_mult/m`.
-  - Readout bias: with `output_mult ≠ 1`, only the matmul path is scaled —
-    `lm_head.decoder.bias` is unaffected by `m` (matmul-path scaling check).
-  - Guard: `mup_enable + muon + match_rms_adamw` raises `ValueError`.
-  - μP off ⇒ init, multipliers, param groups identical to current behavior.
-- [ ] `tests/training/test_mup_coordcheck.py` (`@pytest.mark.slow`): run
-  `coord_check` at widths `{128,256,512}`, depth 4, ~3 steps on the
-  `training_parquet` fixture. Assert the **one-sided** oracle — per-module RMS does
-  not grow with width within tolerance **with** μP, and the `--no-mup` control
-  exceeds it. Exclude the readout-logits module at `t=0` (allowed to shrink at
-  init); assess it at `t ≥ 1`. Add a `scaling="preset_ray"` smoke case.
-- [ ] `tests/training/test_mup_sweep.py` (`@pytest.mark.slow`): 2-point LR grid at
-  one tiny width on the fixture; assert each run writes `metrics.json` and
-  `best_lr_per_width(...).best_lr` selects the lower-loss LR (and `.transferred`
-  is populated).
-- [ ] Regression: extend `tests/training/test_optim.py` and
-  `tests/training/test_e2e_optim.py` with a μP-Muon run asserting the
-  two-optimizer path steps and the new groups exist; confirm μP-off is unchanged.
-- [ ] Run focused tests (per repo convention, use `python -m`):
+  - Init checked **exactly** (not statistically): `trunc_normal_` scales a fixed
+    draw sequence by `std`, so at one shared seed μP-on weights = μP-off weights ×
+    `std_on/std_off` element-wise → ratio `1/√m` (hidden incl. `o_proj`), `1/√m_ffn`
+    (`down_proj`), `1.0` (embed / **readout** / **classifier head**);
+    `lm_head.output_mult ≈ mup_output_mult/m`.
+  - Readout bias: `output_mult` scales only the decoder-input matmul path; the
+    nonzero `lm_head.decoder.bias` is added once, unscaled (difference cancels it).
+  - Guard: `mup_enable + muon + match_rms_adamw` raises `ValueError`; `original` builds.
+  - μP off ⇒ multipliers/param-groups all ×1; μP-on @ base width is bit-identical
+    to μP-off (no-op-at-base invariant).
+- [x] `tests/training/test_mup_coordcheck.py` (`@pytest.mark.slow`): runs
+  `coord_check` at widths `{128,256,512}`, depth 4, 3 steps on the
+  `training_parquet` fixture. Asserts the **one-sided** oracle — worst per-module
+  RMS growth (final step, so `t=0` readout shrink is excluded by construction) is
+  `< 2.0×` **with** μP, while the `--no-mup` control fans out past `2.0×` and
+  exceeds μP. Plus a `scaling="preset_ray"` smoke case (depth co-scaled). Verified:
+  both pass in ~2s on CPU.
+- [x] `tests/training/test_mup_sweep.py` (`@pytest.mark.slow`): 2-point LR grid
+  (`1e-6` frozen vs `1e-3` working) at one tiny width on the fixture via in-process
+  `Trainer(... SweepMetricsCallback)`; asserts each run writes `metrics.json`,
+  `best_lr_per_width(...).best_lr` selects `1e-3`, and `.transferred` is populated
+  (`False` — single width). μP enabled as a no-op (base == width).
+- [x] Regression: extended `tests/training/test_optim.py` (fast: μP partition tags
+  scaled AdamW groups; μP-off `lr_mult` all `1.0`) and `tests/training/test_e2e_optim.py`
+  (slow, CUDA-gated: μP-Muon two-optimizer path steps, aux AdamW carries the `lr/m`
+  group, losses finite). Verified the CUDA e2e test passes on this box.
+- [x] Run focused tests (per repo convention, use `python -m`):
   - `python -m pytest tests/training/test_mup.py tests/training/test_optim.py tests/training/test_config.py tests/model/test_config.py tests/model/test_save_load.py`
-- [ ] Run final gates:
-  - `ruff format src/ tests/ scripts/`
-  - `ruff check src/ tests/ scripts/`
-  - `ty check src/`
-  - `python -m pytest -m "not slow"`
+    → **229 passed**.
+- [x] Run final gates:
+  - `ruff format src/ tests/ scripts/` → 2 files reformatted (the new tests).
+  - `ruff check src/ tests/ scripts/` → All checks passed.
+  - `ty check src/` → All checks passed.
+  - `python -m pytest -m "not slow"` → **1383 passed, 79 deselected**.
 
 ## Phase 10: End-to-End Transfer Validation (run + sign-off)
 
