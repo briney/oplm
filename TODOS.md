@@ -360,22 +360,102 @@ once at the proxy width and reuse the same number at every larger preset.
 
 ## Phase 10: End-to-End Transfer Validation (run + sign-off)
 
-- [ ] Confirm the real-corpus parquet path and the LR grid + step budget with the
-  user before launching real runs.
-- [ ] **Coord-check (width, the gate):**
-  `python -m scripts.mup_coord_check --widths 128,256,512,1024 --optimizer muon`
-  → verify per-module RMS does **not grow** with width (and that `--no-mup` fans
-  out); the readout may shrink at init (assessed at `t ≥ 1`).
-- [ ] **Coord-check (preset ray):**
-  `python -m scripts.mup_coord_check --scaling preset_ray --widths 256,512,1024 --optimizer muon`
-  → empirically validate combined width+depth scaling (Finding 4).
-- [ ] **Pilot sweep:**
-  `python -m scripts.mup_sweep --widths 256,512 --lrs <grid> --gpus <N> --data <corpus> --steps <budget>`
-  → verify the loss-vs-LR minimum lands at the **same** `train.lr` for both proxy
-  widths (`MupTransferResult.transferred == True`).
-- [ ] **Confirmation run:** train one larger preset (e.g. 400M or 1B) reusing that
-  `train.lr`; check the loss curve tracks the μTransfer expectation.
-- [ ] Record results in the lab notebook per the lab-notebook skill.
+> **Runs on a separate environment: 8× B200 + the real training corpus.** All
+> commands need the `train` extra and `torch ≥ 2.10` (Muon). The coord-check and
+> sweep auto-detect CUDA. Set these once per shell, then the commands below are
+> copy-pasteable:
+>
+> ```bash
+> pip install -e ".[train]"
+> export CORPUS=/path/to/real/corpus.parquet   # file OR shard dir (data.train)
+> export OUT=outputs/mup_validation             # all artifacts land here
+> mkdir -p "$OUT"
+> ```
+
+- [ ] **10.1 — Coord-check (width, the gate).** Vary width at fixed depth; μP must
+  hold per-module RMS flat. Run μP and the `--no-mup` control so the one-sided
+  oracle has its contrast (the readout may shrink at init — assessed at `t ≥ 1`,
+  which the final-step growth table already excludes). Writes
+  `coord_check_width_muon_{mup,nomup}.{csv,png}` into `$OUT`.
+
+  ```bash
+  python -m scripts.mup_coord_check --optimizer muon --data "$CORPUS" \
+    --widths 256,512,1024,2048 --base-width 512 --steps 5 \
+    --n-seqs 16 --max-length 256 --out "$OUT"
+  python -m scripts.mup_coord_check --optimizer muon --data "$CORPUS" --no-mup \
+    --widths 256,512,1024,2048 --base-width 512 --steps 5 \
+    --n-seqs 16 --max-length 256 --out "$OUT"
+  ```
+
+  **Pass:** μP run prints "✓ μP oracle holds" (no module's RMS grows with width);
+  the `--no-mup` run visibly fans out. If μP fails, **stop** — do not sweep.
+
+- [ ] **10.2 — Coord-check (preset ray).** Co-scale depth with width at the 32:1
+  preset ratio to empirically validate combined width+depth scaling (the depth
+  half is not guaranteed by μP theory; `--depth` is ignored in this mode). Writes
+  `coord_check_preset_ray_muon_mup.{csv,png}`.
+
+  ```bash
+  python -m scripts.mup_coord_check --scaling preset_ray --optimizer muon \
+    --data "$CORPUS" --widths 512,1024,2048 --base-width 512 --steps 5 \
+    --n-seqs 16 --max-length 256 --out "$OUT"
+  ```
+
+- [ ] **10.3 — Pilot LR sweep (8× B200).** Tune the base LR at the proxy widths.
+  The 2×4 grid below is exactly 8 points → one wave on 8 GPUs (one single-GPU
+  pilot per point). Keep `batch_size`/`warmup_steps`/`steps`/`seed` shared (only
+  width and lr vary) — μP does **not** transfer across batch size or horizon.
+
+  ```bash
+  python -m scripts.mup_sweep --gpus 8 --data "$CORPUS" --out "$OUT/sweep" \
+    --widths 256,512 --lrs 1e-3,3e-3,1e-2,3e-2 \
+    --base-width 512 --scaling width \
+    --steps 1000 --warmup-steps 100 --batch-size 64 --max-length 512 --seed 0
+  ```
+
+  **Pass:** the printed loss-vs-LR minimum lands at the **same** `lr` for both
+  proxy widths and `MupTransferResult.transferred == True`. Record that winning
+  `lr` (see `$OUT/sweep/sweep_loss_vs_lr.png`):
+
+  ```bash
+  export BEST_LR=<winning-lr-from-the-sweep>
+  ```
+
+  Optional: re-run with `--scaling preset_ray --widths 512,1024` to cross-check the
+  transfer verdict along the depth-co-scaled ray.
+
+- [ ] **10.4 — Confirmation run (8× B200).** Train one larger preset reusing
+  `$BEST_LR` unchanged via the μP+Muon overlay. The overlay sets
+  `optimizer=muon`, `muon_adjust_lr_fn=original`, `mup_enable=true`,
+  `mup_base_width=512`; the preset only changes width/depth, so `$BEST_LR` is the
+  base LR. (1B = hidden 1600, `m ≈ 3.12`; use `--preset 400M` for a cheaper
+  check.) Configure Accelerate for 8 processes once (`accelerate config`), or pass
+  the flags inline:
+
+  ```bash
+  accelerate launch --multi_gpu --num_processes 8 -m oplm.train \
+    --preset 1B \
+    --config src/oplm/configs/train/mup_muon.yaml \
+    --name mup-confirm-1B \
+    data.train="$CORPUS" \
+    train.lr="$BEST_LR" \
+    train.max_steps=20_000 train.warmup_steps=2_000 \
+    train.compile=true train.compile_mode=max-autotune
+  ```
+
+  W&B is on by default, so `train/loss` is the live signal. For a held-out eval
+  curve, add a `data.eval` block in a small YAML and append it after the overlay
+  (`--config mup_muon.yaml --config eval.yaml …`) rather than an inline dotlist
+  (inline mappings are brittle to quote) — see `docs/TRAIN.md §8`.
+
+  **Pass:** the loss curve is healthy (no divergence, no LR-too-low stall) — i.e.
+  the proxy-tuned LR transfers to the larger preset without re-sweeping. Optional
+  baseline contrast: a second run at a deliberately off LR (e.g.
+  `train.lr=$(python -c "print($BEST_LR*0.2)")`) should track *worse*.
+
+- [ ] **10.5 — Sign-off.** Record the coord-check verdicts, the sweep transfer
+  result + winning `$BEST_LR`, and the confirmation curve in the lab notebook
+  (per the lab-notebook skill); attach the `$OUT/*.png` plots.
 
 ## Caveats (document in `docs/MUP.md`)
 
