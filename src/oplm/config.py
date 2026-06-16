@@ -42,7 +42,10 @@ class TrainConfig:
     batch_size: int = 32
     gradient_accumulation_steps: int = 1
 
-    # Optimizer
+    # Optimizer.
+    # NOTE: these are conservative *library* fallbacks for bare TrainConfig() /
+    # direct construction. OPLM's production training default (what `oplm train`
+    # loads) is μP + Muon with lr 0.01 — see configs/train/base.yaml and docs/MUP.md.
     optimizer: str = "adamw"
     lr: float = 1e-4
     min_lr: float = 0.0

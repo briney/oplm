@@ -178,9 +178,9 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
         and cast("OplmConfig", model.config).mup_enable
     ):
         raise ValueError(
-            "μP with Muon requires muon_adjust_lr_fn='original' (got 'match_rms_adamw', "
-            "which scales like √width and does not transfer). Set "
-            "train.muon_adjust_lr_fn=original (see configs/train/mup_muon.yaml)."
+            "μP with Muon requires muon_adjust_lr_fn='original' (the default; got "
+            "'match_rms_adamw', which scales like √width and does not transfer). Set "
+            "train.muon_adjust_lr_fn=original (see docs/MUP.md)."
         )
 
     param_groups = partition_optimizer_params(model, cfg)

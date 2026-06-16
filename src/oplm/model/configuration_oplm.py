@@ -91,6 +91,9 @@ class OplmConfig(PretrainedConfig):
         canon_kernel_sizes: int | list[int] | dict[str, Any] = 4,
         canon_activation: str = "none",
         initializer_range: float = 0.02,
+        # μP off by default at the library level (bare OplmConfig() / from_pretrained
+        # of configs that omit it). OPLM's production training default enables μP via
+        # configs/model/base.yaml; existing checkpoints carry their own value. See docs/MUP.md.
         mup_enable: bool = False,
         mup_base_width: int = 512,
         mup_output_mult: float = 1.0,

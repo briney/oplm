@@ -5,11 +5,17 @@ pilot model transfer to much larger models without re-sweeping at every scale.
 Tune `train.lr` **once** at a small proxy width, then reuse the same number at
 every larger preset.
 
-μP is **opt-in** (`model.mup_enable=false` by default) and a **no-op at the base
-width** — with it off, or at `hidden_size == mup_base_width`, init, forward
-multipliers, and per-group LRs are bit-identical to a non-μP run, so existing
-runs, checkpoints, and tests are unchanged. The production optimizer for μP is
-**Muon**; AdamW is also supported.
+μP + Muon is the **default training recipe** (`oplm train` uses it out of the box;
+`train.lr` defaults to the μP base LR `0.01`). It is a **no-op at the base width** —
+at `hidden_size == mup_base_width`, init, forward multipliers, and per-group LRs
+are bit-identical to a non-μP run. The production optimizer for μP is **Muon**;
+AdamW is also supported. To turn μP off (and use a classic AdamW baseline), apply
+`configs/train/baseline_adamw.yaml` (see §1).
+
+Backward-compatibility note: the default lives in the **YAML run-config layer**
+(`configs/*/base.yaml`). Bare `OplmConfig()` / `TrainConfig()` construction and
+`from_pretrained` stay μP-off (the conservative dataclass fallback), and existing
+checkpoints load with whatever `mup_enable` they were saved with.
 
 Related references:
 
@@ -21,32 +27,34 @@ Related references:
 
 ## 1. Quick start
 
-The recipe lives in a config overlay you apply on top of a size `--preset`:
+μP + Muon is the default, so training at any preset just works — `train.lr` is the
+μP base LR (`0.01`), reused unchanged at every size:
 
 ```bash
-# Tune once at the proxy width (50M, hidden_size = mup_base_width = 512):
+oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.01, by default
+```
+
+The defaults live in `configs/train/base.yaml` (`optimizer: muon`,
+`muon_adjust_lr_fn: original`, `lr: 0.01`) and `configs/model/base.yaml`
+(`mup_enable: true`, `mup_base_width: 512`). With μP on, **`train.lr` is the base
+LR** and transfers across width — you do not re-tune it per preset.
+
+**To re-tune the base LR** (e.g. for a new optimizer/data regime), sweep at small
+proxy widths and reuse the argmin (see §6):
+
+```bash
 python -m scripts.mup_sweep --widths 256,512 --lrs 1e-3,3e-3,1e-2,3e-2 \
   --gpus 4 --steps 400 --data /data/corpus.parquet --out sweeps/run1
-# → pick the argmin-loss lr (the sweep prints it and a transfer verdict)
-
-# Reuse that lr unchanged at any larger preset:
-oplm train --preset 400M --config src/oplm/configs/train/mup_muon.yaml \
-  data.train=/data/uniref50/ train.lr=<base-lr-from-the-sweep>
+# then set train.lr=<argmin> in your config (the current default 0.01 came from this)
 ```
 
-`configs/train/mup_muon.yaml` flips on μP and the Muon settings it requires:
+**To disable μP** (classic AdamW baseline, e.g. for an ablation), apply the opt-out
+overlay — note its `lr` is a plain AdamW LR that must be tuned per size:
 
-```yaml
-train:
-  optimizer: muon
-  muon_adjust_lr_fn: original   # μP+Muon REQUIRES this (see §4)
-model:
-  mup_enable: true
-  mup_base_width: 512           # the proxy width where the width multiplier m = 1
+```bash
+oplm train --preset 400M --config src/oplm/configs/train/baseline_adamw.yaml \
+  data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
 ```
-
-With μP on, **`train.lr` is the base LR** — the value you tuned at the proxy
-width. You do not re-tune it per preset.
 
 ---
 
@@ -58,7 +66,8 @@ width. You do not re-tune it per preset.
 2. **Sweep the LR** at two small proxy widths (§6). The loss-vs-LR minimum should
    land at the **same** `lr` for both widths — that shared minimum is your base
    LR, and `MupTransferResult.transferred == True` confirms it.
-3. **Reuse** that base LR at the target preset via `--config mup_muon.yaml`.
+3. **Reuse** that base LR at the target preset — it's already the default
+   (`train.lr` in `configs/train/base.yaml`), so any preset picks it up.
 4. **Confirm** on one larger preset that the loss curve tracks expectation.
 
 The proxy/base width is `mup_base_width` (default `512`, the 50M preset's
@@ -140,12 +149,12 @@ true per-matrix fan-in keeps the scaling exact rather than approximating
 
 ## 4. Why `muon_adjust_lr_fn=original` is mandatory
 
-The default `muon_adjust_lr_fn="match_rms_adamw"` uses `0.2·√(max(d_out, d_in))`,
-which **grows like `√width`** and does **not** transfer. μP+Muon requires
-`"original"` (aspect-ratio-only). The guard is enforced — `build_optimizers`
-raises `ValueError` if `mup_enable` and `optimizer="muon"` and
-`muon_adjust_lr_fn="match_rms_adamw"`. The `mup_muon.yaml` overlay sets it for
-you.
+`muon_adjust_lr_fn="match_rms_adamw"` uses `0.2·√(max(d_out, d_in))`, which
+**grows like `√width`** and does **not** transfer. μP+Muon requires `"original"`
+(aspect-ratio-only), which is the **default** (`configs/train/base.yaml`). The
+guard is enforced — `build_optimizers` raises `ValueError` if `mup_enable` and
+`optimizer="muon"` and `muon_adjust_lr_fn="match_rms_adamw"` — so you only hit it
+if you explicitly switch back to `match_rms_adamw` while μP+Muon are on.
 
 ---
 

@@ -231,11 +231,12 @@ see [OVERVIEW.md](OVERVIEW.md) Part IV.
 
 **Optimizer** — `train.optimizer`:
 
-- `adamw` (default): a single AdamW. 2-D weights get `weight_decay`; biases,
-  norms, and embeddings are no-decay.
-- `muon`: a **hybrid** — eligible 2-D hidden weights are optimized with
+- `muon` (default): a **hybrid** — eligible 2-D hidden weights are optimized with
   `torch.optim.Muon`, while embeddings, norms, biases, and the MLM head
-  (`lm_head.*`) stay on an auxiliary AdamW. Tuned via `train.muon_*`.
+  (`lm_head.*`) stay on an auxiliary AdamW. Tuned via `train.muon_*`. The default
+  pairs with μP (below) and `muon_adjust_lr_fn=original`.
+- `adamw`: a single AdamW. 2-D weights get `weight_decay`; biases, norms, and
+  embeddings are no-decay.
 
 **Schedule** — `train.scheduler`: `warmup_linear` (default), `warmup_cosine`,
 `wsd_linear`, or `wsd_cosine`. All warm up linearly over `train.warmup_steps`;
@@ -246,16 +247,24 @@ once per optimizer step, reaching the floor at the final step.
 See [CONFIG.md](CONFIG.md#train-fields-train) for every optimizer and scheduler
 field.
 
-**μP learning-rate transfer** — to tune `train.lr` once at a small proxy width
-and reuse it unchanged at larger presets, apply the μP+Muon overlay:
+**μP learning-rate transfer** — μP + Muon is the **default**, so `train.lr` is the
+μP base LR (`0.01`) and transfers across width: pick any preset and reuse the same
+`lr` — no per-size retuning.
 
 ```bash
-oplm train --preset 400M --config src/oplm/configs/train/mup_muon.yaml \
-  data.train=/data/uniref50/ train.lr=<base-lr-from-the-pilot-sweep>
+oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.01, by default
 ```
 
-μP is opt-in and a no-op at the base width. See [MUP.md](MUP.md) for the full
-recipe, the coord-check gate, and the pilot LR sweep that produces the base LR.
+To run a classic **AdamW baseline** (μP off), apply the opt-out overlay (its `lr`
+is a plain AdamW LR you must tune per size):
+
+```bash
+oplm train --preset 400M --config src/oplm/configs/train/baseline_adamw.yaml \
+  data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
+```
+
+See [MUP.md](MUP.md) for the full recipe, the coord-check gate, and the pilot LR
+sweep that produces the base LR.
 
 ---
 

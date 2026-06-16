@@ -307,6 +307,9 @@ once at the proxy width and reuse the same number at every larger preset.
   merges at the root). Verified: merges with `--preset 400M`, round-trips through
   `serialize_config`, and `build_optimizers` builds the two-optimizer μP+Muon path
   (Muon `lr` constant + `adjust_lr_fn=original`; aux AdamW emits the `lr/m` group).
+  **Superseded:** after validation, μP+Muon+lr0.01 became the run default in
+  `configs/*/base.yaml`; `mup_muon.yaml` was removed and replaced by the opt-out
+  overlay `configs/train/baseline_adamw.yaml`.
 - [x] Write `docs/MUP.md`: the recipe table, the multiplier-per-preset table, the
   "tune-once-reuse-`train.lr`" workflow, coord-check + sweep commands, and the
   caveats below. Linked from `docs/TRAIN.md` (top references + the optimizer
@@ -471,10 +474,13 @@ once at the proxy width and reuse the same number at every larger preset.
   If memory is still tight, enable `model.gradient_checkpointing=true` (TRAIN.md
   §6) rather than shrinking the micro-batch further.
 
+  μP + Muon are now the **defaults** (`configs/*/base.yaml`), so no `--config`
+  overlay is needed; `train.lr` defaults to the μP base LR `0.01` (override with
+  `$BEST_LR` only if it differs).
+
   ```bash
   accelerate launch --multi_gpu --num_processes 8 -m oplm.train \
     --preset 1B \
-    --config src/oplm/configs/train/mup_muon.yaml \
     --name mup-confirm-1B \
     data.train="$CORPUS" \
     train.lr="$BEST_LR" \
@@ -485,9 +491,9 @@ once at the proxy width and reuse the same number at every larger preset.
   ```
 
   W&B is on by default, so `train/loss` is the live signal. For a held-out eval
-  curve, add a `data.eval` block in a small YAML and append it after the overlay
-  (`--config mup_muon.yaml --config eval.yaml …`) rather than an inline dotlist
-  (inline mappings are brittle to quote) — see `docs/TRAIN.md §8`.
+  curve, add a `data.eval` block in a small YAML and append it via
+  `--config eval.yaml` rather than an inline dotlist (inline mappings are brittle
+  to quote) — see `docs/TRAIN.md §8`.
 
   **Pass:** the loss curve is healthy (no divergence, no LR-too-low stall) — i.e.
   the proxy-tuned LR transfers to the larger preset without re-sweeping. Optional
