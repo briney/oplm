@@ -121,7 +121,7 @@ from `configs/model/base.yaml`.
 | --- | --- | --- | --- |
 | `model.norm_type` | `str` | `layernorm` | `layernorm` or `rmsnorm`. |
 | `model.norm_eps` | `float` | `1e-6` | Norm epsilon. |
-| `model.norm_strategy` | `str` | `pre` | `pre`, `sandwich`, `hybrid`, or `post_sdpa`. |
+| `model.norm_strategy` | `str` | `sandwich` | `pre`, `sandwich`, `hybrid`, or `post_sdpa` (run default `sandwich`; dataclass fallback `pre`). |
 | `model.qk_norm` | `bool` | `true` | Normalize Q and K before attention. |
 | `model.qk_norm_mode` | `str` | `channel` | `channel` (per-channel LayerNorm/RMSNorm + fixed `1/√head_dim` scale, the current behavior) or `l2` (fp32 L2-normalize over `head_dim` + a learned per-head scale). Inert when `qk_norm=false`. |
 | `model.qk_norm_l2_scale_init` | `float \| null` | `null` | `l2` mode only: initial value of the learned per-head scale. `null` initializes to `√head_dim`. Must be positive when set. |
@@ -131,8 +131,8 @@ from `configs/model/base.yaml`.
 | `model.residual_scaling` | `str` | `sqrt_num_layers` | `sqrt_num_layers` (scale each sublayer's residual write by `1/√L`) or `none`. |
 | `model.residual_gate` | `str` | `none` | Learnable multiplicative gate refining each residual write on top of `residual_scaling`: `none` (no new params), `scalar` (one param per attention/FFN write), or `channel` (`(hidden_size,)` param per write). |
 | `model.residual_gate_init` | `float` | `1.0` | Initial value for residual gate parameters. Must be finite. |
-| `model.attn_output_gate` | `str` | `none` | Post-SDPA attention output gate (arXiv:2505.06708, G1): `none` (no new params), `sigmoid`, or `silu`. Adds a bias-free `(hidden_size, hidden_size)` `gate_proj` per layer; the merged attention output is multiplied elementwise by `act(gate_proj(x))` before `o_proj`. |
-| `model.value_residual` | `str` | `none` | ResFormer value residual (arXiv:2410.17897): `none` (no new params), `fixed` (constant λ buffer, no new params), or `learnable` (one scalar λ per layer after the first). Layer 0 exposes its post-V-norm values `v₁`; every later layer blends `v' = λ·v + (1 − λ)·v₁` right after the V projection. |
+| `model.attn_output_gate` | `str` | `sigmoid` | Post-SDPA attention output gate (arXiv:2505.06708, G1): `none` (no new params), `sigmoid`, or `silu`. Adds a bias-free `(hidden_size, hidden_size)` `gate_proj` per layer; the merged attention output is multiplied elementwise by `act(gate_proj(x))` before `o_proj`. Run default `sigmoid`; dataclass fallback `none`. |
+| `model.value_residual` | `str` | `learnable` | ResFormer value residual (arXiv:2410.17897): `none` (no new params), `fixed` (constant λ buffer, no new params), or `learnable` (one scalar λ per layer after the first). Layer 0 exposes its post-V-norm values `v₁`; every later layer blends `v' = λ·v + (1 − λ)·v₁` right after the V projection. Run default `learnable`; dataclass fallback `none`. |
 | `model.value_residual_lambda_init` | `float` | `0.5` | Constant λ under `fixed`; initial value of the learnable λ under `learnable`. Must be finite. Inert when `value_residual=none`. |
 | `model.init_scale_output_projections` | `bool` | `true` | Shrink residual-writing projections by `1/√(2L)` at init. |
 
@@ -152,14 +152,14 @@ from `configs/model/base.yaml`.
 | `model.tie_word_embeddings` | `bool` | `false` | Tie the MLM decoder to the input embedding. |
 | `model.mlm_head_activation` | `str` | `gelu` | `gelu`, `silu`, or `relu`. |
 
-### Canon depthwise convolution (off by default)
+### Canon depthwise convolution (on by default)
 
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
-| `model.canon_enabled` | `bool` | `false` | Master switch for Canon conv sublayers. Supported under `norm_strategy` in `{pre, sandwich, post_sdpa}`; `hybrid` raises at validation (no outer attention pre-norm for Canon-A). |
+| `model.canon_enabled` | `bool` | `true` | Master switch for Canon conv sublayers. Supported under `norm_strategy` in `{pre, sandwich, post_sdpa}`; `hybrid` raises at validation (no outer attention pre-norm for Canon-A). Run default `true`; dataclass fallback `false`. |
 | `model.canon_residual` | `bool` | `true` | Use residual Canon updates (`z + Canon(z)`) by default. |
-| `model.canon_positions` | `list[str]` | `[]` | Subset of `{A, B, C, D}`; required and non-empty when `canon_enabled=true`. The intended paper-exact encoder placements are specified in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). |
-| `model.canon_kernel_sizes` | `int \| list[int] \| dict` | `4` | `int` broadcasts to every layer; a `list[int]` must have length `num_hidden_layers`; a `dict` uses `schedule: linear` (`min`, `max`) or `schedule: constant` (`value`). All entries must be `≥ 2`. |
+| `model.canon_positions` | `list[str]` | `[A, B, C, D]` | Subset of `{A, B, C, D}`; required and non-empty when `canon_enabled=true`. Position semantics are specified in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). Run default all four positions; dataclass fallback `[]`. |
+| `model.canon_kernel_sizes` | `int \| list[int] \| dict` | `7` | `int` broadcasts to every layer; a `list[int]` must have length `num_hidden_layers`; a `dict` uses `schedule: linear` (`min`, `max`) or `schedule: constant` (`value`). All entries must be `≥ 2`. Run default `7`; dataclass fallback `4`. |
 | `model.canon_activation` | `str` | `none` | `none`, `silu`, or `gelu`. |
 
 ### Fine-tuning heads
@@ -193,14 +193,15 @@ models without re-sweeping at every scale. It is **on by default** for `oplm tra
 runs (with `train.optimizer=muon`, `train.muon_adjust_lr_fn=original`,
 `train.lr=0.01`), and a no-op at the base width. See [MUP.md](MUP.md) for the full
 recipe and the tune-once-reuse-`train.lr` workflow; disable it with
-`configs/train/baseline_adamw.yaml`.
+`configs/train/vanilla_esm-c.yaml`.
 
 > **Run defaults vs. dataclass fallbacks.** The `Default` column below (and in the
 > Train table) is the **run default** from `configs/*/base.yaml` — what `oplm train`
 > loads. Bare Python construction (`OplmConfig()` / `TrainConfig()`) and
 > `from_pretrained` use conservative fallbacks instead (`mup_enable=false`,
-> `optimizer=adamw`, `lr=1e-4`), so direct use and existing checkpoints are
-> unaffected.
+> `optimizer=adamw`, `lr=1e-4`, `norm_strategy=pre`, `attn_output_gate=none`,
+> `value_residual=none`, `canon_enabled=false`), so direct use and existing
+> checkpoints are unaffected.
 
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |

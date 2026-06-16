@@ -181,27 +181,44 @@ def test_default_run_uses_mup_muon_recipe() -> None:
     assert cfg.model.mup_width_mult() == 2.0
 
 
-def test_baseline_adamw_overlay_disables_mup() -> None:
-    """The AdamW baseline overlay turns μP off and switches the optimizer to AdamW."""
-    overlay = str(files("oplm.configs.train").joinpath("baseline_adamw.yaml"))
+def test_vanilla_esmc_overlay_restores_conventional_recipe() -> None:
+    """The vanilla ESM-C overlay turns μP off, switches to AdamW, and reverts the architecture."""
+    overlay = str(files("oplm.configs.train").joinpath("vanilla_esm-c.yaml"))
     cfg = load_config(["--config", overlay])
+    # Optimizer / μP opt-out
     assert cfg.train.optimizer == "adamw"
     assert cfg.train.muon_adjust_lr_fn == "match_rms_adamw"
     assert cfg.model.mup_enable is False
     assert cfg.model.mup_width_mult() == 1.0
+    # Architecture reverts to the conventional pre-2026 recipe
+    assert cfg.model.norm_strategy == "pre"
+    assert cfg.model.attn_output_gate == "none"
+    assert cfg.model.value_residual == "none"
+    assert cfg.model.canon_enabled is False
 
 
 def test_dataclass_fallbacks_are_conservative() -> None:
-    """Bare dataclass construction stays μP-off / AdamW (library fallback, backward-compatible)."""
+    """Bare dataclass construction stays μP-off / AdamW (library fallback, backward-compatible).
+
+    The production recipe lives in the YAML (configs/{model,train}/base.yaml); the
+    dataclass keeps the vanilla architecture so bare ``OplmConfig()`` and loading
+    older checkpoints stay backward-compatible.
+    """
     assert OplmModelConfig().mup_enable is False
     assert TrainConfig().optimizer == "adamw"
     assert TrainConfig().lr == pytest.approx(1e-4)
+    # Architecture defaults stay vanilla at the library level (not the YAML recipe).
+    model = OplmModelConfig()
+    assert model.norm_strategy == "pre"
+    assert model.attn_output_gate == "none"
+    assert model.value_residual == "none"
+    assert model.canon_enabled is False
 
 
 def test_canon_residual_cli_override_applies() -> None:
     """The residual Canon toggle remains a simple boolean model field."""
     cfg = load_config(["model.canon_residual=false"])
-    assert cfg.model.canon_enabled is False
+    assert cfg.model.canon_enabled is True  # Canon is on by default
     assert cfg.model.canon_residual is False
 
 
@@ -250,29 +267,30 @@ def test_all_presets_pass_strict_validation(preset: str) -> None:
 
 @pytest.mark.parametrize("preset", AVAILABLE_PRESETS)
 def test_all_presets_resolve_golden_canon_defaults(preset: str) -> None:
-    """Every preset resolves the paper-exact Canon defaults (Canon off, residual on)."""
+    """Every preset resolves the default Canon recipe (all four positions, k=7, residual on)."""
     cfg = load_config(["--preset", preset])
-    assert cfg.model.canon_enabled is False
+    assert cfg.model.canon_enabled is True
     assert cfg.model.canon_residual is True
-    assert cfg.model.canon_positions == []
+    assert cfg.model.canon_positions == ["A", "B", "C", "D"]
+    assert cfg.model.canon_kernel_sizes == [7] * cfg.model.num_hidden_layers
     assert cfg.model.canon_activation == "none"
 
 
-def test_canon_enabled_run_resolves_paper_exact_defaults() -> None:
-    """A Canon-enabled run resolves to the paper-exact encoder configuration.
+def test_canon_default_run_resolves_golden_encoder_config() -> None:
+    """The default run resolves to the golden encoder configuration.
 
-    Golden assertions for the ablation surface: residual Canon, no conv
-    activation, pre-norm strategy, and the base k=4 kernel broadcast across
-    every layer.
+    Golden assertions for the ablation surface: Canon at all four positions with
+    residual updates, no conv activation, sandwich norm strategy, and the base
+    k=7 kernel broadcast across every layer.
     """
-    cfg = load_config(["model.canon_enabled=true", "model.canon_positions=[A,B,C,D]"])
+    cfg = load_config([])
     assert cfg.model.canon_enabled is True
     assert cfg.model.canon_residual is True
     assert cfg.model.canon_positions == ["A", "B", "C", "D"]
     assert cfg.model.canon_activation == "none"
-    assert cfg.model.norm_strategy == "pre"
-    # base.yaml's k=4 resolves to a per-layer list of the right length.
-    assert cfg.model.canon_kernel_sizes == [4] * cfg.model.num_hidden_layers
+    assert cfg.model.norm_strategy == "sandwich"
+    # base.yaml's k=7 resolves to a per-layer list of the right length.
+    assert cfg.model.canon_kernel_sizes == [7] * cfg.model.num_hidden_layers
 
 
 def test_serialized_config_roundtrips_through_load_config(tmp_path: Path) -> None:

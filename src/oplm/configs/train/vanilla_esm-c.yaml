@@ -1,0 +1,25 @@
+# Vanilla ESM-C recipe — the conventional pre-2026 baseline / escape hatch.
+#
+# OPLM now defaults to μP + Muon with sandwich norm, a sigmoid attention output
+# gate, a learnable value residual, and Canon at all four positions (see
+# configs/{train,model}/base.yaml). This overlay turns ALL of that off to recover
+# a conventional ESM-C-style encoder trained with AdamW — for ablations, A-B
+# comparisons, or reproducing the old recipe. Pass it with --config on top of a
+# size --preset:
+#
+#   oplm train --preset 400M --config src/oplm/configs/train/vanilla_esm-c.yaml \
+#     data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
+#
+# IMPORTANT: with μP off, `lr` no longer transfers across width. The value below is
+# a generic AdamW starting point — retune it for your model size. See docs/MUP.md.
+train:
+  optimizer: adamw
+  lr: 1.0e-4
+  muon_adjust_lr_fn: match_rms_adamw # restore the library default (inert for AdamW)
+
+model:
+  mup_enable: false
+  norm_strategy: pre
+  attn_output_gate: none
+  value_residual: none
+  canon_enabled: false

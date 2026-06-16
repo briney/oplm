@@ -18,7 +18,7 @@ model:
   # Normalization
   norm_type: layernorm # layernorm | rmsnorm
   norm_eps: 1.0e-6
-  norm_strategy: pre # pre | sandwich | hybrid | post_sdpa
+  norm_strategy: sandwich # pre | sandwich | hybrid | post_sdpa
   qk_norm: true
   qk_norm_mode: channel # channel (LayerNorm/RMSNorm + 1/sqrt(d) scale) | l2 (L2-normalize + learned per-head scale)
   qk_norm_l2_scale_init: null # l2 mode only; per-head scale init (null -> sqrt(head_dim))
@@ -28,8 +28,8 @@ model:
   residual_scaling: sqrt_num_layers # sqrt_num_layers | none
   residual_gate: none # none | scalar | channel (learnable multiplicative refinement on residual writes)
   residual_gate_init: 1.0 # initial value for residual gate parameters
-  attn_output_gate: none # none | sigmoid | silu (post-SDPA G1 output gate, arXiv:2505.06708)
-  value_residual: none # none | fixed | learnable (ResFormer value residual, arXiv:2410.17897)
+  attn_output_gate: sigmoid # none | sigmoid | silu (post-SDPA G1 output gate, arXiv:2505.06708)
+  value_residual: learnable # none | fixed | learnable (ResFormer value residual, arXiv:2410.17897)
   value_residual_lambda_init: 0.5 # constant lambda (fixed) or init (learnable); layers > 0 only
   init_scale_output_projections: true
 
@@ -45,18 +45,18 @@ model:
   tie_word_embeddings: false
   mlm_head_activation: gelu # gelu | silu | relu
 
-  # Canon depthwise convolution (off by default)
-  canon_enabled: false
+  # Canon depthwise convolution (on by default: all four positions, k=7)
+  canon_enabled: true
   canon_residual: true # residual Canon updates by default
-  canon_positions: [] # subset of {A, B, C, D}
-  canon_kernel_sizes: 4
+  canon_positions: [A, B, C, D] # subset of {A, B, C, D}
+  canon_kernel_sizes: 7
   canon_activation: none # none | silu | gelu
 
   # μP (maximal update parametrization) — LR transfer across width, ON by default.
   # train.lr is the μP base LR and transfers across width automatically (no manual
   # retune per size). At this default hidden_size (1024) over mup_base_width (512),
   # m = 2, so μP actively scales init/LR. To DISABLE μP, use the AdamW baseline
-  # overlay (configs/train/baseline_adamw.yaml) — then train.lr must be retuned.
+  # overlay (configs/train/vanilla_esm-c.yaml) — then train.lr must be retuned.
   # See docs/MUP.md. (The bare OplmConfig() dataclass default is mup_enable=false.)
   mup_enable: true
   mup_base_width: 512 # hidden_size of the proxy/base model where the width multiplier m = 1
