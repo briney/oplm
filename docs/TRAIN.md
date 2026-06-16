@@ -400,12 +400,23 @@ repeated runs skip recompilation.
 
 | Mode | When to use |
 |------|-------------|
-| `default` | Balanced; safe for all hardware. |
+| `default` | Balanced; safe for all hardware. Required with gradient accumulation (see below). |
 | `reduce-overhead` | Uses CUDA graphs to reduce kernel-launch overhead; best for small batch sizes. |
 | `max-autotune` | Tries more optimization strategies; longest compile time, best peak throughput on Blackwell. |
 
 Recommended for all multi-GPU production runs. Use `compile_mode=max-autotune`
 on Blackwell for best throughput at the cost of a longer initial compile.
+
+> **CUDA-graph modes are incompatible with gradient accumulation.**
+> `reduce-overhead` and `max-autotune` enable CUDA graphs, which replay into a
+> single set of static buffers. When `gradient_accumulation_steps > 1`, the
+> trainer runs several forward/backward micro-steps per optimizer step, and a
+> later micro-step's forward overwrites the static output buffer the previous
+> micro-step's backward still needs — `RuntimeError: accessing tensor output of
+> CUDAGraphs that has been overwritten by a subsequent run`. With
+> `gradient_accumulation_steps > 1`, use `compile_mode=default` (Inductor/Triton
+> fusion, no CUDA graphs) or `train.compile=false`. CUDA-graph modes are safe only
+> at `gradient_accumulation_steps=1`.
 
 ```bash
 # opt in via CLI override

@@ -457,10 +457,19 @@ once at the proxy width and reuse the same number at every larger preset.
   **Match the same global batch (8192) AND sequence length (512) the pilot tuned
   at** — μP only fixes width, not batch or seq length. On 8 GPUs: `global batch =
   train.batch_size × 8 × train.gradient_accumulation_steps`, so pick
-  `batch_size`/`grad_accum` whose product with 8 is 8192 (e.g. `128 × 8 × 8 =
+  `batch_size`/`grad_accum` whose product with 8 is 8192 (e.g. `64 × 8 × 16 =
   8192`). The 1B preset defaults to `max_position_embeddings=1024`, so override it
   to 512 to match the pilot. (`oplm train` accepts these as plain overrides — no
   script change needed.)
+
+  Use `train.compile_mode=default` — **not** `reduce-overhead`/`max-autotune`.
+  Those enable CUDA graphs, which are incompatible with
+  `gradient_accumulation_steps > 1` (the graph's static output buffer is
+  overwritten by the next micro-step's forward before the prior backward consumes
+  it: `RuntimeError: accessing tensor output of CUDAGraphs that has been
+  overwritten`). `default` keeps the Inductor/Triton speedups without CUDA graphs.
+  If memory is still tight, enable `model.gradient_checkpointing=true` (TRAIN.md
+  §6) rather than shrinking the micro-batch further.
 
   ```bash
   accelerate launch --multi_gpu --num_processes 8 -m oplm.train \
@@ -469,10 +478,10 @@ once at the proxy width and reuse the same number at every larger preset.
     --name mup-confirm-1B \
     data.train="$CORPUS" \
     train.lr="$BEST_LR" \
-    train.batch_size=128 train.gradient_accumulation_steps=8 \
+    train.batch_size=64 train.gradient_accumulation_steps=16 \
     model.max_position_embeddings=512 \
     train.max_steps=20_000 train.warmup_steps=2_000 \
-    train.compile=true train.compile_mode=max-autotune
+    train.compile=true train.compile_mode=default
   ```
 
   W&B is on by default, so `train/loss` is the live signal. For a held-out eval
