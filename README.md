@@ -225,7 +225,8 @@ oplm train --preset 1B data.train=/data/uniref50/
 
 See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide, and
 **[docs/MUP.md](docs/MUP.md)** for μP learning-rate transfer (tune `lr` once on a
-small model, reuse it at scale; disable via `baseline_adamw.yaml`).
+small model, reuse it at scale; recover the conventional ESM-C recipe via
+`vanilla_esm-c.yaml`).
 
 ---
 

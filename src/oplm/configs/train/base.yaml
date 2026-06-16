@@ -13,12 +13,12 @@ train:
   batch_size: 32
   gradient_accumulation_steps: 1
 
-  # Optimizer — μP + Muon is the default recipe (disable via configs/train/baseline_adamw.yaml).
+  # Optimizer — μP + Muon is the default recipe (disable via configs/train/vanilla_esm-c.yaml).
   optimizer: muon             # adamw | muon
   # μP base learning rate. With μP on (the default; model.mup_enable), this value
   # transfers across model width automatically — do NOT retune it per preset/size.
   # Tuned once at mup_base_width=512 (Muon, adjust_lr_fn=original). Only retune if
-  # you DISABLE μP (e.g. via configs/train/baseline_adamw.yaml), where it is no
+  # you DISABLE μP (e.g. via configs/train/vanilla_esm-c.yaml), where it is no
   # longer width-correct.
   lr: 0.01
   min_lr: 0.0

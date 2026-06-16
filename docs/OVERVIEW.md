@@ -88,10 +88,11 @@ installs everything — **no optional dependency groups**. Build backend:
 ## 1. Philosophy
 
 OPLM is a **vanilla pre-norm encoder transformer with RoPE and QK-norm**. The
-default config reproduces a textbook modern PLM: LayerNorm everywhere (RMSNorm a
-toggle), SwiGLU FFN, untied input/output embeddings, standard multi-head
-attention (`num_heads == num_kv_heads`), residual streams scaled by `1/sqrt(L)`
-per sublayer for depth stability, and a BERT-style MLP MLM head.
+**bare/library config** (`OplmConfig()`, `from_pretrained`) reproduces a textbook
+modern PLM: LayerNorm everywhere (RMSNorm a toggle), SwiGLU FFN, untied
+input/output embeddings, standard multi-head attention (`num_heads ==
+num_kv_heads`), residual streams scaled by `1/sqrt(L)` per sublayer for depth
+stability, and a BERT-style MLP MLM head.
 
 A small, curated set of **research toggles** layers on top, each independently
 switchable from config and each a literature-backed ablation hypothesis (not an
@@ -99,16 +100,21 @@ open-ended knob):
 
 - Canon-style bidirectional depthwise conv sublayers (arXiv 2512.17351)
 - Partial RoPE / NoPE split (arXiv 2502.14837v1)
-- Hybrid norm (arXiv 2503.04598)
-- Sandwich norm
-- Post-SDPA norm
+- Hybrid / sandwich / post-SDPA norm placement (arXiv 2503.04598)
+- Sigmoid/SiLU post-SDPA attention output gate (arXiv 2505.06708)
+- ResFormer cross-layer value residual (arXiv 2410.17897)
 
-With every toggle off (the default), the model is the textbook baseline.
+With every toggle off — the **bare/library default**, and what Part I's per-field
+"(default)" labels refer to — the model is the textbook baseline. The
+**production training default** (`oplm train`, via `configs/*/base.yaml`) instead
+turns on the validated best recipe: μP + Muon, sandwich norm, a sigmoid attention
+output gate, a learnable value residual, and Canon at all four positions (`k=7`).
+Recover the textbook baseline with `configs/train/vanilla_esm-c.yaml`. See
+[CONFIG.md](CONFIG.md) for the run-default-vs-library-fallback split.
 
 **Explicitly removed** (tried, no consistent gain, not even available as toggles;
 re-introduction requires a deliberate revisit): grouped-query attention
-(`num_kv_heads < num_heads`), attention residuals (Kimi-style), cross-layer value
-residuals (Proust-style), output gating (static/query-dependent), shared K/V
+(`num_kv_heads < num_heads`), attention residuals (Kimi-style), shared K/V
 projection, multi-token value embeddings, query-dependent attention gates.
 
 | Feature | Status | | Feature | Status |
@@ -117,11 +123,15 @@ projection, multi-token value embeddings, query-dependent attention gates.
 | RoPE (full), QK-norm | Default | | Partial RoPE / NoPE | Toggle |
 | MHA (`H == H_kv`) | Default | | Hybrid / Sandwich / Post-SDPA norm | Toggle |
 | SwiGLU FFN | Default | | Canon depthwise conv | Toggle |
-| BERT-style MLM head | Default | | Tied embeddings | Toggle |
-| Untied embeddings | Default | | GQA / value residuals / output gating | Removed |
-| Residual scaling `1/sqrt(L)` | Default | | shared K/V / value embeddings | Removed |
-| Init scaling `1/sqrt(2L)` on output projections | Default | | | |
-| SDPA attention (+ manual softmax for weights) | Default | | | |
+| BERT-style MLM head | Default | | Sigmoid/SiLU attn output gate | Toggle |
+| Untied embeddings | Default | | ResFormer value residual | Toggle |
+| Residual scaling `1/sqrt(L)` | Default | | Tied embeddings | Toggle |
+| Init scaling `1/sqrt(2L)` on output projections | Default | | GQA / shared K/V / value embeddings | Removed |
+| SDPA attention (+ manual softmax for weights) | Default | | attention residuals / query-dependent gates | Removed |
+
+Run defaults are loaded from `configs/*/base.yaml`; the "Toggle" features above
+that the production recipe turns on are sandwich norm, the attention output gate,
+the value residual, and Canon (see §1 paragraph and [CONFIG.md](CONFIG.md)).
 
 ## 2. Public API
 
@@ -397,7 +407,8 @@ keeps the `1/sqrt(d_head)` scale. V is not normed — *except* under
 "QKV-norm" formulation) and the block-level attention pre-norm is suppressed.
 Under all other strategies `v_norm` is `nn.Identity()`.
 
-**Output gating** (`attn_output_gate`, off by default). The post-SDPA G1 gate of
+**Output gating** (`attn_output_gate`, off at the library level; `sigmoid` in the
+production recipe). The post-SDPA G1 gate of
 "Gated Attention for Large Language Models" (arXiv:2505.06708): a `gate_proj`
 linear `(D, D)` computes an elementwise, head-specific gate from the attention
 input `x`, and the merged attention output is multiplied by it before `o_proj`:
@@ -414,7 +425,8 @@ and as a regular 2-D hidden matrix it joins the Muon group under Muon. The gate
 sits after the attention kernel, so the SDPA and manual paths share it.
 `"none"` adds no parameters and preserves checkpoint compatibility.
 
-**Value residual** (`value_residual`, off by default). The cross-layer value
+**Value residual** (`value_residual`, off at the library level; `learnable` in the
+production recipe). The cross-layer value
 residual of "Value Residual Learning" / ResFormer (arXiv:2410.17897): layer 0
 exposes its post-V-norm values `v₁`, and every later layer blends its own values
 toward them immediately after the V projection (before RoPE and the kernel, so

@@ -9,8 +9,9 @@ every larger preset.
 `train.lr` defaults to the μP base LR `0.01`). It is a **no-op at the base width** —
 at `hidden_size == mup_base_width`, init, forward multipliers, and per-group LRs
 are bit-identical to a non-μP run. The production optimizer for μP is **Muon**;
-AdamW is also supported. To turn μP off (and use a classic AdamW baseline), apply
-`configs/train/baseline_adamw.yaml` (see §1).
+AdamW is also supported. To turn μP off (and recover the conventional ESM-C
+recipe — AdamW plus the pre-2026 architecture), apply
+`configs/train/vanilla_esm-c.yaml` (see §1).
 
 Backward-compatibility note: the default lives in the **YAML run-config layer**
 (`configs/*/base.yaml`). Bare `OplmConfig()` / `TrainConfig()` construction and
@@ -48,11 +49,12 @@ python -m scripts.mup_sweep --widths 256,512 --lrs 1e-3,3e-3,1e-2,3e-2 \
 # then set train.lr=<argmin> in your config (the current default 0.01 came from this)
 ```
 
-**To disable μP** (classic AdamW baseline, e.g. for an ablation), apply the opt-out
-overlay — note its `lr` is a plain AdamW LR that must be tuned per size:
+**To disable μP** (vanilla ESM-C recipe — AdamW plus the pre-2026 architecture,
+e.g. for an ablation), apply the opt-out overlay — note its `lr` is a plain AdamW
+LR that must be tuned per size:
 
 ```bash
-oplm train --preset 400M --config src/oplm/configs/train/baseline_adamw.yaml \
+oplm train --preset 400M --config src/oplm/configs/train/vanilla_esm-c.yaml \
   data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
 ```
 

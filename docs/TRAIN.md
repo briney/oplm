@@ -255,11 +255,12 @@ field.
 oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.01, by default
 ```
 
-To run a classic **AdamW baseline** (μP off), apply the opt-out overlay (its `lr`
-is a plain AdamW LR you must tune per size):
+To run the **vanilla ESM-C recipe** (μP off, AdamW, and the conventional pre-2026
+architecture), apply the opt-out overlay (its `lr` is a plain AdamW LR you must
+tune per size):
 
 ```bash
-oplm train --preset 400M --config src/oplm/configs/train/baseline_adamw.yaml \
+oplm train --preset 400M --config src/oplm/configs/train/vanilla_esm-c.yaml \
   data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
 ```
 

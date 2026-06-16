@@ -34,7 +34,8 @@ The encoder adaptation uses a bidirectional same-length depthwise convolution
 over sequence positions. Pad-token rows are zeroed before convolution so pad
 content cannot contribute to real tokens.
 
-The default kernel size remains `4` to preserve the paper's kernel-size choice.
+The library (bare-config) default kernel size is `4`, the paper's choice; the
+production training default (`configs/model/base.yaml`) uses `7`.
 For even kernels, exact token-centered symmetry is impossible in a same-length
 discrete convolution. OPLM uses the existing half-token alignment:
 
