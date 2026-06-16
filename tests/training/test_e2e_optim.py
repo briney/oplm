@@ -58,6 +58,44 @@ def test_muon_two_optimizer_path(training_parquet: Path, tmp_path: Path) -> None
     assert losses and all(math.isfinite(v) for v in losses)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Muon requires CUDA")
+@pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+def test_mup_muon_two_optimizer_path(training_parquet: Path, tmp_path: Path) -> None:
+    """μP+Muon drives the two-optimizer path; the aux AdamW carries a μP-scaled (lr/m) group."""
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=4,
+        optimizer="muon",
+        lr=1e-3,
+        log_every=1,
+        hidden_size=128,
+        num_attention_heads=2,  # head_dim = 64
+    )
+    cfg.model.mup_enable = True
+    cfg.model.mup_base_width = 64  # m = 2 at hidden 128
+    cfg.train.muon_adjust_lr_fn = "original"  # the μP+Muon guard requires this
+    callback = FullRecordingCallback()
+    trainer = Trainer(cfg, callbacks=[callback])
+
+    # Muon + auxiliary AdamW: two optimizers / two schedulers.
+    assert len(trainer.optimizers) == 2
+    assert len(trainer.schedulers) == 2
+    # The auxiliary AdamW carries the new μP group: lm_head.dense at lr / m.
+    aux_adamw = trainer.optimizers[1]
+    assert any(g["lr"] == pytest.approx(cfg.train.lr / 2.0) for g in aux_adamw.param_groups)
+
+    trainer.train()
+
+    for optimizer in trainer.optimizers:
+        assert len(optimizer.state) > 0  # both optimizers stepped
+    losses = [m["train/loss"] for _, m in callback.train_logs]
+    assert losses and all(math.isfinite(v) for v in losses)
+
+
 @pytest.mark.parametrize("scheduler", _SCHEDULERS)
 def test_lr_trajectory_matches_schedule(
     scheduler: str, training_parquet: Path, tmp_path: Path

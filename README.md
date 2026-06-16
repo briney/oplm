@@ -214,14 +214,18 @@ oplm info --preset 400M
 ## Training
 
 OPLM trains with HuggingFace Accelerate (FSDP, mixed precision, gradient
-checkpointing, optional Muon optimizer) over parquet sequence datasets, with a
-built-in eval harness for MLM metrics and structure-based contact prediction.
+checkpointing) over parquet sequence datasets, with a built-in eval harness for
+MLM metrics and structure-based contact prediction. Training defaults to **μP +
+Muon**, so `train.lr` is the μP base LR and transfers across model size — set it
+once and reuse it at every preset.
 
 ```bash
-oplm train --preset 400M --config configs/my_run.yaml
+oplm train --preset 1B data.train=/data/uniref50/
 ```
 
-See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide.
+See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide, and
+**[docs/MUP.md](docs/MUP.md)** for μP learning-rate transfer (tune `lr` once on a
+small model, reuse it at scale; disable via `baseline_adamw.yaml`).
 
 ---
 

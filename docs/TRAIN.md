@@ -7,6 +7,7 @@ resume.
 This is the *how-to*. Related references:
 
 - [CONFIG.md](CONFIG.md) — every `model.*` / `train.*` / `data.*` field.
+- [MUP.md](MUP.md) — μP learning-rate transfer across width (tune `lr` once, reuse at scale).
 - [EVAL_HARNESS.md](EVAL_HARNESS.md) — evaluation during training.
 - [DATA_TOOLING.md](DATA_TOOLING.md) — dataset formats and the masking scheme.
 - [OVERVIEW.md](OVERVIEW.md) — Part IV documents the trainer's internal design.
@@ -230,11 +231,12 @@ see [OVERVIEW.md](OVERVIEW.md) Part IV.
 
 **Optimizer** — `train.optimizer`:
 
-- `adamw` (default): a single AdamW. 2-D weights get `weight_decay`; biases,
-  norms, and embeddings are no-decay.
-- `muon`: a **hybrid** — eligible 2-D hidden weights are optimized with
+- `muon` (default): a **hybrid** — eligible 2-D hidden weights are optimized with
   `torch.optim.Muon`, while embeddings, norms, biases, and the MLM head
-  (`lm_head.*`) stay on an auxiliary AdamW. Tuned via `train.muon_*`.
+  (`lm_head.*`) stay on an auxiliary AdamW. Tuned via `train.muon_*`. The default
+  pairs with μP (below) and `muon_adjust_lr_fn=original`.
+- `adamw`: a single AdamW. 2-D weights get `weight_decay`; biases, norms, and
+  embeddings are no-decay.
 
 **Schedule** — `train.scheduler`: `warmup_linear` (default), `warmup_cosine`,
 `wsd_linear`, or `wsd_cosine`. All warm up linearly over `train.warmup_steps`;
@@ -244,6 +246,25 @@ once per optimizer step, reaching the floor at the final step.
 
 See [CONFIG.md](CONFIG.md#train-fields-train) for every optimizer and scheduler
 field.
+
+**μP learning-rate transfer** — μP + Muon is the **default**, so `train.lr` is the
+μP base LR (`0.01`) and transfers across width: pick any preset and reuse the same
+`lr` — no per-size retuning.
+
+```bash
+oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.01, by default
+```
+
+To run a classic **AdamW baseline** (μP off), apply the opt-out overlay (its `lr`
+is a plain AdamW LR you must tune per size):
+
+```bash
+oplm train --preset 400M --config src/oplm/configs/train/baseline_adamw.yaml \
+  data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
+```
+
+See [MUP.md](MUP.md) for the full recipe, the coord-check gate, and the pilot LR
+sweep that produces the base LR.
 
 ---
 
@@ -388,12 +409,23 @@ repeated runs skip recompilation.
 
 | Mode | When to use |
 |------|-------------|
-| `default` | Balanced; safe for all hardware. |
+| `default` | Balanced; safe for all hardware. Required with gradient accumulation (see below). |
 | `reduce-overhead` | Uses CUDA graphs to reduce kernel-launch overhead; best for small batch sizes. |
 | `max-autotune` | Tries more optimization strategies; longest compile time, best peak throughput on Blackwell. |
 
 Recommended for all multi-GPU production runs. Use `compile_mode=max-autotune`
 on Blackwell for best throughput at the cost of a longer initial compile.
+
+> **CUDA-graph modes are incompatible with gradient accumulation.**
+> `reduce-overhead` and `max-autotune` enable CUDA graphs, which replay into a
+> single set of static buffers. When `gradient_accumulation_steps > 1`, the
+> trainer runs several forward/backward micro-steps per optimizer step, and a
+> later micro-step's forward overwrites the static output buffer the previous
+> micro-step's backward still needs — `RuntimeError: accessing tensor output of
+> CUDAGraphs that has been overwritten by a subsequent run`. With
+> `gradient_accumulation_steps > 1`, use `compile_mode=default` (Inductor/Triton
+> fusion, no CUDA graphs) or `train.compile=false`. CUDA-graph modes are safe only
+> at `gradient_accumulation_steps=1`.
 
 ```bash
 # opt in via CLI override

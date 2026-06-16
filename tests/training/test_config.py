@@ -151,6 +151,53 @@ def test_ablation_toggle_defaults_preserve_current_behavior() -> None:
     assert cfg.model.canon_residual is True
 
 
+def test_mup_cli_overrides_apply() -> None:
+    """CLI dotlist overrides reach the μP knobs and the derived multiplier updates."""
+    cfg = load_config(
+        [
+            "--preset",
+            "400M",  # hidden_size = 1024
+            "model.mup_enable=true",
+            "model.mup_base_width=512",
+            "model.mup_output_mult=2.0",
+        ]
+    )
+    assert cfg.model.mup_enable is True
+    assert cfg.model.mup_base_width == 512
+    assert cfg.model.mup_output_mult == 2.0
+    assert cfg.model.mup_width_mult() == 2.0  # 1024 / 512
+
+
+def test_default_run_uses_mup_muon_recipe() -> None:
+    """With no overrides the production default is μP + Muon at base LR 0.01."""
+    cfg = load_config([])
+    assert cfg.train.optimizer == "muon"
+    assert cfg.train.muon_adjust_lr_fn == "original"
+    assert cfg.train.lr == pytest.approx(0.01)
+    assert cfg.model.mup_enable is True
+    assert cfg.model.mup_base_width == 512
+    assert cfg.model.mup_output_mult == 1.0
+    # Default hidden_size 1024 over base 512 ⇒ m = 2 (μP actively scales here).
+    assert cfg.model.mup_width_mult() == 2.0
+
+
+def test_baseline_adamw_overlay_disables_mup() -> None:
+    """The AdamW baseline overlay turns μP off and switches the optimizer to AdamW."""
+    overlay = str(files("oplm.configs.train").joinpath("baseline_adamw.yaml"))
+    cfg = load_config(["--config", overlay])
+    assert cfg.train.optimizer == "adamw"
+    assert cfg.train.muon_adjust_lr_fn == "match_rms_adamw"
+    assert cfg.model.mup_enable is False
+    assert cfg.model.mup_width_mult() == 1.0
+
+
+def test_dataclass_fallbacks_are_conservative() -> None:
+    """Bare dataclass construction stays μP-off / AdamW (library fallback, backward-compatible)."""
+    assert OplmModelConfig().mup_enable is False
+    assert TrainConfig().optimizer == "adamw"
+    assert TrainConfig().lr == pytest.approx(1e-4)
+
+
 def test_canon_residual_cli_override_applies() -> None:
     """The residual Canon toggle remains a simple boolean model field."""
     cfg = load_config(["model.canon_residual=false"])
@@ -266,12 +313,19 @@ _DATA_YAML = _packaged_section("oplm.configs.data", "base.yaml", "data")
 _MODEL_YAML = _packaged_section("oplm.configs.model", "base.yaml", "model")
 
 
+# train/base.yaml carries OPLM's opinionated production defaults (μP + Muon), which
+# intentionally diverge from the conservative TrainConfig dataclass fallbacks for
+# these fields. Every other key must still mirror the dataclass (drift guard).
+_TRAIN_PRODUCTION_OVERRIDES = {"optimizer", "lr", "muon_adjust_lr_fn"}
+
+
 @pytest.mark.parametrize("key", sorted(_TRAIN_YAML))
 def test_train_base_yaml_matches_dataclass(key: str) -> None:
-    """Every ``train/base.yaml`` key equals its ``TrainConfig`` default."""
+    """Every ``train/base.yaml`` key is a ``TrainConfig`` field; non-overrides equal the default."""
     defaults = asdict(TrainConfig())
     assert key in defaults, f"{key!r} is not a TrainConfig field"
-    assert _TRAIN_YAML[key] == defaults[key]
+    if key not in _TRAIN_PRODUCTION_OVERRIDES:
+        assert _TRAIN_YAML[key] == defaults[key]
 
 
 @pytest.mark.parametrize("key", sorted(_DATA_YAML))

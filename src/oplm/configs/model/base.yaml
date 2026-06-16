@@ -52,6 +52,16 @@ model:
   canon_kernel_sizes: 4
   canon_activation: none # none | silu | gelu
 
+  # μP (maximal update parametrization) — LR transfer across width, ON by default.
+  # train.lr is the μP base LR and transfers across width automatically (no manual
+  # retune per size). At this default hidden_size (1024) over mup_base_width (512),
+  # m = 2, so μP actively scales init/LR. To DISABLE μP, use the AdamW baseline
+  # overlay (configs/train/baseline_adamw.yaml) — then train.lr must be retuned.
+  # See docs/MUP.md. (The bare OplmConfig() dataclass default is mup_enable=false.)
+  mup_enable: true
+  mup_base_width: 512 # hidden_size of the proxy/base model where the width multiplier m = 1
+  mup_output_mult: 1.0 # tunable O(1) readout (output-logit) multiplier
+
   # Init / checkpointing
   initializer_range: 0.02
   gradient_checkpointing: false

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from oplm.config import TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM
@@ -27,6 +29,20 @@ def _model() -> OplmForMaskedLM:
             num_attention_heads=4,
             num_hidden_layers=2,
             max_position_embeddings=64,
+        )
+    )
+
+
+def _mup_model() -> OplmForMaskedLM:
+    """A μP-enabled model at width 256 over base width 64 (m = 4, m_ffn = 3)."""
+    return OplmForMaskedLM(
+        OplmModelConfig(
+            hidden_size=256,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            max_position_embeddings=64,
+            mup_enable=True,
+            mup_base_width=64,
         )
     )
 
@@ -88,6 +104,43 @@ def test_adamw_leaves_muon_group_empty() -> None:
     model = _model()
     groups = partition_optimizer_params(model, TrainConfig(optimizer="adamw"))
     assert groups.muon_params == []
+
+
+def test_mup_partition_tags_scaled_adamw_groups() -> None:
+    """Under μP, AdamW groups carry per-matrix LR multipliers (the new μP groups).
+
+    Complements ``test_mup.py`` (which asserts the built optimizers' LRs) by
+    checking the partition-level contract: ``lm_head.dense`` lands in a ``1/m``
+    group, the untied readout in a ``×1`` group, and the backbone hidden weights
+    stay on Muon (never in an AdamW μP group).
+    """
+    model = _mup_model()
+    id_to_name = {id(p): n for n, p in model.named_parameters()}
+    groups = partition_optimizer_params(model, TrainConfig(optimizer="muon"))
+    m = model.config.mup_width_mult()
+
+    def lr_mult_of(name: str) -> float:
+        return next(
+            g.lr_mult
+            for g in groups.adamw_groups
+            if any(id_to_name[id(p)] == name for p in g.params)
+        )
+
+    assert lr_mult_of("lm_head.dense.weight") == pytest.approx(1.0 / m)
+    assert lr_mult_of("lm_head.decoder.weight") == 1.0  # μP readout: width-independent
+
+    muon_names = _names_of(groups.muon_params, id_to_name)
+    assert "oplm.backbone.layers.0.attention.q_proj.weight" in muon_names
+    assert not any(name.startswith("lm_head.") for name in muon_names)
+
+
+def test_mup_off_partition_lr_mults_all_one() -> None:
+    """With μP off, every AdamW group keeps ``lr_mult == 1.0`` (no behavior change)."""
+    model = _model()  # μP disabled by default
+    for optimizer in ("adamw", "muon"):
+        groups = partition_optimizer_params(model, TrainConfig(optimizer=optimizer))
+        assert all(g.lr_mult == 1.0 for g in groups.adamw_groups)
+        assert len(groups.adamw_groups) <= 2  # only the usual decay / no-decay split
 
 
 def test_residual_gates_land_in_no_decay_group() -> None:

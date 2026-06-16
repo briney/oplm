@@ -1,6 +1,9 @@
-# OPLM default training configuration (mirrors oplm.config.TrainConfig).
-# Authoritative defaults: loaded by oplm.config.load_config. Values here MUST
-# equal the TrainConfig dataclass defaults (enforced by tests/training/test_config.py).
+# OPLM default training configuration — loaded by oplm.config.load_config.
+# These are OPLM's opinionated *production* defaults: μP + Muon, with `lr` as the
+# μP base LR (see docs/MUP.md). They intentionally differ from the conservative
+# oplm.config.TrainConfig dataclass fallbacks (adamw / lr 1e-4 / match_rms_adamw),
+# which back bare TrainConfig() / direct construction. tests/training/test_config.py
+# checks every key here is a real TrainConfig field (typo guard), not value-equality.
 train:
   # Duration
   max_steps: 50_000
@@ -10,15 +13,23 @@ train:
   batch_size: 32
   gradient_accumulation_steps: 1
 
-  # Optimizer
-  optimizer: adamw            # adamw | muon
-  lr: 1.0e-4
+  # Optimizer — μP + Muon is the default recipe (disable via configs/train/baseline_adamw.yaml).
+  optimizer: muon             # adamw | muon
+  # μP base learning rate. With μP on (the default; model.mup_enable), this value
+  # transfers across model width automatically — do NOT retune it per preset/size.
+  # Tuned once at mup_base_width=512 (Muon, adjust_lr_fn=original). Only retune if
+  # you DISABLE μP (e.g. via configs/train/baseline_adamw.yaml), where it is no
+  # longer width-correct.
+  lr: 0.01
   min_lr: 0.0
   weight_decay: 0.01
   adam_beta1: 0.9
   adam_beta2: 0.98
   adam_eps: 1.0e-8
-  muon_adjust_lr_fn: match_rms_adamw   # match_rms_adamw | original
+  # μP + Muon REQUIRES "original" (aspect-ratio-only, ~constant across width so the
+  # base LR transfers). "match_rms_adamw" scales like √width and does NOT transfer;
+  # build_optimizers raises if it is left on with μP + Muon.
+  muon_adjust_lr_fn: original          # match_rms_adamw | original
   muon_momentum: 0.95
   muon_nesterov: true
   muon_ns_steps: 5

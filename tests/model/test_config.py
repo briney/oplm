@@ -54,6 +54,9 @@ def test_defaults_match_architecture_spec():
     assert cfg.classifier_pool == "mean"
     assert cfg.classifier_dropout == 0.0
     assert cfg.pre_head_norm is False
+    assert cfg.mup_enable is False
+    assert cfg.mup_base_width == 512
+    assert cfg.mup_output_mult == 1.0
     assert cfg.gradient_checkpointing is False
     assert cfg.pad_token_id == 1
     assert cfg.bos_token_id == 0
@@ -341,6 +344,85 @@ def test_pretrained_config_kwargs_forwarded():
 def test_tie_word_embeddings_forwarded_to_base_class():
     cfg = OplmConfig(tie_word_embeddings=True)
     assert cfg.tie_word_embeddings is True
+
+
+# ---------------------------------------------------------------------------
+# μP (maximal update parametrization) fields and helpers
+# ---------------------------------------------------------------------------
+
+
+def test_mup_width_mult_is_noop_when_disabled():
+    """With μP off, the width multiplier is 1.0 regardless of hidden_size."""
+    cfg = OplmConfig(hidden_size=1024, num_attention_heads=16, mup_base_width=512)
+    assert cfg.mup_enable is False
+    assert cfg.mup_width_mult() == 1.0
+
+
+def test_mup_width_mult_is_one_at_base_width():
+    """When enabled at the base width, m = 1 (the pilot-sweep reference)."""
+    cfg = OplmConfig(hidden_size=512, num_attention_heads=8, mup_enable=True, mup_base_width=512)
+    assert cfg.mup_width_mult() == 1.0
+
+
+def test_mup_width_mult_scales_with_hidden_size():
+    """m = hidden_size / mup_base_width when μP is enabled."""
+    cfg = OplmConfig(hidden_size=1024, num_attention_heads=16, mup_enable=True, mup_base_width=512)
+    assert cfg.mup_width_mult() == 2.0
+
+
+def test_mup_base_intermediate_size_uses_rounding_not_global_m():
+    """down_proj's base fan-in follows the same round_up_to as the live FFN width.
+
+    At hidden 1024 the live intermediate is 2816 and the base (512) intermediate
+    is 1536, so the FFN fan-in ratio is 2816/1536 ≈ 1.833 — distinct from the
+    hidden width multiplier m = 2.0 (the FFN-rounding correction, μP Finding 5).
+    """
+    cfg = OplmConfig(hidden_size=1024, num_attention_heads=16, mup_enable=True, mup_base_width=512)
+    assert cfg.intermediate_size == 2816
+    assert cfg.mup_base_intermediate_size() == 1536
+    assert cfg.mup_base_intermediate_size() == round_up_to(int(8 * 512 / 3), 256)
+    assert cfg.intermediate_size / cfg.mup_base_intermediate_size() != cfg.mup_width_mult()
+
+
+def test_mup_base_intermediate_size_honors_relu2():
+    """The base FFN fan-in uses the relu2 (~4·D) derivation under relu2 activation."""
+    cfg = OplmConfig(hidden_size=768, ffn_activation="relu2", mup_base_width=512)
+    assert cfg.mup_base_intermediate_size() == round_up_to(4 * 512, 256) == 2048
+
+
+@pytest.mark.parametrize("bad_width", [0, -1])
+def test_rejects_non_positive_mup_base_width(bad_width):
+    with pytest.raises(ValueError, match="mup_base_width must be >= 1"):
+        OplmConfig(mup_base_width=bad_width)
+
+
+@pytest.mark.parametrize("bad_mult", [0.0, -1.0])
+def test_rejects_non_positive_mup_output_mult(bad_mult):
+    with pytest.raises(ValueError, match="mup_output_mult must be > 0"):
+        OplmConfig(mup_output_mult=bad_mult)
+
+
+def test_mup_fields_survive_save_load_roundtrip(tmp_path: Path):
+    """μP fields ride in config.json and restore on from_pretrained."""
+    cfg = OplmConfig(
+        hidden_size=512,
+        num_attention_heads=8,
+        mup_enable=True,
+        mup_base_width=256,
+        mup_output_mult=2.5,
+    )
+    cfg.save_pretrained(tmp_path)
+
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert on_disk["mup_enable"] is True
+    assert on_disk["mup_base_width"] == 256
+    assert on_disk["mup_output_mult"] == 2.5
+
+    restored = OplmConfig.from_pretrained(tmp_path)
+    assert restored.mup_enable is True
+    assert restored.mup_base_width == 256
+    assert restored.mup_output_mult == 2.5
+    assert restored.mup_width_mult() == 2.0  # 512 / 256
 
 
 # ---------------------------------------------------------------------------

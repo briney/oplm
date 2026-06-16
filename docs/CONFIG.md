@@ -186,6 +186,28 @@ Consumed by `OplmForSequenceClassification` / `OplmForTokenClassification`.
 | `model.unk_token_id` | `int` | `3` | `<unk>`. |
 | `model.mask_token_id` | `int` | `32` | `<mask>`. |
 
+### μP (maximal update parametrization)
+
+μP makes a learning rate tuned on a small pilot model transfer to much larger
+models without re-sweeping at every scale. It is **on by default** for `oplm train`
+runs (with `train.optimizer=muon`, `train.muon_adjust_lr_fn=original`,
+`train.lr=0.01`), and a no-op at the base width. See [MUP.md](MUP.md) for the full
+recipe and the tune-once-reuse-`train.lr` workflow; disable it with
+`configs/train/baseline_adamw.yaml`.
+
+> **Run defaults vs. dataclass fallbacks.** The `Default` column below (and in the
+> Train table) is the **run default** from `configs/*/base.yaml` — what `oplm train`
+> loads. Bare Python construction (`OplmConfig()` / `TrainConfig()`) and
+> `from_pretrained` use conservative fallbacks instead (`mup_enable=false`,
+> `optimizer=adamw`, `lr=1e-4`), so direct use and existing checkpoints are
+> unaffected.
+
+| Override | Type | Default | Valid values / notes |
+| --- | --- | --- | --- |
+| `model.mup_enable` | `bool` | `true` | Master switch (run default; dataclass fallback `false`). When `false`, init, forward multipliers, and per-group LRs are identical to non-μP runs. |
+| `model.mup_base_width` | `int` | `512` | `hidden_size` of the proxy/base model where the width multiplier `m = hidden_size / mup_base_width` equals 1 (the width the pilot LR sweep tunes at). Must be `≥ 1`. |
+| `model.mup_output_mult` | `float` | `1.0` | Tunable O(1) multiplier on the output logits (applied as `mup_output_mult / m` on the readout matmul path). Must be `> 0`. |
+
 ### Derived and validated fields
 
 When omitted, derived fields resolve from the core dimensions:
@@ -207,6 +229,7 @@ Config construction raises `ValueError` if any of these fail:
   `value_residual_lambda_init` are finite
 - when `canon_enabled`, `canon_positions` is a non-empty, duplicate-free subset
   of `{A, B, C, D}`
+- `mup_base_width ≥ 1` and `mup_output_mult > 0`
 
 ## Train fields (`train.*`)
 
@@ -218,14 +241,14 @@ Backed by `oplm.config.TrainConfig`.
 | `train.max_epochs` | `int \| null` | `null` | Optional epoch-based stop. |
 | `train.batch_size` | `int` | `32` | Per-process batch size, before accumulation. |
 | `train.gradient_accumulation_steps` | `int` | `1` | Must be `≥ 1`. |
-| `train.optimizer` | `str` | `adamw` | `adamw` or `muon` (hybrid Muon + AdamW). |
-| `train.lr` | `float` | `1e-4` | Peak learning rate. |
+| `train.optimizer` | `str` | `muon` | `adamw` or `muon` (hybrid Muon + AdamW). Run default `muon` (dataclass fallback `adamw`). |
+| `train.lr` | `float` | `0.01` | Peak learning rate. With μP on (the default) this is the **μP base LR** — it transfers across width, so do not retune per size; retune only if μP is disabled. Dataclass fallback `1e-4`. |
 | `train.min_lr` | `float` | `0.0` | Must be `≥ 0` and `≤ lr`. |
 | `train.weight_decay` | `float` | `0.01` | Decoupled weight decay. |
 | `train.adam_beta1` | `float` | `0.9` | AdamW β₁ (also Muon's auxiliary AdamW). |
 | `train.adam_beta2` | `float` | `0.98` | AdamW β₂. |
 | `train.adam_eps` | `float` | `1e-8` | AdamW ε. |
-| `train.muon_adjust_lr_fn` | `str` | `match_rms_adamw` | `match_rms_adamw` or `original`. |
+| `train.muon_adjust_lr_fn` | `str` | `original` | `match_rms_adamw` or `original`. Run default `original` (required by μP+Muon); dataclass fallback `match_rms_adamw`. |
 | `train.muon_momentum` | `float` | `0.95` | Must be `≥ 0`. |
 | `train.muon_nesterov` | `bool` | `true` | Muon Nesterov momentum. |
 | `train.muon_ns_steps` | `int` | `5` | Newton–Schulz steps; must be `≥ 1`. |

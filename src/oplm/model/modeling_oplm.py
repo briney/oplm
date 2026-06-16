@@ -84,15 +84,28 @@ class OplmPreTrainedModel(PreTrainedModel):
         modules; when `config.init_scale_output_projections` is set, their std
         is shrunk by `1/sqrt(2 * num_hidden_layers)` to keep the residual
         stream variance stable with depth.
+
+        Under μP (`config.mup_enable`), hidden weight matrices additionally
+        shrink their std by `1/sqrt(m_W)`, where `m_W` is the per-matrix fan-in
+        multiplier `fan_in / fan_in_base` (`OplmConfig.mup_fanin_mult`). μP
+        readouts (`lm_head.decoder`, the `classifier` heads; tagged
+        `_is_readout = True`) keep a width-independent std `σ` and never receive
+        the `1/sqrt(m_W)` factor; embeddings (μP input weights) likewise stay at
+        `σ`. Every μP factor is a no-op (`m_W = 1`) at the base width or when μP
+        is disabled, so init is bit-for-bit identical to the non-μP path there.
         """
         std = self.config.initializer_range
 
         if isinstance(module, nn.Linear):
-            module_std = std
-            if getattr(module, "_is_residual_writer", False) and (
-                self.config.init_scale_output_projections
-            ):
-                module_std = std / math.sqrt(2 * self.config.num_hidden_layers)
+            if getattr(module, "_is_readout", False):
+                # μP readout: width-independent init, no 1/sqrt(m_W) factor.
+                module_std = std
+            else:
+                module_std = std / math.sqrt(self.config.mup_fanin_mult(module.in_features))
+                if getattr(module, "_is_residual_writer", False) and (
+                    self.config.init_scale_output_projections
+                ):
+                    module_std /= math.sqrt(2 * self.config.num_hidden_layers)
             nn.init.trunc_normal_(
                 module.weight, mean=0.0, std=module_std, a=-2 * module_std, b=2 * module_std
             )
@@ -317,9 +330,19 @@ class OplmMLMHead(nn.Module):
         self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
         # The decoder writes to vocab space, NOT the residual stream: no 1/sqrt(2L) scaling.
         self.decoder._is_residual_writer = False  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+        # μP readout: width-independent init (constant σ, no 1/sqrt(m)); consumed
+        # by _init_weights (Phase 2) and the coord-check labeling.
+        self.decoder._is_readout = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
+        # μP output-logit multiplier: mup_output_mult / m (m = hidden-fan-in width
+        # mult, the decoder's fan-in). 1.0 when μP is off, so this is a no-op.
+        # Applied to the decoder *input* in forward so logits are Θ(1/√m) at init
+        # with the correct update scale — matching mup.MuReadout.
+        self.output_mult = config.mup_output_mult / config.mup_width_mult()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decoder(self.norm(self.act(self.dense(x))))
+        # Scale the decoder *input* (matmul path only), not its output, so the
+        # additive decoder.bias is left untouched.
+        return self.decoder(self.output_mult * self.norm(self.act(self.dense(x))))
 
 
 class OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin):
@@ -406,6 +429,8 @@ class OplmForSequenceClassification(OplmPreTrainedModel, EsmcCompatMixin):
             self.pre_head_norm = nn.Identity()
         self.dropout = nn.Dropout(config.classifier_dropout)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels, bias=True)
+        # μP readout: width-independent init (constant σ, never σ/sqrt(m)). See docs/MUP.md.
+        self.classifier._is_readout = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
         self.tokenizer = None
         self.post_init()
 
@@ -508,6 +533,8 @@ class OplmForTokenClassification(OplmPreTrainedModel, EsmcCompatMixin):
             self.pre_head_norm = nn.Identity()
         self.dropout = nn.Dropout(config.classifier_dropout)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels, bias=True)
+        # μP readout: width-independent init (constant σ, never σ/sqrt(m)). See docs/MUP.md.
+        self.classifier._is_readout = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
         self.tokenizer = None
         self.post_init()
 
