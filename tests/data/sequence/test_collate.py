@@ -474,6 +474,8 @@ def test_collator_pad_to_multiple_of_with_weighted_masking(tokenizer) -> None:
     assert "masking_weights" not in out
     for key in ("input_ids", "attention_mask", "labels"):
         assert out[key].shape[1] == t
+    # Confirm masking actually fired on the weighted+pad path (not silently skipped).
+    assert (out["labels"] != -100).any(), "Weighted+pad path must produce at least one masked position"
 
 
 def test_collator_pad_masking_correctness(tokenizer) -> None:
@@ -485,10 +487,23 @@ def test_collator_pad_masking_correctness(tokenizer) -> None:
     # Padded positions (attention_mask==0) must have labels==-100 (loss-neutral).
     pad_positions = out["attention_mask"] == 0
     assert (out["labels"][pad_positions] == -100).all(), "Padded positions must have ignore_index labels"
-    # Non-masked real positions must also be -100.
-    non_masked_real = (out["attention_mask"] == 1) & (out["labels"] == -100)
-    # This is simply the unmasked positions — just check no crash; the key check is above.
-    assert non_masked_real.dtype == torch.bool
+    # Every labeled (non-ignore_index) position must be a real, maskable token.
+    # Concretely: labels != -100 implies attention_mask == 1 (real token, not pad)
+    # AND the original token id (stored in labels by the collator) is not in the
+    # non-maskable set (eligible for masking).
+    # This catches masking leaking onto pad columns or special tokens.
+    # Note: out["input_ids"] has been modified in-place (BERT 80/10/10 replacement),
+    # so labels holds the original ids at masked positions — that's what we check.
+    labeled = out["labels"] != -100
+    non_maskable = collator._non_maskable
+    original_ids_at_labeled = out["labels"][labeled]  # original token ids (not -100, not replaced)
+    assert labeled.any(), "At least one position must be masked"
+    assert (out["attention_mask"][labeled] == 1).all(), (
+        "Labeled positions must be real tokens (attention_mask==1), not pad"
+    )
+    assert not torch.isin(original_ids_at_labeled, non_maskable).any(), (
+        "Labeled positions must not be special/non-maskable tokens (eligible-position contract)"
+    )
 
 
 def test_collator_pad_to_multiple_none_matches_default(tokenizer) -> None:
