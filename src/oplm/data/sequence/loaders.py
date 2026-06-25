@@ -94,6 +94,7 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
         weighted_masking=cfg.data.weighted_masking,
         deterministic=False,
         seed=cfg.train.seed,
+        pad_to_multiple_of=cfg.data.pad_to_multiple_of,
     )
     return _build_dataloader(dataset, collator, cfg)
 
@@ -131,6 +132,7 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
         weighted_masking=cfg.data.weighted_masking,
         deterministic=True,
         seed=_EVAL_SEED,
+        pad_to_multiple_of=cfg.data.pad_to_multiple_of,
     )
     return _build_dataloader(dataset, collator, cfg, loader_cls=_ResettingDataLoader)
 

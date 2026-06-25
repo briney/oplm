@@ -270,6 +270,9 @@ Backed by `oplm.config.TrainConfig`.
 | `train.mixed_precision` | `str` | `bf16` | `bf16`, `fp16`, or `no`. |
 | `train.compile` | `bool` | `false` | Enable `torch.compile` (opt-in; adds first-step latency). |
 | `train.compile_mode` | `str` | `default` | Compile mode: `default` \| `reduce-overhead` \| `max-autotune`. |
+| `train.compile_dynamic` | `bool \| null` | `true` | `torch.compile(dynamic=...)`: `true` = one dynamic graph (default), `false` = static graph per shape (best with `data.pad_to_multiple_of` to bound shapes), `null` = Dynamo auto. When `false`, the trainer raises `torch._dynamo.config.cache_size_limit` to accommodate the expected number of shape buckets. |
+| `train.throughput_warmup_steps` | `int` | `50` | Exclude the first N optimizer steps from throughput accounting (covers compile/warmup latency). Set to `0` to include all steps. Must be `≥ 0`. |
+| `train.peak_tflops` | `float \| null` | `null` | Device peak throughput in TFLOPs (e.g. `1979.0` for H100 BF16). When set, the trainer also logs `train/mfu` (achieved TFLOPs / peak). `null` → log only `train/achieved_tflops`. Must be `> 0` when set. |
 | `train.config_path` | `str \| null` | `null` | Auto-populated from `--config` for provenance. |
 
 ## Data fields (`data.*`)
@@ -284,6 +287,7 @@ Backed by `oplm.config.DataConfig`.
 | `data.mask_token_prob` | `float` | `0.8` | Of masked positions, fraction replaced with `<mask>`. In `[0, 1]`. |
 | `data.random_token_prob` | `float` | `0.1` | Of masked positions, fraction replaced with a random amino acid. `mask_token_prob + random_token_prob ≤ 1`; the remainder is left unchanged. |
 | `data.weighted_masking` | `bool` | `false` | Honor a per-row `masking_weights` column when selecting positions. |
+| `data.pad_to_multiple_of` | `int \| null` | `null` | Pad each batch to the smallest multiple of N ≥ batch-longest sequence. `null` = pad to batch-longest (default behavior). Must be `≥ 1` when set. **Divisibility requirement:** `model.max_position_embeddings % pad_to_multiple_of == 0` is enforced at config load to prevent position-id overflow. Pairs with `train.compile_dynamic=false` + large N (64/128/256) to bound the Dynamo shape space to a small fixed set of static graphs. |
 | `data.num_workers` | `int` | `4` | DataLoader workers. |
 | `data.pin_memory` | `bool` | `true` | Pin host memory for batches. |
 | `data.prefetch_factor` | `int` | `4` | Batches prefetched per worker. |

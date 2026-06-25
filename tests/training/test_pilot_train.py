@@ -4,6 +4,10 @@ Runs the live :class:`~oplm.training.trainer.Trainer` over a tiny model and the
 real ``training_parquet`` fixture for a handful of CPU steps: the loop must
 complete with no shape errors, write a checkpoint, fire eval on its cadence, and
 resume cleanly from a checkpoint to continue to a larger ``max_steps``.
+
+The ``pad_to_multiple_of`` smoke test lives in
+``tests/training/test_pad_to_multiple_smoke.py`` so it runs in the fast
+(non-slow) suite.
 """
 
 from __future__ import annotations
@@ -109,3 +113,5 @@ def test_resume_continues_to_larger_max_steps(training_parquet: Path, tmp_path: 
 
     resumed.train()
     assert resumed.global_step == 6
+
+

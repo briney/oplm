@@ -71,14 +71,16 @@ def tokenize_and_pad(
     max_length: int,
     *,
     weights: Sequence[Sequence[float] | None] | None = None,
+    pad_to_multiple_of: int | None = None,
 ) -> dict[str, Tensor]:
     """Tokenize and pad a batch of sequences (no masking, no labels).
 
     Each raw sequence is truncated to ``max_length - 2`` residues (leaving room for
     ``<cls>``/``<eos>``), tokenized with the canonical tokenizer, and padded to the
-    batch's longest member with ``pad_token_id``. This is the shared primitive used
-    by the variant/structure/downstream consumers and, internally, by
-    :class:`MLMCollator`.
+    smallest multiple of ``pad_to_multiple_of`` that is ≥ the batch's longest member
+    (or exactly the batch's longest member when ``pad_to_multiple_of`` is ``None``).
+    This is the shared primitive used by the variant/structure/downstream consumers
+    and, internally, by :class:`MLMCollator`.
 
     Args:
         batch: Items are raw sequence ``str`` s or mappings carrying a ``"sequence"``.
@@ -91,6 +93,9 @@ def tokenize_and_pad(
             ``None`` row → uniform ``1.0``) via :func:`~oplm.data.tokenizer.align_per_residue`.
             Used internally by the MLM collator; the default output is the two keys
             below.
+        pad_to_multiple_of: When set, pads sequences to the smallest multiple of this
+            value that is ≥ the batch's longest member. ``None`` (default) pads to
+            exactly the batch's longest member, reproducing today's behavior.
 
     Returns:
         ``{"input_ids": (B, T) long, "attention_mask": (B, T) long}``, plus
@@ -100,7 +105,9 @@ def tokenize_and_pad(
     max_residues = max_length - 2  # room for <cls>/<eos>
     truncated = [seq[:max_residues] for seq in sequences]
 
-    encoded = tokenizer(truncated, padding=True, return_tensors="pt")
+    encoded = tokenizer(
+        truncated, padding=True, pad_to_multiple_of=pad_to_multiple_of, return_tensors="pt"
+    )
     out: dict[str, Tensor] = {
         "input_ids": encoded["input_ids"],
         "attention_mask": encoded["attention_mask"],
@@ -145,6 +152,10 @@ class MLMCollator:
             When ``False`` the column is ignored and masking is uniform.
         deterministic: Freeze masks per batch index (evaluation policy).
         seed: Base seed for the deterministic per-batch generator.
+        pad_to_multiple_of: Forwarded to :func:`tokenize_and_pad`. When set, the
+            sequence axis is padded to the smallest multiple of this value ≥ the
+            batch's longest member. ``None`` (default) pads to exactly the batch's
+            longest member, reproducing today's behavior.
 
     Raises:
         ValueError: If any probability is outside ``[0, 1]`` or
@@ -162,6 +173,7 @@ class MLMCollator:
         weighted_masking: bool = False,
         deterministic: bool = False,
         seed: int = 0,
+        pad_to_multiple_of: int | None = None,
     ) -> None:
         _validate_probs(mask_prob, mask_token_prob, random_token_prob)
         self._tokenizer = tokenizer
@@ -172,6 +184,7 @@ class MLMCollator:
         self._weighted_masking = weighted_masking
         self._deterministic = deterministic
         self._seed = seed
+        self._pad_to_multiple_of = pad_to_multiple_of
 
         # Derived id constants (computed once from the tokenizer, never hardcoded).
         self._mask_token_id = mask_token_id(tokenizer)
@@ -186,7 +199,13 @@ class MLMCollator:
         generator = self._next_generator()
 
         raw_weights = self._collect_weights(batch) if self._weighted_masking else None
-        encoded = tokenize_and_pad(batch, self._tokenizer, self._max_length, weights=raw_weights)
+        encoded = tokenize_and_pad(
+            batch,
+            self._tokenizer,
+            self._max_length,
+            weights=raw_weights,
+            pad_to_multiple_of=self._pad_to_multiple_of,
+        )
         input_ids = encoded["input_ids"]  # (B, T) long
         attention_mask = encoded["attention_mask"]  # (B, T) long
         labels = torch.full_like(input_ids, _IGNORE_INDEX)

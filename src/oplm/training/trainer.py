@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -158,12 +159,47 @@ class Trainer:
                 from torch import _dynamo
 
                 _dynamo.config.optimize_ddp = False
-            _status("[dim]Compiling model (torch.compile)...[/dim]")
+            # When compile_dynamic is not True (False or None/auto with bucketed static
+            # shapes), raise the Dynamo recompile budget so bucketed shapes do not
+            # silently fall back to eager. Use the same local `from torch import _dynamo`
+            # pattern to avoid shadowing the module-level `torch`.
+            if cfg.train.compile_dynamic is not True:
+                from torch import _dynamo
+
+                if cfg.data.pad_to_multiple_of is not None:
+                    buckets = math.ceil(
+                        cfg.model.max_position_embeddings / cfg.data.pad_to_multiple_of
+                    )
+                    _dynamo.config.cache_size_limit = max(
+                        _dynamo.config.cache_size_limit, buckets + 8
+                    )
+                    logger.info(
+                        "compile_dynamic=%s, pad_to_multiple_of=%d: "
+                        "expecting ~%d sequence-length buckets; "
+                        "raised cache_size_limit to %d",
+                        cfg.train.compile_dynamic,
+                        cfg.data.pad_to_multiple_of,
+                        buckets,
+                        _dynamo.config.cache_size_limit,
+                    )
+                elif cfg.train.compile_dynamic is False:
+                    logger.warning(
+                        "compile_dynamic=False with pad_to_multiple_of=None: "
+                        "batch-max padding produces unbounded shapes under static "
+                        "compile and will thrash Dynamo recompiles. "
+                        "Set pad_to_multiple_of or compile_dynamic=True.",
+                    )
+            _status(
+                f"[dim]Compiling model (torch.compile, dynamic={cfg.train.compile_dynamic})"
+                "...[/dim]"
+            )
             # torch.compile stubs return Callable; cast to nn.Module so downstream
             # calls are well-typed — OptimizedModule IS an nn.Module at runtime.
             self.model = cast(
                 "nn.Module",
-                torch.compile(self.model, dynamic=True, mode=cfg.train.compile_mode),
+                torch.compile(
+                    self.model, dynamic=cfg.train.compile_dynamic, mode=cfg.train.compile_mode
+                ),
             )
         self.optimizers = list(prepared[1 : 1 + num_optimizers])
         self.optimizer = self.optimizers[0]
@@ -182,6 +218,12 @@ class Trainer:
 
         # FLOP estimation
         self.flops_per_token = estimate_flops_per_token(cfg.model)
+
+        # Throughput timing state (steady-state window; warmup steps excluded)
+        self._step_timer_start: float | None = None
+        self._tput_window_tokens = 0
+        self._tput_window_seconds = 0.0
+        self._tput_window_steps = 0
 
         # Dataset size for fractional epoch computation
         self._dataset_size = raw_dataset_size
@@ -287,6 +329,16 @@ class Trainer:
                 self.tokens_seen += tokens_delta
                 self._step_local_tokens = 0
 
+                # Accumulate throughput window, excluding warmup steps
+                now = time.perf_counter()
+                if (
+                    self._step_timer_start is not None
+                    and self.global_step > cfg.throughput_warmup_steps
+                ):
+                    self._tput_window_seconds += now - self._step_timer_start
+                    self._tput_window_tokens += tokens_delta
+                    self._tput_window_steps += 1
+
                 # Logging
                 if self.global_step % cfg.log_every == 0:
                     self._log_step(current_loss)
@@ -315,6 +367,10 @@ class Trainer:
                         status=f"{self.global_step}/{self.total_steps}",
                         metrics=f"loss={current_loss:.4f} eval={eval_str}",
                     )
+
+                # Restart the step timer AFTER eval/checkpoint so their wall time
+                # is excluded from the next step's measurement.
+                self._step_timer_start = time.perf_counter()
 
             # Final checkpoint — guaranteed unless disabled. Skip when the last
             # step already triggered a periodic save (avoids a redundant re-write).
@@ -409,6 +465,26 @@ class Trainer:
             "train/flops": cumulative_flops,
             "train/lr": self.scheduler.get_last_lr()[0],
         }
+
+        # Steady-state throughput (window resets after each log emission).
+        # Note: flops_per_token omits attention-score FLOPs, so achieved_tflops/mfu
+        # undercount padding waste — tokens_per_sec is the headline metric.
+        if self._tput_window_steps > 0 and self._tput_window_seconds > 0:
+            tokens_per_sec = self._tput_window_tokens / self._tput_window_seconds
+            step_time_s = self._tput_window_seconds / self._tput_window_steps
+            achieved_tflops = (
+                self.flops_per_token * self._tput_window_tokens / self._tput_window_seconds / 1e12
+            )
+            metrics["train/tokens_per_sec"] = tokens_per_sec
+            metrics["train/step_time_s"] = step_time_s
+            metrics["train/achieved_tflops"] = achieved_tflops
+            if self.cfg.train.peak_tflops:
+                metrics["train/mfu"] = achieved_tflops / self.cfg.train.peak_tflops
+            # Reset window accumulators
+            self._tput_window_tokens = 0
+            self._tput_window_seconds = 0.0
+            self._tput_window_steps = 0
+
         self._log_metrics(metrics)
 
     def _save_checkpoint(self) -> None:

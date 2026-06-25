@@ -108,6 +108,10 @@ def tiny_train_cfg(
     mixed_precision: str = "no",
     compile: bool = False,
     compile_mode: str = "default",
+    compile_dynamic: bool | None = True,
+    throughput_warmup_steps: int = 50,
+    peak_tflops: float | None = None,
+    pad_to_multiple_of: int | None = None,
     wandb_enabled: bool = False,
     wandb_project: str = "oplm",
     wandb_run_name: str | None = None,
@@ -162,6 +166,9 @@ def tiny_train_cfg(
             mixed_precision=mixed_precision,
             compile=compile,
             compile_mode=compile_mode,
+            compile_dynamic=compile_dynamic,
+            throughput_warmup_steps=throughput_warmup_steps,
+            peak_tflops=peak_tflops,
             wandb_enabled=wandb_enabled,
             wandb_project=wandb_project,
             wandb_run_name=wandb_run_name,
@@ -172,6 +179,7 @@ def tiny_train_cfg(
             num_workers=num_workers,
             pin_memory=pin_memory,
             mask_prob=mask_prob,
+            pad_to_multiple_of=pad_to_multiple_of,
         ),
     )
 
@@ -210,10 +218,21 @@ def make_tiny_cfg() -> Callable[..., OplmConfig]:
 
 @pytest.fixture
 def reset_dynamo() -> Generator[None, None, None]:
-    """Clear torch.compile cache before and after a test."""
-    torch._dynamo.reset()
-    yield
-    torch._dynamo.reset()
+    """Clear torch.compile cache before and after a test.
+
+    Also saves and restores ``_dynamo.config.cache_size_limit`` so that the
+    trainer's compile block (which calls ``max(..., buckets + 8)``) cannot raise
+    the process-global limit for subsequent tests.
+    """
+    from torch import _dynamo
+
+    original_cache_size_limit = _dynamo.config.cache_size_limit
+    _dynamo.reset()
+    try:
+        yield
+    finally:
+        _dynamo.reset()
+        _dynamo.config.cache_size_limit = original_cache_size_limit
 
 
 @pytest.fixture
