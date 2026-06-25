@@ -512,12 +512,12 @@ latency. Eval and checkpoint steps are also excluded from wall-time accounting.
 | `train/tokens_per_sec` | yes | Tokens processed per second (headline metric). |
 | `train/step_time_s` | yes | Average optimizer-step wall time (seconds). |
 | `train/achieved_tflops` | yes | Estimated TFLOPs/s based on `estimate_flops_per_token`. Note: omits attention-score FLOPs; use `tokens_per_sec` for throughput comparison. |
-| `train/mfu` | only when `peak_tflops` set | `achieved_tflops / peak_tflops`. Set `train.peak_tflops` to your device peak (e.g. `989.5` for an A100 BF16, `1979.0` for H100 BF16). |
+| `train/mfu` | only when `peak_tflops` set | `achieved_tflops / peak_tflops`. Set `train.peak_tflops` to your device peak (e.g. `312.0` for an A100 SXM BF16, `989.5` for an H100 SXM BF16). |
 
 ```yaml
 train:
   throughput_warmup_steps: 100   # exclude first 100 steps from tput window
-  peak_tflops: 1979.0            # H100 BF16 peak → also logs train/mfu
+  peak_tflops: 989.5             # H100 SXM BF16 dense peak → also logs train/mfu
 ```
 
 ---
