@@ -182,13 +182,12 @@ class Trainer:
                         buckets,
                         _dynamo.config.cache_size_limit,
                     )
-                else:
+                elif cfg.train.compile_dynamic is False:
                     logger.warning(
-                        "compile_dynamic=%s with pad_to_multiple_of=None: "
-                        "batch-max padding produces unbounded shapes under non-dynamic "
+                        "compile_dynamic=False with pad_to_multiple_of=None: "
+                        "batch-max padding produces unbounded shapes under static "
                         "compile and will thrash Dynamo recompiles. "
                         "Set pad_to_multiple_of or compile_dynamic=True.",
-                        cfg.train.compile_dynamic,
                     )
             _status(
                 f"[dim]Compiling model (torch.compile, dynamic={cfg.train.compile_dynamic})...[/dim]"

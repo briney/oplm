@@ -218,10 +218,21 @@ def make_tiny_cfg() -> Callable[..., OplmConfig]:
 
 @pytest.fixture
 def reset_dynamo() -> Generator[None, None, None]:
-    """Clear torch.compile cache before and after a test."""
-    torch._dynamo.reset()
-    yield
-    torch._dynamo.reset()
+    """Clear torch.compile cache before and after a test.
+
+    Also saves and restores ``_dynamo.config.cache_size_limit`` so that the
+    trainer's compile block (which calls ``max(..., buckets + 8)``) cannot raise
+    the process-global limit for subsequent tests.
+    """
+    from torch import _dynamo
+
+    original_cache_size_limit = _dynamo.config.cache_size_limit
+    _dynamo.reset()
+    try:
+        yield
+    finally:
+        _dynamo.reset()
+        _dynamo.config.cache_size_limit = original_cache_size_limit
 
 
 @pytest.fixture

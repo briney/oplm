@@ -243,7 +243,7 @@ def test_throughput_mfu_emitted_when_peak_tflops_set(
         max_steps=1,
         compile=False,
     )
-    # Set peak_tflops on the config directly (tiny_train_cfg doesn't expose it)
+    # Set peak_tflops directly on the config (conftest exposes it via tiny_train_cfg but compile=False skips the compile block)
     cfg_with_peak.train.peak_tflops = peak
 
     trainer = Trainer(cfg_with_peak)
