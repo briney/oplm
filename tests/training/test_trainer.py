@@ -136,6 +136,173 @@ def test_compile_dynamic_true_passes_through(
     )
 
 
+# ---------------------------------------------------------------------------
+# Throughput accumulator unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_throughput_logging(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Throughput metrics are emitted correctly when window data is present.
+
+    Drive the throughput accumulators directly: set the window fields, capture
+    _log_metrics via monkeypatch, call _log_step, and assert the emitted metrics.
+
+    Checks:
+    - train/tokens_per_sec, train/step_time_s, train/achieved_tflops are present
+      and numerically correct.
+    - train/mfu appears only when peak_tflops is set.
+    - Window resets to zero after logging.
+    """
+    from oplm.training import trainer as trainer_module
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    # Monkeypatch torch.compile to avoid real compilation
+    monkeypatch.setattr(trainer_module.torch, "compile", lambda model, **kw: model)
+
+    # Build trainer without peak_tflops set
+    cfg_no_peak = tiny_train_cfg(
+        tmp_path / "no_peak",
+        training_parquet,
+        max_steps=1,
+        compile=False,
+    )
+    trainer = Trainer(cfg_no_peak)
+
+    # Seed window with known values
+    window_tokens = 1000
+    window_seconds = 0.5
+    window_steps = 2
+    trainer._tput_window_tokens = window_tokens
+    trainer._tput_window_seconds = window_seconds
+    trainer._tput_window_steps = window_steps
+
+    # Capture _log_metrics calls
+    captured: list[dict[str, float]] = []
+
+    def _capture_log_metrics(metrics: dict[str, float]) -> None:
+        captured.append(dict(metrics))
+
+    monkeypatch.setattr(trainer, "_log_metrics", _capture_log_metrics)
+
+    # Call _log_step (loss value is irrelevant for this test)
+    trainer._log_step(0.5)
+
+    assert len(captured) == 1
+    m = captured[0]
+
+    # Numerically correct
+    expected_tps = window_tokens / window_seconds  # 2000.0
+    expected_step_time = window_seconds / window_steps  # 0.25
+    expected_tflops = trainer.flops_per_token * window_tokens / window_seconds / 1e12
+
+    assert "train/tokens_per_sec" in m, "train/tokens_per_sec missing"
+    assert "train/step_time_s" in m, "train/step_time_s missing"
+    assert "train/achieved_tflops" in m, "train/achieved_tflops missing"
+    assert abs(m["train/tokens_per_sec"] - expected_tps) < 1e-6, (
+        f"tokens_per_sec: got {m['train/tokens_per_sec']}, expected {expected_tps}"
+    )
+    assert abs(m["train/step_time_s"] - expected_step_time) < 1e-9, (
+        f"step_time_s: got {m['train/step_time_s']}, expected {expected_step_time}"
+    )
+    assert abs(m["train/achieved_tflops"] - expected_tflops) < 1e-12, (
+        f"achieved_tflops: got {m['train/achieved_tflops']}, expected {expected_tflops}"
+    )
+
+    # train/mfu must NOT appear when peak_tflops is not set
+    assert "train/mfu" not in m, f"train/mfu should be absent when peak_tflops=None, got {m}"
+
+    # Window must reset
+    assert trainer._tput_window_tokens == 0
+    assert trainer._tput_window_seconds == 0.0
+    assert trainer._tput_window_steps == 0
+
+
+def test_throughput_mfu_emitted_when_peak_tflops_set(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """train/mfu is emitted when peak_tflops is set and is numerically correct."""
+    from oplm.training import trainer as trainer_module
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    monkeypatch.setattr(trainer_module.torch, "compile", lambda model, **kw: model)
+
+    peak = 312.0  # arbitrary TFLOPs (e.g. A100 BF16 peak)
+    cfg_with_peak = tiny_train_cfg(
+        tmp_path / "with_peak",
+        training_parquet,
+        max_steps=1,
+        compile=False,
+    )
+    # Set peak_tflops on the config directly (tiny_train_cfg doesn't expose it)
+    cfg_with_peak.train.peak_tflops = peak
+
+    trainer = Trainer(cfg_with_peak)
+
+    window_tokens = 2000
+    window_seconds = 1.0
+    trainer._tput_window_tokens = window_tokens
+    trainer._tput_window_seconds = window_seconds
+    trainer._tput_window_steps = 4
+
+    captured: list[dict[str, float]] = []
+    monkeypatch.setattr(trainer, "_log_metrics", lambda m: captured.append(dict(m)))
+
+    trainer._log_step(0.5)
+
+    assert len(captured) == 1
+    m = captured[0]
+
+    assert "train/mfu" in m, "train/mfu must be present when peak_tflops is set"
+    expected_achieved = trainer.flops_per_token * window_tokens / window_seconds / 1e12
+    expected_mfu = expected_achieved / peak
+    assert abs(m["train/mfu"] - expected_mfu) < 1e-12, (
+        f"mfu: got {m['train/mfu']}, expected {expected_mfu}"
+    )
+
+
+def test_throughput_empty_window_emits_no_tput_keys(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No throughput keys appear when the window is empty (warmup exclusion)."""
+    from oplm.training import trainer as trainer_module
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    monkeypatch.setattr(trainer_module.torch, "compile", lambda model, **kw: model)
+
+    cfg = tiny_train_cfg(
+        tmp_path / "empty_window",
+        training_parquet,
+        max_steps=1,
+        compile=False,
+    )
+    trainer = Trainer(cfg)
+
+    # Window is at defaults (all zeros) — no throughput metrics should appear
+    captured: list[dict[str, float]] = []
+    monkeypatch.setattr(trainer, "_log_metrics", lambda m: captured.append(dict(m)))
+
+    trainer._log_step(0.5)
+
+    assert len(captured) == 1
+    m = captured[0]
+    for key in ("train/tokens_per_sec", "train/step_time_s", "train/achieved_tflops", "train/mfu"):
+        assert key not in m, f"{key} should be absent when window is empty, got {m}"
+
+
 def test_compile_dynamic_false_no_pad_emits_warning(
     tmp_path: Path,
     training_parquet: Path,
