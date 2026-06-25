@@ -10,15 +10,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
-
 import pytest
 import torch
 
 from tests.training.conftest import configure_accelerator_device, tiny_train_cfg
-
-if TYPE_CHECKING:
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +60,7 @@ def test_compile_dynamic_false_passed_to_torch_compile(
     The test monkeypatches ``torch.compile`` so no actual compilation occurs and
     the Trainer can be built on CPU. The captured kwargs are then inspected.
     """
-    import torch._dynamo
+    from torch import _dynamo
 
     from oplm.training import trainer as trainer_module
     from oplm.training.trainer import Trainer
@@ -86,7 +81,7 @@ def test_compile_dynamic_false_passed_to_torch_compile(
         pad_to_multiple_of=32,
     )
 
-    original_limit = torch._dynamo.config.cache_size_limit
+    original_limit = _dynamo.config.cache_size_limit
     Trainer(cfg)
 
     # The compile call must have forwarded dynamic=False
@@ -97,9 +92,9 @@ def test_compile_dynamic_false_passed_to_torch_compile(
 
     # The Dynamo cache_size_limit must have been raised above its original value.
     # With max_position_embeddings=64 and pad_to_multiple_of=32: buckets=2, limit=max(orig,10)
-    assert torch._dynamo.config.cache_size_limit > original_limit, (
+    assert _dynamo.config.cache_size_limit > original_limit, (
         f"cache_size_limit was not raised: "
-        f"original={original_limit}, current={torch._dynamo.config.cache_size_limit}"
+        f"original={original_limit}, current={_dynamo.config.cache_size_limit}"
     )
 
 
@@ -113,7 +108,7 @@ def test_compile_dynamic_true_passes_through(
 
     The recompile-budget branch must NOT fire when compile_dynamic is True.
     """
-    import torch._dynamo
+    from torch import _dynamo
 
     from oplm.training import trainer as trainer_module
     from oplm.training.trainer import Trainer
@@ -123,7 +118,7 @@ def test_compile_dynamic_true_passes_through(
     capture = _CompileCapture()
     monkeypatch.setattr(trainer_module.torch, "compile", capture)
 
-    original_limit = torch._dynamo.config.cache_size_limit
+    original_limit = _dynamo.config.cache_size_limit
     cfg = tiny_train_cfg(
         tmp_path,
         training_parquet,
@@ -136,7 +131,7 @@ def test_compile_dynamic_true_passes_through(
     assert len(capture.calls) == 1
     assert capture.calls[0]["dynamic"] is True
     # cache_size_limit must be untouched when compile_dynamic=True
-    assert torch._dynamo.config.cache_size_limit == original_limit, (
+    assert _dynamo.config.cache_size_limit == original_limit, (
         "cache_size_limit was unexpectedly modified for compile_dynamic=True"
     )
 
