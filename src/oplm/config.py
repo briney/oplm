@@ -302,13 +302,10 @@ class DataConfig:
                     f"pad_to_multiple_of must be an int, got bool ({self.pad_to_multiple_of!r})"
                 )
             if not isinstance(self.pad_to_multiple_of, int):
-                raise ValueError(
-                    f"pad_to_multiple_of must be an int, got {type(self.pad_to_multiple_of).__name__}"
-                )
+                got = type(self.pad_to_multiple_of).__name__
+                raise ValueError(f"pad_to_multiple_of must be an int, got {got}")
             if self.pad_to_multiple_of < 1:
-                raise ValueError(
-                    f"pad_to_multiple_of must be >= 1, got {self.pad_to_multiple_of}"
-                )
+                raise ValueError(f"pad_to_multiple_of must be >= 1, got {self.pad_to_multiple_of}")
         if not 0.0 <= self.mask_token_prob <= 1.0:
             raise ValueError(f"mask_token_prob must be in [0, 1], got {self.mask_token_prob}")
         if not 0.0 <= self.random_token_prob <= 1.0:

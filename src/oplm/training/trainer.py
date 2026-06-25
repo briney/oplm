@@ -190,13 +190,16 @@ class Trainer:
                         "Set pad_to_multiple_of or compile_dynamic=True.",
                     )
             _status(
-                f"[dim]Compiling model (torch.compile, dynamic={cfg.train.compile_dynamic})...[/dim]"
+                f"[dim]Compiling model (torch.compile, dynamic={cfg.train.compile_dynamic})"
+                "...[/dim]"
             )
             # torch.compile stubs return Callable; cast to nn.Module so downstream
             # calls are well-typed — OptimizedModule IS an nn.Module at runtime.
             self.model = cast(
                 "nn.Module",
-                torch.compile(self.model, dynamic=cfg.train.compile_dynamic, mode=cfg.train.compile_mode),
+                torch.compile(
+                    self.model, dynamic=cfg.train.compile_dynamic, mode=cfg.train.compile_mode
+                ),
             )
         self.optimizers = list(prepared[1 : 1 + num_optimizers])
         self.optimizer = self.optimizers[0]
@@ -328,7 +331,10 @@ class Trainer:
 
                 # Accumulate throughput window, excluding warmup steps
                 now = time.perf_counter()
-                if self._step_timer_start is not None and self.global_step > cfg.throughput_warmup_steps:
+                if (
+                    self._step_timer_start is not None
+                    and self.global_step > cfg.throughput_warmup_steps
+                ):
                     self._tput_window_seconds += now - self._step_timer_start
                     self._tput_window_tokens += tokens_delta
                     self._tput_window_steps += 1
@@ -466,7 +472,9 @@ class Trainer:
         if self._tput_window_steps > 0 and self._tput_window_seconds > 0:
             tokens_per_sec = self._tput_window_tokens / self._tput_window_seconds
             step_time_s = self._tput_window_seconds / self._tput_window_steps
-            achieved_tflops = self.flops_per_token * self._tput_window_tokens / self._tput_window_seconds / 1e12
+            achieved_tflops = (
+                self.flops_per_token * self._tput_window_tokens / self._tput_window_seconds / 1e12
+            )
             metrics["train/tokens_per_sec"] = tokens_per_sec
             metrics["train/step_time_s"] = step_time_s
             metrics["train/achieved_tflops"] = achieved_tflops
