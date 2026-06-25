@@ -158,12 +158,45 @@ class Trainer:
                 from torch import _dynamo
 
                 _dynamo.config.optimize_ddp = False
-            _status("[dim]Compiling model (torch.compile)...[/dim]")
+            # When compile_dynamic is not True (False or None/auto with bucketed static
+            # shapes), raise the Dynamo recompile budget so bucketed shapes do not
+            # silently fall back to eager. Use the same local `from torch import _dynamo`
+            # pattern to avoid shadowing the module-level `torch`.
+            if cfg.train.compile_dynamic is not True:
+                from torch import _dynamo
+
+                if cfg.data.pad_to_multiple_of is not None:
+                    buckets = math.ceil(
+                        cfg.model.max_position_embeddings / cfg.data.pad_to_multiple_of
+                    )
+                    _dynamo.config.cache_size_limit = max(
+                        _dynamo.config.cache_size_limit, buckets + 8
+                    )
+                    logger.info(
+                        "compile_dynamic=%s, pad_to_multiple_of=%d: "
+                        "expecting ~%d sequence-length buckets; "
+                        "raised cache_size_limit to %d",
+                        cfg.train.compile_dynamic,
+                        cfg.data.pad_to_multiple_of,
+                        buckets,
+                        _dynamo.config.cache_size_limit,
+                    )
+                else:
+                    logger.warning(
+                        "compile_dynamic=%s with pad_to_multiple_of=None: "
+                        "batch-max padding produces unbounded shapes under non-dynamic "
+                        "compile and will thrash Dynamo recompiles. "
+                        "Set pad_to_multiple_of or compile_dynamic=True.",
+                        cfg.train.compile_dynamic,
+                    )
+            _status(
+                f"[dim]Compiling model (torch.compile, dynamic={cfg.train.compile_dynamic})...[/dim]"
+            )
             # torch.compile stubs return Callable; cast to nn.Module so downstream
             # calls are well-typed — OptimizedModule IS an nn.Module at runtime.
             self.model = cast(
                 "nn.Module",
-                torch.compile(self.model, dynamic=True, mode=cfg.train.compile_mode),
+                torch.compile(self.model, dynamic=cfg.train.compile_dynamic, mode=cfg.train.compile_mode),
             )
         self.optimizers = list(prepared[1 : 1 + num_optimizers])
         self.optimizer = self.optimizers[0]

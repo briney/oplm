@@ -108,6 +108,8 @@ def tiny_train_cfg(
     mixed_precision: str = "no",
     compile: bool = False,
     compile_mode: str = "default",
+    compile_dynamic: bool | None = True,
+    pad_to_multiple_of: int | None = None,
     wandb_enabled: bool = False,
     wandb_project: str = "oplm",
     wandb_run_name: str | None = None,
@@ -162,6 +164,7 @@ def tiny_train_cfg(
             mixed_precision=mixed_precision,
             compile=compile,
             compile_mode=compile_mode,
+            compile_dynamic=compile_dynamic,
             wandb_enabled=wandb_enabled,
             wandb_project=wandb_project,
             wandb_run_name=wandb_run_name,
@@ -172,6 +175,7 @@ def tiny_train_cfg(
             num_workers=num_workers,
             pin_memory=pin_memory,
             mask_prob=mask_prob,
+            pad_to_multiple_of=pad_to_multiple_of,
         ),
     )
 
