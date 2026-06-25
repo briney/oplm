@@ -131,3 +131,35 @@ def test_compile_checkpoint_hf_export(
     assert hf_dir.exists(), "HF export directory missing"
     model = OplmForMaskedLM.from_pretrained(str(hf_dir))
     assert model is not None
+
+
+@_REQUIRES_CUDA
+def test_compile_dynamic_false_pad_to_multiple_runs(
+    tmp_path: Path, training_parquet: Path, reset_dynamo: None
+) -> None:
+    """compile=True + compile_dynamic=False + pad_to_multiple_of=16: static-bucket path runs.
+
+    With compile_dynamic=False the trainer specializes a static graph per concrete
+    sequence length.  pad_to_multiple_of=16 bounds the shape space to a small
+    number of buckets so the Dynamo cache_size_limit rail does not trip.  This test
+    proves the end-to-end path — static-bucket compile + bucketed collation — runs
+    without error and produces finite losses.
+    """
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        output_dir=tmp_path,
+        train_data=training_parquet,
+        max_steps=3,
+        log_every=1,
+        compile=True,
+        compile_mode="default",
+        compile_dynamic=False,
+        pad_to_multiple_of=16,
+    )
+    cb = FullRecordingCallback()
+    Trainer(cfg, callbacks=[cb]).train()
+
+    assert len(cb.train_logs) == 3
+    for _, metrics in cb.train_logs:
+        assert torch.isfinite(torch.tensor(metrics["train/loss"]))

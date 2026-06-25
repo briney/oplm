@@ -4,6 +4,11 @@ Runs the live :class:`~oplm.training.trainer.Trainer` over a tiny model and the
 real ``training_parquet`` fixture for a handful of CPU steps: the loop must
 complete with no shape errors, write a checkpoint, fire eval on its cadence, and
 resume cleanly from a checkpoint to continue to a larger ``max_steps``.
+
+Also includes a smoke test for ``data.pad_to_multiple_of`` (Phase 5): a short run
+with ``pad_to_multiple_of=16`` and ``throughput_warmup_steps=0`` asserts that
+training completes without shape errors, eval fires, and ``train/tokens_per_sec``
+is logged.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import pytest
 from oplm.config import DataConfig, OplmConfig, TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.training import TrainerCallback
+from tests.training.conftest import FullRecordingCallback, tiny_train_cfg
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -109,3 +115,51 @@ def test_resume_continues_to_larger_max_steps(training_parquet: Path, tmp_path: 
 
     resumed.train()
     assert resumed.global_step == 6
+
+
+def test_pad_to_multiple_smoke(training_parquet: Path, tmp_path: Path) -> None:
+    """pad_to_multiple_of=16 + throughput_warmup_steps=0 smoke: completes, evals, logs tput.
+
+    Asserts:
+    - Training completes the full step budget with no shape mismatch.
+    - The eval pass fires at least once and every eval metric is finite.
+    - ``train/tokens_per_sec`` is present in at least one logged metric payload
+      (throughput_warmup_steps=0 ensures warmup exclusion is bypassed for this
+      short run).
+
+    ``compile`` is left OFF so no real compilation occurs — this test is intentionally
+    CPU-fast for the non-GPU CI tier.
+    """
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=4,
+        log_every=1,
+        pad_to_multiple_of=16,
+        throughput_warmup_steps=0,
+        eval={
+            "hd": {
+                "path": str(training_parquet),
+                "type": "sequence",
+                "every": {"steps": 2},
+            }
+        },
+        compile=False,
+    )
+    callback = FullRecordingCallback()
+    Trainer(cfg, callbacks=[callback]).train()
+
+    # (a) Training completes with no shape mismatch (no exception raised above).
+    assert callback.train_end_count == 1
+
+    # (b) The eval pass ran and all metrics are finite.
+    assert callback.evals, "eval never fired"
+    for _step, eval_metrics in callback.evals:
+        for key, val in eval_metrics.items():
+            assert math.isfinite(val), f"eval metric {key!r} is not finite"
+
+    # (c) train/tokens_per_sec was emitted in at least one log payload.
+    tput_steps = [step for step, m in callback.train_logs if "train/tokens_per_sec" in m]
+    assert tput_steps, "train/tokens_per_sec was never logged (throughput_warmup_steps=0 should enable it)"

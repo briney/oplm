@@ -392,14 +392,26 @@ Trainer(cfg, callbacks=[PrintLoss()]).train()
 
 ## 13. torch.compile
 
-Pass `train.compile=true` to enable `torch.compile(model, dynamic=True)`.
+Pass `train.compile=true` to enable `torch.compile`.
 
 The model is compiled before DDP wrapping (after gradient checkpointing is
 enabled, if set), so the compiled graph includes the recompute wrapper and DDP
 sees an `OptimizedModule` rather than a raw model — the standard ordering.
-`dynamic=True` is mandatory: protein sequences are padded to the batch maximum,
-so `seq_len` varies per batch; without dynamic shapes every unique length would
-trigger a recompile.
+
+**Dynamic mode** (`train.compile_dynamic`):
+
+| Value | Behavior |
+|-------|----------|
+| `true` (default) | One dynamic graph; handles variable sequence lengths without recompilation. |
+| `false` | Static graph per concrete shape; best throughput when combined with `data.pad_to_multiple_of` to bound the shape space to a small fixed set of buckets. |
+| `null` | Dynamo auto-detects dynamism. |
+
+With `compile_dynamic=false`, the trainer automatically raises
+`torch._dynamo.config.cache_size_limit` to accommodate the expected number of
+length buckets (computed from `max_position_embeddings / pad_to_multiple_of`). If
+`pad_to_multiple_of` is unset with `compile_dynamic=false`, the trainer logs a
+warning: batch-max padding yields near-continuous shape variation and will thrash
+recompiles.
 
 **First-step latency:** compilation runs on the first forward pass and may take
 several minutes for large models. Subsequent steps run the compiled graph.
@@ -429,8 +441,83 @@ on Blackwell for best throughput at the cost of a longer initial compile.
 > at `gradient_accumulation_steps=1`.
 
 ```bash
-# opt in via CLI override
+# dynamic graph (default): one compiled graph handles variable-length batches
 torchrun --nproc_per_node=8 -m oplm.train --config my_run.yaml train.compile=true
+
+# static-bucket graph: collate to multiples of 128, compile one graph per bucket
+torchrun --nproc_per_node=8 -m oplm.train --config my_run.yaml \
+  train.compile=true train.compile_dynamic=false data.pad_to_multiple_of=128
+```
+
+---
+
+## 14. Pad-to-multiple batching (`data.pad_to_multiple_of`)
+
+By default every batch is padded to the longest sequence it contains
+(`pad_to_multiple_of=null`). Setting `pad_to_multiple_of=N` instead pads each
+batch to the smallest multiple of N that covers the longest sequence.
+
+**Why it helps:**
+
+- *Tensor-core alignment* (any compile mode, even `compile=false`): cuBLAS/cuDNN
+  fast paths prefer leading matmul dimensions divisible by 8 (BF16) or 16 (FP8).
+  N ∈ {8, 16} captures this benefit with minimal padding waste.
+- *Static-shape bucketing* (`compile_dynamic=false`): each unique padded length
+  triggers a separate compiled graph. A small N leaves the shape space
+  near-continuous (pathological recompiles); a large N (64/128/256) collapses
+  lengths into a small fixed set of buckets so a handful of static graphs are
+  compiled once and reused — typically the bigger throughput win.
+
+**Divisibility requirement:** `model.max_position_embeddings % pad_to_multiple_of
+== 0` is enforced at config load. This prevents a padded length from exceeding
+`max_position_embeddings` and causing position-id overflow. All built-in presets
+(context length 1024) divide evenly by 8, 16, 32, 64, 128, and 256.
+
+**Benchmark matrix:**
+
+| Config | `compile_dynamic` | `pad_to_multiple_of` | Notes |
+|--------|:-----------------:|:--------------------:|-------|
+| A — baseline | `true` | `null` | Default behavior, one dynamic graph. |
+| B — alignment | `true` | `8` or `16` | Tensor-core alignment only; minimal padding overhead. |
+| C — static-bucket | `false` | `64`, `128`, or `256` | Static graphs per bucket; combine with `compile_mode=max-autotune` on Blackwell for best peak throughput. |
+
+```yaml
+# recipe B — dynamic compile + tensor-core alignment
+train:
+  compile: true
+  compile_dynamic: true
+data:
+  pad_to_multiple_of: 16
+
+# recipe C — static-bucket compile (pick N to suit your sequence-length distribution)
+train:
+  compile: true
+  compile_dynamic: false
+  compile_mode: max-autotune
+data:
+  pad_to_multiple_of: 128
+```
+
+---
+
+## 15. Throughput logging
+
+The trainer logs steady-state throughput metrics once per `train.log_every`
+steps. The first `train.throughput_warmup_steps` optimizer steps (default `50`)
+are excluded from the measurement window to avoid including compile/JIT warmup
+latency. Eval and checkpoint steps are also excluded from wall-time accounting.
+
+| Metric | Always logged | Notes |
+|--------|:-------------:|-------|
+| `train/tokens_per_sec` | yes | Tokens processed per second (headline metric). |
+| `train/step_time_s` | yes | Average optimizer-step wall time (seconds). |
+| `train/achieved_tflops` | yes | Estimated TFLOPs/s based on `estimate_flops_per_token`. Note: omits attention-score FLOPs; use `tokens_per_sec` for throughput comparison. |
+| `train/mfu` | only when `peak_tflops` set | `achieved_tflops / peak_tflops`. Set `train.peak_tflops` to your device peak (e.g. `989.5` for an A100 BF16, `1979.0` for H100 BF16). |
+
+```yaml
+train:
+  throughput_warmup_steps: 100   # exclude first 100 steps from tput window
+  peak_tflops: 1979.0            # H100 BF16 peak → also logs train/mfu
 ```
 
 ---
