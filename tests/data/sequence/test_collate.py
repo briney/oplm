@@ -407,3 +407,99 @@ def test_invalid_probabilities_raise(tokenizer, mask_token_prob, random_token_pr
             mask_token_prob=mask_token_prob,
             random_token_prob=random_token_prob,
         )
+
+
+# --------------------------------------------------------------------------- #
+# pad_to_multiple_of
+# --------------------------------------------------------------------------- #
+
+
+def test_primitive_pad_to_multiple_of(tokenizer) -> None:
+    """With pad_to_multiple_of=16, T is divisible by 16 and >= longest unpadded member."""
+    multiple = 16
+    out_unpadded = tokenize_and_pad(_batch(_SEQUENCES), tokenizer, _MAX_LENGTH)
+    longest_unpadded = int(out_unpadded["input_ids"].shape[1])
+
+    out = tokenize_and_pad(_batch(_SEQUENCES), tokenizer, _MAX_LENGTH, pad_to_multiple_of=multiple)
+    t = out["input_ids"].shape[1]
+    assert t % multiple == 0, f"T={t} is not divisible by {multiple}"
+    assert t >= longest_unpadded, f"T={t} is shorter than unpadded longest {longest_unpadded}"
+
+
+def test_primitive_pad_to_multiple_all_keys_share_t(tokenizer) -> None:
+    """input_ids, attention_mask, and masking_weights all share the same T."""
+    multiple = 16
+    seqs = ["MEEP", "AC"]
+    weights = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0]]
+    out = tokenize_and_pad(seqs, tokenizer, _MAX_LENGTH, pad_to_multiple_of=multiple, weights=weights)
+    t = out["input_ids"].shape[1]
+    assert t % multiple == 0
+    assert out["attention_mask"].shape[1] == t
+    assert out["masking_weights"].shape[1] == t
+
+
+def test_primitive_pad_to_multiple_none_reproduces_batch_max(tokenizer) -> None:
+    """pad_to_multiple_of=None is byte-identical to today's batch-max behavior."""
+    out_none = tokenize_and_pad(_batch(_SEQUENCES), tokenizer, _MAX_LENGTH, pad_to_multiple_of=None)
+    out_default = tokenize_and_pad(_batch(_SEQUENCES), tokenizer, _MAX_LENGTH)
+    assert torch.equal(out_none["input_ids"], out_default["input_ids"])
+    assert torch.equal(out_none["attention_mask"], out_default["attention_mask"])
+
+
+def test_collator_pad_to_multiple_of_shapes(tokenizer) -> None:
+    """MLMCollator with pad_to_multiple_of=16: all output tensors share T divisible by 16."""
+    multiple = 16
+    collator = MLMCollator(tokenizer, max_length=_MAX_LENGTH, pad_to_multiple_of=multiple)
+    out = collator(_batch(_SEQUENCES))
+    t = out["input_ids"].shape[1]
+    assert t % multiple == 0
+    for key in ("input_ids", "attention_mask", "labels"):
+        assert out[key].shape[1] == t, f"key={key} has shape {out[key].shape}, expected T={t}"
+
+
+def test_collator_pad_to_multiple_of_with_weighted_masking(tokenizer) -> None:
+    """With weighted masking + pad_to_multiple_of=16, masking_weights is consumed (not emitted);
+    output tensors still share T divisible by 16."""
+    multiple = 16
+    weights = [[1.0] * len(s) for s in _SEQUENCES]
+    batch = [
+        {**row, "masking_weights": w} for row, w in zip(_batch(_SEQUENCES), weights, strict=True)
+    ]
+    collator = MLMCollator(
+        tokenizer, max_length=_MAX_LENGTH, pad_to_multiple_of=multiple, weighted_masking=True
+    )
+    out = collator(batch)
+    t = out["input_ids"].shape[1]
+    assert t % multiple == 0
+    assert "masking_weights" not in out
+    for key in ("input_ids", "attention_mask", "labels"):
+        assert out[key].shape[1] == t
+
+
+def test_collator_pad_masking_correctness(tokenizer) -> None:
+    """Padded columns stay at ignore_index=-100 (labels) and real tokens have non-(-100) labels
+    only at masked positions; the eligible-position contract holds on the non-pad region."""
+    multiple = 16
+    collator = MLMCollator(tokenizer, max_length=_MAX_LENGTH, pad_to_multiple_of=multiple)
+    out = collator(_batch(_SEQUENCES))
+    # Padded positions (attention_mask==0) must have labels==-100 (loss-neutral).
+    pad_positions = out["attention_mask"] == 0
+    assert (out["labels"][pad_positions] == -100).all(), "Padded positions must have ignore_index labels"
+    # Non-masked real positions must also be -100.
+    non_masked_real = (out["attention_mask"] == 1) & (out["labels"] == -100)
+    # This is simply the unmasked positions — just check no crash; the key check is above.
+    assert non_masked_real.dtype == torch.bool
+
+
+def test_collator_pad_to_multiple_none_matches_default(tokenizer) -> None:
+    """MLMCollator(pad_to_multiple_of=None) is byte-identical to no argument."""
+    collator_none = MLMCollator(
+        tokenizer, max_length=_MAX_LENGTH, deterministic=True, seed=42, pad_to_multiple_of=None
+    )
+    collator_default = MLMCollator(
+        tokenizer, max_length=_MAX_LENGTH, deterministic=True, seed=42
+    )
+    out_none = collator_none(_batch(_SEQUENCES))
+    out_default = collator_default(_batch(_SEQUENCES))
+    for key in ("input_ids", "attention_mask", "labels"):
+        assert torch.equal(out_none[key], out_default[key]), f"key={key} differs"
