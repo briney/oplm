@@ -1,0 +1,5 @@
+As currently implemented, compilation uses `dynamic=True` and training batches are padded to the max length of the batch. I've seen some data from others that padding each batch to the nearest multiple of, say, 8 can improve performance. This other work was done when compiling with default mode and with `dynamic=False`, so I'd like to implement this type of padding scheme so that I can benchmark with our current architecture. A few things before we get started making a plan. First, what would be the presumed performance benefit of such padding? Is it due to GPU architecture (this is all being done on Blackwell chips), or does does "padding to a multiple of" primarily get its benefit by reducing the number of on-the-fly compilations by effectively binning batches into a few discrete length groups? Let's brainstorm how/why this is likely to work, then we can embark on making a plan to implement.
+
+---
+
+1) strict divisibility 2) yes, add MFU logging 3) 50 steps sounds reasonable for a throughput warmup

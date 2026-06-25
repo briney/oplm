@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.7.7",
+  "checkpoint_id": "3f1d77470830",
+  "strategy": "manual-commit",
+  "branch": "feature/pad-to-multiple-compile-dynamic",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "TODOS.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/3f/1d77470830/0/metadata.json",
+      "transcript": "/3f/1d77470830/0/full.jsonl",
+      "content_hash": "/3f/1d77470830/0/content_hash.txt",
+      "prompt": "/3f/1d77470830/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 9051,
+    "cache_creation_tokens": 101821,
+    "cache_read_tokens": 2174093,
+    "output_tokens": 49369,
+    "api_call_count": 33
+  }
+}
