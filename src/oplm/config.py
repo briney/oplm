@@ -94,8 +94,11 @@ class TrainConfig:
     # torch.compile
     # Compiles the model with torch.compile before DDP wrapping. Requires an
     # initial compilation step on the first forward pass (may take several minutes
-    # for large models). Uses dynamic=True internally so variable sequence lengths
-    # do not trigger recompilation. Disabled by default.
+    # for large models). Disabled by default.
+    # compile_dynamic controls the ``dynamic`` argument to torch.compile:
+    #   True  — single dynamic graph (variable shapes without recompilation; default).
+    #   False — static graph per shape (best with pad_to_multiple_of to limit shapes).
+    #   None  — Dynamo auto-selects (single-element tensors → static, others → dynamic).
     compile: bool = False
     # Compilation mode passed to torch.compile(mode=...).
     # "default"          — balanced; safe for all hardware.
@@ -104,6 +107,15 @@ class TrainConfig:
     # "max-autotune"     — tries more optimization strategies; longest compile
     #                      time, best peak throughput on Blackwell.
     compile_mode: str = "default"
+    # dynamic flag for torch.compile: True (one dynamic graph), False (static per
+    # shape — pair with pad_to_multiple_of to bound the shape space), None (auto).
+    compile_dynamic: bool | None = True
+
+    # Throughput / MFU logging
+    # Steps to exclude from steady-state throughput (compile/warmup transient).
+    throughput_warmup_steps: int = 50
+    # Device peak TFLOPs for MFU calculation. None → log achieved TFLOPs only.
+    peak_tflops: float | None = None
 
     def __post_init__(self) -> None:
         """Validate training configuration."""
@@ -145,6 +157,12 @@ class TrainConfig:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
             )
+        if self.throughput_warmup_steps < 0:
+            raise ValueError(
+                f"throughput_warmup_steps must be >= 0, got {self.throughput_warmup_steps}"
+            )
+        if self.peak_tflops is not None and self.peak_tflops <= 0:
+            raise ValueError(f"peak_tflops must be > 0, got {self.peak_tflops}")
 
 
 @dataclass
@@ -260,6 +278,11 @@ class DataConfig:
     random_token_prob: float = 0.1  # of masked positions -> random canonical AA
     weighted_masking: bool = False  # honor the masking_weights column when True (§4.5.1)
 
+    # Collation padding: None = pad to batch-longest sequence; N = pad to the
+    # smallest multiple of N that is >= batch-longest. Useful for compile+static
+    # regimes (dynamic=False) to reduce unique shapes and improve throughput.
+    pad_to_multiple_of: int | None = None
+
     # DataLoader settings
     num_workers: int = 4
     pin_memory: bool = True
@@ -270,7 +293,22 @@ class DataConfig:
     shuffle_rows: bool = True
 
     def __post_init__(self) -> None:
-        """Validate the masking-split probabilities."""
+        """Validate the masking-split probabilities and padding config."""
+        if self.pad_to_multiple_of is not None:
+            # Reject bool explicitly: isinstance(True, int) is True in Python, so
+            # a bare int check would silently accept True/False.
+            if isinstance(self.pad_to_multiple_of, bool):
+                raise ValueError(
+                    f"pad_to_multiple_of must be an int, got bool ({self.pad_to_multiple_of!r})"
+                )
+            if not isinstance(self.pad_to_multiple_of, int):
+                raise ValueError(
+                    f"pad_to_multiple_of must be an int, got {type(self.pad_to_multiple_of).__name__}"
+                )
+            if self.pad_to_multiple_of < 1:
+                raise ValueError(
+                    f"pad_to_multiple_of must be >= 1, got {self.pad_to_multiple_of}"
+                )
         if not 0.0 <= self.mask_token_prob <= 1.0:
             raise ValueError(f"mask_token_prob must be in [0, 1], got {self.mask_token_prob}")
         if not 0.0 <= self.random_token_prob <= 1.0:
@@ -494,6 +532,19 @@ def load_config(argv: list[str]) -> OplmConfig:
     model_dict = cast("dict[str, Any]", OmegaConf.to_container(base.model, resolve=True) or {})
     _reject_unknown_model_keys(model_dict, OplmModelConfig)
     cfg.model = OplmModelConfig(**model_dict)
+
+    # Cross-config divisibility check: pad_to_multiple_of must evenly divide
+    # max_position_embeddings so padded lengths can never overflow position IDs.
+    # This is the only place both cfg.data and the resolved cfg.model are available.
+    if cfg.data.pad_to_multiple_of is not None:
+        max_pos = cfg.model.max_position_embeddings
+        ptm = cfg.data.pad_to_multiple_of
+        if max_pos % ptm != 0:
+            raise ValueError(
+                f"pad_to_multiple_of ({ptm}) must evenly divide "
+                f"model.max_position_embeddings ({max_pos}); "
+                f"{max_pos} % {ptm} = {max_pos % ptm}"
+            )
 
     cfg.train.config_path = config_path
 

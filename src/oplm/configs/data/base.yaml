@@ -27,6 +27,9 @@ data:
   #                  scoring: wt_marginals, top_k_fraction: 0.1 }
   eval: null
 
+  # Collation padding: null = pad to batch-longest; N = pad to smallest multiple of N >= batch-longest.
+  pad_to_multiple_of: null
+
   # Sequence masking
   mask_prob: 0.15
   mask_token_prob: 0.8

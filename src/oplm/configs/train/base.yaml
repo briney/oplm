@@ -62,3 +62,6 @@ train:
   mixed_precision: bf16       # bf16 | fp16 | no
   compile: false
   compile_mode: default       # default | reduce-overhead | max-autotune
+  compile_dynamic: true   # true | false | null(auto) — torch.compile dynamic flag
+  throughput_warmup_steps: 50
+  peak_tflops: null   # set device peak (TFLOPs) to log MFU

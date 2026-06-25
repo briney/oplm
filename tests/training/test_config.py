@@ -385,3 +385,74 @@ def test_compile_mode_invalid() -> None:
     """An unrecognized compile_mode raises ValueError."""
     with pytest.raises(ValueError, match="compile_mode"):
         TrainConfig(wandb_enabled=False, compile_mode="turbo")
+
+
+# --- Phase-1 new knobs: defaults -------------------------------------------------
+
+
+def test_new_knob_defaults() -> None:
+    """Bare DataConfig()/TrainConfig() expose the new knobs with behavior-preserving defaults."""
+    dc = DataConfig()
+    assert dc.pad_to_multiple_of is None
+
+    tc = TrainConfig()
+    assert tc.compile_dynamic is True
+    assert tc.throughput_warmup_steps == 50
+    assert tc.peak_tflops is None
+
+
+# --- Phase-1 DataConfig.pad_to_multiple_of validation ---------------------------
+
+
+@pytest.mark.parametrize("bad_val", [0, -1])
+def test_pad_to_multiple_of_rejects_non_positive(bad_val: int) -> None:
+    """pad_to_multiple_of must be >= 1 (0 and negative raise ValueError)."""
+    with pytest.raises(ValueError, match="pad_to_multiple_of"):
+        DataConfig(pad_to_multiple_of=bad_val)
+
+
+def test_pad_to_multiple_of_rejects_bool() -> None:
+    """pad_to_multiple_of=True must raise even though bool is a subtype of int."""
+    with pytest.raises(ValueError, match="pad_to_multiple_of"):
+        DataConfig(pad_to_multiple_of=True)  # type: ignore[arg-type]
+
+
+# --- Phase-1 TrainConfig throughput/peak_tflops validation -----------------------
+
+
+def test_throughput_warmup_steps_rejects_negative() -> None:
+    """throughput_warmup_steps must be >= 0."""
+    with pytest.raises(ValueError, match="throughput_warmup_steps"):
+        TrainConfig(throughput_warmup_steps=-1)
+
+
+def test_peak_tflops_rejects_zero() -> None:
+    """peak_tflops=0 must raise ValueError."""
+    with pytest.raises(ValueError, match="peak_tflops"):
+        TrainConfig(peak_tflops=0.0)
+
+
+def test_peak_tflops_rejects_negative() -> None:
+    """peak_tflops must be > 0 when provided."""
+    with pytest.raises(ValueError, match="peak_tflops"):
+        TrainConfig(peak_tflops=-1.0)
+
+
+# --- Phase-1 cross-config divisibility (load_config) ----------------------------
+
+
+def test_pad_divisibility_raises_on_non_divisible(tmp_path: "Path") -> None:
+    """pad_to_multiple_of=128 with max_position_embeddings=1000 (non-divisible) raises."""
+    config_path = _write_yaml(tmp_path, "data:\n  pad_to_multiple_of: 128\n")
+    with pytest.raises(ValueError, match="pad_to_multiple_of"):
+        load_config(
+            ["--config", config_path, "model.max_position_embeddings=1000"]
+        )
+
+
+def test_pad_divisibility_passes_on_divisible(tmp_path: "Path") -> None:
+    """pad_to_multiple_of=128 with max_position_embeddings=1024 (divisible) loads cleanly."""
+    config_path = _write_yaml(tmp_path, "data:\n  pad_to_multiple_of: 128\n")
+    cfg = load_config(["--config", config_path, "model.max_position_embeddings=1024"])
+    assert cfg.data.pad_to_multiple_of == 128
+    assert cfg.model.max_position_embeddings == 1024
