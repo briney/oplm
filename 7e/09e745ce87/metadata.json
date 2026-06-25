@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.7.7",
+  "checkpoint_id": "7e09e745ce87",
+  "strategy": "manual-commit",
+  "branch": "feature/pad-to-multiple-compile-dynamic",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "src/oplm/config.py",
+    "src/oplm/training/trainer.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/7e/09e745ce87/0/metadata.json",
+      "transcript": "/7e/09e745ce87/0/full.jsonl",
+      "content_hash": "/7e/09e745ce87/0/content_hash.txt",
+      "prompt": "/7e/09e745ce87/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 10780,
+    "cache_creation_tokens": 574193,
+    "cache_read_tokens": 16889247,
+    "output_tokens": 125242,
+    "api_call_count": 117
+  }
+}
