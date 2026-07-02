@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.7.8",
+  "checkpoint_version": "branch-v1",
+  "checkpoint_id": "10e6e692efce",
+  "strategy": "manual-commit",
+  "branch": "fix/precision-min-seq-sep-default",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "docs/CONFIG.md",
+    "docs/EVAL_HARNESS.md",
+    "docs/OVERVIEW.md",
+    "src/oplm/eval/metrics/categorical_jacobian.py",
+    "src/oplm/eval/metrics/contact.py",
+    "src/oplm/eval/tasks/structure.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/10/e6e692efce/0/metadata.json",
+      "transcript": "/10/e6e692efce/0/full.jsonl",
+      "compact_transcript": "/10/e6e692efce/0/transcript.jsonl",
+      "content_hash": "/10/e6e692efce/0/content_hash.txt",
+      "prompt": "/10/e6e692efce/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 9220,
+    "cache_creation_tokens": 126994,
+    "cache_read_tokens": 1451991,
+    "output_tokens": 21006,
+    "api_call_count": 38
+  }
+}

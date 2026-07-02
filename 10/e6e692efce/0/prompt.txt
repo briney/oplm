@@ -1,0 +1,5 @@
+The current precision@L eval matric defaults to a minimum sequence distance of 6, but the original paper used 24 (what they called "long range precision@L). We already expose a config flag for this, but I'd like to switch the default from 6 to 24.
+
+---
+
+One question before we commit + push -- what happens to structures whose sequences are longer than the model's max seq length (1024 by default, but many pilot-scale training runs have used 512 for the first training phase and then 2048 for the second phase)? Are they truncated, dropped entirely, or what?
