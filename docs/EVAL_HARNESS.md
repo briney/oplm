@@ -84,7 +84,7 @@ respond to point mutations elsewhere:
 4. **Score** — build the ground-truth contact map from backbone coordinates
    (virtual Cβ via ideal backbone geometry, works for glycine; contact iff Cβ–Cβ
    distance < `contact_threshold`, default 8.0 Å), restrict to long-range pairs
-   (`|i − j| ≥ min_seq_sep`, default 6), and compute precision over the top
+   (`|i − j| ≥ min_seq_sep`, default 24), and compute precision over the top
    `L / l_divisor` predicted pairs.
 
 Structures are sharded across ranks and gathered with `all_gather_object`. A

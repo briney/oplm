@@ -43,7 +43,7 @@ class StructureTaskConfig:
     """Typed structure-eval knobs, parsed from EvalDatasetEntry.extra."""
 
     contact_threshold: float = 8.0
-    min_seq_sep: int = 6
+    min_seq_sep: int = 24
     l_divisor: int = 1
     use_cbeta: bool = True
     categorical_jacobian_sample_size: int | None = None
@@ -70,7 +70,7 @@ class StructureTaskConfig:
 
         cfg = cls(
             contact_threshold=float(extra.get("contact_threshold", 8.0)),
-            min_seq_sep=int(extra.get("min_seq_sep", 6)),
+            min_seq_sep=int(extra.get("min_seq_sep", 24)),
             l_divisor=int(extra.get("l_divisor", 1)),
             use_cbeta=_strict_bool("use_cbeta", True),
             categorical_jacobian_sample_size=_opt_int("categorical_jacobian_sample_size"),
@@ -103,7 +103,8 @@ class StructureEvalTask(EvalTask):
 
     Task-specific config (extra keys on the eval dataset entry):
         contact_threshold (float): Distance cutoff in Å. Default 8.0.
-        min_seq_sep (int): Minimum sequence separation. Default 6.
+        min_seq_sep (int): Minimum sequence separation. Default 24
+            (long-range contacts, matching the reference paper).
         l_divisor (int): L divisor (1=L, 2=L/2, 5=L/5). Default 1.
         use_cbeta (bool): Use Cβ distances. Default True.
         categorical_jacobian_sample_size (int | None): Optional deterministic

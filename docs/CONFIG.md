@@ -354,7 +354,7 @@ categorical Jacobian over PDB/CIF structures.
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `contact_threshold` | `float` | `8.0` | Contact distance threshold (Å). |
-| `min_seq_sep` | `int` | `6` | Minimum sequence separation for scoring. |
+| `min_seq_sep` | `int` | `24` | Minimum sequence separation for scoring (long-range contacts, matching the reference paper). |
 | `l_divisor` | `int` | `1` | Score the top `L / l_divisor` contacts. |
 | `use_cbeta` | `bool` | `true` | Use virtual C-β distances. |
 | `categorical_jacobian_sample_size` | `int \| null` | `null` | Optional deterministic subset of structures (the Jacobian costs `L × 20` forwards each). |
