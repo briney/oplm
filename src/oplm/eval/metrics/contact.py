@@ -102,7 +102,7 @@ def compute_precision_at_l(
     pred_contacts: Tensor,
     true_contacts: Tensor,
     seq_len: int,
-    min_seq_sep: int = 6,
+    min_seq_sep: int = 24,
     l_divisor: int = 1,
 ) -> float:
     """Compute precision@(L/divisor) for long-range contacts.

@@ -201,7 +201,7 @@ def build_structure_pair_score_data(
     pred_contacts: Tensor,
     true_contacts: Tensor,
     seq_len: int,
-    min_seq_sep: int = 6,
+    min_seq_sep: int = 24,
 ) -> StructurePairScoreData:
     """Flatten a contact score matrix into valid long-range residue pairs."""
     seq_len_actual = true_contacts.shape[0]
@@ -221,7 +221,7 @@ def build_structure_pair_score_data(
 def compute_mean_pair_score_precision_at_l(
     structures: list[StructurePairScoreData],
     l_divisor: int = 1,
-    min_seq_sep: int = 6,
+    min_seq_sep: int = 24,
 ) -> float:
     """Average precision@L over per-structure pair-score predictions."""
     precisions: list[float] = []

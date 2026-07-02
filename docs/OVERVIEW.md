@@ -1364,7 +1364,7 @@ consumed by the parser; every other key folds into `EvalDatasetEntry.extra: dict
 A task converts `extra` to a frozen validated dataclass **once**, in its
 constructor, via `from_extra()` — one place to cast/validate, no scattered
 `extra.get(...)` in `evaluate`. Example (`StructureTaskConfig`): `contact_threshold
-8.0`, `min_seq_sep 6`, `l_divisor 1`, `use_cbeta True`,
+8.0`, `min_seq_sep 24`, `l_divisor 1`, `use_cbeta True`,
 `categorical_jacobian_sample_size`, `_sample_seed 42`, `_mutation_batch_size 20`,
 `max_structures`.
 
@@ -1379,7 +1379,7 @@ Eval-specific scoring math, kept in the harness (it is scoring, not loading).
   perplexity}`.
 - **Contact / precision@L primitives (`contact.py`)**: **contact map** — binary
   `(L,L)`, residues `i,j` in contact iff Cβ–Cβ distance (virtual Cβ from N,CA,C
-  when absent) `< contact_threshold` (8.0 Å) and `|i−j| ≥ min_seq_sep` (6); **APC**
+  when absent) `< contact_threshold` (8.0 Å) and `|i−j| ≥ min_seq_sep` (24); **APC**
   — `F_apc[i,j] = F[i,j] − (rowmean_i·colmean_j)/mean(F)`; **precision@L** — rank
   long-range pairs by score, take top `L/l_divisor`, report fraction that are true
   contacts.
