@@ -6,6 +6,7 @@ Uses OmegaConf for YAML serialization, CLI overrides, and type-safe merging.
 from __future__ import annotations
 
 import inspect
+import math
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
@@ -57,6 +58,8 @@ class TrainConfig:
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_ns_steps: int = 5
+    mup_depth_lr_exponent: float = 0.0
+    mup_depth_reference_layers: int = 24
     max_grad_norm: float = 1.0
 
     # Scheduler
@@ -163,6 +166,16 @@ class TrainConfig:
             )
         if self.peak_tflops is not None and self.peak_tflops <= 0:
             raise ValueError(f"peak_tflops must be > 0, got {self.peak_tflops}")
+        if not math.isfinite(self.mup_depth_lr_exponent) or self.mup_depth_lr_exponent < 0:
+            raise ValueError(
+                "mup_depth_lr_exponent must be finite and >= 0, "
+                f"got {self.mup_depth_lr_exponent}"
+            )
+        if self.mup_depth_reference_layers < 1:
+            raise ValueError(
+                "mup_depth_reference_layers must be >= 1, "
+                f"got {self.mup_depth_reference_layers}"
+            )
 
 
 @dataclass
