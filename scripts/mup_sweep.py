@@ -30,6 +30,23 @@ COARSE_LRS = (0.0025, 0.004, 0.0063, 0.01, 0.016, 0.025, 0.04)
 OUTPUT_MULTS = (0.5, 1.0, 2.0)
 
 
+def _parse_ints(raw: str, *, name: str) -> list[int]:
+    try:
+        values = [int(token) for token in raw.split(",") if token.strip()]
+    except ValueError as exc:
+        raise typer.BadParameter(f"{name} must be comma-separated ints, got {raw!r}") from exc
+    if not values:
+        raise typer.BadParameter(f"{name} must list at least one value")
+    return values
+
+
+def _parse_strings(raw: str, *, name: str) -> list[str]:
+    values = [token.strip() for token in raw.split(",") if token.strip()]
+    if not values:
+        raise typer.BadParameter(f"{name} must list at least one value")
+    return values
+
+
 def _cell(
     *,
     preset: str,
@@ -200,9 +217,7 @@ def _generate_phase(
             selected=[],
         ),
     )
-    (out / "commands.txt").write_text(
-        "\n".join(shlex.join(command) for command in commands) + "\n"
-    )
+    (out / "commands.txt").write_text("\n".join(shlex.join(command) for command in commands) + "\n")
     return phase_path, commands
 
 
@@ -251,6 +266,132 @@ def _refine_cells(
         )
         for candidate in candidates
         for output_mult in output_mults
+    ]
+
+
+def _replicate_cells(
+    source_runs: list[RunSpec], candidates: list[Params], seeds: list[int]
+) -> list[Params]:
+    cells: list[Params] = []
+    if 42 not in seeds:
+        raise ValueError("replicate seeds must include source seed 42")
+    for candidate in candidates:
+        source = next(
+            run
+            for run in source_runs
+            if run.params.get("lr") == candidate["lr"]
+            and run.params.get("output_mult") == candidate["output_mult"]
+            and run.params.get("seed") == 42
+        )
+        for seed in seeds:
+            if seed == 42:
+                continue
+            cells.append({**source.params, "seed": seed})
+    return cells
+
+
+def _transfer_cells(
+    candidates: list[Params],
+    *,
+    presets: list[str],
+    steps: list[int],
+    exponents: list[float],
+    global_examples: int,
+    seed: int,
+    warmup: int,
+) -> list[Params]:
+    if len(presets) != len(steps):
+        raise ValueError("--presets and --steps must contain the same number of values")
+    return [
+        _cell(
+            preset=preset,
+            lr=float(candidate["lr"]),
+            output_mult=float(candidate["output_mult"]),
+            depth_exponent=exponent,
+            seed=seed,
+            global_examples=global_examples,
+            max_steps=model_steps,
+            warmup_steps=warmup,
+        )
+        for candidate in candidates
+        for preset, model_steps in zip(presets, steps, strict=True)
+        for exponent in exponents
+    ]
+
+
+def _bridge_cells(
+    candidates: list[Params],
+    *,
+    multipliers: list[float],
+    global_examples: int,
+    seed: int,
+    steps: int,
+    warmup: int,
+) -> list[Params]:
+    candidate = candidates[0]
+    return [
+        _cell(
+            preset="170M",
+            lr=float(candidate["lr"]) * multiplier,
+            output_mult=float(candidate["output_mult"]),
+            depth_exponent=float(candidate["depth_exponent"]),
+            seed=seed,
+            global_examples=global_examples,
+            max_steps=steps,
+            warmup_steps=warmup,
+            batch_mult=multiplier,
+        )
+        for multiplier in multipliers
+    ]
+
+
+def _confirm_cells(
+    candidates: list[Params],
+    *,
+    global_examples: int,
+    seed: int,
+    steps: int,
+    warmup: int,
+) -> list[Params]:
+    return [
+        _cell(
+            preset="800M",
+            lr=float(candidate["lr"]),
+            output_mult=float(candidate["output_mult"]),
+            depth_exponent=float(candidate["depth_exponent"]),
+            seed=seed,
+            global_examples=global_examples,
+            max_steps=steps,
+            warmup_steps=warmup,
+            batch_mult=float(candidate["batch_mult"]),
+        )
+        for candidate in candidates
+    ]
+
+
+def _scale_cells(
+    candidates: list[Params],
+    *,
+    presets: list[str],
+    global_examples: int,
+    seed: int,
+    steps: int,
+    warmup: int,
+) -> list[Params]:
+    candidate = candidates[0]
+    return [
+        _cell(
+            preset=preset,
+            lr=float(candidate["lr"]),
+            output_mult=float(candidate["output_mult"]),
+            depth_exponent=float(candidate["depth_exponent"]),
+            seed=seed,
+            global_examples=global_examples,
+            max_steps=steps,
+            warmup_steps=warmup,
+            batch_mult=float(candidate["batch_mult"]),
+        )
+        for preset in presets
     ]
 
 
@@ -305,9 +446,7 @@ def smoke(
 def coarse(
     config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
     out: Annotated[Path, typer.Option("--out", file_okay=False)],
-    source: Annotated[
-        Path | None, typer.Option("--from", exists=True, dir_okay=False)
-    ] = None,
+    source: Annotated[Path | None, typer.Option("--from", exists=True, dir_okay=False)] = None,
     metric: Annotated[str | None, typer.Option("--metric")] = None,
     lrs: Annotated[str, typer.Option("--lrs")] = "0.0025,0.004,0.0063,0.01,0.016,0.025,0.04",
     global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
@@ -367,6 +506,217 @@ def refine(
         )
         _generate_phase(
             name="refine",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            accelerate_config=accelerate_config,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def replicate(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    seeds: Annotated[str, typer.Option("--seeds")] = "42,43,44",
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+) -> None:
+    """Generate missing replicate seeds while retaining the source seed-42 results."""
+    try:
+        source_phase = load_phase(source)
+        cells = _replicate_cells(
+            source_phase.runs,
+            _input_candidates(source, candidates, ("lr", "output_mult")),
+            _parse_ints(seeds, name="--seeds"),
+        )
+        _generate_phase(
+            name="replicate",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            accelerate_config=accelerate_config,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def transfer(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    presets: Annotated[str, typer.Option("--presets")] = "400M,800M,1B",
+    steps: Annotated[str, typer.Option("--steps")] = "10000,20000,10000",
+    exponents: Annotated[str, typer.Option("--exponents")] = "0,0.25,0.5",
+    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+) -> None:
+    """Generate the paired LR/output depth-transfer grid."""
+    try:
+        cells = _transfer_cells(
+            _input_candidates(source, candidates, ("lr", "output_mult")),
+            presets=_parse_strings(presets, name="--presets"),
+            steps=_parse_ints(steps, name="--steps"),
+            exponents=parse_floats(exponents, name="--exponents"),
+            global_examples=global_examples,
+            seed=seed,
+            warmup=warmup,
+        )
+        _generate_phase(
+            name="transfer",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            accelerate_config=accelerate_config,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def bridge(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    multipliers: Annotated[str, typer.Option("--multipliers")] = "0.7,1,1.4,2",
+    global_examples: Annotated[int, typer.Option("--global-examples")] = 8192,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 10000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+) -> None:
+    """Generate the production-batch bridge for the top transfer candidate."""
+    try:
+        cells = _bridge_cells(
+            _input_candidates(
+                source,
+                candidates,
+                ("lr", "output_mult", "depth_exponent"),
+            ),
+            multipliers=parse_floats(multipliers, name="--multipliers"),
+            global_examples=global_examples,
+            seed=seed,
+            steps=steps,
+            warmup=warmup,
+        )
+        _generate_phase(
+            name="bridge",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            accelerate_config=accelerate_config,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def confirm(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    global_examples: Annotated[int, typer.Option("--global-examples")] = 8192,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 10000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+) -> None:
+    """Generate the production-batch 800M confirmation phase."""
+    try:
+        cells = _confirm_cells(
+            _input_candidates(
+                source,
+                candidates,
+                ("lr", "output_mult", "depth_exponent", "batch_mult"),
+            ),
+            global_examples=global_examples,
+            seed=seed,
+            steps=steps,
+            warmup=warmup,
+        )
+        _generate_phase(
+            name="confirm",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            accelerate_config=accelerate_config,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def scale(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    presets: Annotated[str, typer.Option("--presets")] = "50M,170M,400M,800M,1B",
+    global_examples: Annotated[int, typer.Option("--global-examples")] = 8192,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 100000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+) -> None:
+    """Generate winner-only scaling runs across the production preset ray."""
+    try:
+        cells = _scale_cells(
+            _input_candidates(
+                source,
+                candidates,
+                ("lr", "output_mult", "depth_exponent", "batch_mult"),
+            ),
+            presets=_parse_strings(presets, name="--presets"),
+            global_examples=global_examples,
+            seed=seed,
+            steps=steps,
+            warmup=warmup,
+        )
+        _generate_phase(
+            name="scale",
             base_config=config,
             out=out,
             metric=metric,

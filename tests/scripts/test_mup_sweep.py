@@ -4,6 +4,7 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
+import typer
 from scripts import mup_sweep
 from scripts._mup_common import PhaseManifest, RunSpec, load_phase, write_phase
 from typer.testing import CliRunner
@@ -45,6 +46,28 @@ data:
     return path
 
 
+def _write_selected_phase(
+    tmp_path: Path,
+    phase: str,
+    selected: list[dict[str, float]],
+    runs: list[RunSpec] | None = None,
+) -> Path:
+    path = tmp_path / phase / "phase.json"
+    write_phase(
+        path,
+        PhaseManifest(
+            1,
+            phase,
+            "eval/heldout/loss",
+            None,
+            runs or [],
+            [],
+            selected,
+        ),
+    )
+    return path
+
+
 def test_smoke_generates_three_production_cells(base_config: Path, tmp_path: Path) -> None:
     out = tmp_path / "smoke"
     result = runner.invoke(
@@ -80,9 +103,7 @@ def test_smoke_generates_three_production_cells(base_config: Path, tmp_path: Pat
     assert cfg.train.gradient_accumulation_steps == 8
 
 
-def test_generation_rejects_nonproduction_weight_decay(
-    base_config: Path, tmp_path: Path
-) -> None:
+def test_generation_rejects_nonproduction_weight_decay(base_config: Path, tmp_path: Path) -> None:
     text = base_config.read_text().replace("weight_decay: 0.01", "weight_decay: 0.0")
     base_config.write_text(text)
     result = runner.invoke(
@@ -116,9 +137,7 @@ def test_generation_rejects_nonproduction_optimizer(
     assert message in result.output
 
 
-def test_generation_rejects_nonintegral_accumulation(
-    base_config: Path, tmp_path: Path
-) -> None:
+def test_generation_rejects_nonintegral_accumulation(base_config: Path, tmp_path: Path) -> None:
     result = runner.invoke(
         mup_sweep.app,
         [
@@ -171,9 +190,7 @@ def test_refine_uses_coarse_selected_lrs(base_config: Path, tmp_path: Path) -> N
     phase = load_phase(out / "phase.json")
     assert len(phase.runs) == 9
     assert {(run.params["lr"], run.params["output_mult"]) for run in phase.runs} == {
-        (lr, output_mult)
-        for lr in (0.0063, 0.01, 0.016)
-        for output_mult in (0.5, 1.0, 2.0)
+        (lr, output_mult) for lr in (0.0063, 0.01, 0.016) for output_mult in (0.5, 1.0, 2.0)
     }
 
 
@@ -272,3 +289,415 @@ def test_generation_requires_metric_for_ambiguous_eval_config(
     )
     assert result.exit_code != 0
     assert "--metric is required" in result.output
+
+
+def test_later_phase_default_cell_counts() -> None:
+    candidates = [
+        {"lr": 0.01, "output_mult": 1.0},
+        {"lr": 0.016, "output_mult": 0.5},
+    ]
+    source_runs = [
+        RunSpec(
+            id=f"refine-{index}",
+            config=f"runs/refine-{index}/run.yaml",
+            result=f"runs/refine-{index}/result.json",
+            params={
+                "preset": "170M",
+                **candidate,
+                "depth_exponent": 0.0,
+                "seed": 42,
+                "global_examples": 2048,
+                "max_steps": 20000,
+                "warmup_steps": 5000,
+            },
+        )
+        for index, candidate in enumerate(candidates)
+    ]
+
+    assert len(mup_sweep._replicate_cells(source_runs, candidates, [42, 43, 44])) == 4
+    assert (
+        len(
+            mup_sweep._transfer_cells(
+                candidates,
+                presets=["400M", "800M", "1B"],
+                steps=[10000, 20000, 10000],
+                exponents=[0.0, 0.25, 0.5],
+                global_examples=2048,
+                seed=42,
+                warmup=5000,
+            )
+        )
+        == 18
+    )
+
+    transferred = [{"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.25}]
+    bridge = mup_sweep._bridge_cells(
+        transferred,
+        multipliers=[0.7, 1.0, 1.4, 2.0],
+        global_examples=8192,
+        seed=42,
+        steps=10000,
+        warmup=5000,
+    )
+    assert len(bridge) == 4
+    assert [cell["lr"] for cell in bridge] == pytest.approx([0.007, 0.01, 0.014, 0.02])
+
+    bridge_finalists = [
+        {"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.25, "batch_mult": 1.0},
+        {"lr": 0.014, "output_mult": 1.0, "depth_exponent": 0.25, "batch_mult": 1.4},
+    ]
+    assert (
+        len(
+            mup_sweep._confirm_cells(
+                bridge_finalists,
+                global_examples=8192,
+                seed=42,
+                steps=10000,
+                warmup=5000,
+            )
+        )
+        == 2
+    )
+    assert (
+        len(
+            mup_sweep._scale_cells(
+                bridge_finalists[:1],
+                presets=["50M", "170M", "400M", "800M", "1B"],
+                global_examples=8192,
+                seed=42,
+                steps=100000,
+                warmup=5000,
+            )
+        )
+        == 5
+    )
+
+
+def test_replicate_generates_only_new_seeds_from_source_runs(
+    base_config: Path, tmp_path: Path
+) -> None:
+    candidates = [
+        {"lr": 0.01, "output_mult": 1.0},
+        {"lr": 0.016, "output_mult": 0.5},
+    ]
+    source_runs = [
+        RunSpec(
+            id=f"refine-{index}",
+            config=f"runs/refine-{index}/run.yaml",
+            result=f"runs/refine-{index}/result.json",
+            params={
+                "preset": "170M",
+                **candidate,
+                "depth_exponent": 0.0,
+                "seed": 42,
+                "global_examples": 2048,
+                "max_steps": 20000,
+                "warmup_steps": 5000,
+            },
+        )
+        for index, candidate in enumerate(candidates)
+    ]
+    source = _write_selected_phase(tmp_path, "refine", candidates, source_runs)
+    out = tmp_path / "replicate"
+
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            "replicate",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    phase = load_phase(out / "phase.json")
+    assert phase.source == "../refine/phase.json"
+    assert [
+        (run.params["lr"], run.params["output_mult"], run.params["seed"]) for run in phase.runs
+    ] == [
+        (0.01, 1.0, 43),
+        (0.01, 1.0, 44),
+        (0.016, 0.5, 43),
+        (0.016, 0.5, 44),
+    ]
+    assert {
+        (
+            run.params["preset"],
+            run.params["depth_exponent"],
+            run.params["global_examples"],
+            run.params["max_steps"],
+            run.params["warmup_steps"],
+        )
+        for run in phase.runs
+    } == {("170M", 0.0, 2048, 20000, 5000)}
+
+
+def test_transfer_generates_paired_candidates_across_default_models(
+    base_config: Path, tmp_path: Path
+) -> None:
+    candidates = [
+        {"lr": 0.01, "output_mult": 1.0},
+        {"lr": 0.016, "output_mult": 0.5},
+    ]
+    source = _write_selected_phase(tmp_path, "replicate", candidates)
+    out = tmp_path / "transfer"
+
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            "transfer",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    params = [run.params for run in load_phase(out / "phase.json").runs]
+    assert len(params) == 18
+    assert {(cell["lr"], cell["output_mult"]) for cell in params} == {
+        (0.01, 1.0),
+        (0.016, 0.5),
+    }
+    assert {(cell["preset"], cell["max_steps"]) for cell in params} == {
+        ("400M", 10000),
+        ("800M", 20000),
+        ("1B", 10000),
+    }
+    assert {cell["depth_exponent"] for cell in params} == {0.0, 0.25, 0.5}
+    assert {(cell["global_examples"], cell["seed"], cell["warmup_steps"]) for cell in params} == {
+        (2048, 42, 5000)
+    }
+
+
+def test_bridge_uses_only_explicit_top_transfer_candidate(
+    base_config: Path, tmp_path: Path
+) -> None:
+    source = _write_selected_phase(
+        tmp_path,
+        "transfer",
+        [
+            {"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.25},
+            {"lr": 0.02, "output_mult": 0.5, "depth_exponent": 0.5},
+        ],
+    )
+    out = tmp_path / "bridge"
+
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            "bridge",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(out),
+            "--candidates",
+            "0.02:0.5:0.5",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    params = [run.params for run in load_phase(out / "phase.json").runs]
+    assert [cell["lr"] for cell in params] == pytest.approx([0.014, 0.02, 0.028, 0.04])
+    assert [cell["batch_mult"] for cell in params] == [0.7, 1.0, 1.4, 2.0]
+    assert {
+        (
+            cell["preset"],
+            cell["output_mult"],
+            cell["depth_exponent"],
+            cell["global_examples"],
+            cell["seed"],
+            cell["max_steps"],
+            cell["warmup_steps"],
+        )
+        for cell in params
+    } == {("170M", 0.5, 0.5, 8192, 42, 10000, 5000)}
+
+
+def test_confirm_preserves_bridge_depth_and_batch_corrections(
+    base_config: Path, tmp_path: Path
+) -> None:
+    finalists = [
+        {"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.25, "batch_mult": 1.0},
+        {"lr": 0.014, "output_mult": 0.5, "depth_exponent": 0.5, "batch_mult": 1.4},
+    ]
+    source = _write_selected_phase(tmp_path, "bridge-replicate", finalists)
+    out = tmp_path / "confirm"
+
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            "confirm",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    params = [run.params for run in load_phase(out / "phase.json").runs]
+    assert len(params) == 2
+    assert [
+        (
+            cell["lr"],
+            cell["output_mult"],
+            cell["depth_exponent"],
+            cell["batch_mult"],
+        )
+        for cell in params
+    ] == [
+        (0.01, 1.0, 0.25, 1.0),
+        (0.014, 0.5, 0.5, 1.4),
+    ]
+    assert {
+        (
+            cell["preset"],
+            cell["global_examples"],
+            cell["seed"],
+            cell["max_steps"],
+            cell["warmup_steps"],
+        )
+        for cell in params
+    } == {("800M", 8192, 42, 10000, 5000)}
+
+
+def test_scale_uses_only_confirmed_winner_across_default_presets(
+    base_config: Path, tmp_path: Path
+) -> None:
+    source = _write_selected_phase(
+        tmp_path,
+        "confirm",
+        [
+            {"lr": 0.014, "output_mult": 0.5, "depth_exponent": 0.5, "batch_mult": 1.4},
+            {"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.25, "batch_mult": 1.0},
+        ],
+    )
+    out = tmp_path / "scale"
+
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            "scale",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    params = [run.params for run in load_phase(out / "phase.json").runs]
+    assert [cell["preset"] for cell in params] == ["50M", "170M", "400M", "800M", "1B"]
+    assert {
+        (
+            cell["lr"],
+            cell["output_mult"],
+            cell["depth_exponent"],
+            cell["batch_mult"],
+            cell["global_examples"],
+            cell["seed"],
+            cell["max_steps"],
+            cell["warmup_steps"],
+        )
+        for cell in params
+    } == {(0.014, 0.5, 0.5, 1.4, 8192, 42, 100000, 5000)}
+
+
+@pytest.mark.parametrize("command", ["replicate", "transfer", "bridge", "confirm", "scale"])
+def test_later_phase_commands_require_selected_candidates(
+    base_config: Path, tmp_path: Path, command: str
+) -> None:
+    source = _write_selected_phase(tmp_path, f"empty-{command}", [])
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            command,
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(tmp_path / f"out-{command}"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "has no selected candidates" in result.output
+
+
+def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
+    source = _write_selected_phase(
+        tmp_path,
+        "selected",
+        [{"lr": 0.01, "output_mult": 1.0}],
+        [
+            RunSpec(
+                "source",
+                "runs/source/run.yaml",
+                "runs/source/result.json",
+                {
+                    "preset": "170M",
+                    "lr": 0.01,
+                    "output_mult": 1.0,
+                    "depth_exponent": 0.0,
+                    "seed": 42,
+                    "global_examples": 2048,
+                    "max_steps": 20000,
+                    "warmup_steps": 5000,
+                },
+            )
+        ],
+    )
+    replicate = runner.invoke(
+        mup_sweep.app,
+        [
+            "replicate",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(tmp_path / "replicate-invalid"),
+            "--seeds",
+            "43,44",
+        ],
+    )
+    assert replicate.exit_code != 0
+    assert "must include source seed 42" in replicate.output
+
+    transfer = runner.invoke(
+        mup_sweep.app,
+        [
+            "transfer",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(tmp_path / "transfer-invalid"),
+            "--presets",
+            "400M,800M",
+            "--steps",
+            "10000",
+        ],
+    )
+    assert transfer.exit_code != 0
+    assert "same number of values" in transfer.output
+
+    with pytest.raises(typer.BadParameter, match="must list at least one value"):
+        mup_sweep._parse_ints(",", name="--seeds")
+    with pytest.raises(typer.BadParameter, match="must list at least one value"):
+        mup_sweep._parse_strings(",", name="--presets")
