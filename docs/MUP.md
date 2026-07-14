@@ -1,7 +1,7 @@
 # μP: Learning-Rate Transfer Across Width
 
 **Maximal Update Parameterization (μP)** lets a learning rate tuned on a small
-pilot model transfer to much larger models without re-sweeping at every scale.
+proxy model transfer to much larger models without re-sweeping at every scale.
 Tune `train.lr` **once** at a small proxy width, then reuse the same number at
 every larger preset.
 
@@ -21,7 +21,7 @@ checkpoints load with whatever `mup_enable` they were saved with.
 Related references:
 
 - [TRAIN.md](TRAIN.md) — the general training how-to.
-- [CONFIG.md](CONFIG.md#μp-maximal-update-parametrization) — the three `mup_*` config knobs.
+- [CONFIG.md](CONFIG.md#μp-maximal-update-parametrization) — the μP model and training knobs.
 - [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md) — the model itself.
 
 ---
@@ -40,14 +40,10 @@ The defaults live in `configs/train/base.yaml` (`optimizer: muon`,
 (`mup_enable: true`, `mup_base_width: 512`). With μP on, **`train.lr` is the base
 LR** and transfers across width — you do not re-tune it per preset.
 
-**To re-tune the base LR** (e.g. for a new optimizer/data regime), sweep at small
-proxy widths and reuse the argmin (see §6):
-
-```bash
-python -m scripts.mup_sweep --widths 256,512 --lrs 1e-3,3e-3,1e-2,3e-2 \
-  --gpus 4 --steps 400 --data /data/corpus.parquet --out sweeps/run1
-# then set train.lr=<argmin> in your config (the current default 0.01 came from this)
-```
+**To re-tune the base LR** for a new optimizer or data regime, follow the phased
+production workflow in [LR_SWEEP.md](LR_SWEEP.md). It ranks held-out validation
+loss, repeats finalists across three seeds, verifies transfer across the preset
+ray, and measures the production-batch correction.
 
 **To disable μP** (vanilla ESM-C recipe — AdamW plus the pre-2026 architecture,
 e.g. for an ablation), apply the opt-out overlay — note its `lr` is a plain AdamW
@@ -65,16 +61,17 @@ oplm train --preset 400M --config src/oplm/configs/train/vanilla_esm-c.yaml \
 1. **Gate the implementation** with the coordinate check (§5). This is the
    correctness test: with μP, per-module activation RMS must *not grow* with
    width. Run it before trusting any sweep.
-2. **Sweep the LR** at two small proxy widths (§6). The loss-vs-LR minimum should
-   land at the **same** `lr` for both widths — that shared minimum is your base
-   LR, and `MupTransferResult.transferred == True` confirms it.
-3. **Reuse** that base LR at the target preset — it's already the default
-   (`train.lr` in `configs/train/base.yaml`), so any preset picks it up.
-4. **Confirm** on one larger preset that the loss curve tracks expectation.
+2. **Run the phased sweep** in [LR_SWEEP.md](LR_SWEEP.md). It selects by held-out
+   validation-loss ranking, three-seed means, and summed per-model transfer ranks.
+3. **Reuse** the selected base LR across width under the same batch and data
+   conditions. The production batch bridge supplies any batch correction.
+4. **Confirm** the combined width, depth, and batch result before scaling.
 
-The proxy/base width is `mup_base_width` (default `512`, the 50M preset's
-`hidden_size`); the width multiplier `m = hidden_size / mup_base_width` is `1`
-there, so μP is a no-op at 50M and scales everything else relative to it.
+The general model-config fallback/default is `mup_base_width=512`, the `50M`
+preset's `hidden_size`; the width multiplier `m = hidden_size / mup_base_width`
+is `1` there. The production sweep deliberately overrides that value and forces
+`mup_base_width=768`, making the `170M` preset its production anchor. Do not mix
+results calibrated against the two different anchors.
 
 ---
 
@@ -130,9 +127,24 @@ Every entry below is a no-op when `mup_enable=false` or `m_W = 1`.
   for hidden-fan-in matrices, `lr/m_ffn` for `down_proj`); embedding, the readout
   `lm_head.decoder`, norms, and biases stay at `lr` (×1).
 
+### Optional repeated-block depth correction
+
+Width-μP supplies `width_aware_lr`. When model depth also changes, the optional
+empirical correction for parameters inside repeated Transformer blocks is:
+
+```text
+effective_block_lr(L) = width_aware_lr * (mup_depth_reference_layers / L) ** mup_depth_lr_exponent
+```
+
+`mup_depth_reference_layers` defaults to `24`, and
+`mup_depth_lr_exponent=0.0` makes the correction a no-op. The correction does
+not apply to embeddings, the final stack norm, or the MLM head/readout. The
+production sweep tests one exponent for the complete scaling ray.
+
 ### Multipliers across the presets
 
-`mup_base_width=512`, so `i0 = 1536` and the 50M preset is the `m = 1` base:
+For the general `mup_base_width=512` default, `i0 = 1536` and the 50M preset is
+the `m = 1` base:
 
 | Preset | `hidden_size` | `intermediate_size` | `m` | `m_ffn` |
 |---|---|---|---|---|
@@ -168,14 +180,20 @@ batch, and records every `nn.Linear`/`nn.Embedding` output RMS per step.
 
 ```bash
 # The gate (vary width only, fixed depth):
-python -m scripts.mup_coord_check --widths 128,256,512,1024 --optimizer muon
+python -m scripts.mup_coord_check --config configs/my-run.yaml \
+  --widths 128,256,512,1024 --depth 24 --base-width 512 --optimizer muon
 
 # The control — should fan out / grow with width:
-python -m scripts.mup_coord_check --no-mup --widths 128,256,512,1024
+python -m scripts.mup_coord_check --config configs/my-run.yaml --no-mup \
+  --widths 128,256,512,1024 --depth 24 --base-width 512
 
 # The preset ray (co-scale depth with width; see Caveats):
-python -m scripts.mup_coord_check --scaling preset_ray --widths 256,512,1024 --optimizer muon
+python -m scripts.mup_coord_check --config configs/my-run.yaml \
+  --scaling preset_ray --widths 512,768,1024 --base-width 512 --optimizer muon
 ```
+
+The production gate uses base width 768 and is listed verbatim in
+[LR_SWEEP.md](LR_SWEEP.md#parameterization-gates).
 
 Each run writes `coord_check_{scaling}_{optimizer}_{mup|nomup}.{csv,png}` into
 `--out` (μP and its control land side by side) and prints a per-module
@@ -195,42 +213,13 @@ RMS-growth table plus a verdict.
 
 ---
 
-## 6. LR sweep harness
+## 6. Production sweep harness
 
-Once the gate passes, sweep the LR across an `(width, lr)` grid. The orchestrator
-fans one pilot subprocess per grid point, each pinned to a single GPU.
-
-```bash
-python -m scripts.mup_sweep --widths 256,512 --lrs 1e-3,3e-3,1e-2,3e-2 \
-  --gpus 4 --steps 400 --batch-size 128 --grad-accum 64 \
-  --data /data/corpus.parquet --out sweeps/run1
-```
-
-- `--widths` are hidden sizes. `--scaling width` (default) fixes depth;
-  `--scaling preset_ray` co-scales depth with width to validate the preset ray.
-- `--gpus N` is the concurrency (GPU ids `0..N-1`); every run shares `seed`,
-  `batch_size`, `grad_accum`, `warmup_steps`, and `steps` — only `lr` and width vary.
-- **Tune at the production batch.** Set the global batch (`batch_size × grad_accum`
-  on one GPU) to the value production will use, via gradient accumulation — μP
-  fixes width, not batch size (§7). The banner prints the resulting global batch;
-  confirm it matches production. Match the sequence length (`--max-length`) too.
-
-On completion it loads each run's `metrics.json`, prints the per-`(width, lr)`
-loss table, the argmin LR per width, and the **transfer verdict**, then writes
-`sweep_loss_vs_lr.png` (one line per width, argmin starred). The μP payoff: the
-minimum lands at the **same** `lr` for every proxy width
-(`MupTransferResult.transferred == True`) — that `lr` is what you put in
-`train.lr`.
-
-A single grid point can be run standalone for debugging:
-
-```bash
-python -m scripts.mup_pilot_run --width 512 --lr 1e-2 --steps 200 \
-  --data /data/corpus.parquet --out runs/w512_lr1e-2
-```
-
-These scripts require the `train` extra (`pip install -e '.[train]'`) for pandas
-and matplotlib.
+The executable local Accelerate and SUNK/Slurm command sequences, phase
+artifacts, and selection rules live in [LR_SWEEP.md](LR_SWEEP.md). The harness
+uses one production YAML, keeps weight decay fixed at `0.01`, and carries selected
+candidates through refine, replicate, transfer, batch bridge, confirmation, and
+winner-only scaling phases.
 
 ---
 
@@ -243,18 +232,11 @@ and matplotlib.
   **empirically** — coord-check `preset_ray` mode plus a confirmation run — not
   asserted from theory.
 - **μP does not transfer across batch size, sequence length, or training horizon.**
-  Tune the pilot sweep at the **production global batch** *and* the production
-  **sequence length** (`--max-length`), reached via gradient accumulation on the
-  narrow proxy (`mup_sweep --grad-accum`, so `global = batch_size × grad_accum`) —
-  do *not* sweep at a small batch and extrapolate with `lr ∝ √(batch ratio)`. That
-  rule only holds in the small-batch (noise-dominated) regime; at the large batch
-  sizes used at scale (near/above the critical batch size) the optimal LR saturates
-  and the rule overshoots. Sequence length matters for the same reason batch does:
-  it sets the per-step (masked-)token count, i.e. the gradient-noise regime — but
-  it does **not** affect μP's width-transfer *correctness* (RoPE and the
-  `1/√head_dim` softmax scaling are width-driven and length-invariant, so the
-  coordinate-check oracle holds at any length). For the training horizon, prefer
-  WSD schedules / weight-decay adjustment rather than re-tuning per scale.
+  The production runbook therefore keeps the sequence-length distribution fixed,
+  measures a proxy-to-production batch bridge, and uses a WSD schedule for the
+  longer production horizon. The width coordinate-check oracle itself remains
+  length-invariant because RoPE and `1/√head_dim` softmax scaling are driven by
+  width, not sequence length.
 - **`original` clips the Muon factor at 1 for `d_out < d_in` matrices** (e.g.
   `down_proj`). It is still ~scale-invariant modulo FFN rounding, so transfer
   holds — the coord-check validates this empirically.

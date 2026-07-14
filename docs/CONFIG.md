@@ -78,7 +78,7 @@ only the core dimensions; everything else inherits the defaults below.
 | `50M`   |      ~50M   |     16 |    512 |     8 |       64 |
 | `170M`  |     ~170M   |     24 |    768 |    12 |       64 |
 | `400M`  |     ~400M   |     32 |   1024 |    16 |       64 |
-| `800M`  |     ~800M   |     40 |   1280 |    16 |       80 |
+| `800M`  |     ~800M   |     40 |   1280 |    20 |       64 |
 | `1B`    |     ~1.6B   |     50 |   1600 |    25 |       64 |
 | `3B`    |     ~3.3B   |     64 |   2048 |    32 |       64 |
 | `6B`    |       ~6B   |     80 |   2560 |    40 |       64 |
@@ -188,7 +188,7 @@ Consumed by `OplmForSequenceClassification` / `OplmForTokenClassification`.
 
 ### μP (maximal update parametrization)
 
-μP makes a learning rate tuned on a small pilot model transfer to much larger
+μP makes a learning rate tuned on a small proxy model transfer to much larger
 models without re-sweeping at every scale. It is **on by default** for `oplm train`
 runs (with `train.optimizer=muon`, `train.muon_adjust_lr_fn=original`,
 `train.lr=0.01`), and a no-op at the base width. See [MUP.md](MUP.md) for the full
@@ -206,7 +206,7 @@ recipe and the tune-once-reuse-`train.lr` workflow; disable it with
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
 | `model.mup_enable` | `bool` | `true` | Master switch (run default; dataclass fallback `false`). When `false`, init, forward multipliers, and per-group LRs are identical to non-μP runs. |
-| `model.mup_base_width` | `int` | `512` | `hidden_size` of the proxy/base model where the width multiplier `m = hidden_size / mup_base_width` equals 1 (the width the pilot LR sweep tunes at). Must be `≥ 1`. |
+| `model.mup_base_width` | `int` | `512` | `hidden_size` of the proxy/base model where `m = hidden_size / mup_base_width` equals 1. The production sweep overrides this fallback/default with its forced 768-wide anchor. Must be `≥ 1`. |
 | `model.mup_output_mult` | `float` | `1.0` | Tunable O(1) multiplier on the output logits (applied as `mup_output_mult / m` on the readout matmul path). Must be `> 0`. |
 
 ### Derived and validated fields
@@ -253,6 +253,8 @@ Backed by `oplm.config.TrainConfig`.
 | `train.muon_momentum` | `float` | `0.95` | Must be `≥ 0`. |
 | `train.muon_nesterov` | `bool` | `true` | Muon Nesterov momentum. |
 | `train.muon_ns_steps` | `int` | `5` | Newton–Schulz steps; must be `≥ 1`. |
+| `train.mup_depth_lr_exponent` | `float` | `0.0` | Repeated-block LR exponent; finite and `>= 0`. Zero is a no-op. |
+| `train.mup_depth_reference_layers` | `int` | `24` | Reference layer count in `(reference/L)^exponent`; must be `>= 1`. |
 | `train.max_grad_norm` | `float` | `1.0` | Set `0` to disable clipping. |
 | `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, or `wsd_cosine`. |
 | `train.warmup_steps` | `int` | `5_000` | Must be `≥ 0`. |
@@ -273,7 +275,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.compile_dynamic` | `bool \| null` | `true` | `torch.compile(dynamic=...)`: `true` = one dynamic graph (default), `false` = static graph per shape (best with `data.pad_to_multiple_of` to bound shapes), `null` = Dynamo auto. When `false`, the trainer raises `torch._dynamo.config.cache_size_limit` to accommodate the expected number of shape buckets. |
 | `train.throughput_warmup_steps` | `int` | `50` | Exclude the first N optimizer steps from throughput accounting (covers compile/warmup latency). Set to `0` to include all steps. Must be `≥ 0`. |
 | `train.peak_tflops` | `float \| null` | `null` | Device peak throughput in TFLOPs (e.g. `1979.0` for H100 BF16). When set, the trainer also logs `train/mfu` (achieved TFLOPs / peak). `null` → log only `train/achieved_tflops`. Must be `> 0` when set. |
-| `train.config_path` | `str \| null` | `null` | Auto-populated from `--config` for provenance. |
+| `train.config_path` | `str \| null` | `null` | Auto-populated with the source path passed to `--config`. |
 
 ## Data fields (`data.*`)
 
