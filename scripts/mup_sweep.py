@@ -1,304 +1,382 @@
-"""μP learning-rate sweep orchestrator.
-
-Fans out one :mod:`scripts.mup_pilot_run` subprocess per ``(width, lr)`` grid
-point, each pinned to a single GPU via ``CUDA_VISIBLE_DEVICES`` with a
-GPU-sized concurrency pool. On completion it loads every run's ``metrics.json``
-(:func:`~oplm.training.mup.summarize_sweep`), prints the argmin-loss LR per
-width and the **transfer verdict** (:func:`~oplm.training.mup.best_lr_per_width`),
-and writes a loss-vs-LR plot.
-
-The μP payoff: the loss-vs-LR minimum should land at the **same** ``lr`` for
-every proxy width (``MupTransferResult.transferred == True``), so that ``lr`` —
-the value you put in ``train.lr`` — can be reused unchanged at larger presets.
-
-Run (one GPU per concurrent point)::
-
-    python -m scripts.mup_sweep --widths 256,512 --lrs 1e-3,3e-3,1e-2,3e-2 \\
-        --gpus 4 --steps 400 --data corpus.parquet --out sweeps/run1
-
-``--widths`` are hidden sizes; with ``--scaling width`` depth is fixed
-(``--depth``), with ``--scaling preset_ray`` depth co-scales with width (which
-validates the preset ray, the combined width+depth path). Every run shares
-``seed``, ``batch_size``, ``warmup_steps``, and ``steps`` — only ``lr`` and the
-width (plus depth in preset_ray mode) vary. Requires the ``train`` extra.
-"""
+"""Generate deterministic μP sweep phase artifacts from a production YAML."""
 
 from __future__ import annotations
 
-import math
-import os
-import queue
-import subprocess
-import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from itertools import product
-
-# typer resolves these annotations at runtime (get_type_hints), so Path must be a
-# real runtime import, not a TYPE_CHECKING-only one.
-from pathlib import Path  # noqa: TC003
-from typing import TYPE_CHECKING, Annotated
+import shlex
+from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime.
+from typing import Annotated
 
 import typer
-from rich.console import Console
-from rich.table import Table
 
-from scripts._mup_common import Optimizer, Scaling, parse_floats, parse_widths
-
-if TYPE_CHECKING:
-    import pandas as pd
-
-    from oplm.training.mup import MupTransferResult
+from oplm.config import get_preset_config, load_config, serialize_config
+from scripts._mup_common import (
+    Params,
+    PhaseManifest,
+    RunSpec,
+    accelerate_argv,
+    gradient_accumulation_steps,
+    load_phase,
+    parse_candidates,
+    parse_floats,
+    relative_path,
+    result_metric,
+    write_phase,
+)
 
 app = typer.Typer(name="mup-sweep", help=__doc__, add_completion=False)
-console = Console()
 
-# Tail of a failed run's stderr surfaced in the summary (chars).
-_STDERR_TAIL = 2000
-
-
-@dataclass(frozen=True)
-class _GridPoint:
-    """One sweep cell: a width × lr to train and where its metrics land."""
-
-    width: int
-    lr: float
-    run_dir: Path
+SMOKE_LRS = (0.0025, 0.01, 0.04)
+COARSE_LRS = (0.0025, 0.004, 0.0063, 0.01, 0.016, 0.025, 0.04)
+OUTPUT_MULTS = (0.5, 1.0, 2.0)
 
 
-@dataclass(frozen=True)
-class _RunResult:
-    """Outcome of one pilot subprocess."""
+def _cell(
+    *,
+    preset: str,
+    lr: float,
+    output_mult: float,
+    depth_exponent: float,
+    seed: int,
+    global_examples: int,
+    max_steps: int,
+    warmup_steps: int,
+    batch_mult: float | None = None,
+) -> Params:
+    params: Params = {
+        "preset": preset,
+        "lr": lr,
+        "output_mult": output_mult,
+        "depth_exponent": depth_exponent,
+        "seed": seed,
+        "global_examples": global_examples,
+        "max_steps": max_steps,
+        "warmup_steps": warmup_steps,
+    }
+    if batch_mult is not None:
+        params["batch_mult"] = batch_mult
+    return params
 
-    point: _GridPoint
-    returncode: int
-    stderr_tail: str
+
+def _write_run_config(
+    base_config: Path,
+    run_dir: Path,
+    params: Params,
+    *,
+    num_processes: int,
+) -> Path:
+    max_steps = int(params["max_steps"])
+    warmup_steps = int(params["warmup_steps"])
+    if warmup_steps < 0 or warmup_steps >= max_steps:
+        raise ValueError(
+            "warmup_steps must satisfy 0 <= warmup_steps < max_steps, "
+            f"got {warmup_steps} and {max_steps}"
+        )
+
+    preset = str(params["preset"])
+    preset_model = get_preset_config(preset).model
+    base = load_config(["--config", str(base_config)])
+    if base.train.optimizer != "muon":
+        raise ValueError(f"μP sweep requires train.optimizer=muon, got {base.train.optimizer}")
+    if base.train.muon_adjust_lr_fn != "original":
+        raise ValueError(
+            "μP sweep requires train.muon_adjust_lr_fn=original, "
+            f"got {base.train.muon_adjust_lr_fn}"
+        )
+    if base.train.weight_decay != 0.01:
+        raise ValueError(
+            f"μP sweep requires train.weight_decay=0.01, got {base.train.weight_decay}"
+        )
+    grad_accum = gradient_accumulation_steps(
+        int(params["global_examples"]),
+        per_device_batch=base.train.batch_size,
+        world_size=num_processes,
+    )
+    run_name = run_dir.name
+    overrides = [
+        f"model.hidden_size={preset_model.hidden_size}",
+        f"model.num_hidden_layers={preset_model.num_hidden_layers}",
+        f"model.num_attention_heads={preset_model.num_attention_heads}",
+        "model.head_dim=64",
+        "model.mup_enable=true",
+        "model.mup_base_width=768",
+        f"model.mup_output_mult={params['output_mult']}",
+        f"train.lr={params['lr']}",
+        f"train.mup_depth_lr_exponent={params['depth_exponent']}",
+        "train.mup_depth_reference_layers=24",
+        f"train.seed={params['seed']}",
+        f"train.gradient_accumulation_steps={grad_accum}",
+        f"train.max_steps={params['max_steps']}",
+        "train.max_epochs=null",
+        f"train.warmup_steps={params['warmup_steps']}",
+        f"train.stable_steps={max_steps - warmup_steps}",
+        "train.scheduler=wsd_linear",
+        f"train.output_dir={run_dir / 'output'}",
+        f"train.wandb_run_name={run_name}",
+    ]
+    cfg = load_config(["--config", str(base_config), *overrides])
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    return path
 
 
-def _pilot_argv(point: _GridPoint, *, steps: int, data: Path, common: list[str]) -> list[str]:
-    """Build the ``python -m scripts.mup_pilot_run`` argv for one grid point."""
+def _resolve_metric(base_config: Path, metric: str | None) -> str:
+    if metric is not None:
+        return metric
+    cfg = load_config(["--config", str(base_config)])
+    eval_names = [name for name, value in (cfg.data.eval or {}).items() if value is not None]
+    if len(eval_names) != 1:
+        raise ValueError("--metric is required unless the base config has exactly one eval task")
+    return f"eval/{eval_names[0]}/loss"
+
+
+def _input_candidates(source: Path, raw: str | None, names: tuple[str, ...]) -> list[Params]:
+    if raw is not None:
+        return parse_candidates(raw, names)
+    selected = load_phase(source).selected
+    if not selected:
+        raise ValueError(
+            f"source phase {source} has no selected candidates; analyze it or pass --candidates"
+        )
+    return [dict(candidate) for candidate in selected]
+
+
+def _run_id(params: Params) -> str:
+    return (
+        f"{params['preset']}-lr{float(params['lr']):g}"
+        f"-om{float(params['output_mult']):g}"
+        f"-a{float(params['depth_exponent']):g}-s{int(params['seed'])}"
+    )
+
+
+def _generate_phase(
+    *,
+    name: str,
+    base_config: Path,
+    out: Path,
+    metric: str | None,
+    source: Path | None,
+    cells: list[Params],
+    num_processes: int,
+    accelerate_config: Path | None,
+) -> tuple[Path, list[list[str]]]:
+    base_config = base_config.resolve()
+    out = out.resolve()
+    source = source.resolve() if source is not None else None
+    out.mkdir(parents=True, exist_ok=True)
+    runs: list[RunSpec] = []
+    commands: list[list[str]] = []
+    for params in cells:
+        run_id = _run_id(params)
+        run_dir = out / "runs" / run_id
+        config = _write_run_config(base_config, run_dir, params, num_processes=num_processes)
+        result = run_dir / "result.json"
+        runs.append(
+            RunSpec(
+                run_id,
+                str(relative_path(config, out)),
+                str(relative_path(result, out)),
+                params,
+            )
+        )
+        commands.append(
+            accelerate_argv(
+                config=config,
+                result=result,
+                num_processes=num_processes,
+                accelerate_config=accelerate_config,
+            )
+        )
+    phase_path = out / "phase.json"
+    write_phase(
+        phase_path,
+        PhaseManifest(
+            version=1,
+            phase=name,
+            metric=_resolve_metric(base_config, metric),
+            source=str(relative_path(source, out)) if source is not None else None,
+            runs=runs,
+            ranking=[],
+            selected=[],
+        ),
+    )
+    (out / "commands.txt").write_text(
+        "\n".join(shlex.join(command) for command in commands) + "\n"
+    )
+    return phase_path, commands
+
+
+def _smoke_cells(
+    lrs: list[float], global_examples: int, seed: int, steps: int, warmup: int
+) -> list[Params]:
     return [
-        sys.executable,
-        "-m",
-        "scripts.mup_pilot_run",
-        "--width",
-        str(point.width),
-        "--lr",
-        repr(point.lr),
-        "--steps",
-        str(steps),
-        "--data",
-        str(data),
-        "--out",
-        str(point.run_dir),
-        *common,
+        _cell(
+            preset="170M",
+            lr=lr,
+            output_mult=1.0,
+            depth_exponent=0.0,
+            seed=seed,
+            global_examples=global_examples,
+            max_steps=steps,
+            warmup_steps=warmup,
+        )
+        for lr in lrs
     ]
 
 
-def _run_point(
-    point: _GridPoint,
-    *,
+def _coarse_cells(
+    lrs: list[float], global_examples: int, seed: int, steps: int, warmup: int
+) -> list[Params]:
+    return _smoke_cells(lrs, global_examples, seed, steps, warmup)
+
+
+def _refine_cells(
+    candidates: list[Params],
+    output_mults: list[float],
+    global_examples: int,
+    seed: int,
     steps: int,
-    data: Path,
-    common: list[str],
-    gpu_pool: queue.Queue[int],
-) -> _RunResult:
-    """Run one pilot subprocess pinned to a GPU borrowed from ``gpu_pool``."""
-    gpu = gpu_pool.get()
-    try:
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-        console.print(f"[dim]start[/dim] width={point.width} lr={point.lr:g} (GPU {gpu})")
-        proc = subprocess.run(
-            _pilot_argv(point, steps=steps, data=data, common=common),
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
+    warmup: int,
+) -> list[Params]:
+    return [
+        _cell(
+            preset="170M",
+            lr=float(candidate["lr"]),
+            output_mult=output_mult,
+            depth_exponent=0.0,
+            seed=seed,
+            global_examples=global_examples,
+            max_steps=steps,
+            warmup_steps=warmup,
         )
-    finally:
-        gpu_pool.put(gpu)
-
-    if proc.returncode == 0:
-        console.print(f"[green]done[/green]  width={point.width} lr={point.lr:g}")
-    else:
-        console.print(
-            f"[red]FAIL[/red]  width={point.width} lr={point.lr:g} (rc={proc.returncode})"
-        )
-    return _RunResult(point, proc.returncode, (proc.stderr or "")[-_STDERR_TAIL:])
+        for candidate in candidates
+        for output_mult in output_mults
+    ]
 
 
-def _print_results(result: MupTransferResult, df: pd.DataFrame) -> None:
-    """Print the per-(width, lr) losses, the best LR per width, and the verdict."""
-    table = Table(title="Sweep losses", border_style="dim")
-    table.add_column("width", justify="right")
-    table.add_column("lr", justify="right")
-    table.add_column("final_train_loss", justify="right")
-    sorted_df = df.sort_values(["width", "lr"])
-    losses = sorted_df["final_train_loss"].tolist()
-    for width, lr, loss in zip(
-        sorted_df["width"].tolist(), sorted_df["lr"].tolist(), losses, strict=True
-    ):
-        shown = "—" if loss is None or math.isnan(loss) else f"{float(loss):.4f}"
-        table.add_row(str(width), f"{float(lr):g}", shown)
-    console.print(table)
-
-    for width, lr in sorted(result.best_lr.items()):
-        console.print(f"  width [bold]{width}[/bold]: best lr = [cyan]{lr:g}[/cyan]")
-    if result.transferred:
-        console.print("[green]✓ transferred[/green]: every width's best LR agrees — reuse it.")
-    else:
-        console.print(
-            "[yellow]not transferred[/yellow]: widths disagree on the best LR "
-            "(too-coarse grid, too-few steps, or μP misconfigured)."
-        )
-
-
-def _plot_loss_vs_lr(df: pd.DataFrame, out_png: Path, result: MupTransferResult) -> None:
-    """Write a loss-vs-LR plot, one line per width, argmin starred."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(6.0, 4.5))
-    # `best_lr` is int-keyed and covers every swept width, so iterating it both
-    # picks the lines to draw and stars each width's argmin (and keeps types clean).
-    for width in sorted(result.best_lr):
-        valid = df[df["width"] == width].sort_values("lr").dropna(subset=["final_train_loss"])
-        if valid.empty:
-            continue
-        ax.plot(valid["lr"], valid["final_train_loss"], marker="o", label=f"width {width}")
-        best = result.best_lr[width]
-        best_row = valid[valid["lr"] == best]
-        if not best_row.empty:
-            ax.scatter(
-                [best],
-                [best_row["final_train_loss"].iloc[0]],
-                marker="*",
-                s=220,
-                color="black",
-                zorder=5,
-            )
-    ax.set(xscale="log", xlabel="learning rate", ylabel="final EMA train loss")
-    verdict = " — transferred ✓" if result.transferred else ""
-    ax.set_title(f"μP LR sweep{verdict}")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150)
-    plt.close(fig)
+def _smoke_gated_lrs(source: Path, lrs: list[float]) -> list[float]:
+    phase = load_phase(source)
+    runs_by_lr = {float(run.params["lr"]): run for run in phase.runs}
+    phase_dir = source.resolve().parent
+    for lr in SMOKE_LRS[:2]:
+        run = runs_by_lr.get(lr)
+        if run is None or result_metric(phase_dir, run, phase.metric) is None:
+            raise ValueError(f"smoke lr={lr:g} lacks a finite {phase.metric}")
+    high_run = runs_by_lr.get(SMOKE_LRS[-1])
+    if high_run is None or result_metric(phase_dir, high_run, phase.metric) is None:
+        return [lr for lr in lrs if lr != SMOKE_LRS[-1]]
+    return lrs
 
 
 @app.command()
-def main(
-    lrs: Annotated[str, typer.Option("--lrs", help="Comma-separated LR grid.")],
-    data: Annotated[Path, typer.Option("--data", help="Training parquet file or shard dir.")],
-    out: Annotated[Path, typer.Option("--out", help="Sweep output directory.")],
-    widths: Annotated[
-        str, typer.Option("--widths", help="Comma-separated hidden sizes (multiples of 64).")
-    ] = "256,512",
-    gpus: Annotated[int, typer.Option("--gpus", help="Concurrent runs = GPUs (ids 0..N-1).")] = 1,
-    steps: Annotated[int, typer.Option("--steps", help="max_steps per run (shared).")] = 200,
-    depth: Annotated[
-        int, typer.Option("--depth", help="Layers (width mode; preset_ray co-scales).")
-    ] = 4,
-    scaling: Annotated[
-        Scaling, typer.Option("--scaling", help="'width' (fixed depth) or 'preset_ray'.")
-    ] = Scaling.width,
-    optimizer: Annotated[
-        Optimizer, typer.Option("--optimizer", help="Optimizer (μP+muon uses 'original').")
-    ] = Optimizer.muon,
-    mup: Annotated[bool, typer.Option("--mup/--no-mup", help="Enable μP for every run.")] = True,
-    base_width: Annotated[int, typer.Option("--base-width", help="μP base width.")] = 512,
-    output_mult: Annotated[float, typer.Option("--output-mult", help="μP readout mult.")] = 1.0,
-    batch_size: Annotated[
-        int, typer.Option("--batch-size", help="Per-step micro-batch (per GPU).")
-    ] = 32,
-    grad_accum: Annotated[
-        int,
-        typer.Option(
-            "--grad-accum",
-            help="Gradient-accumulation steps; global batch = batch_size × grad_accum (per point).",
-        ),
-    ] = 1,
-    warmup_steps: Annotated[int, typer.Option("--warmup-steps", help="Scheduler warmup.")] = 0,
-    weight_decay: Annotated[float, typer.Option("--weight-decay", help="Weight decay.")] = 0.0,
-    max_length: Annotated[int, typer.Option("--max-length", help="max_position_embeddings.")] = 512,
-    seed: Annotated[int, typer.Option("--seed", help="Shared random seed.")] = 0,
-    num_workers: Annotated[int, typer.Option("--num-workers", help="DataLoader workers.")] = 4,
-    mixed_precision: Annotated[
-        str, typer.Option("--mixed-precision", help="'bf16'/'fp16'/'no'.")
-    ] = "bf16",
+def smoke(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    lrs: Annotated[str, typer.Option("--lrs")] = "0.0025,0.01,0.04",
+    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 1000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 100,
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
 ) -> None:
-    """Run a μP LR × width sweep, then report the best LR per width and the verdict."""
-    from oplm.training.mup import best_lr_per_width, summarize_sweep
+    """Generate the three-cell production smoke phase."""
+    try:
+        _generate_phase(
+            name="smoke",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=None,
+            cells=_smoke_cells(
+                parse_floats(lrs, name="--lrs"), global_examples, seed, steps, warmup
+            ),
+            num_processes=num_processes,
+            accelerate_config=accelerate_config,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-    width_list = parse_widths(widths)
-    lr_list = parse_floats(lrs, name="--lrs")
-    if gpus < 1:
-        raise typer.BadParameter(f"--gpus must be >= 1; got {gpus}")
-    out.mkdir(parents=True, exist_ok=True)
 
-    # Options identical across every grid point (only width + lr vary).
-    common = [
-        "--depth", str(depth),
-        "--scaling", scaling.value,
-        "--optimizer", optimizer.value,
-        "--mup" if mup else "--no-mup",
-        "--base-width", str(base_width),
-        "--output-mult", repr(output_mult),
-        "--batch-size", str(batch_size),
-        "--grad-accum", str(grad_accum),
-        "--warmup-steps", str(warmup_steps),
-        "--weight-decay", repr(weight_decay),
-        "--max-length", str(max_length),
-        "--seed", str(seed),
-        "--num-workers", str(num_workers),
-        "--mixed-precision", mixed_precision,
-    ]  # fmt: skip
+@app.command()
+def coarse(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    source: Annotated[
+        Path | None, typer.Option("--from", exists=True, dir_okay=False)
+    ] = None,
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    lrs: Annotated[str, typer.Option("--lrs")] = "0.0025,0.004,0.0063,0.01,0.016,0.025,0.04",
+    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 10000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+) -> None:
+    """Generate the production coarse LR phase, optionally gated by smoke results."""
+    try:
+        lr_values = parse_floats(lrs, name="--lrs")
+        if source is not None:
+            lr_values = _smoke_gated_lrs(source, lr_values)
+        _generate_phase(
+            name="coarse",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=_coarse_cells(lr_values, global_examples, seed, steps, warmup),
+            num_processes=num_processes,
+            accelerate_config=accelerate_config,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-    grid = [_GridPoint(w, lr, out / f"w{w}_lr{lr:g}") for w, lr in product(width_list, lr_list)]
-    console.print(
-        f"[bold]μP sweep[/bold] {len(grid)} runs "
-        f"({len(width_list)} widths × {len(lr_list)} LRs) on {gpus} GPU(s) → {out}"
-    )
-    # Global batch is shared across every grid point (one GPU/point), so only width
-    # + lr vary — μP transfers LR across width, not batch size (see docs/MUP.md).
-    console.print(
-        f"[dim]global batch = {batch_size} × {grad_accum} = {batch_size * grad_accum} "
-        f"per optimizer step[/dim]"
-    )
 
-    gpu_pool: queue.Queue[int] = queue.Queue()
-    for gpu in range(gpus):
-        gpu_pool.put(gpu)
-
-    results: list[_RunResult] = []
-    with ThreadPoolExecutor(max_workers=gpus) as pool:
-        futures = [
-            pool.submit(_run_point, point, steps=steps, data=data, common=common, gpu_pool=gpu_pool)
-            for point in grid
-        ]
-        for future in as_completed(futures):
-            results.append(future.result())
-
-    failed = [r for r in results if r.returncode != 0]
-    succeeded = [
-        r for r in results if r.returncode == 0 and (r.point.run_dir / "metrics.json").exists()
-    ]
-    if failed:
-        console.print(f"[red]{len(failed)} run(s) failed.[/red] Example stderr tail:")
-        console.print(failed[0].stderr_tail or "(no stderr captured)")
-    if not succeeded:
-        raise typer.Exit(code=1)
-
-    df = summarize_sweep([r.point.run_dir for r in succeeded])
-    result = best_lr_per_width(df)
-    _print_results(result, df)
-    plot_path = out / "sweep_loss_vs_lr.png"
-    _plot_loss_vs_lr(df, plot_path, result)
-    console.print(f"[green]wrote[/green] {plot_path}")
+@app.command()
+def refine(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    output_mults: Annotated[str, typer.Option("--output-mults")] = "0.5,1,2",
+    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 20000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+) -> None:
+    """Generate the production LR × output-multiplier refinement phase."""
+    try:
+        cells = _refine_cells(
+            _input_candidates(source, candidates, ("lr", "output_mult")),
+            parse_floats(output_mults, name="--output-mults"),
+            global_examples,
+            seed,
+            steps,
+            warmup,
+        )
+        _generate_phase(
+            name="refine",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            accelerate_config=accelerate_config,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 if __name__ == "__main__":

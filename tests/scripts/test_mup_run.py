@@ -4,10 +4,10 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
-
-from oplm.config import serialize_config
 from scripts import mup_run
 from tests.training.conftest import tiny_train_cfg
+
+from oplm.config import serialize_config
 
 if TYPE_CHECKING:
     from pathlib import Path
