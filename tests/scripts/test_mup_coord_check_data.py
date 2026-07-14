@@ -11,7 +11,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
-from scripts.mup_coord_check import _DEFAULT_SEQUENCES, _load_sequences
+from scripts._mup_common import Scaling
+from scripts.mup_coord_check import _DEFAULT_SEQUENCES, _build_cfg_fn, _load_sequences
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -43,3 +44,37 @@ def test_load_sequences_shard_directory(training_parquet: Path, tmp_path: Path) 
     seqs = _load_sequences(shard_dir, n_seqs)
     assert len(seqs) == n_seqs
     assert all(isinstance(s, str) and s for s in seqs)
+
+
+def test_coord_check_resolves_production_model_features(tmp_path: Path) -> None:
+    config = tmp_path / "base.yaml"
+    config.write_text(
+        """
+model:
+  norm_strategy: sandwich
+  canon_enabled: true
+  canon_positions: [A, B, C, D]
+  residual_gate: channel
+  value_residual: learnable
+""".lstrip()
+    )
+    build = _build_cfg_fn(
+        config=config,
+        depth=24,
+        mup=True,
+        scaling=Scaling.preset_ray,
+        base_width=768,
+        output_mult=1.0,
+    )
+
+    cfg = build(1280)
+
+    assert cfg.hidden_size == 1280
+    assert cfg.num_hidden_layers == 40
+    assert cfg.num_attention_heads == 20
+    assert cfg.head_dim == 64
+    assert cfg.norm_strategy == "sandwich"
+    assert cfg.canon_positions == ["A", "B", "C", "D"]
+    assert cfg.residual_gate == "channel"
+    assert cfg.value_residual == "learnable"
+    assert cfg.mup_base_width == 768
