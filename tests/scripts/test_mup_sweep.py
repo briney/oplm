@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -296,6 +297,76 @@ def test_generation_requires_metric_for_ambiguous_eval_config(
     )
     assert result.exit_code != 0
     assert "--metric is required" in result.output
+
+
+@pytest.mark.parametrize(
+    "metric",
+    ["eval/heldout/accuracy", "eval/heldout/perplexity"],
+)
+def test_generation_rejects_explicit_non_loss_metric(
+    base_config: Path, tmp_path: Path, metric: str
+) -> None:
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            "smoke",
+            "--config",
+            str(base_config),
+            "--out",
+            str(tmp_path / "smoke"),
+            "--metric",
+            metric,
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--metric must be eval/heldout/loss" in result.output
+
+
+def test_generation_accepts_explicit_configured_loss_metric(
+    base_config: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "smoke"
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            "smoke",
+            "--config",
+            str(base_config),
+            "--out",
+            str(out),
+            "--metric",
+            "eval/heldout/loss",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert load_phase(out / "phase.json").metric == "eval/heldout/loss"
+
+
+def test_generation_resolves_relative_accelerate_config(
+    base_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accelerate_config = tmp_path / "accelerate.yaml"
+    accelerate_config.write_text("compute_environment: LOCAL_MACHINE\n")
+    out = tmp_path / "smoke"
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        mup_sweep.app,
+        [
+            "smoke",
+            "--config",
+            str(base_config),
+            "--out",
+            str(out),
+            "--accelerate-config",
+            accelerate_config.name,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    command = shlex.split((out / "commands.txt").read_text().splitlines()[0])
+    config_index = command.index("--config_file") + 1
+    assert command[config_index] == str(accelerate_config.resolve())
 
 
 def test_later_phase_default_cell_counts() -> None:

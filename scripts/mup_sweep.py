@@ -140,13 +140,22 @@ def _write_run_config(
 
 
 def _resolve_metric(base_config: Path, metric: str | None) -> str:
-    if metric is not None:
-        return metric
     cfg = load_config(["--config", str(base_config)])
     eval_names = [name for name, value in (cfg.data.eval or {}).items() if value is not None]
+    allowed_metrics = [f"eval/{name}/loss" for name in eval_names]
+    if metric is not None:
+        if metric not in allowed_metrics:
+            if len(allowed_metrics) == 1:
+                expected = allowed_metrics[0]
+            elif allowed_metrics:
+                expected = f"one of: {', '.join(allowed_metrics)}"
+            else:
+                expected = "a configured eval/<task>/loss"
+            raise ValueError(f"--metric must be {expected}")
+        return metric
     if len(eval_names) != 1:
         raise ValueError("--metric is required unless the base config has exactly one eval task")
-    return f"eval/{eval_names[0]}/loss"
+    return allowed_metrics[0]
 
 
 def _input_candidates(source: Path, raw: str | None, names: tuple[str, ...]) -> list[Params]:
@@ -182,6 +191,7 @@ def _generate_phase(
     base_config = base_config.resolve()
     out = out.resolve()
     source = source.resolve() if source is not None else None
+    accelerate_config = accelerate_config.resolve() if accelerate_config is not None else None
     out.mkdir(parents=True, exist_ok=True)
     runs: list[RunSpec] = []
     commands: list[list[str]] = []
