@@ -768,16 +768,12 @@ def test_missing_and_nonfinite_results_are_ineligible(tmp_path: Path) -> None:
     assert analyzed.selected == [{"lr": 0.01}]
 
 
-def _replicate_fixture(
-    tmp_path: Path, *, losses: dict[float, list[float]]
-) -> tuple[Path, Path]:
+def _replicate_fixture(tmp_path: Path, *, losses: dict[float, list[float]]) -> tuple[Path, Path]:
     source_dir = tmp_path / "refine"
     replicate_dir = tmp_path / "replicate"
     source_dir.mkdir()
     replicate_dir.mkdir()
-    candidates = [
-        {"lr": lr, "output_mult": 1.0, "depth_exponent": 0.0} for lr in losses
-    ]
+    candidates = [{"lr": lr, "output_mult": 1.0, "depth_exponent": 0.0} for lr in losses]
     source_runs = [
         RunSpec(
             f"lr-{lr:g}-seed-42",

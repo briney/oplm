@@ -284,9 +284,10 @@ def test_depth_lr_multiplier_composes_with_muon_groups() -> None:
     )
     optimizers = build_optimizers(model, cfg)
 
-    assert _group_lr(
-        "oplm.backbone.layers.0.attention.q_proj.weight", model, optimizers
-    ) == ("Muon", pytest.approx(lr * depth_mult))
+    assert _group_lr("oplm.backbone.layers.0.attention.q_proj.weight", model, optimizers) == (
+        "Muon",
+        pytest.approx(lr * depth_mult),
+    )
     assert _group_lr("lm_head.dense.weight", model, optimizers) == (
         "AdamW",
         pytest.approx(lr / m),
@@ -307,16 +308,18 @@ def test_depth_lr_multiplier_composes_with_adamw_width_groups() -> None:
     )
     optimizers = build_optimizers(model, cfg)
 
-    assert _group_lr(
-        "oplm.backbone.layers.0.attention.q_proj.weight", model, optimizers
-    ) == ("AdamW", pytest.approx(lr * depth_mult / m))
+    assert _group_lr("oplm.backbone.layers.0.attention.q_proj.weight", model, optimizers) == (
+        "AdamW",
+        pytest.approx(lr * depth_mult / m),
+    )
     assert _group_lr("lm_head.dense.weight", model, optimizers) == (
         "AdamW",
         pytest.approx(lr / m),
     )
-    assert _group_lr(
-        "oplm.backbone.embed_tokens.embed_tokens.weight", model, optimizers
-    ) == ("AdamW", pytest.approx(lr))
+    assert _group_lr("oplm.backbone.embed_tokens.embed_tokens.weight", model, optimizers) == (
+        "AdamW",
+        pytest.approx(lr),
+    )
 
 
 # ---------------------------------------------------------------------------

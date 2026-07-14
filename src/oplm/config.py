@@ -168,13 +168,11 @@ class TrainConfig:
             raise ValueError(f"peak_tflops must be > 0, got {self.peak_tflops}")
         if not math.isfinite(self.mup_depth_lr_exponent) or self.mup_depth_lr_exponent < 0:
             raise ValueError(
-                "mup_depth_lr_exponent must be finite and >= 0, "
-                f"got {self.mup_depth_lr_exponent}"
+                f"mup_depth_lr_exponent must be finite and >= 0, got {self.mup_depth_lr_exponent}"
             )
         if self.mup_depth_reference_layers < 1:
             raise ValueError(
-                "mup_depth_reference_layers must be >= 1, "
-                f"got {self.mup_depth_reference_layers}"
+                f"mup_depth_reference_layers must be >= 1, got {self.mup_depth_reference_layers}"
             )
 
 

@@ -496,9 +496,7 @@ def _replicate_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str,
     entries: list[dict[str, object]] = []
     for key in keys:
         matching = [
-            (phase_dir, run)
-            for phase_dir, run in locations
-            if _aggregate_key(run.params) == key
+            (phase_dir, run) for phase_dir, run in locations if _aggregate_key(run.params) == key
         ]
         seeds = {int(run.params["seed"]) for _, run in matching}
         values = [result_metric(phase_dir, run, phase.metric) for phase_dir, run in matching]
@@ -533,9 +531,7 @@ def _transfer_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, 
     for key in keys:
         ranks = [per_model_rank.get((preset, key)) for preset in presets]
         score = (
-            sum(int(rank) for rank in ranks)
-            if all(rank is not None for rank in ranks)
-            else None
+            sum(int(rank) for rank in ranks) if all(rank is not None for rank in ranks) else None
         )
         params = _aggregate_params(key)
         params.pop("batch_mult", None)
@@ -584,15 +580,13 @@ def analyze_phase(path: Path) -> PhaseManifest:
         elif phase.phase == "bridge":
             keys = ("lr", "output_mult", "depth_exponent", "batch_mult")
             ranked = [
-                {**entry, "params": _candidate(entry["params"], keys)}
-                for entry in phase.ranking
+                {**entry, "params": _candidate(entry["params"], keys)} for entry in phase.ranking
             ]
             phase.selected = _select_count(ranked, 2)
         elif phase.phase == "confirm":
             keys = ("lr", "output_mult", "depth_exponent", "batch_mult")
             ranked = [
-                {**entry, "params": _candidate(entry["params"], keys)}
-                for entry in phase.ranking
+                {**entry, "params": _candidate(entry["params"], keys)} for entry in phase.ranking
             ]
             phase.selected = _select_count(ranked, 1)
         elif phase.phase == "scale":
