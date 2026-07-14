@@ -247,7 +247,7 @@ def coord_check(
 
 
 class SweepMetricsCallback(TrainerCallback):
-    """Capture a sweep run's losses and write ``metrics.json`` at train end.
+    """Capture a sweep run's losses and write ``result.json`` at train end.
 
     ``trainer_state.json`` carries no loss, so the LR sweep relies on this
     callback. It EMA-smooths the train loss across ``on_log`` events, keeps the
