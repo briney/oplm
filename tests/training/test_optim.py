@@ -15,7 +15,7 @@ import pytest
 from oplm.config import TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM
-from oplm.training.optim import partition_optimizer_params
+from oplm.training.optim import OptimizerParamGroups, partition_optimizer_params
 
 if TYPE_CHECKING:
     import torch
@@ -52,13 +52,17 @@ def _names_of(params: list[torch.nn.Parameter], id_to_name: dict[int, str]) -> s
     return {id_to_name[id(p)] for p in params}
 
 
+def _muon_params(groups: OptimizerParamGroups) -> list[torch.nn.Parameter]:
+    return [param for group in groups.muon_groups for param in group.params]
+
+
 def test_muon_excludes_lm_head_weights() -> None:
     """Under Muon, no ``lm_head.*`` weight leaks into Muon; both 2-D head weights go to AdamW."""
     model = _model()
     id_to_name = {id(p): n for n, p in model.named_parameters()}
     groups = partition_optimizer_params(model, TrainConfig(optimizer="muon"))
 
-    muon_names = _names_of(groups.muon_params, id_to_name)
+    muon_names = _names_of(_muon_params(groups), id_to_name)
     assert not any(name.startswith("lm_head.") for name in muon_names)
 
     decay_names = _names_of(groups.adamw_decay_params, id_to_name)
@@ -88,7 +92,7 @@ def test_partition_covers_every_trainable_param_once() -> None:
     groups = partition_optimizer_params(model, TrainConfig(optimizer="muon"))
 
     grouped = [
-        *groups.muon_params,
+        *_muon_params(groups),
         *groups.adamw_decay_params,
         *groups.adamw_no_decay_params,
     ]
@@ -103,7 +107,7 @@ def test_adamw_leaves_muon_group_empty() -> None:
     """With the default AdamW optimizer, nothing is routed to Muon."""
     model = _model()
     groups = partition_optimizer_params(model, TrainConfig(optimizer="adamw"))
-    assert groups.muon_params == []
+    assert _muon_params(groups) == []
 
 
 def test_mup_partition_tags_scaled_adamw_groups() -> None:
@@ -129,7 +133,7 @@ def test_mup_partition_tags_scaled_adamw_groups() -> None:
     assert lr_mult_of("lm_head.dense.weight") == pytest.approx(1.0 / m)
     assert lr_mult_of("lm_head.decoder.weight") == 1.0  # μP readout: width-independent
 
-    muon_names = _names_of(groups.muon_params, id_to_name)
+    muon_names = _names_of(_muon_params(groups), id_to_name)
     assert "oplm.backbone.layers.0.attention.q_proj.weight" in muon_names
     assert not any(name.startswith("lm_head.") for name in muon_names)
 
@@ -141,6 +145,20 @@ def test_mup_off_partition_lr_mults_all_one() -> None:
         groups = partition_optimizer_params(model, TrainConfig(optimizer=optimizer))
         assert all(g.lr_mult == 1.0 for g in groups.adamw_groups)
         assert len(groups.adamw_groups) <= 2  # only the usual decay / no-decay split
+
+
+def test_zero_depth_exponent_keeps_one_muon_lr_group() -> None:
+    model = _model()
+    groups = partition_optimizer_params(
+        model,
+        TrainConfig(
+            optimizer="muon",
+            mup_depth_lr_exponent=0.0,
+            mup_depth_reference_layers=24,
+        ),
+    )
+    assert len(groups.muon_groups) == 1
+    assert groups.muon_groups[0].lr_mult == 1.0
 
 
 def test_residual_gates_land_in_no_decay_group() -> None:
@@ -165,6 +183,6 @@ def test_residual_gates_land_in_no_decay_group() -> None:
     for optimizer in ("adamw", "muon"):
         groups = partition_optimizer_params(model, TrainConfig(optimizer=optimizer))
         no_decay = _names_of(groups.adamw_no_decay_params, id_to_name)
-        muon = _names_of(groups.muon_params, id_to_name)
+        muon = _names_of(_muon_params(groups), id_to_name)
         assert gate_names <= no_decay, f"gates missing from no-decay under {optimizer}"
         assert not (gate_names & muon), f"gates leaked into Muon under {optimizer}"

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class AdamwParamGroup:
-    """AdamW parameters sharing a ``(weight_decay, μP LR multiplier)`` pair."""
+    """AdamW parameters sharing a ``(weight_decay, width/depth LR multiplier)`` pair."""
 
     params: list[torch.nn.Parameter]
     weight_decay: float
@@ -30,16 +30,29 @@ class AdamwParamGroup:
 
 
 @dataclass(frozen=True)
+class MuonParamGroup:
+    """Muon parameters sharing one depth LR multiplier."""
+
+    params: list[torch.nn.Parameter]
+    lr_mult: float
+
+
+@dataclass(frozen=True)
 class OptimizerParamGroups:
     """Partitioned model parameters for AdamW or Muon training.
 
+    Muon params are split into one :class:`MuonParamGroup` per distinct depth
+    LR multiplier. At depth exponent zero, every Muon parameter stays in one
+    group with multiplier ``1.0``.
+
     AdamW params are split into one :class:`AdamwParamGroup` per distinct
-    ``(weight_decay, μP LR multiplier)``. With μP off (or at the base width) every
-    multiplier is ``1.0``, so there are at most the usual two groups (decay +
-    no-decay) and the optimizer is identical to the pre-μP path.
+    ``(weight_decay, composed width/depth LR multiplier)``. With μP off (or at
+    the base width) and depth exponent zero every multiplier is ``1.0``, so there
+    are at most the usual two groups (decay + no-decay) and the optimizer is
+    identical to the pre-μP path.
     """
 
-    muon_params: list[torch.nn.Parameter]
+    muon_groups: list[MuonParamGroup]
     adamw_groups: list[AdamwParamGroup]
 
     @property
@@ -58,13 +71,23 @@ def _uses_no_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
     return param.ndim <= 1 or "embed" in name
 
 
+def _depth_lr_multiplier(name: str, model_config: OplmConfig, cfg: TrainConfig) -> float:
+    """Return the repeated-block depth correction for one named parameter."""
+    if not name.startswith("oplm.backbone.layers."):
+        return 1.0
+    return (
+        cfg.mup_depth_reference_layers / model_config.num_hidden_layers
+    ) ** cfg.mup_depth_lr_exponent
+
+
 def partition_optimizer_params(model: nn.Module, cfg: TrainConfig) -> OptimizerParamGroups:
-    """Split model parameters into Muon and AdamW groups.
+    """Split model parameters into depth-aware Muon and width/depth-aware AdamW groups.
 
     The AdamW path preserves the existing OPLM grouping rules. The Muon path
     follows PyTorch's recommendation to use Muon only for eligible 2D hidden
     weights and keep embeddings, biases, norms, classifier weights, and other
-    non-2D parameters on AdamW.
+    non-2D parameters on AdamW. Repeated-block parameters receive the configured
+    depth LR multiplier, composed with μP width scaling for AdamW parameters.
 
     Args:
         model: The model whose parameters should be partitioned.
@@ -82,53 +105,61 @@ def partition_optimizer_params(model: nn.Module, cfg: TrainConfig) -> OptimizerP
     # a no-op (returns 1.0) whenever μP is disabled, so the non-μP path is intact.
     model_config = cast("OplmConfig", model.config)
 
-    muon_params: list[torch.nn.Parameter] = []
-    # Preserve first-seen order of (weight_decay, lr_mult) keys for determinism.
+    # Preserve first-seen order of multiplier keys for determinism.
+    muon_buckets: dict[float, list[torch.nn.Parameter]] = {}
     adamw_buckets: dict[tuple[float, float], list[torch.nn.Parameter]] = {}
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
+        depth_mult = _depth_lr_multiplier(name, model_config, cfg)
         if _uses_no_weight_decay(name, param):
             weight_decay = 0.0
         elif cfg.optimizer == "muon" and param.ndim == 2 and not name.startswith("lm_head."):
-            muon_params.append(param)
+            muon_buckets.setdefault(depth_mult, []).append(param)
             continue
         else:
             weight_decay = cfg.weight_decay
 
-        lr_mult = mup_lr_multiplier(name, param, model_config)
+        lr_mult = mup_lr_multiplier(name, param, model_config) * depth_mult
         adamw_buckets.setdefault((weight_decay, lr_mult), []).append(param)
 
+    muon_groups = [
+        MuonParamGroup(params=params, lr_mult=mult) for mult, params in muon_buckets.items()
+    ]
     adamw_groups = [
         AdamwParamGroup(params=params, weight_decay=wd, lr_mult=mult)
         for (wd, mult), params in adamw_buckets.items()
     ]
 
-    grouped = [*muon_params, *(p for g in adamw_groups for p in g.params)]
+    grouped = [
+        *(param for group in muon_groups for param in group.params),
+        *(param for group in adamw_groups for param in group.params),
+    ]
     grouped_ids = [id(param) for param in grouped]
     model_ids = [id(param) for param in model.parameters() if param.requires_grad]
     if len(grouped_ids) != len(set(grouped_ids)):
         raise RuntimeError("Optimizer parameter partition duplicated one or more parameters")
     if set(grouped_ids) != set(model_ids):
         raise RuntimeError("Optimizer parameter partition did not cover all trainable parameters")
-    if cfg.optimizer == "muon" and not muon_params:
+    if cfg.optimizer == "muon" and not muon_groups:
         raise ValueError("Muon optimizer requires at least one eligible 2D hidden weight")
 
-    return OptimizerParamGroups(muon_params=muon_params, adamw_groups=adamw_groups)
+    return OptimizerParamGroups(muon_groups=muon_groups, adamw_groups=adamw_groups)
 
 
 def _build_adamw_optimizer(
     adamw_groups: Sequence[AdamwParamGroup],
     cfg: TrainConfig,
 ) -> torch.optim.AdamW:
-    """Build an AdamW optimizer, one param-group per ``(weight_decay, μP mult)``.
+    """Build AdamW with groups keyed by weight decay and composed width/depth LR mult.
 
-    Each group's base LR is ``cfg.lr * lr_mult``; with μP off every multiplier is
-    ``1.0``, so this reduces to the original two-group (decay/no-decay) optimizer
-    at ``cfg.lr``. LambdaLR captures each group's ``initial_lr`` and scales them
-    all by the same schedule λ, so the heterogeneous base LRs compose correctly.
+    Each group's base LR is ``cfg.lr * lr_mult``; with μP off and depth exponent
+    zero every multiplier is ``1.0``, so this reduces to the original two-group
+    (decay/no-decay) optimizer at ``cfg.lr``. LambdaLR captures each group's
+    ``initial_lr`` and scales them all by the same schedule λ, so the heterogeneous
+    base LRs compose correctly.
     """
     param_groups = [
         {"params": list(g.params), "weight_decay": g.weight_decay, "lr": cfg.lr * g.lr_mult}
@@ -188,7 +219,10 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
         return [_build_adamw_optimizer(param_groups.adamw_groups, cfg)]
 
     muon_optimizer = torch.optim.Muon(
-        param_groups.muon_params,
+        [
+            {"params": list(group.params), "lr": cfg.lr * group.lr_mult}
+            for group in param_groups.muon_groups
+        ],
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
         momentum=cfg.muon_momentum,
