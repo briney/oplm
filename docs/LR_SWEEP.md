@@ -24,18 +24,35 @@ different from the general model-config fallback/default of `mup_base_width=512`
 
 ## One production config
 
-Use one `configs/mup-production.yaml` for every command below. It must contain the production
-model, data, masking, and evaluation settings. The command sequence assumes exactly one eval
-task so the harness can infer its `eval/<name>/loss` metric.
-
-The phase generator validates these fixed optimizer settings:
+Use one `configs/mup-production.yaml` for every command below. Create that path (including its
+`configs/` directory) at the repository root with this base config, replacing only the two
+dataset paths:
 
 ```yaml
+model:
+  norm_strategy: sandwich
+  canon_enabled: true
+  canon_positions: [A, B, C, D]
+  residual_gate: channel
+
 train:
+  batch_size: 32
   optimizer: muon
   muon_adjust_lr_fn: original
   weight_decay: 0.01
+
+data:
+  train: /path/to/train.parquet
+  eval:
+    heldout:
+      path: /path/to/eval.parquet
+      type: sequence
+      every: {steps: 500}
 ```
+
+The file merges over the packaged defaults. Add any production-specific masking, precision,
+compile, or checkpoint overrides to this same file before launch. Keep exactly one named
+sequence eval task so the harness can infer its `eval/<name>/loss` metric.
 
 Keep weight decay fixed at `0.01` for the complete workflow. The generator also resolves each
 cell with μP enabled, base width 768, reference depth 24, the requested depth exponent, and a
@@ -103,7 +120,7 @@ The defaults implement this funnel:
 | `refine` | Cross the selected local LR region with output multipliers `0.5,1,2`. |
 | first `replicate` | Add seeds 43 and 44 to seed 42 for the two finalists. |
 | `transfer` | Test both finalists and depth exponents `0,0.25,0.5` at 400M, 800M, and 1B. |
-| `bridge` | Test batch multipliers `0.7,1,1.4,2` at the 170M production batch. |
+| `bridge` | Test batch-correction LR multipliers `0.7,1,1.4,2` at the 170M production batch. |
 | second `replicate` | Add seeds 43 and 44 to the bridge finalists. |
 | `confirm` | Rank the production-batch finalists at 800M. |
 | `scale` | Run the winner for 100,000 steps across 50M, 170M, 400M, 800M, and 1B. |
