@@ -173,6 +173,9 @@ cython_debug/
 # Local git worktrees
 .worktrees/
 
+# Local agent execution state
+.superpowers/
+
 # PyPI configuration file
 .pypirc
 
