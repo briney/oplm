@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
@@ -66,6 +67,12 @@ def _write_selected_phase(
         ),
     )
     return path
+
+
+def _write_result(phase_dir: Path, run: RunSpec, loss: float) -> None:
+    path = phase_dir / run.result
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"eval": {"eval/heldout/loss": loss}}))
 
 
 def test_smoke_generates_three_production_cells(base_config: Path, tmp_path: Path) -> None:
@@ -701,3 +708,206 @@ def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
         mup_sweep._parse_ints(",", name="--seeds")
     with pytest.raises(typer.BadParameter, match="must list at least one value"):
         mup_sweep._parse_strings(",", name="--presets")
+
+
+def test_coarse_selects_interior_winner_and_neighbors(tmp_path: Path) -> None:
+    lrs = [0.0025, 0.004, 0.0063, 0.01, 0.016, 0.025, 0.04]
+    runs = [
+        RunSpec(
+            f"run-{index}",
+            f"runs/run-{index}/run.yaml",
+            f"runs/run-{index}/result.json",
+            {"lr": lr, "output_mult": 1.0, "seed": 42},
+        )
+        for index, lr in enumerate(lrs)
+    ]
+    phase = PhaseManifest(1, "coarse", "eval/heldout/loss", None, runs, [], [])
+    path = tmp_path / "phase.json"
+    write_phase(path, phase)
+    for run in runs:
+        _write_result(tmp_path, run, abs(float(run.params["lr"]) - 0.01) + 1.0)
+
+    mup_sweep.analyze_phase(path)
+
+    analyzed = load_phase(path)
+    assert [candidate["lr"] for candidate in analyzed.selected] == [0.0063, 0.01, 0.016]
+
+
+def test_coarse_edge_winner_blocks_refinement(tmp_path: Path) -> None:
+    runs = [
+        RunSpec(
+            f"run-{index}",
+            f"runs/run-{index}/run.yaml",
+            f"runs/run-{index}/result.json",
+            {"lr": lr, "output_mult": 1.0, "seed": 42},
+        )
+        for index, lr in enumerate([0.0025, 0.004, 0.0063])
+    ]
+    path = tmp_path / "phase.json"
+    write_phase(path, PhaseManifest(1, "coarse", "eval/heldout/loss", None, runs, [], []))
+    for index, run in enumerate(runs):
+        _write_result(tmp_path, run, 1.0 + index)
+    mup_sweep.analyze_phase(path)
+    assert load_phase(path).selected == []
+
+
+def test_missing_and_nonfinite_results_are_ineligible(tmp_path: Path) -> None:
+    runs = [
+        RunSpec("ok", "runs/ok/run.yaml", "runs/ok/result.json", {"lr": 0.01}),
+        RunSpec("missing", "runs/missing/run.yaml", "runs/missing/result.json", {"lr": 0.016}),
+        RunSpec("nan", "runs/nan/run.yaml", "runs/nan/result.json", {"lr": 0.025}),
+    ]
+    path = tmp_path / "phase.json"
+    write_phase(path, PhaseManifest(1, "confirm", "eval/heldout/loss", None, runs, [], []))
+    _write_result(tmp_path, runs[0], 1.0)
+    _write_result(tmp_path, runs[2], float("nan"))
+    mup_sweep.analyze_phase(path)
+    analyzed = load_phase(path)
+    scores = {entry["id"]: entry["score"] for entry in analyzed.ranking}
+    assert scores == {"ok": 1.0, "missing": None, "nan": None}
+    assert analyzed.selected == [{"lr": 0.01}]
+
+
+def _replicate_fixture(
+    tmp_path: Path, *, losses: dict[float, list[float]]
+) -> tuple[Path, Path]:
+    source_dir = tmp_path / "refine"
+    replicate_dir = tmp_path / "replicate"
+    source_dir.mkdir()
+    replicate_dir.mkdir()
+    candidates = [
+        {"lr": lr, "output_mult": 1.0, "depth_exponent": 0.0} for lr in losses
+    ]
+    source_runs = [
+        RunSpec(
+            f"lr-{lr:g}-seed-42",
+            f"runs/lr-{lr:g}-seed-42/run.yaml",
+            f"runs/lr-{lr:g}-seed-42/result.json",
+            {**candidate, "seed": 42},
+        )
+        for lr, candidate in zip(losses, candidates, strict=True)
+    ]
+    replicate_runs = [
+        RunSpec(
+            f"lr-{lr:g}-seed-{seed}",
+            f"runs/lr-{lr:g}-seed-{seed}/run.yaml",
+            f"runs/lr-{lr:g}-seed-{seed}/result.json",
+            {**candidate, "seed": seed},
+        )
+        for lr, candidate in zip(losses, candidates, strict=True)
+        for seed in (43, 44)
+    ]
+    source_path = source_dir / "phase.json"
+    replicate_path = replicate_dir / "phase.json"
+    write_phase(
+        source_path,
+        PhaseManifest(1, "refine", "eval/heldout/loss", None, source_runs, [], candidates),
+    )
+    write_phase(
+        replicate_path,
+        PhaseManifest(
+            1,
+            "replicate",
+            "eval/heldout/loss",
+            "../refine/phase.json",
+            replicate_runs,
+            [],
+            [],
+        ),
+    )
+    for run in source_runs:
+        lr = float(run.params["lr"])
+        _write_result(source_dir, run, losses[lr][0])
+    for run in replicate_runs:
+        lr = float(run.params["lr"])
+        seed_index = int(run.params["seed"]) - 42
+        _write_result(replicate_dir, run, losses[lr][seed_index])
+    return source_path, replicate_path
+
+
+def _transfer_fixture(tmp_path: Path) -> Path:
+    phase_dir = tmp_path / "transfer"
+    phase_dir.mkdir()
+    runs: list[RunSpec] = []
+    for lr in (0.01, 0.016):
+        for exponent in (0.0, 0.25, 0.5):
+            for preset in ("400M", "800M", "1B"):
+                run_id = f"{preset}-lr{lr:g}-a{exponent:g}"
+                runs.append(
+                    RunSpec(
+                        run_id,
+                        f"runs/{run_id}/run.yaml",
+                        f"runs/{run_id}/result.json",
+                        {
+                            "preset": preset,
+                            "lr": lr,
+                            "output_mult": 1.0,
+                            "depth_exponent": exponent,
+                            "seed": 42,
+                        },
+                    )
+                )
+    path = phase_dir / "phase.json"
+    write_phase(
+        path,
+        PhaseManifest(1, "transfer", "eval/heldout/loss", None, runs, [], []),
+    )
+    model_offset = {"400M": 0.0, "800M": 0.01, "1B": 0.02}
+    for run in runs:
+        lr = float(run.params["lr"])
+        exponent = float(run.params["depth_exponent"])
+        preset = str(run.params["preset"])
+        if lr == 0.016 and exponent == 0.5 and preset == "1B":
+            continue
+        loss = 1.0 + model_offset[preset] + abs(exponent - 0.25) + (lr - 0.01) * 10
+        _write_result(phase_dir, run, loss)
+    return path
+
+
+def test_replicate_ranks_three_seed_mean_and_reuses_source_seed(tmp_path: Path) -> None:
+    # Source refine has seed 42 for two candidates; replicate has seeds 43 and 44.
+    # Candidate 0.01 losses 1.0, 1.1, 1.2; candidate 0.016 losses 0.9, 1.5, 1.6.
+    # Mean therefore selects 0.01 despite 0.016 winning seed 42.
+    source_path, replicate_path = _replicate_fixture(
+        tmp_path,
+        losses={0.01: [1.0, 1.1, 1.2], 0.016: [0.9, 1.5, 1.6]},
+    )
+    assert source_path.exists()
+    mup_sweep.analyze_phase(replicate_path)
+    analyzed = load_phase(replicate_path)
+    assert analyzed.selected[0]["lr"] == 0.01
+    assert analyzed.ranking[0]["score"] == pytest.approx(1.1)
+
+
+def test_transfer_sums_per_model_ranks_and_requires_all_models(tmp_path: Path) -> None:
+    path = _transfer_fixture(tmp_path)
+    mup_sweep.analyze_phase(path)
+    analyzed = load_phase(path)
+    assert analyzed.selected[0] == {
+        "lr": 0.01,
+        "output_mult": 1.0,
+        "depth_exponent": 0.25,
+    }
+    incomplete = next(
+        entry
+        for entry in analyzed.ranking
+        if entry["params"]["lr"] == 0.016 and entry["params"]["depth_exponent"] == 0.5
+    )
+    assert incomplete["score"] is None
+
+
+def test_local_execution_is_sequential_and_stops_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool) -> None:
+        seen.append(argv)
+        if len(seen) == 2:
+            raise subprocess.CalledProcessError(1, argv)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    commands = [["run", "one"], ["run", "two"], ["run", "three"]]
+    with pytest.raises(subprocess.CalledProcessError):
+        mup_sweep._run_local(commands)
+    assert seen == commands[:2]

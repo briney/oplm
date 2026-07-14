@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import shlex
+import subprocess
 from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime.
 from typing import Annotated
 
@@ -409,6 +411,212 @@ def _smoke_gated_lrs(source: Path, lrs: list[float]) -> list[float]:
     return lrs
 
 
+def _candidate(params: Params, keys: tuple[str, ...]) -> Params:
+    return {key: params[key] for key in keys if key in params}
+
+
+def _direct_ranking(phase_dir: Path, phase: PhaseManifest) -> list[dict[str, object]]:
+    entries = [
+        {
+            "id": run.id,
+            "params": run.params,
+            "score": result_metric(phase_dir, run, phase.metric),
+        }
+        for run in phase.runs
+    ]
+    return sorted(
+        entries,
+        key=lambda entry: (
+            entry["score"] is None,
+            float(entry["score"]) if entry["score"] is not None else math.inf,
+            float(entry["params"].get("lr", math.inf)),
+        ),
+    )
+
+
+def _source_phase(phase_path: Path, phase: PhaseManifest) -> tuple[Path, PhaseManifest]:
+    if phase.source is None:
+        raise ValueError(f"{phase.phase} requires a source phase")
+    source_path = (phase_path.parent / phase.source).resolve()
+    return source_path, load_phase(source_path)
+
+
+def _aggregate_key(params: Params) -> tuple[float, float, float, float | None]:
+    batch_mult = params.get("batch_mult")
+    return (
+        float(params["lr"]),
+        float(params["output_mult"]),
+        float(params.get("depth_exponent", 0.0)),
+        float(batch_mult) if batch_mult is not None else None,
+    )
+
+
+def _aggregate_params(key: tuple[float, float, float, float | None]) -> Params:
+    lr, output_mult, depth_exponent, batch_mult = key
+    params: Params = {
+        "lr": lr,
+        "output_mult": output_mult,
+        "depth_exponent": depth_exponent,
+    }
+    if batch_mult is not None:
+        params["batch_mult"] = batch_mult
+    return params
+
+
+def _sort_aggregate(entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    def key(entry: dict[str, object]) -> tuple[bool, float, float, float, float, float]:
+        params = entry["params"]
+        batch_mult = params.get("batch_mult")
+        return (
+            entry["score"] is None,
+            float(entry["score"]) if entry["score"] is not None else math.inf,
+            float(params["lr"]),
+            float(params["output_mult"]),
+            float(params["depth_exponent"]),
+            float(batch_mult) if batch_mult is not None else 0.0,
+        )
+
+    return sorted(entries, key=key)
+
+
+def _select_count(ranking: list[dict[str, object]], count: int) -> list[Params]:
+    eligible = [entry for entry in ranking if entry["score"] is not None]
+    if len(eligible) < count:
+        return []
+    return [dict(entry["params"]) for entry in eligible[:count]]
+
+
+def _replicate_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, object]]:
+    source_path, source = _source_phase(phase_path, phase)
+    locations = [
+        *((source_path.parent, run) for run in source.runs),
+        *((phase_path.parent, run) for run in phase.runs),
+    ]
+    keys = {_aggregate_key(run.params) for run in phase.runs}
+    entries: list[dict[str, object]] = []
+    for key in keys:
+        matching = [
+            (phase_dir, run)
+            for phase_dir, run in locations
+            if _aggregate_key(run.params) == key
+        ]
+        seeds = {int(run.params["seed"]) for _, run in matching}
+        values = [result_metric(phase_dir, run, phase.metric) for phase_dir, run in matching]
+        score = (
+            sum(float(value) for value in values) / len(values)
+            if 42 in seeds
+            and len(seeds) == len(matching)
+            and len(seeds) >= 2
+            and all(value is not None for value in values)
+            else None
+        )
+        entries.append({"params": _aggregate_params(key), "score": score})
+    return _sort_aggregate(entries)
+
+
+def _transfer_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, object]]:
+    keys = {_aggregate_key(run.params) for run in phase.runs}
+    presets = {str(run.params["preset"]) for run in phase.runs}
+    per_model_rank: dict[tuple[str, tuple[float, float, float, float | None]], int] = {}
+    for preset in presets:
+        rows = [
+            (result_metric(phase_path.parent, run, phase.metric), run)
+            for run in phase.runs
+            if run.params["preset"] == preset
+        ]
+        valid = [(loss, run) for loss, run in rows if loss is not None]
+        valid.sort(key=lambda row: (float(row[0]), float(row[1].params["lr"])))
+        for rank, (_, run) in enumerate(valid, start=1):
+            per_model_rank[(preset, _aggregate_key(run.params))] = rank
+
+    entries: list[dict[str, object]] = []
+    for key in keys:
+        ranks = [per_model_rank.get((preset, key)) for preset in presets]
+        score = (
+            sum(int(rank) for rank in ranks)
+            if all(rank is not None for rank in ranks)
+            else None
+        )
+        params = _aggregate_params(key)
+        params.pop("batch_mult", None)
+        entries.append({"params": params, "score": score})
+    return _sort_aggregate(entries)
+
+
+def analyze_phase(path: Path) -> PhaseManifest:
+    path = path.resolve()
+    phase = load_phase(path)
+    phase.selected = []
+
+    if phase.phase == "replicate":
+        phase.ranking = _replicate_ranking(path, phase)
+        phase.selected = _select_count(phase.ranking, 2)
+    elif phase.phase == "transfer":
+        phase.ranking = _transfer_ranking(path, phase)
+        phase.selected = _select_count(phase.ranking, 2)
+    else:
+        phase.ranking = _direct_ranking(path.parent, phase)
+        eligible = [entry for entry in phase.ranking if entry["score"] is not None]
+        if phase.phase == "smoke":
+            scores = {float(entry["params"]["lr"]): entry["score"] for entry in phase.ranking}
+            if scores.get(0.0025) is None or scores.get(0.01) is None:
+                raise ValueError("smoke requires finite validation loss at LR 0.0025 and 0.01")
+        elif phase.phase == "coarse":
+            if eligible:
+                by_lr = sorted(eligible, key=lambda entry: float(entry["params"]["lr"]))
+                winner_lr = float(phase.ranking[0]["params"]["lr"])
+                winner_index = next(
+                    index
+                    for index, entry in enumerate(by_lr)
+                    if float(entry["params"]["lr"]) == winner_lr
+                )
+                if 0 < winner_index < len(by_lr) - 1:
+                    phase.selected = [
+                        _candidate(entry["params"], ("lr", "output_mult"))
+                        for entry in by_lr[winner_index - 1 : winner_index + 2]
+                    ]
+        elif phase.phase == "refine":
+            ranked = [
+                {**entry, "params": _candidate(entry["params"], ("lr", "output_mult"))}
+                for entry in phase.ranking
+            ]
+            phase.selected = _select_count(ranked, 2)
+        elif phase.phase == "bridge":
+            keys = ("lr", "output_mult", "depth_exponent", "batch_mult")
+            ranked = [
+                {**entry, "params": _candidate(entry["params"], keys)}
+                for entry in phase.ranking
+            ]
+            phase.selected = _select_count(ranked, 2)
+        elif phase.phase == "confirm":
+            keys = ("lr", "output_mult", "depth_exponent", "batch_mult")
+            ranked = [
+                {**entry, "params": _candidate(entry["params"], keys)}
+                for entry in phase.ranking
+            ]
+            phase.selected = _select_count(ranked, 1)
+        elif phase.phase == "scale":
+            pass
+        else:
+            raise ValueError(f"unknown μP phase {phase.phase!r}")
+
+    write_phase(path, phase)
+    return phase
+
+
+@app.command()
+def analyze(
+    phase_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Rank completed cells and update one phase manifest in place."""
+    analyze_phase(phase_json)
+
+
+def _run_local(commands: list[list[str]]) -> None:
+    for command in commands:
+        subprocess.run(command, check=True)
+
+
 @app.command()
 def smoke(
     config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
@@ -420,13 +628,14 @@ def smoke(
     steps: Annotated[int, typer.Option("--steps")] = 1000,
     warmup: Annotated[int, typer.Option("--warmup")] = 100,
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
 ) -> None:
     """Generate the three-cell production smoke phase."""
     try:
-        _generate_phase(
+        phase_path, commands = _generate_phase(
             name="smoke",
             base_config=config,
             out=out,
@@ -438,6 +647,9 @@ def smoke(
             num_processes=num_processes,
             accelerate_config=accelerate_config,
         )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -454,6 +666,7 @@ def coarse(
     steps: Annotated[int, typer.Option("--steps")] = 10000,
     warmup: Annotated[int, typer.Option("--warmup")] = 5000,
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -463,7 +676,7 @@ def coarse(
         lr_values = parse_floats(lrs, name="--lrs")
         if source is not None:
             lr_values = _smoke_gated_lrs(source, lr_values)
-        _generate_phase(
+        phase_path, commands = _generate_phase(
             name="coarse",
             base_config=config,
             out=out,
@@ -473,6 +686,9 @@ def coarse(
             num_processes=num_processes,
             accelerate_config=accelerate_config,
         )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -490,6 +706,7 @@ def refine(
     steps: Annotated[int, typer.Option("--steps")] = 20000,
     warmup: Annotated[int, typer.Option("--warmup")] = 5000,
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -504,7 +721,7 @@ def refine(
             steps,
             warmup,
         )
-        _generate_phase(
+        phase_path, commands = _generate_phase(
             name="refine",
             base_config=config,
             out=out,
@@ -514,6 +731,9 @@ def refine(
             num_processes=num_processes,
             accelerate_config=accelerate_config,
         )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -527,6 +747,7 @@ def replicate(
     candidates: Annotated[str | None, typer.Option("--candidates")] = None,
     seeds: Annotated[str, typer.Option("--seeds")] = "42,43,44",
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -539,7 +760,7 @@ def replicate(
             _input_candidates(source, candidates, ("lr", "output_mult")),
             _parse_ints(seeds, name="--seeds"),
         )
-        _generate_phase(
+        phase_path, commands = _generate_phase(
             name="replicate",
             base_config=config,
             out=out,
@@ -549,6 +770,9 @@ def replicate(
             num_processes=num_processes,
             accelerate_config=accelerate_config,
         )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -567,6 +791,7 @@ def transfer(
     seed: Annotated[int, typer.Option("--seed")] = 42,
     warmup: Annotated[int, typer.Option("--warmup")] = 5000,
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -582,7 +807,7 @@ def transfer(
             seed=seed,
             warmup=warmup,
         )
-        _generate_phase(
+        phase_path, commands = _generate_phase(
             name="transfer",
             base_config=config,
             out=out,
@@ -592,6 +817,9 @@ def transfer(
             num_processes=num_processes,
             accelerate_config=accelerate_config,
         )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -609,6 +837,7 @@ def bridge(
     steps: Annotated[int, typer.Option("--steps")] = 10000,
     warmup: Annotated[int, typer.Option("--warmup")] = 5000,
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -627,7 +856,7 @@ def bridge(
             steps=steps,
             warmup=warmup,
         )
-        _generate_phase(
+        phase_path, commands = _generate_phase(
             name="bridge",
             base_config=config,
             out=out,
@@ -637,6 +866,9 @@ def bridge(
             num_processes=num_processes,
             accelerate_config=accelerate_config,
         )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -653,6 +885,7 @@ def confirm(
     steps: Annotated[int, typer.Option("--steps")] = 10000,
     warmup: Annotated[int, typer.Option("--warmup")] = 5000,
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -670,7 +903,7 @@ def confirm(
             steps=steps,
             warmup=warmup,
         )
-        _generate_phase(
+        phase_path, commands = _generate_phase(
             name="confirm",
             base_config=config,
             out=out,
@@ -680,6 +913,9 @@ def confirm(
             num_processes=num_processes,
             accelerate_config=accelerate_config,
         )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -697,6 +933,7 @@ def scale(
     steps: Annotated[int, typer.Option("--steps")] = 100000,
     warmup: Annotated[int, typer.Option("--warmup")] = 5000,
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -715,7 +952,7 @@ def scale(
             steps=steps,
             warmup=warmup,
         )
-        _generate_phase(
+        phase_path, commands = _generate_phase(
             name="scale",
             base_config=config,
             out=out,
@@ -725,6 +962,9 @@ def scale(
             num_processes=num_processes,
             accelerate_config=accelerate_config,
         )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 

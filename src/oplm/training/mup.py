@@ -9,8 +9,7 @@ the model-package single source of truth (so width-aware init stays
   scale per-group AdamW learning rates (Phase 4);
 * :func:`coord_check` — the empirical correctness gate (per-activation RMS vs
   width);
-* :class:`SweepMetricsCallback`, :func:`summarize_sweep`, :func:`best_lr_per_width`
-  — the LR-sweep metric utilities.
+* :class:`SweepMetricsCallback` — the LR-cell metric utility.
 
 See ``docs/MUP.md`` for the recipe table and the coord-check pass/fail oracle.
 """
@@ -18,7 +17,6 @@ See ``docs/MUP.md`` for the recipe table and the coord-check pass/fail oracle.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -36,13 +34,10 @@ if TYPE_CHECKING:
     from oplm.training.trainer import Trainer
 
 __all__ = [
-    "MupTransferResult",
     "SweepMetricsCallback",
-    "best_lr_per_width",
     "coord_check",
     "mup_fanin_mult",
     "mup_lr_multiplier",
-    "summarize_sweep",
 ]
 
 # Parameter-name suffixes that identify μP readouts (width-independent LR, ×1):
@@ -295,68 +290,3 @@ class SweepMetricsCallback(TrainerCallback):
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(payload, indent=2))
-
-
-def summarize_sweep(run_dirs: Sequence[str | Path]) -> pd.DataFrame:
-    """Load each run's ``metrics.json`` into a frame keyed by ``(width, lr)``.
-
-    Args:
-        run_dirs: Run directories (or direct paths to a ``metrics.json``) written
-            by :class:`SweepMetricsCallback`.
-
-    Returns:
-        One row per run with ``width``, ``lr``, ``final_train_loss``, ``steps``,
-        and one column per ``eval/*`` metric present.
-    """
-    import pandas as pd
-
-    rows: list[dict[str, object]] = []
-    for run_dir in run_dirs:
-        path = Path(run_dir)
-        metrics_path = path if path.name == "metrics.json" else path / "metrics.json"
-        data = json.loads(metrics_path.read_text())
-        row: dict[str, object] = {
-            "width": data["width"],
-            "lr": data["lr"],
-            "final_train_loss": data.get("final_train_loss"),
-            "steps": data.get("steps"),
-        }
-        row.update(data.get("eval") or {})
-        rows.append(row)
-    return pd.DataFrame.from_records(rows)
-
-
-@dataclass(frozen=True)
-class MupTransferResult:
-    """Outcome of an LR sweep: the best LR per width plus the μTransfer verdict.
-
-    Attributes:
-        best_lr: Argmin-loss base LR for each width.
-        transferred: ``True`` iff at least two widths were swept and they all agree
-            on the same argmin LR (the empirical width-transfer verdict).
-    """
-
-    best_lr: dict[int, float]
-    transferred: bool
-
-
-def best_lr_per_width(
-    df: pd.DataFrame, *, loss_column: str = "final_train_loss"
-) -> MupTransferResult:
-    """Argmin-loss LR per width and whether the widths agree (the transfer verdict).
-
-    Args:
-        df: A sweep frame from :func:`summarize_sweep` (needs ``width``, ``lr``,
-            and ``loss_column``).
-        loss_column: Column whose minimum selects the best LR per width.
-
-    Returns:
-        A :class:`MupTransferResult`. ``transferred`` is ``True`` only when ≥2
-        widths were swept and every width's argmin LR matches.
-    """
-    best: dict[int, float] = {}
-    for _, group in df.groupby("width"):
-        best_idx = group[loss_column].idxmin()
-        best[int(group.loc[best_idx, "width"])] = float(group.loc[best_idx, "lr"])
-    transferred = len(best) >= 2 and len(set(best.values())) == 1
-    return MupTransferResult(best_lr=best, transferred=transferred)
