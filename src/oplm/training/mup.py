@@ -306,8 +306,8 @@ def _rms(t: torch.Tensor) -> torch.Tensor:
     return t.detach().float().pow(2).mean().sqrt()
 
 
-# Probe-batch caps: bound the ``output_attentions`` memory (``(B, H, T, T)`` per
-# layer) at depth. A small slice is representative for the entropy signal.
+# Probe-batch caps: keep the diagnostic forward cheap. output_hidden_states uses
+# the memory-efficient SDPA path (as training does), so a small slice suffices.
 _PROBE_MAX_EXAMPLES = 4
 _PROBE_MAX_TOKENS = 256
 
@@ -321,22 +321,25 @@ class StabilityDiagnosticsCallback(TrainerCallback):
     step untouched — the per-step tripwire for gradient spikes.
 
     Every ``probe_every`` training logs it additionally runs one eager diagnostic
-    forward on the *unwrapped* model (``output_hidden_states`` +
-    ``output_attentions``) over a small fixed probe batch and records, under the
-    ``diag/`` prefix:
+    forward (``output_hidden_states``) on the *unwrapped* model over a small fixed
+    probe batch and records, under the ``diag/`` prefix:
 
     * per-depth residual-stream RMS (``diag/residual_rms/{max,mean,argmax_layer,
       final_layer}``) — residual growth and the hidden-state index that drives it
       (index 0 is the post-embedding state; 1..L are block outputs);
-    * output-logit RMS (``diag/logit_rms``);
-    * attention entropy and max probability (``diag/attn_entropy/{mean,min}``,
-      ``diag/attn_max_prob/max``) — the exact collapse signal SDPA hides.
+    * output-logit RMS (``diag/logit_rms``).
 
-    The probe runs off the compiled training step (eager, unwrapped, ``no_grad``,
-    ``eval`` restored afterward), so there are **no forward hooks** and
-    ``torch.compile`` stays on for training. ``probe_every=0`` logs only the grad
-    norm. Metrics emit through ``accelerator.log`` on the training-loss cadence
-    (eval-only logs are skipped).
+    Distributed-safety (this used to hang DDP runs): the probe issues **no
+    collectives**, runs **only on the main process** (weights are DDP-identical
+    across ranks, so rank 0's shard is representative), uses the tested SDPA path
+    (not the memory-heavy ``output_attentions`` manual path), and calls
+    ``torch.cuda.synchronize()`` inside its guard so an async CUDA fault surfaces
+    *there* — caught and the probe self-disabled — rather than corrupting the next
+    NCCL collective and timing out the whole group. It also runs off the compiled
+    training step (eager, unwrapped, ``no_grad``, ``eval`` restored afterward), so
+    there are **no forward hooks** and ``torch.compile`` stays on for training.
+    ``probe_every=0`` logs only the grad norm. Metrics emit through
+    ``accelerator.log`` on the training-loss cadence (eval-only logs are skipped).
     """
 
     def __init__(self, *, probe_every: int = 25) -> None:
@@ -350,7 +353,9 @@ class StabilityDiagnosticsCallback(TrainerCallback):
     # -- lifecycle ----------------------------------------------------------
 
     def on_train_start(self, trainer: Trainer) -> None:
-        if self.probe_every > 0:
+        # Probe on the main process only (see class docstring); other ranks skip
+        # it entirely, so they never capture a batch or run the extra forward.
+        if self.probe_every > 0 and trainer.accelerator.is_main_process:
             self._probe_batch = self._capture_probe_batch(trainer)
 
     def on_log(self, trainer: Trainer, metrics: dict[str, float], step: int) -> None:
@@ -394,7 +399,12 @@ class StabilityDiagnosticsCallback(TrainerCallback):
         return probe or None
 
     def _run_probe(self, trainer: Trainer, diag: dict[str, float]) -> None:
-        """Eager diagnostic forward on the unwrapped model; fill residual/logit/entropy."""
+        """Eager, main-process-only diagnostic forward; fill residual + logit RMS."""
+        # Main process only: the extra forward has no collectives, so other ranks
+        # must NOT run it (that is what previously hung DDP — an async CUDA fault
+        # in the probe corrupted a rank's context and timed out the next collective).
+        if not trainer.accelerator.is_main_process:
+            return
         if self._probe_batch is None or "input_ids" not in self._probe_batch:
             return
         model = trainer.accelerator.unwrap_model(trainer.model)
@@ -406,13 +416,15 @@ class StabilityDiagnosticsCallback(TrainerCallback):
                     input_ids=self._probe_batch["input_ids"],
                     attention_mask=self._probe_batch.get("attention_mask"),
                     output_hidden_states=True,
-                    output_attentions=True,
                 )
+            # Force any async CUDA fault to surface here, inside the guard, rather
+            # than at the next collective (where it would hang the whole group).
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             self._emit_residual(diag, getattr(outputs, "hidden_states", None))
             logits = getattr(outputs, "logits", None)
             if isinstance(logits, torch.Tensor):
                 diag["diag/logit_rms"] = float(_rms(logits))
-            self._emit_entropy(diag, getattr(outputs, "attentions", None))
         except Exception as exc:  # noqa: BLE001 - diagnostics must never kill training
             logger.warning("stability probe failed; disabling it: %s", exc)
             self._probe_disabled = True
@@ -434,21 +446,3 @@ class StabilityDiagnosticsCallback(TrainerCallback):
         diag["diag/residual_rms/mean"] = float(values.mean())
         diag["diag/residual_rms/argmax_layer"] = float(int(values.argmax()))
         diag["diag/residual_rms/final_layer"] = float(values[-1])
-
-    @staticmethod
-    def _emit_entropy(diag: dict[str, float], attentions: object) -> None:
-        """Record per-layer attention entropy and max probability from the weights."""
-        entropies: list[torch.Tensor] = []
-        max_probs: list[torch.Tensor] = []
-        for attn in attentions or ():  # ty: ignore[not-iterable]
-            if not isinstance(attn, torch.Tensor):
-                continue
-            # attn: (B, H, T, T) fp32, softmaxed over keys.
-            p = attn.detach().float().clamp_min(1e-12)
-            entropies.append(-(p * p.log()).sum(-1).mean())
-            max_probs.append(p.max())
-        if entropies:
-            ent = torch.stack(entropies)
-            diag["diag/attn_entropy/mean"] = float(ent.mean())
-            diag["diag/attn_entropy/min"] = float(ent.min())
-            diag["diag/attn_max_prob/max"] = float(torch.stack(max_probs).max())

@@ -127,7 +127,6 @@ def test_stability_diagnostics_emit_during_real_run(training_parquet: Path, tmp_
     assert "diag/residual_rms/max" in diag
     assert "diag/logit_rms" in diag
     assert "diag/grad_norm" in diag
-    assert "diag/attn_entropy/mean" in diag  # Tier B probe fired
     assert all(math.isfinite(v) for v in diag.values())
 
 

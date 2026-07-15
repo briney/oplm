@@ -155,7 +155,7 @@ stability diagnostics on the deep phases and probes to record the *mechanism*, n
 
 ```yaml
 train:
-  stability_diagnostics: true  # per-step grad norm + periodic residual/logit/entropy probe
+  stability_diagnostics: true  # per-step grad norm + periodic residual/logit probe
   stability_probe_every: 25    # cadence (in logs) of the probe forward; 0 = grad norm only
 ```
 
@@ -165,13 +165,14 @@ This attaches `StabilityDiagnosticsCallback`, which logs under `diag/*`:
   tripwire; present only when `max_grad_norm > 0`);
 - `diag/residual_rms/{max,mean,argmax_layer,final_layer}` — residual-stream growth and which
   hidden state drives it;
-- `diag/logit_rms` — output-logit growth;
-- `diag/attn_entropy/{mean,min}`, `diag/attn_max_prob/max` — exact per-layer attention entropy
-  (QK-norm and the sigmoid output gate are active by default, so a hard collapse is unlikely, but
-  channel-mode QK-norm still permits logit growth via its learned scale).
+- `diag/logit_rms` — output-logit growth.
 
 Everything except the grad norm comes from **one eager diagnostic forward every
-`stability_probe_every` logs**, run on the unwrapped model over a small fixed batch. There are no
+`stability_probe_every` logs** (`output_hidden_states`, the tested SDPA path), run on the
+unwrapped model over a small fixed batch. It runs **on the main process only** — model weights are
+DDP-identical across ranks, so rank 0's shard is representative, and keeping the extra forward off
+the other ranks is what makes it distributed-safe (an earlier version that also used
+`output_attentions` and ran on every rank hung multi-GPU runs with an NCCL timeout). There are no
 forward hooks, so **`torch.compile` stays on** for the training step — leave `train.compile` at
 its production value. Set `stability_probe_every=0` for grad-norm-only (cheapest).
 

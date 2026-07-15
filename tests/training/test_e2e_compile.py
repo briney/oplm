@@ -155,12 +155,7 @@ def test_compile_with_stability_diagnostics_trains(
     trainer.train()
 
     diag = {k: v for metrics in logged for k, v in metrics.items() if k.startswith("diag/")}
-    for key in (
-        "diag/grad_norm",
-        "diag/residual_rms/max",
-        "diag/logit_rms",
-        "diag/attn_entropy/mean",
-    ):
+    for key in ("diag/grad_norm", "diag/residual_rms/max", "diag/logit_rms"):
         assert key in diag, f"missing {key}"
     assert all(math.isfinite(v) for v in diag.values())
 

@@ -2,9 +2,10 @@
 
 These exercise the callback directly against a tiny model and a stub trainer
 (no Accelerate). The design is hook-free: the grad norm is logged every training
-log, and a periodic eager probe forward supplies the per-depth residual RMS,
-logit RMS, and attention-entropy signals. Tests assert those two paths, the
-eval-log skip, the probe cadence, and the config defaults/validation.
+log, and a periodic main-process-only eager probe forward supplies the per-depth
+residual RMS and logit RMS. Tests assert those two paths, the main-process
+gating (distributed-safety), the eval-log skip, the probe cadence, and the config
+defaults/validation.
 """
 
 from __future__ import annotations
@@ -29,9 +30,6 @@ _PROBE_KEYS = (
     "diag/residual_rms/argmax_layer",
     "diag/residual_rms/final_layer",
     "diag/logit_rms",
-    "diag/attn_entropy/mean",
-    "diag/attn_entropy/min",
-    "diag/attn_max_prob/max",
 )
 
 
@@ -57,8 +55,9 @@ def _batch() -> dict[str, torch.Tensor]:
 
 
 class _StubAccelerator:
-    def __init__(self) -> None:
+    def __init__(self, *, is_main_process: bool = True) -> None:
         self.device = torch.device("cpu")
+        self.is_main_process = is_main_process
         self.logged: list[tuple[int, dict[str, float]]] = []
 
     def unwrap_model(self, model: OplmForMaskedLM) -> OplmForMaskedLM:
@@ -69,9 +68,15 @@ class _StubAccelerator:
 
 
 class _StubTrainer:
-    def __init__(self, model: OplmForMaskedLM, dataloader: object | None = None) -> None:
+    def __init__(
+        self,
+        model: OplmForMaskedLM,
+        dataloader: object | None = None,
+        *,
+        is_main_process: bool = True,
+    ) -> None:
         self.model = model
-        self.accelerator = _StubAccelerator()
+        self.accelerator = _StubAccelerator(is_main_process=is_main_process)
         self.dataloader = dataloader
         self._last_grad_norm = torch.tensor(1.23)
 
@@ -90,8 +95,8 @@ def test_grad_norm_logged_every_train_log() -> None:
     assert not any(key in metrics for key in _PROBE_KEYS)
 
 
-def test_probe_emits_all_signals() -> None:
-    """A fired probe emits residual, logit, and attention-entropy metrics."""
+def test_probe_emits_residual_and_logit_signals() -> None:
+    """A fired probe emits per-depth residual RMS and logit RMS (plus grad norm)."""
     batch = _batch()
     trainer = _StubTrainer(_model(), dataloader=[batch])
     cb = StabilityDiagnosticsCallback(probe_every=1)
@@ -104,8 +109,22 @@ def test_probe_emits_all_signals() -> None:
         assert key in metrics, f"missing {key}"
     assert "diag/grad_norm" in metrics
     assert 0 <= metrics["diag/residual_rms/argmax_layer"] <= _LAYERS  # index into (L+1)-tuple
-    assert metrics["diag/attn_entropy/min"] >= 0.0
-    assert 0.0 <= metrics["diag/attn_max_prob/max"] <= 1.0
+    # Attention entropy was dropped (output_attentions manual path was unsafe under DDP).
+    assert not any(key.startswith("diag/attn_") for key in metrics)
+
+
+def test_probe_skipped_on_non_main_process() -> None:
+    """On a non-main rank the probe never runs (distributed-safety: no extra forward)."""
+    trainer = _StubTrainer(_model(), dataloader=[_batch()], is_main_process=False)
+    cb = StabilityDiagnosticsCallback(probe_every=1)
+
+    cb.on_train_start(trainer)  # must not capture a probe batch off-main
+    assert cb._probe_batch is None
+    cb.on_log(trainer, {"train/loss": 2.0}, step=1)
+
+    _step, metrics = trainer.accelerator.logged[-1]
+    assert not any(key in metrics for key in _PROBE_KEYS)  # no probe metrics
+    assert "diag/grad_norm" in metrics  # grad norm still emitted
 
 
 def test_registers_no_forward_hooks() -> None:
