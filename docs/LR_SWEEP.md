@@ -149,17 +149,19 @@ be selected empirically here. Override with `--exponents` to widen or refine the
 
 ## Stability diagnostics
 
-Deep runs can pass the coordinate check and the short proxy phases yet still diverge later
-(the historical 800M run was stable at init but fell apart before 5,000 steps). Enable the
-stability diagnostics on the deep phases and probes to record the *mechanism*, not just the loss:
+Diagnostics are **off by default** and do not affect selection — the sweep ranks by held-out
+validation loss regardless. They are an opt-in aid for recording the *mechanism* of a divergence
+(the historical 800M run was stable at init but fell apart before 5,000 steps). Enable them per
+phase with the `--diagnostics` flag (default `--no-diagnostics`), which pins
+`train.stability_diagnostics` in each generated cell and overrides whatever the base config says:
 
-```yaml
-train:
-  stability_diagnostics: true  # per-step grad norm + periodic residual/logit probe
-  stability_probe_every: 25    # cadence (in logs) of the probe forward; 0 = grad norm only
+```bash
+python -m scripts.mup_sweep coarse --config configs/mup-production.yaml \
+  --from sweeps/smoke/phase.json --out sweeps/coarse --num-processes 8 --local --diagnostics
 ```
 
-This attaches `StabilityDiagnosticsCallback`, which logs under `diag/*`:
+Tune the probe cadence with `train.stability_probe_every` in the base config (default 25 logs;
+`0` = grad-norm-only). When enabled, `StabilityDiagnosticsCallback` logs under `diag/*`:
 
 - `diag/grad_norm` — pre-clip global gradient norm, **every training log** (the per-step spike
   tripwire; present only when `max_grad_norm > 0`);

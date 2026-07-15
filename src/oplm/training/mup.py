@@ -306,10 +306,12 @@ def _rms(t: torch.Tensor) -> torch.Tensor:
     return t.detach().float().pow(2).mean().sqrt()
 
 
-# Probe-batch caps: keep the diagnostic forward cheap. output_hidden_states uses
-# the memory-efficient SDPA path (as training does), so a small slice suffices.
-_PROBE_MAX_EXAMPLES = 4
-_PROBE_MAX_TOKENS = 256
+# Probe-batch caps: keep the diagnostic forward tiny so it cannot OOM even at the
+# largest presets (its activations sit on top of the resident training memory).
+# output_hidden_states uses the memory-efficient SDPA path, so one short sequence
+# is plenty for the residual/logit RMS signal.
+_PROBE_MAX_EXAMPLES = 1
+_PROBE_MAX_TOKENS = 128
 
 
 class StabilityDiagnosticsCallback(TrainerCallback):

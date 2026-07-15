@@ -109,6 +109,28 @@ def test_smoke_generates_three_production_cells(base_config: Path, tmp_path: Pat
     assert cfg.train.warmup_steps == 100
     assert cfg.train.stable_steps == 900
     assert cfg.train.gradient_accumulation_steps == 8
+    # Diagnostics are off unless --diagnostics is passed (see test below).
+    assert cfg.train.stability_diagnostics is False
+
+
+def test_diagnostics_flag_toggles_stability_diagnostics(base_config: Path, tmp_path: Path) -> None:
+    """--diagnostics pins train.stability_diagnostics=true in each generated cell."""
+    off = tmp_path / "off"
+    on = tmp_path / "on"
+    assert (
+        runner.invoke(mup_sweep.app, ["smoke", "--config", str(base_config), "--out", str(off)])
+    ).exit_code == 0
+    assert (
+        runner.invoke(
+            mup_sweep.app,
+            ["smoke", "--config", str(base_config), "--out", str(on), "--diagnostics"],
+        )
+    ).exit_code == 0
+
+    off_cfg = load_config(["--config", str(off / load_phase(off / "phase.json").runs[0].config)])
+    on_cfg = load_config(["--config", str(on / load_phase(on / "phase.json").runs[0].config)])
+    assert off_cfg.train.stability_diagnostics is False
+    assert on_cfg.train.stability_diagnostics is True
 
 
 def test_generation_rejects_nonproduction_weight_decay(base_config: Path, tmp_path: Path) -> None:

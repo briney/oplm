@@ -82,6 +82,7 @@ def _write_run_config(
     params: Params,
     *,
     num_processes: int,
+    diagnostics: bool = False,
 ) -> Path:
     max_steps = int(params["max_steps"])
     warmup_steps = int(params["warmup_steps"])
@@ -131,6 +132,9 @@ def _write_run_config(
         "train.scheduler=wsd_linear",
         f"train.output_dir={run_dir / 'output'}",
         f"train.wandb_run_name={run_name}",
+        # Explicitly pin diagnostics so the flag overrides whatever the base config
+        # carries (off by default keeps the sweep robust; see docs/LR_SWEEP.md).
+        f"train.stability_diagnostics={str(diagnostics).lower()}",
     ]
     cfg = load_config(["--config", str(base_config), *overrides])
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -187,6 +191,7 @@ def _generate_phase(
     cells: list[Params],
     num_processes: int,
     accelerate_config: Path | None,
+    diagnostics: bool = False,
 ) -> tuple[Path, list[list[str]]]:
     base_config = base_config.resolve()
     out = out.resolve()
@@ -198,7 +203,9 @@ def _generate_phase(
     for params in cells:
         run_id = _run_id(params)
         run_dir = out / "runs" / run_id
-        config = _write_run_config(base_config, run_dir, params, num_processes=num_processes)
+        config = _write_run_config(
+            base_config, run_dir, params, num_processes=num_processes, diagnostics=diagnostics
+        )
         result = run_dir / "result.json"
         runs.append(
             RunSpec(
@@ -636,6 +643,7 @@ def smoke(
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
     """Generate the three-cell production smoke phase."""
     try:
@@ -650,6 +658,7 @@ def smoke(
             ),
             num_processes=num_processes,
             accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
         )
         if local:
             _run_local(commands)
@@ -674,6 +683,7 @@ def coarse(
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
     """Generate the production coarse LR phase, optionally gated by smoke results."""
     try:
@@ -689,6 +699,7 @@ def coarse(
             cells=_coarse_cells(lr_values, global_examples, seed, steps, warmup),
             num_processes=num_processes,
             accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
         )
         if local:
             _run_local(commands)
@@ -714,6 +725,7 @@ def refine(
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
     """Generate the production LR × output-multiplier refinement phase."""
     try:
@@ -734,6 +746,7 @@ def refine(
             cells=cells,
             num_processes=num_processes,
             accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
         )
         if local:
             _run_local(commands)
@@ -755,6 +768,7 @@ def replicate(
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
     """Generate missing replicate seeds while retaining the source seed-42 results."""
     try:
@@ -773,6 +787,7 @@ def replicate(
             cells=cells,
             num_processes=num_processes,
             accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
         )
         if local:
             _run_local(commands)
@@ -800,6 +815,7 @@ def transfer(
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
     """Generate the paired LR/output depth-transfer grid."""
     try:
@@ -821,6 +837,7 @@ def transfer(
             cells=cells,
             num_processes=num_processes,
             accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
         )
         if local:
             _run_local(commands)
@@ -846,6 +863,7 @@ def bridge(
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
     """Generate the production-batch bridge for the top transfer candidate."""
     try:
@@ -870,6 +888,7 @@ def bridge(
             cells=cells,
             num_processes=num_processes,
             accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
         )
         if local:
             _run_local(commands)
@@ -894,6 +913,7 @@ def confirm(
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
     """Generate the production-batch 800M confirmation phase."""
     try:
@@ -917,6 +937,7 @@ def confirm(
             cells=cells,
             num_processes=num_processes,
             accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
         )
         if local:
             _run_local(commands)
@@ -942,6 +963,7 @@ def scale(
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
     """Generate winner-only scaling runs across the production preset ray."""
     try:
@@ -966,6 +988,7 @@ def scale(
             cells=cells,
             num_processes=num_processes,
             accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
         )
         if local:
             _run_local(commands)
