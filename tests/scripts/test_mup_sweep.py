@@ -402,7 +402,7 @@ def test_later_phase_default_cell_counts() -> None:
                 exponents=[0.0, 0.25, 0.5],
                 global_examples=2048,
                 seed=42,
-                warmup=5000,
+                warmups=[1000, 2000, 1000],
             )
         )
         == 18
@@ -545,15 +545,14 @@ def test_transfer_generates_paired_candidates_across_default_models(
         (0.01, 1.0),
         (0.016, 0.5),
     }
-    assert {(cell["preset"], cell["max_steps"]) for cell in params} == {
-        ("400M", 10000),
-        ("800M", 20000),
-        ("1B", 10000),
+    # Per-preset warmup is ~10% of each preset's horizon (400M/1B 10k → 1000; 800M 20k → 2000).
+    assert {(cell["preset"], cell["max_steps"], cell["warmup_steps"]) for cell in params} == {
+        ("400M", 10000, 1000),
+        ("800M", 20000, 2000),
+        ("1B", 10000, 1000),
     }
     assert {cell["depth_exponent"] for cell in params} == {0.0, 0.5, 0.75, 1.0}
-    assert {(cell["global_examples"], cell["seed"], cell["warmup_steps"]) for cell in params} == {
-        (2048, 42, 5000)
-    }
+    assert {(cell["global_examples"], cell["seed"]) for cell in params} == {(2048, 42)}
 
 
 def test_bridge_uses_only_explicit_top_transfer_candidate(
@@ -599,7 +598,7 @@ def test_bridge_uses_only_explicit_top_transfer_candidate(
             cell["warmup_steps"],
         )
         for cell in params
-    } == {("170M", 0.5, 0.5, 8192, 42, 10000, 5000)}
+    } == {("170M", 0.5, 0.5, 8192, 42, 10000, 1000)}
 
 
 def test_confirm_preserves_bridge_depth_and_batch_corrections(
@@ -649,7 +648,7 @@ def test_confirm_preserves_bridge_depth_and_batch_corrections(
             cell["warmup_steps"],
         )
         for cell in params
-    } == {("800M", 8192, 42, 10000, 5000)}
+    } == {("800M", 8192, 42, 10000, 1000)}
 
 
 def test_scale_uses_only_confirmed_winner_across_default_presets(
@@ -774,7 +773,9 @@ def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
         ],
     )
     assert transfer.exit_code != 0
-    assert "same number of values" in transfer.output
+    # Normalize Rich's error-panel wrapping (border chars + line breaks) before matching.
+    normalized = " ".join(transfer.output.replace("│", " ").split())
+    assert "same number of values" in normalized
 
     with pytest.raises(typer.BadParameter, match="must list at least one value"):
         mup_sweep._parse_ints(",", name="--seeds")

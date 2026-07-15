@@ -310,10 +310,10 @@ def _transfer_cells(
     exponents: list[float],
     global_examples: int,
     seed: int,
-    warmup: int,
+    warmups: list[int],
 ) -> list[Params]:
-    if len(presets) != len(steps):
-        raise ValueError("--presets and --steps must contain the same number of values")
+    if len(presets) != len(steps) or len(presets) != len(warmups):
+        raise ValueError("--presets, --steps, and --warmup must contain the same number of values")
     return [
         _cell(
             preset=preset,
@@ -323,10 +323,10 @@ def _transfer_cells(
             seed=seed,
             global_examples=global_examples,
             max_steps=model_steps,
-            warmup_steps=warmup,
+            warmup_steps=model_warmup,
         )
         for candidate in candidates
-        for preset, model_steps in zip(presets, steps, strict=True)
+        for preset, model_steps, model_warmup in zip(presets, steps, warmups, strict=True)
         for exponent in exponents
     ]
 
@@ -668,7 +668,7 @@ def coarse(
     global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
-    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k coarse run
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
@@ -708,7 +708,7 @@ def refine(
     global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 20000,
-    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 2000,  # 10% of the 20k refine run
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
@@ -793,7 +793,8 @@ def transfer(
     exponents: Annotated[str, typer.Option("--exponents")] = "0,0.5,0.75,1.0",
     global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
     seed: Annotated[int, typer.Option("--seed")] = 42,
-    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    # Per-preset warmup (aligned with --presets/--steps), ~10% of each horizon.
+    warmup: Annotated[str, typer.Option("--warmup")] = "1000,2000,1000",
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
@@ -809,7 +810,7 @@ def transfer(
             exponents=parse_floats(exponents, name="--exponents"),
             global_examples=global_examples,
             seed=seed,
-            warmup=warmup,
+            warmups=_parse_ints(warmup, name="--warmup"),
         )
         phase_path, commands = _generate_phase(
             name="transfer",
@@ -839,7 +840,7 @@ def bridge(
     global_examples: Annotated[int, typer.Option("--global-examples")] = 8192,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
-    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k bridge run
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[
@@ -887,7 +888,7 @@ def confirm(
     global_examples: Annotated[int, typer.Option("--global-examples")] = 8192,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
-    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k confirm run
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     accelerate_config: Annotated[

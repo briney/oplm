@@ -129,6 +129,13 @@ The proxy phases default to 2,048 global examples (roughly 1M tokens for the int
 distribution); bridge and later phases use 8,192 (roughly 4M). μP does not make batch size
 irrelevant, so the bridge measures this correction rather than assuming a scaling rule.
 
+Each cell warms up over ~10% of its own horizon: 1,000 steps for the 10k phases (smoke uses 100
+over 1k), 2,000 for the 20k `refine` and the 20k 800M `transfer` cell, and 5,000 (~5%) for the
+100k `scale` cells. Warmup *fraction*, like batch size, does not transfer across horizon — so the
+proxy keeps it modest rather than spending half of a short run ramping, which also avoids the
+selection bias where a large warmup fraction tolerates a hotter peak LR than production's ~0.4%
+warmup can sustain. `transfer` takes a per-preset `--warmup` list aligned with `--presets`/`--steps`.
+
 ## Depth-LR exponent grid
 
 `transfer` sweeps `mup_depth_lr_exponent` over `0,0.5,0.75,1.0` — the empirical repeated-block
