@@ -1,0 +1,1 @@
+What is the warmup for the `coarse` stage models? I'm assuming we should shorten it from the default (5k steps) given that the whole run is 10k steps, but 1) is that a correct asssumption, and 2) are we doing that?
