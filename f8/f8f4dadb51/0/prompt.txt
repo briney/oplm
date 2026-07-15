@@ -1,0 +1,1 @@
+same crash/error situation again. Could it be an OOM situation? Are the diagnostics actually necessary? They seem to be causing a fair number of issues, so if they're more in the "nice to have" category, I think we should disable them. Can we add a `--diagnostics/--no-diagnostics` flag?
