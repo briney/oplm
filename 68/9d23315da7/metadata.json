@@ -1,0 +1,35 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "689d23315da7",
+  "strategy": "manual-commit",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "docs/LR_SWEEP.md",
+    "docs/MUP.md",
+    "scripts/mup_sweep.py",
+    "src/oplm/config.py",
+    "src/oplm/training/mup.py",
+    "src/oplm/training/trainer.py",
+    "tests/scripts/test_mup_sweep.py",
+    "tests/training/test_e2e_compile.py",
+    "tests/training/test_mup_stability.py",
+    "tests/training/test_pilot_train.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/68/9d23315da7/0/metadata.json",
+      "transcript": "/68/9d23315da7/0/full.jsonl",
+      "compact_transcript": "/68/9d23315da7/0/transcript.jsonl",
+      "content_hash": "/68/9d23315da7/0/content_hash.txt",
+      "prompt": "/68/9d23315da7/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 188,
+    "cache_creation_tokens": 265705,
+    "cache_read_tokens": 19002630,
+    "output_tokens": 133449,
+    "api_call_count": 99
+  }
+}

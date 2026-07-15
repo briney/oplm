@@ -1,0 +1,17 @@
+I'm running through the muP sweep described in `docs/LR_SWEEP.md`. The reason I'm redoing the sweep in a more systematic manner is because I previously computed the muP LR using a single model size (50M params) and didn't do any sweeping at all, nor did I adjust for depth differences as I scale. Subsequently, the 170M and 400M parameter runs worked fine but 800M was unstable from the start and totally fell apart after less than 5k steps. A few things. First, am I using the correct residual scaling (1/√L) given the architecture of the model, including canon layers? Would a CompleteP-like 1/L be a better starting point? Anything else we shold explore beyond what's already laid out in the LR_SWEEP plan?
+
+---
+
+Go ahead and make the changes directly, no need to write to TODOS.md
+
+---
+
+Do we absolutely need the diagnostics that require forward hooks? No compilation will slow things down pretty significantly, I think.
+
+---
+
+You have an A6000 GPU in your local environment, give the e2e tests a shot to make sure `compile=true` and the diagnostics training run are working.
+
+---
+
+what were the changes in the trainer and config.py?
