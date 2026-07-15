@@ -119,7 +119,7 @@ The defaults implement this funnel:
 | `coarse` | Rank the seven-point LR grid at 170M for 10,000 steps. |
 | `refine` | Cross the selected local LR region with output multipliers `0.5,1,2`. |
 | first `replicate` | Add seeds 43 and 44 to seed 42 for the two finalists. |
-| `transfer` | Test both finalists and depth exponents `0,0.25,0.5` at 400M, 800M, and 1B. |
+| `transfer` | Test both finalists and depth exponents `0,0.5,0.75,1.0` at 400M, 800M, and 1B. |
 | `bridge` | Test batch-correction LR multipliers `0.7,1,1.4,2` at the 170M production batch. |
 | second `replicate` | Add seeds 43 and 44 to the bridge finalists. |
 | `confirm` | Rank the production-batch finalists at 800M. |
@@ -128,6 +128,78 @@ The defaults implement this funnel:
 The proxy phases default to 2,048 global examples (roughly 1M tokens for the intended length
 distribution); bridge and later phases use 8,192 (roughly 4M). μP does not make batch size
 irrelevant, so the bridge measures this correction rather than assuming a scaling rule.
+
+## Depth-LR exponent grid
+
+`transfer` sweeps `mup_depth_lr_exponent` over `0,0.5,0.75,1.0` — the empirical repeated-block
+LR correction `effective_block_lr = width_aware_lr * (24 / L) ** exponent`. The residual-branch
+scaling stays fixed at `1/√L` (`residual_scaling=sqrt_num_layers`); this grid tunes only the
+optimizer-side depth correction, which is the dominant lever for depth transfer. The upper end
+reaches `1.0` deliberately: it is the CompleteP (Adam) value and the strongest correction worth
+testing for a 40–50 layer stack. Because OPLM trains with Muon (an orthogonalized update, not
+Adam or SGD), the transferring exponent is not the published CompleteP/Depth-μP number and must
+be selected empirically here. Override with `--exponents` to widen or refine the grid.
+
+## Stability diagnostics
+
+Deep runs can pass the coordinate check and the short proxy phases yet still diverge later
+(the historical 800M run was stable at init but fell apart before 5,000 steps). Enable the
+stability diagnostics on the deep phases and probes to record the *mechanism*, not just the loss:
+
+```yaml
+train:
+  stability_diagnostics: true  # per-step grad norm + periodic residual/logit/entropy probe
+  stability_probe_every: 25    # cadence (in logs) of the probe forward; 0 = grad norm only
+```
+
+This attaches `StabilityDiagnosticsCallback`, which logs under `diag/*`:
+
+- `diag/grad_norm` — pre-clip global gradient norm, **every training log** (the per-step spike
+  tripwire; present only when `max_grad_norm > 0`);
+- `diag/residual_rms/{max,mean,argmax_layer,final_layer}` — residual-stream growth and which
+  hidden state drives it;
+- `diag/logit_rms` — output-logit growth;
+- `diag/attn_entropy/{mean,min}`, `diag/attn_max_prob/max` — exact per-layer attention entropy
+  (QK-norm and the sigmoid output gate are active by default, so a hard collapse is unlikely, but
+  channel-mode QK-norm still permits logit growth via its learned scale).
+
+Everything except the grad norm comes from **one eager diagnostic forward every
+`stability_probe_every` logs**, run on the unwrapped model over a small fixed batch. There are no
+forward hooks, so **`torch.compile` stays on** for the training step — leave `train.compile` at
+its production value. Set `stability_probe_every=0` for grad-norm-only (cheapest).
+
+## Deep stability probe
+
+The proxy `transfer`/`confirm` horizons are shorter than the ~5,000-step regime where the old
+800M run failed, so they cannot by themselves certify deep stability. After `confirm` selects a
+winner, run one long 800M probe at the production batch, past the historical failure horizon,
+with diagnostics on:
+
+```bash
+oplm train --preset 800M --config configs/mup-production.yaml \
+  train.lr=<confirmed-lr> train.mup_depth_lr_exponent=<confirmed-exponent> \
+  train.max_steps=12000 train.stability_diagnostics=true train.stability_probe_every=25 \
+  data.train=/path/to/train.parquet
+```
+
+If it survives with flat `diag/*` traces, scale with confidence; if it diverges, the `diag/*`
+series identify whether the cause is residual-stream growth, attention-logit growth, output-logit
+growth, or a gradient spike.
+
+## Head-count control
+
+The `800M` preset was corrected to 20 heads (`head_dim=64`); the earlier unstable run used 16
+heads (`head_dim=80`), which violates the width-μP "fixed head dim" assumption independently of
+depth. To quantify how much of the original instability was that violation versus depth, run the
+old geometry once at the old depth-unaware LR with diagnostics on, as a comparison baseline:
+
+```bash
+oplm train --preset 800M --config configs/mup-production.yaml \
+  model.num_attention_heads=16 model.head_dim=80 \
+  train.lr=<old-50M-derived-lr> train.mup_depth_lr_exponent=0 \
+  train.max_steps=12000 train.stability_diagnostics=true train.stability_probe_every=25 \
+  data.train=/path/to/train.parquet
+```
 
 ## Phase artifacts
 

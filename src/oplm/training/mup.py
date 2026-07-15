@@ -17,6 +17,7 @@ See ``docs/MUP.md`` for the recipe table and the coord-check pass/fail oracle.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,6 +25,8 @@ import torch
 from torch import nn
 
 from oplm.training.callbacks import TrainerCallback
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -34,6 +37,7 @@ if TYPE_CHECKING:
     from oplm.training.trainer import Trainer
 
 __all__ = [
+    "StabilityDiagnosticsCallback",
     "SweepMetricsCallback",
     "coord_check",
     "mup_fanin_mult",
@@ -290,3 +294,161 @@ class SweepMetricsCallback(TrainerCallback):
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(payload, indent=2))
+
+
+# ----------------------------------------------------------------------------
+# Training-stability diagnostics
+# ----------------------------------------------------------------------------
+
+
+def _rms(t: torch.Tensor) -> torch.Tensor:
+    """Root-mean-square of a tensor as a detached 0-dim float tensor."""
+    return t.detach().float().pow(2).mean().sqrt()
+
+
+# Probe-batch caps: bound the ``output_attentions`` memory (``(B, H, T, T)`` per
+# layer) at depth. A small slice is representative for the entropy signal.
+_PROBE_MAX_EXAMPLES = 4
+_PROBE_MAX_TOKENS = 256
+
+
+class StabilityDiagnosticsCallback(TrainerCallback):
+    """Log training-stability signals for deep-model μP diagnosis — hook-free.
+
+    On every training-loss log it emits the pre-clip global grad norm
+    (``diag/grad_norm``, read from ``trainer._last_grad_norm``; absent when
+    ``max_grad_norm <= 0``). This costs nothing and leaves the compiled training
+    step untouched — the per-step tripwire for gradient spikes.
+
+    Every ``probe_every`` training logs it additionally runs one eager diagnostic
+    forward on the *unwrapped* model (``output_hidden_states`` +
+    ``output_attentions``) over a small fixed probe batch and records, under the
+    ``diag/`` prefix:
+
+    * per-depth residual-stream RMS (``diag/residual_rms/{max,mean,argmax_layer,
+      final_layer}``) — residual growth and the hidden-state index that drives it
+      (index 0 is the post-embedding state; 1..L are block outputs);
+    * output-logit RMS (``diag/logit_rms``);
+    * attention entropy and max probability (``diag/attn_entropy/{mean,min}``,
+      ``diag/attn_max_prob/max``) — the exact collapse signal SDPA hides.
+
+    The probe runs off the compiled training step (eager, unwrapped, ``no_grad``,
+    ``eval`` restored afterward), so there are **no forward hooks** and
+    ``torch.compile`` stays on for training. ``probe_every=0`` logs only the grad
+    norm. Metrics emit through ``accelerator.log`` on the training-loss cadence
+    (eval-only logs are skipped).
+    """
+
+    def __init__(self, *, probe_every: int = 25) -> None:
+        if probe_every < 0:
+            raise ValueError(f"probe_every must be >= 0, got {probe_every}")
+        self.probe_every = probe_every
+        self._probe_batch: dict[str, torch.Tensor] | None = None
+        self._log_count = 0
+        self._probe_disabled = False
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def on_train_start(self, trainer: Trainer) -> None:
+        if self.probe_every > 0:
+            self._probe_batch = self._capture_probe_batch(trainer)
+
+    def on_log(self, trainer: Trainer, metrics: dict[str, float], step: int) -> None:
+        # Fire only on training-step logs, not eval-only emissions, so the diag
+        # cadence tracks train logging.
+        if "train/loss" not in metrics:
+            return
+        self._log_count += 1
+
+        diag: dict[str, float] = {}
+        grad_norm = getattr(trainer, "_last_grad_norm", None)
+        if grad_norm is not None:
+            diag["diag/grad_norm"] = float(grad_norm)
+
+        if (
+            self.probe_every > 0
+            and not self._probe_disabled
+            and self._log_count % self.probe_every == 0
+        ):
+            self._run_probe(trainer, diag)
+
+        if diag:
+            trainer.accelerator.log(diag, step=step)
+
+    # -- probe --------------------------------------------------------------
+
+    @staticmethod
+    def _capture_probe_batch(trainer: Trainer) -> dict[str, torch.Tensor] | None:
+        """Grab one small fixed batch (a fresh iterator; the train iterator is untouched)."""
+        try:
+            batch = next(iter(trainer.dataloader))
+        except (StopIteration, TypeError, KeyError):
+            logger.warning("stability probe: could not capture a batch; disabling it")
+            return None
+        device = trainer.accelerator.device
+        probe = {
+            key: batch[key][:_PROBE_MAX_EXAMPLES, :_PROBE_MAX_TOKENS].to(device)
+            for key in ("input_ids", "attention_mask")
+            if key in batch
+        }
+        return probe or None
+
+    def _run_probe(self, trainer: Trainer, diag: dict[str, float]) -> None:
+        """Eager diagnostic forward on the unwrapped model; fill residual/logit/entropy."""
+        if self._probe_batch is None or "input_ids" not in self._probe_batch:
+            return
+        model = trainer.accelerator.unwrap_model(trainer.model)
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=self._probe_batch["input_ids"],
+                    attention_mask=self._probe_batch.get("attention_mask"),
+                    output_hidden_states=True,
+                    output_attentions=True,
+                )
+            self._emit_residual(diag, getattr(outputs, "hidden_states", None))
+            logits = getattr(outputs, "logits", None)
+            if isinstance(logits, torch.Tensor):
+                diag["diag/logit_rms"] = float(_rms(logits))
+            self._emit_entropy(diag, getattr(outputs, "attentions", None))
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never kill training
+            logger.warning("stability probe failed; disabling it: %s", exc)
+            self._probe_disabled = True
+        finally:
+            if was_training:
+                model.train()
+
+    @staticmethod
+    def _emit_residual(diag: dict[str, float], hidden_states: object) -> None:
+        """Reduce the (L+1)-tuple of residual states to max/mean/argmax/final RMS."""
+        if not hidden_states:
+            return
+        values = torch.stack(
+            [_rms(h) for h in hidden_states if isinstance(h, torch.Tensor)]  # ty: ignore[not-iterable]
+        )
+        if values.numel() == 0:
+            return
+        diag["diag/residual_rms/max"] = float(values.max())
+        diag["diag/residual_rms/mean"] = float(values.mean())
+        diag["diag/residual_rms/argmax_layer"] = float(int(values.argmax()))
+        diag["diag/residual_rms/final_layer"] = float(values[-1])
+
+    @staticmethod
+    def _emit_entropy(diag: dict[str, float], attentions: object) -> None:
+        """Record per-layer attention entropy and max probability from the weights."""
+        entropies: list[torch.Tensor] = []
+        max_probs: list[torch.Tensor] = []
+        for attn in attentions or ():  # ty: ignore[not-iterable]
+            if not isinstance(attn, torch.Tensor):
+                continue
+            # attn: (B, H, T, T) fp32, softmaxed over keys.
+            p = attn.detach().float().clamp_min(1e-12)
+            entropies.append(-(p * p.log()).sum(-1).mean())
+            max_probs.append(p.max())
+        if entropies:
+            ent = torch.stack(entropies)
+            diag["diag/attn_entropy/mean"] = float(ent.mean())
+            diag["diag/attn_entropy/min"] = float(ent.min())
+            diag["diag/attn_max_prob/max"] = float(torch.stack(max_probs).max())

@@ -790,7 +790,7 @@ def transfer(
     candidates: Annotated[str | None, typer.Option("--candidates")] = None,
     presets: Annotated[str, typer.Option("--presets")] = "400M,800M,1B",
     steps: Annotated[str, typer.Option("--steps")] = "10000,20000,10000",
-    exponents: Annotated[str, typer.Option("--exponents")] = "0,0.25,0.5",
+    exponents: Annotated[str, typer.Option("--exponents")] = "0,0.5,0.75,1.0",
     global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     warmup: Annotated[int, typer.Option("--warmup")] = 5000,

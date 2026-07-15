@@ -139,7 +139,10 @@ effective_block_lr(L) = width_aware_lr * (mup_depth_reference_layers / L) ** mup
 `mup_depth_reference_layers` defaults to `24`, and
 `mup_depth_lr_exponent=0.0` makes the correction a no-op. The correction does
 not apply to embeddings, the final stack norm, or the MLM head/readout. The
-production sweep tests one exponent for the complete scaling ray.
+production sweep selects one exponent for the complete scaling ray from a
+`0,0.5,0.75,1.0` grid (empirical because Muon is neither Adam nor SGD, so the
+published CompleteP/Depth-μP exponents do not carry over); see
+[LR_SWEEP.md](LR_SWEEP.md#depth-lr-exponent-grid).
 
 ### Multipliers across the presets
 

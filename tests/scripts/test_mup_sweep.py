@@ -539,7 +539,8 @@ def test_transfer_generates_paired_candidates_across_default_models(
 
     assert result.exit_code == 0, result.output
     params = [run.params for run in load_phase(out / "phase.json").runs]
-    assert len(params) == 18
+    # 2 candidates × 3 presets × 4 depth exponents.
+    assert len(params) == 24
     assert {(cell["lr"], cell["output_mult"]) for cell in params} == {
         (0.01, 1.0),
         (0.016, 0.5),
@@ -549,7 +550,7 @@ def test_transfer_generates_paired_candidates_across_default_models(
         ("800M", 20000),
         ("1B", 10000),
     }
-    assert {cell["depth_exponent"] for cell in params} == {0.0, 0.25, 0.5}
+    assert {cell["depth_exponent"] for cell in params} == {0.0, 0.5, 0.75, 1.0}
     assert {(cell["global_examples"], cell["seed"], cell["warmup_steps"]) for cell in params} == {
         (2048, 42, 5000)
     }
