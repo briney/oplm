@@ -1,0 +1,44 @@
+I've started the `coarse` runs, but I don't see anything being logged to `diag/...` in wandb, just `train/...` and `system/...` so far (haven't hit the first scheduled eval yet, so nothing there. When will `diag` stuff log, if ever?
+
+---
+
+The first training run crashed at step 250, which coincides with the first full diagnostics run. Lots of opaque (to me) errors like the one below, one from each rank. Diagnose and propose a fix.
+
+[rank2]:[E715 08:11:04.746233312 ProcessGroupNCCL.cpp:749] [Rank 2] Some NCCL operations have failed or timed out. Due to the asynchronous nature of CUDA kernels, subs
+equent GPU operations might run on corrupted/incomplete data.
+[rank2]:[E715 08:11:04.746244717 ProcessGroupNCCL.cpp:763] [Rank 2] To avoid data inconsistency, we are taking the entire process down.
+[rank2]:[E715 08:11:04.746960396 ProcessGroupNCCL.cpp:2093] [PG ID 0 PG GUID 0(default_pg) Rank 2] Process group watchdog thread terminated with exception: [Rank 2] Wa
+tchdog caught collective operation timeout: WorkNCCL(SeqNum=7010, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=600000) ran for 600021 milliseconds before timin
+g out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:691 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x774f6d772fdd in /home/jovya
+n/.local/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x26a (0x774e51467d7a in /home/jovyan/.
+local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x16a1 (0x774e5146c261 in /home/jovyan/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0x105 (0x774e5146d5a5 in /home/jovyan/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x774f2f26edb4 in /usr/lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x774f73037aa4 in /usr/lib/x86_64-linux-gnu/libc.so.6)
+frame #6: __clone + 0x44 (0x774f730c4a64 in /usr/lib/x86_64-linux-gnu/libc.so.6)
+
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG ID 0 PG GUID 0(default_pg) Rank 2] Process group watchdog thread terminated with exception: [Rank 2] Watchdog caught collective operation timeout: WorkN
+CCL(SeqNum=7010, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=600000) ran for 600021 milliseconds before timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:691 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x774f6d772fdd in /home/jovya
+n/.local/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x26a (0x774e51467d7a in /home/jovyan/.
+local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x16a1 (0x774e5146c261 in /home/jovyan/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0x105 (0x774e5146d5a5 in /home/jovyan/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x774f2f26edb4 in /usr/lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x774f73037aa4 in /usr/lib/x86_64-linux-gnu/libc.so.6)
+frame #6: __clone + 0x44 (0x774f730c4a64 in /usr/lib/x86_64-linux-gnu/libc.so.6)
+
+Exception raised from run at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:2099 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x774f6d772fdd in /home/jovya
+n/.local/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x9bbbc8 (0x774e50cd3bc8 in /home/jovyan/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: <unknown function> + 0xecdb4 (0x774f2f26edb4 in /usr/lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #3: <unknown function> + 0x9caa4 (0x774f73037aa4 in /usr/lib/x86_64-linux-gnu/libc.so.6)
+frame #4: __clone + 0x44 (0x774f730c4a64 in /usr/lib/x86_64-linux-gnu/libc.so.6)
