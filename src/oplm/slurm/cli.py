@@ -122,8 +122,8 @@ def status(
         # scheduler can't be queried, which looks identical to everything actually having
         # finished. Say so explicitly instead.
         console.print(
-            "[yellow]squeue not found[/yellow]: cannot query the scheduler; "
-            "listing submitted job ids only"
+            "[yellow]scheduler unreachable[/yellow]: cannot query squeue (not found, or its "
+            "controller did not answer before the timeout); listing submitted job ids only"
         )
         for var, job_id in ids.items():
             console.print(f"{var}: {job_id}")

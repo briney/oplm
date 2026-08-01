@@ -223,7 +223,10 @@ def test_status_reports_scheduler_unavailable_when_squeue_is_missing(
 
     result = runner.invoke(app, ["slurm", "status", str(out)])
     assert result.exit_code == 0, result.stdout
-    assert "squeue not found" in result.stdout
+    # Cause-neutral wording: this branch also fires when squeue exists but its controller
+    # wedged past the query timeout, so the message must not claim squeue is missing.
+    assert "scheduler unreachable" in result.stdout
+    assert "squeue not found" not in result.stdout
     assert "JOB_0: 812345" in result.stdout
     assert "active" not in result.stdout
     assert "finished" not in result.stdout
