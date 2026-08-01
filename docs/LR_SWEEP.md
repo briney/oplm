@@ -26,7 +26,7 @@ different from the general model-config fallback/default of `mup_base_width=512`
 
 Use one `configs/mup-production.yaml` for every command below. Create that path (including its
 `configs/` directory) at the repository root with this base config, replacing only the two
-dataset paths:
+dataset paths and the cluster paths in the `slurm:` block:
 
 ```yaml
 model:
@@ -48,17 +48,47 @@ data:
       path: /path/to/eval.parquet
       type: sequence
       every: {steps: 500}
+
+slurm:
+  partition: hpc-mid
+  time_limit:
+    default: "168:00:00"
+    analyze: "01:00:00"
+  cpus_per_task: 128
+  gpus_per_node: 8
+  exclusive: true
+  mem: "0"
+  log_dir: /mnt/home/briney/logs
+  env_file: /mnt/home/briney/.env
+  container_image: /mnt/data/containers/deeplearning_v2026-05-26.sqsh
+  container_mounts:
+    - /mnt/data:/mnt/data
+    - /tmp:/tmp
+  install: pip install oplm[train]
+  max_concurrent: 4
+  nodes:
+    default: {170M: 1, 400M: 4, 800M: 8, 1B: 8}
+    bridge: {170M: 4}
+    confirm: {800M: 8}
+  max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
 ```
 
 The file merges over the packaged defaults. Add any production-specific masking, precision,
 compile, or checkpoint overrides to this same file before launch. Keep exactly one named
-sequence eval task so the harness can infer its `eval/<name>/loss` metric.
+sequence eval task **for every proxy phase** (`smoke` through `confirm`) so the harness can infer
+its `eval/<name>/loss` metric — `scale` is the one exception; it trains production checkpoints, so
+it uses the full multi-task eval suite from `configs/scaling.yaml` (seven tasks: three sequence
+losses plus `casp14` structure eval and two ProteinGym tasks), not this single-task metric.
 
 Keep weight decay fixed at `0.01` for the complete workflow. The generator also resolves each
 cell with μP enabled, base width 768, reference depth 24, the requested depth exponent, and a
 `wsd_linear` schedule whose stable phase runs from the end of warmup to the end of the cell.
-The base config's per-device batch size must divide each requested global batch across the
-selected process count.
+
+The `slurm:` block above follows the general schema documented in [SLURM.md](SLURM.md) — see
+that page for every field, its default, and the accepted `nodes`/`time_limit` forms. Every phase
+command below reads `nodes`, `time_limit`, and `max_batch_size` from it and derives each cell's
+per-device batch and gradient-accumulation steps, so **the `slurm:` block is required even when
+running a phase with `--local`** — it is not only consulted for real Slurm submission.
 
 ## Parameterization gates
 
@@ -67,13 +97,13 @@ ray:
 
 ```bash
 # Parameterization gates (run μP-on and --no-mup control).
-python -m scripts.mup_coord_check --config configs/mup-production.yaml \
+oplm sweep coord-check --config configs/mup-production.yaml \
   --scaling width --widths 384,768,1536 --depth 24 --base-width 768 \
   --out sweeps/coord-width
-python -m scripts.mup_coord_check --config configs/mup-production.yaml \
+oplm sweep coord-check --config configs/mup-production.yaml \
   --no-mup --scaling width --widths 384,768,1536 --depth 24 \
   --base-width 768 --out sweeps/coord-width-control
-python -m scripts.mup_coord_check --config configs/mup-production.yaml \
+oplm sweep coord-check --config configs/mup-production.yaml \
   --scaling preset_ray --widths 512,768,1024,1280 --base-width 768 \
   --out sweeps/coord-ray
 ```
@@ -83,39 +113,140 @@ non-systematic variation is acceptable, and readout logits may shrink at initial
 design. The non-μP control should visibly fan out. The preset-ray check is an empirical test of
 combined width/depth behavior, not a replacement for the fixed-depth width gate.
 
-## Local eight-GPU run
+## Running phases on Slurm
 
-`--local` executes all cells in one phase sequentially. Each cell uses one eight-process
-Accelerate launch, then the phase is ranked before the command returns. Do not generate the
-next phase until the current one has completed and been ranked.
+Every phase from `smoke` through `confirm` **generates** artifacts (fully resolved `run.yaml`
+configs, a `phase.json` manifest, and one Slurm array job per preset plus a dependent `analyze`
+job — see [SLURM.md §6](SLURM.md#6-job-arrays-and-the-homogeneous-resource-constraint)). Do not
+generate the next phase until the current one has completed and been ranked. `scale` is different
+— see the note at the end of this section.
+
+For the cheap, fast proxy phases (`smoke`, `coarse`, `refine`, and the first `replicate`), pass
+`--submit` so generation and submission happen in one step. For the expensive, multi-day,
+multi-node phases (`transfer`, `bridge`, the second `replicate`, `confirm`), omit `--submit`,
+inspect the generated `jobs/*.sbatch` scripts and `jobs/submit.sh`, then run `bash
+sweeps/<phase>/jobs/submit.sh` yourself once you're ready to commit the allocation:
 
 ```bash
-# Generate jobs; add --local to run each phase sequentially on all eight GPUs.
-python -m scripts.mup_sweep smoke --config configs/mup-production.yaml \
-  --out sweeps/smoke --num-processes 8 --local
-python -m scripts.mup_sweep coarse --config configs/mup-production.yaml \
-  --from sweeps/smoke/phase.json --out sweeps/coarse --num-processes 8 --local
-python -m scripts.mup_sweep refine --config configs/mup-production.yaml \
-  --from sweeps/coarse/phase.json --out sweeps/refine --num-processes 8 --local
-python -m scripts.mup_sweep replicate --config configs/mup-production.yaml \
-  --from sweeps/refine/phase.json --out sweeps/refine-replicate --num-processes 8 --local
-python -m scripts.mup_sweep transfer --config configs/mup-production.yaml \
-  --from sweeps/refine-replicate/phase.json --out sweeps/transfer --num-processes 8 --local
-python -m scripts.mup_sweep bridge --config configs/mup-production.yaml \
-  --from sweeps/transfer/phase.json --out sweeps/bridge --num-processes 8 --local
-python -m scripts.mup_sweep replicate --config configs/mup-production.yaml \
-  --from sweeps/bridge/phase.json --out sweeps/bridge-replicate --num-processes 8 --local
-python -m scripts.mup_sweep confirm --config configs/mup-production.yaml \
-  --from sweeps/bridge-replicate/phase.json --out sweeps/confirm --num-processes 8 --local
-python -m scripts.mup_sweep scale --config configs/mup-production.yaml \
-  --from sweeps/confirm/phase.json --out sweeps/scale --num-processes 8 --local
+# Cheap phases: generate and submit in one step.
+oplm sweep smoke --config configs/mup-production.yaml --out sweeps/smoke --submit
+oplm sweep coarse --config configs/mup-production.yaml \
+  --from sweeps/smoke/phase.json --out sweeps/coarse --submit
+oplm sweep refine --config configs/mup-production.yaml \
+  --from sweeps/coarse/phase.json --out sweeps/refine --submit
+oplm sweep replicate --config configs/mup-production.yaml \
+  --from sweeps/refine/phase.json --out sweeps/refine-replicate --submit
+
+# Expensive phases: generate, review, then submit manually.
+oplm sweep transfer --config configs/mup-production.yaml \
+  --from sweeps/refine-replicate/phase.json --out sweeps/transfer
+bash sweeps/transfer/jobs/submit.sh
+oplm sweep bridge --config configs/mup-production.yaml \
+  --from sweeps/transfer/phase.json --out sweeps/bridge
+bash sweeps/bridge/jobs/submit.sh
+oplm sweep replicate --config configs/mup-production.yaml \
+  --from sweeps/bridge/phase.json --out sweeps/bridge-replicate --submit
+oplm sweep confirm --config configs/mup-production.yaml \
+  --from sweeps/bridge-replicate/phase.json --out sweeps/confirm
+bash sweeps/confirm/jobs/submit.sh
+
+# scale never submits -- see the phase table below.
+oplm sweep scale --config configs/mup-production.yaml \
+  --from sweeps/confirm/phase.json --out sweeps/scale
 ```
+
+Each `generate` call's own `--submit` and the `jobs/submit.sh` it always writes are equivalent —
+`--submit` just runs that submission immediately instead of leaving it for you to review first.
+The generator's dependent `analyze` job runs `oplm sweep analyze <phase>/phase.json` automatically
+once every array for that phase has finished (or diverged) via `afterany`, so a completed,
+submitted phase ranks itself; you do not need to call `analyze` by hand unless you're re-ranking
+after a manual resubmission.
+
+`scale` writes plain per-preset `run.yaml`/`.sbatch` pairs under `sweeps/scale/jobs/`, with no
+`phase.json`, `jobs.json`, or `submit.sh` — there is no ranking left to do and nothing for
+`oplm slurm status` to track. Submit each one directly once you've reviewed it:
+
+```bash
+sbatch sweeps/scale/jobs/oplm-170M-scale.sbatch
+sbatch sweeps/scale/jobs/oplm-400M-scale.sbatch
+# ...one per --presets entry
+```
+
+`--local` remains available (see `oplm sweep smoke --help`) for a single-machine sanity run: it
+executes every cell sequentially on one eight-GPU node with no Slurm involvement at all, then
+ranks the phase before the command returns. It is useful for confirming a new production config's
+cells generate and train correctly before committing a multi-day Slurm allocation, but it is not
+the production path — `--local` and `--submit` are mutually exclusive.
+
+### Node counts and derived per-device batch
+
+Under the `slurm:` block above, every cell resolves to `gradient_accumulation_steps=1`. Wall-time
+estimates are derived from a single 170M measurement (~12 h per 10,000 steps at global batch
+2048) scaled by parameter count and node count; cells also now pin full gradient checkpointing
+(`model.gradient_checkpointing_mode=full`), which was not necessarily in effect when that
+measurement was taken. Treat the wall-time column as order-of-magnitude guidance, not a promise:
+
+| Phase | Preset | Global batch | Nodes | Per-device batch | Est. wall time |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `smoke`/`coarse`/`refine`/`replicate` | 170M | 2048 | 1 | 256 | ~12 h (`coarse`, 10k steps) |
+| `transfer` | 400M | 2048 | 4 | 64 | ~7 h (10k steps) |
+| `transfer` | 800M | 2048 | 8 | 32 | ~14 h (20k steps) |
+| `transfer` | 1B | 2048 | 8 | 32 | ~13 h (10k steps) |
+| `bridge` | 170M | 8192 | 4 | 256 | ~12 h (10k steps) |
+| `confirm` | 800M | 8192 | 8 | 128 | ~28 h (10k steps) |
+
+Full gradient checkpointing is what makes the 400M+ per-device batches above fit in memory; it
+costs roughly 30–40% more compute than selective checkpointing.
+
+### Status and resubmission
+
+`oplm sweep status <phase.json>` reports each cell's state (`complete`, `non-finite`, `running`,
+`missing`, or `unknown` — see `--help` for the full definitions) and prints a ready-to-run
+resubmit line for any preset with incomplete cells:
+
+```text
+$ oplm sweep status sweeps/smoke/phase.json
+                        smoke (eval/heldout/loss)
+┏━━━━━━━━┳━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓
+┃ preset ┃ idx ┃ cell                     ┃ state    ┃ eval/heldout/loss ┃
+┡━━━━━━━━╇━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
+│ 170M   │   0 │ 170M-lr0.0004-om1-a0-s42 │ complete │            2.3100 │
+│ 170M   │   1 │ 170M-lr0.0016-om1-a0-s42 │ missing  │                 - │
+│ 170M   │   2 │ 170M-lr0.0063-om1-a0-s42 │ missing  │                 - │
+└────────┴─────┴──────────────────────────┴──────────┴───────────────────┘
+resubmit 170M: sbatch --array=1,2 jobs/170M.sbatch
+```
+
+Run the printed `sbatch --array=...` line from inside the phase's own directory (it is relative to
+`jobs/`). A preset is withheld from resubmit guidance (with an explicit `skip` line) when every one
+of its open cells is `running` or `unknown` — resubmitting a `running` cell risks a duplicate run,
+and an `unknown` cell's true state cannot be determined at all because the scheduler could not be
+reached.
+
+## The re-centered learning-rate grid
+
+`smoke` and `coarse`'s `--lrs` default to the module constants in `src/oplm/sweep/phases.py`
+(confirm with `oplm sweep smoke --help` / `oplm sweep coarse --help`):
+
+- `smoke` (`SMOKE_LRS`): `0.0004,0.0016,0.0063`
+- `coarse` (`COARSE_LRS`): `0.0004,0.00063,0.001,0.0016,0.0025,0.004,0.0063`
+
+**This grid moved down one half-decade from an earlier `0.0025,0.01,0.04` (smoke) /
+`0.0025,0.004,0.0063,0.01,0.016,0.025,0.04` (coarse) grid.** A real 170M coarse sweep on the old
+grid ranked `0.0025 ≈ 0.004 ≫ 0.0063 > 0.01 > 0.016`, putting the winner at the **lower boundary**
+of the grid — and `analyze_phase` only selects a refinement region when the coarse winner is
+*interior* to its finite grid, so that coarse phase ranked its cells but selected nothing,
+stalling the funnel with no candidate to hand `refine`. The new grid keeps the same 1.6× spacing,
+shifted one half-decade down, so both of the old grid's observed winners now sit interior with
+headroom below them, and `0.0063` remains as an upper guard.
+
+## Phase funnel
 
 The defaults implement this funnel:
 
 | Phase | Purpose |
 | --- | --- |
-| `smoke` | Check LRs `0.0025,0.01,0.04` at 170M for 1,000 steps. |
+| `smoke` | Check LRs `0.0004,0.0016,0.0063` at 170M for 1,000 steps. |
 | `coarse` | Rank the seven-point LR grid at 170M for 10,000 steps. |
 | `refine` | Cross the selected local LR region with output multipliers `0.5,1,2`. |
 | first `replicate` | Add seeds 43 and 44 to seed 42 for the two finalists. |
@@ -123,7 +254,12 @@ The defaults implement this funnel:
 | `bridge` | Test batch-correction LR multipliers `0.7,1,1.4,2` at the 170M production batch. |
 | second `replicate` | Add seeds 43 and 44 to the bridge finalists. |
 | `confirm` | Rank the production-batch finalists at 800M. |
-| `scale` | Run the winner for 100,000 steps across 50M, 170M, 400M, 800M, and 1B. |
+| `scale` | **Generate-only** — write production job scripts for the confirmed winner. |
+
+`scale` runs no proxy cells and owns no ranking: it writes 100,000-step production job scripts
+carrying the confirmed `lr`, `output_mult`, and `depth_exponent` for each requested preset
+(default `170M,400M,800M,1B`) and never submits them — you review and submit the generated
+scripts yourself (see [SLURM.md](SLURM.md)).
 
 The proxy phases default to 2,048 global examples (roughly 1M tokens for the intended length
 distribution); bridge and later phases use 8,192 (roughly 4M). μP does not make batch size
@@ -134,7 +270,8 @@ over 1k), 2,000 for the 20k `refine` and the 20k 800M `transfer` cell, and 5,000
 100k `scale` cells. Warmup *fraction*, like batch size, does not transfer across horizon — so the
 proxy keeps it modest rather than spending half of a short run ramping, which also avoids the
 selection bias where a large warmup fraction tolerates a hotter peak LR than production's ~0.4%
-warmup can sustain. `transfer` takes a per-preset `--warmup` list aligned with `--presets`/`--steps`.
+warmup can sustain. `transfer` takes a per-preset `--warmup` list aligned with
+`--presets`/`--steps`.
 
 ## Depth-LR exponent grid
 
@@ -156,8 +293,8 @@ phase with the `--diagnostics` flag (default `--no-diagnostics`), which pins
 `train.stability_diagnostics` in each generated cell and overrides whatever the base config says:
 
 ```bash
-python -m scripts.mup_sweep coarse --config configs/mup-production.yaml \
-  --from sweeps/smoke/phase.json --out sweeps/coarse --num-processes 8 --local --diagnostics
+oplm sweep coarse --config configs/mup-production.yaml \
+  --from sweeps/smoke/phase.json --out sweeps/coarse --diagnostics
 ```
 
 Tune the probe cadence with `train.stability_probe_every` in the base config (default 25 logs;
@@ -213,12 +350,17 @@ oplm train --preset 800M --config configs/mup-production.yaml \
 
 ## Phase artifacts
 
-Every phase directory has the same small layout:
+Every phase directory has the same layout:
 
 ```text
 sweeps/<phase>/
 ├── phase.json
 ├── commands.txt
+├── jobs/
+│   ├── <preset>.sbatch       # one array job per preset in this phase
+│   ├── <preset>.jobs         # array index -> run id, one per line
+│   ├── analyze.sbatch        # runs `oplm sweep analyze`, depends on every array (afterany)
+│   └── submit.sh             # submits every job above in dependency order
 └── runs/
     └── <id>/
         ├── run.yaml
@@ -226,9 +368,12 @@ sweeps/<phase>/
         └── output/
 ```
 
-- `phase.json` is the phase manifest. It records the source phase, planned cells, ranking, and
-  selected candidates.
-- `commands.txt` contains one shell-quoted Accelerate command per generated cell.
+- `phase.json` is the phase manifest. It records the source phase, planned cells (including each
+  cell's resolved `nodes`, `per_device_batch`, and `gradient_accumulation_steps`), ranking,
+  selected candidates, the `oplm` version that generated it, and (once submitted) job ids.
+- `commands.txt` contains one shell-quoted Accelerate command per generated cell, for reference or
+  ad hoc reruns outside Slurm.
+- `jobs/` is the Slurm layer's output — see [SLURM.md](SLURM.md) for what it contains and why.
 - `runs/<id>/run.yaml` is the fully resolved config for that cell.
 - `runs/<id>/result.json` contains the final evaluation values used by ranking.
 - `runs/<id>/output/` is the normal training output directory.
@@ -250,19 +395,14 @@ refinement region. Refinement, replication, transfer, bridge, and confirmation t
 candidate set according to the implemented phase rules. Inspect the validation losses and the
 `ranking` and `selected` arrays in each `phase.json` before continuing.
 
-## SUNK/Slurm use
-
-Omit `--local` to generate artifacts without running them. Queue each line from that phase's
-`commands.txt` inside its SUNK/Slurm allocation. After all expected results have completed,
-rank the phase before generating the next one:
-
-```bash
-# Generate without --local, queue each commands.txt line inside its SUNK allocation,
-# then rank completed results before generating the next phase.
-python -m scripts.mup_sweep analyze sweeps/coarse/phase.json
-```
-
-Use the same phase order and `--from` links as the local sequence.
+**`batch_mult` is ranking metadata only — it is never re-applied to a config.** `bridge` records
+each candidate's batch-correction multiplier as `batch_mult` and folds the correction directly
+into that candidate's `lr` (`lr = candidate["lr"] * multiplier`); every later phase (`confirm`,
+`scale`) carries `batch_mult` forward purely so you can see which batch correction a winner came
+from, but reads only `lr`, `output_mult`, and `depth_exponent` back out of a selected candidate.
+There is no `train.batch_mult` training-config field, and there must not be one applied by hand
+either — the correction is already inside `lr`. Re-applying `batch_mult` on top of that `lr` would
+square the correction.
 
 ## Production WSD schedule
 
@@ -288,11 +428,23 @@ train:
   max_steps: 2_260_000  # 10k warmup + 1.5M stable + 750k decay
 ```
 
+**Watch out for a zero-decay footgun.** The sweep phases in this document deliberately set
+`stable_steps = max_steps - warmup_steps` for every proxy cell — for a *short* proxy run that
+convention is fine, since selection only cares about the peak stable LR, not a cooldown. That same
+arithmetic is **wrong** for a real production run: it leaves **zero** steps between the end of the
+stable plateau and `max_steps`, so a `wsd_linear` schedule trains at peak LR all the way to the
+end with no decay at all — silently, since nothing errors. This is not a hypothetical: this
+repo's own production job scripts previously shipped with exactly that configuration.
+`configs/scaling.yaml` gets this right — `warmup_steps: 5000`, `stable_steps: 85000`,
+`max_steps: 100000`, leaving a real 10,000-step (10%) linear-decay tail — and is the reference to
+copy the pattern from, not the short-horizon sweep cells.
+
 Preserve optimizer state through the small dataset-mixture change at the stable-to-decay
 transition. Do not reset momentum or add a second warmup.
 
 ## References
 
+- [SLURM.md](SLURM.md) — the general Slurm job-generation layer this runbook builds on.
 - [MUP.md](MUP.md) — OPLM's width-μP parameterization and coordinate-check interpretation.
 - [CONFIG.md](CONFIG.md) — model and training configuration fields.
 - [TRAIN.md](TRAIN.md) — training, distributed launch, schedules, and resume.

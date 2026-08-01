@@ -183,15 +183,15 @@ batch, and records every `nn.Linear`/`nn.Embedding` output RMS per step.
 
 ```bash
 # The gate (vary width only, fixed depth):
-python -m scripts.mup_coord_check --config configs/my-run.yaml \
+oplm sweep coord-check --config configs/my-run.yaml \
   --widths 128,256,512,1024 --depth 24 --base-width 512 --optimizer muon
 
 # The control — should fan out / grow with width:
-python -m scripts.mup_coord_check --config configs/my-run.yaml --no-mup \
+oplm sweep coord-check --config configs/my-run.yaml --no-mup \
   --widths 128,256,512,1024 --depth 24 --base-width 512
 
 # The preset ray (co-scale depth with width; see Caveats):
-python -m scripts.mup_coord_check --config configs/my-run.yaml \
+oplm sweep coord-check --config configs/my-run.yaml \
   --scaling preset_ray --widths 512,768,1024 --base-width 512 --optimizer muon
 ```
 
@@ -218,11 +218,12 @@ RMS-growth table plus a verdict.
 
 ## 6. Production sweep harness
 
-The executable local Accelerate and SUNK/Slurm command sequences, phase
-artifacts, and selection rules live in [LR_SWEEP.md](LR_SWEEP.md). The harness
-uses one production YAML, keeps weight decay fixed at `0.01`, and carries selected
-candidates through refine, replicate, transfer, batch bridge, confirmation, and
-winner-only scaling phases.
+The executable `oplm sweep` command sequence, Slurm job generation, phase
+artifacts, and selection rules live in [LR_SWEEP.md](LR_SWEEP.md) (job scripts
+themselves are rendered by the general layer documented in
+[SLURM.md](SLURM.md)). The harness uses one production YAML, keeps weight decay
+fixed at `0.01`, and carries selected candidates through refine, replicate,
+transfer, batch bridge, confirmation, and winner-only scaling phases.
 
 ---
 
@@ -254,5 +255,7 @@ winner-only scaling phases.
 ## See also
 
 - [TRAIN.md](TRAIN.md) — training how-to (data, launching, checkpointing).
+- [LR_SWEEP.md](LR_SWEEP.md) — the phased production LR sweep runbook.
+- [SLURM.md](SLURM.md) — the general Slurm job-generation layer the sweep builds on.
 - [CONFIG.md](CONFIG.md#μp-maximal-update-parametrization) — the `mup_*` knobs.
 - [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md) — depth scaling and the readout.

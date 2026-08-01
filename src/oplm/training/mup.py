@@ -252,7 +252,8 @@ class SweepMetricsCallback(TrainerCallback):
     ``trainer_state.json`` carries no loss, so the LR sweep relies on this
     callback. It EMA-smooths the train loss across ``on_log`` events, keeps the
     last value per ``eval/*`` key from ``on_eval_end``, and writes
-    ``{final_train_loss, eval, lr, width, steps}`` on ``on_train_end``.
+    ``{final_train_loss, eval, lr, width, steps, global_batch, oplm_version}``
+    on ``on_train_end``.
     """
 
     def __init__(self, path: str | Path, *, ema_decay: float = 0.9) -> None:
