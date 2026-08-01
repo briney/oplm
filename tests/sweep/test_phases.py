@@ -87,7 +87,7 @@ def test_smoke_generates_three_production_cells(base_config: Path, tmp_path: Pat
     phase = load_phase(out / "phase.json")
     assert phase.phase == "smoke"
     assert phase.metric == "eval/heldout/loss"
-    assert [run.params["lr"] for run in phase.runs] == [0.0025, 0.01, 0.04]
+    assert [run.params["lr"] for run in phase.runs] == [0.0004, 0.0016, 0.0063]
     assert len((out / "commands.txt").read_text().splitlines()) == 3
 
     cfg = load_config(["--config", str(out / phase.runs[1].config)])
@@ -102,7 +102,7 @@ def test_smoke_generates_three_production_cells(base_config: Path, tmp_path: Pat
     assert cfg.model.mup_output_mult == 1.0
     assert cfg.train.optimizer == "muon"
     assert cfg.train.weight_decay == 0.01
-    assert cfg.train.lr == 0.01
+    assert cfg.train.lr == 0.0016
     assert cfg.train.scheduler == "wsd_linear"
     assert cfg.train.max_steps == 1000
     assert cfg.train.max_epochs is None
@@ -224,33 +224,46 @@ def test_refine_uses_coarse_selected_lrs(base_config: Path, tmp_path: Path) -> N
     }
 
 
-def _write_smoke_phase(tmp_path: Path, metrics: dict[float, float | None]) -> Path:
-    metric = "eval/heldout/loss"
-    runs = [
-        RunSpec(
-            f"lr-{lr:g}",
-            f"runs/lr-{lr:g}/run.yaml",
-            f"runs/lr-{lr:g}/result.json",
-            {"lr": lr},
-        )
-        for lr in (0.0025, 0.01, 0.04)
-    ]
-    path = tmp_path / "smoke" / "phase.json"
-    write_phase(path, PhaseManifest(1, "smoke", metric, None, runs, [], []))
-    for run in runs:
-        value = metrics[float(run.params["lr"])]
+def _write_smoke_phase(tmp_path: Path, *, results: dict[float, float | None]) -> Path:
+    """Write a minimal smoke phase directory with one cell per learning rate."""
+    out = tmp_path / "smoke"
+    (out / "runs").mkdir(parents=True)
+    runs = []
+    for lr, value in results.items():
+        run_id = f"170M-lr{lr:g}"
+        run_dir = out / "runs" / run_id
+        run_dir.mkdir()
         if value is not None:
-            result = path.parent / run.result
-            result.parent.mkdir(parents=True)
-            result.write_text(json.dumps({"eval": {metric: value}}))
+            (run_dir / "result.json").write_text(json.dumps({"eval": {"eval/heldout/loss": value}}))
+        runs.append(
+            RunSpec(
+                run_id,
+                f"runs/{run_id}/run.yaml",
+                f"runs/{run_id}/result.json",
+                {"preset": "170M", "lr": lr, "output_mult": 1.0, "depth_exponent": 0.0, "seed": 42},
+            )
+        )
+    path = out / "phase.json"
+    write_phase(
+        path,
+        PhaseManifest(
+            version=1,
+            phase="smoke",
+            metric="eval/heldout/loss",
+            source=None,
+            runs=runs,
+            ranking=[],
+            selected=[],
+        ),
+    )
     return path
 
 
 @pytest.mark.parametrize(
     ("high_metric", "expected_lrs"),
     [
-        (1.2, [0.0025, 0.004, 0.0063, 0.01, 0.016, 0.025, 0.04]),
-        (None, [0.0025, 0.004, 0.0063, 0.01, 0.016, 0.025]),
+        (1.2, [0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063]),
+        (None, [0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004]),
     ],
 )
 def test_coarse_uses_smoke_divergence_gate(
@@ -259,7 +272,7 @@ def test_coarse_uses_smoke_divergence_gate(
     high_metric: float | None,
     expected_lrs: list[float],
 ) -> None:
-    source = _write_smoke_phase(tmp_path, {0.0025: 1.4, 0.01: 1.1, 0.04: high_metric})
+    source = _write_smoke_phase(tmp_path, results={0.0004: 1.4, 0.0016: 1.1, 0.0063: high_metric})
     out = tmp_path / "coarse"
     result = runner.invoke(
         phases.app,
@@ -277,13 +290,13 @@ def test_coarse_uses_smoke_divergence_gate(
     assert [run.params["lr"] for run in load_phase(out / "phase.json").runs] == expected_lrs
 
 
-@pytest.mark.parametrize("failed_lr", [0.0025, 0.01])
+@pytest.mark.parametrize("failed_lr", [0.0004, 0.0016])
 def test_coarse_rejects_nonfinite_required_smoke_cells(
     base_config: Path, tmp_path: Path, failed_lr: float
 ) -> None:
-    metrics: dict[float, float | None] = {0.0025: 1.4, 0.01: 1.1, 0.04: 1.2}
+    metrics: dict[float, float | None] = {0.0004: 1.4, 0.0016: 1.1, 0.0063: 1.2}
     metrics[failed_lr] = None
-    source = _write_smoke_phase(tmp_path, metrics)
+    source = _write_smoke_phase(tmp_path, results=metrics)
     result = runner.invoke(
         phases.app,
         [
@@ -298,6 +311,57 @@ def test_coarse_rejects_nonfinite_required_smoke_cells(
     )
     assert result.exit_code != 0
     assert f"{failed_lr:g}" in result.output
+
+
+def test_grid_constants_are_recentered() -> None:
+    assert phases.COARSE_LRS == (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)
+    assert phases.SMOKE_LRS == (0.0004, 0.0016, 0.0063)
+    # Smoke probes the coarse grid's endpoints and midpoint.
+    assert phases.SMOKE_LRS[0] == phases.COARSE_LRS[0]
+    assert phases.SMOKE_LRS[-1] == phases.COARSE_LRS[-1]
+    assert phases.SMOKE_LRS[1] == phases.COARSE_LRS[len(phases.COARSE_LRS) // 2]
+
+
+def test_no_phase_logic_hardcodes_a_learning_rate() -> None:
+    """The old gates tested scores.get(0.0025) / scores.get(0.01) literally.
+
+    Scoped to the two gate functions rather than the whole module: `_write_run_config`
+    legitimately mentions 0.01 when validating `train.weight_decay`, which is unrelated.
+    """
+    import inspect
+
+    for func in (phases._smoke_gated_lrs, phases.analyze_phase):
+        body = inspect.getsource(func)
+        for literal in ("0.0025", "0.01", "0.0016", "0.0004"):
+            assert literal not in body, (
+                f"{func.__name__} still references the literal learning rate {literal}"
+            )
+
+
+def test_smoke_gate_follows_a_custom_grid(tmp_path: Path) -> None:
+    """Gates must track --lrs, not a module constant."""
+    source = _write_smoke_phase(
+        tmp_path,
+        # Custom grid, nothing to do with SMOKE_LRS.
+        results={0.002: 3.1, 0.008: 3.0, 0.032: None},
+    )
+    # The highest LR diverged, so it is dropped from the downstream coarse grid.
+    assert phases._smoke_gated_lrs(source, [0.002, 0.008, 0.032]) == [0.002, 0.008]
+
+
+def test_smoke_gate_raises_when_a_low_lr_is_non_finite(tmp_path: Path) -> None:
+    source = _write_smoke_phase(
+        tmp_path,
+        results={0.002: 3.1, 0.008: None, 0.032: 3.5},
+    )
+    with pytest.raises(ValueError, match="0.008"):
+        phases._smoke_gated_lrs(source, [0.002, 0.008, 0.032])
+
+
+def test_analyze_smoke_requires_two_lowest_finite(tmp_path: Path) -> None:
+    source = _write_smoke_phase(tmp_path, results={0.002: 3.1, 0.008: None, 0.032: 3.5})
+    with pytest.raises(ValueError, match="two lowest"):
+        phases.analyze_phase(source)
 
 
 def test_generation_requires_metric_for_ambiguous_eval_config(

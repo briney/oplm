@@ -28,9 +28,18 @@ from oplm.sweep.common import (
 
 app = typer.Typer(name="mup-sweep", help=__doc__, add_completion=False)
 
-SMOKE_LRS = (0.0025, 0.01, 0.04)
-COARSE_LRS = (0.0025, 0.004, 0.0063, 0.01, 0.016, 0.025, 0.04)
+# Grid re-centered after the 170M coarse sweep ranked 0.0025 ~ 0.004 >> 0.0063 > 0.01 > 0.016,
+# putting the winner on the old grid's lower boundary. Same 1.6x spacing, shifted one half-decade
+# down, so both observed winners sit interior with headroom below and 0.0063 remains an upper
+# guard. See docs/LR_SWEEP.md.
+SMOKE_LRS = (0.0004, 0.0016, 0.0063)
+COARSE_LRS = (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)
 OUTPUT_MULTS = (0.5, 1.0, 2.0)
+
+
+def _grid_default(values: tuple[float, ...]) -> str:
+    """Render an LR grid as the comma-separated string a Typer default expects."""
+    return ",".join(f"{value:g}" for value in values)
 
 
 def _as_float(value: JsonScalar) -> float:
@@ -436,16 +445,34 @@ def _scale_cells(
 
 
 def _smoke_gated_lrs(source: Path, lrs: list[float]) -> list[float]:
+    """Drop the smoke phase's highest LR from ``lrs`` when it failed to produce a finite metric.
+
+    The gate is derived from the source manifest's own learning rates rather than from a module
+    constant, so changing ``--lrs`` moves the gate with it.
+
+    Args:
+        source: Path to the completed smoke ``phase.json``.
+        lrs: Candidate coarse grid.
+
+    Returns:
+        ``lrs``, minus the smoke phase's highest learning rate if that cell diverged.
+
+    Raises:
+        ValueError: If the smoke phase has fewer than two cells, or either of its two lowest
+            learning rates lacks a finite metric.
+    """
     phase = load_phase(source)
-    runs_by_lr = {_as_float(run.params["lr"]): run for run in phase.runs}
     phase_dir = source.resolve().parent
-    for lr in SMOKE_LRS[:2]:
-        run = runs_by_lr.get(lr)
-        if run is None or result_metric(phase_dir, run, phase.metric) is None:
+    runs_by_lr = {_as_float(run.params["lr"]): run for run in phase.runs}
+    phase_lrs = sorted(runs_by_lr)
+    if len(phase_lrs) < 2:
+        raise ValueError(f"smoke phase {source} must have at least two learning rates")
+    for lr in phase_lrs[:2]:
+        if result_metric(phase_dir, runs_by_lr[lr], phase.metric) is None:
             raise ValueError(f"smoke lr={lr:g} lacks a finite {phase.metric}")
-    high_run = runs_by_lr.get(SMOKE_LRS[-1])
-    if high_run is None or result_metric(phase_dir, high_run, phase.metric) is None:
-        return [lr for lr in lrs if lr != SMOKE_LRS[-1]]
+    highest = phase_lrs[-1]
+    if result_metric(phase_dir, runs_by_lr[highest], phase.metric) is None:
+        return [lr for lr in lrs if lr != highest]
     return lrs
 
 
@@ -595,8 +622,16 @@ def analyze_phase(path: Path) -> PhaseManifest:
         eligible = [entry for entry in phase.ranking if entry["score"] is not None]
         if phase.phase == "smoke":
             scores = {float(entry["params"]["lr"]): entry["score"] for entry in phase.ranking}
-            if scores.get(0.0025) is None or scores.get(0.01) is None:
-                raise ValueError("smoke requires finite validation loss at LR 0.0025 and 0.01")
+            ordered = sorted(scores)
+            if len(ordered) < 2:
+                raise ValueError("smoke requires at least two learning rates")
+            missing = [lr for lr in ordered[:2] if scores[lr] is None]
+            if missing:
+                listed = ", ".join(f"{lr:g}" for lr in missing)
+                raise ValueError(
+                    "smoke requires finite validation loss at the two lowest learning rates; "
+                    f"missing: {listed}"
+                )
         elif phase.phase == "coarse":
             if eligible:
                 by_lr = sorted(eligible, key=lambda entry: float(entry["params"]["lr"]))
@@ -656,7 +691,7 @@ def smoke(
     config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
     out: Annotated[Path, typer.Option("--out", file_okay=False)],
     metric: Annotated[str | None, typer.Option("--metric")] = None,
-    lrs: Annotated[str, typer.Option("--lrs")] = "0.0025,0.01,0.04",
+    lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(SMOKE_LRS),
     global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 1000,
@@ -696,7 +731,7 @@ def coarse(
     out: Annotated[Path, typer.Option("--out", file_okay=False)],
     source: Annotated[Path | None, typer.Option("--from", exists=True, dir_okay=False)] = None,
     metric: Annotated[str | None, typer.Option("--metric")] = None,
-    lrs: Annotated[str, typer.Option("--lrs")] = "0.0025,0.004,0.0063,0.01,0.016,0.025,0.04",
+    lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(COARSE_LRS),
     global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
