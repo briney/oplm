@@ -1,0 +1,745 @@
+<task-notification>
+<task-id>ab313d9bc3d3d1b6a</task-id>
+<tool-use-id>toolu_013Uu1sq5CN5iNtZxxJztjB7</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/ab313d9bc3d3d1b6a.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 1: move sweep modules" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Good — `.superpowers/sdd/` is entirely gitignored (`*`), so the report file overwrite doesn't affect the commit. Everything is in order.
+
+## Report
+
+**Status:** DONE
+
+**Commit:** `a5eeae9` — "refactor: move sweep tooling into the oplm package"
+
+**Test summary:** `python -m pytest tests/sweep/ -q` → 46 passed (identical to the 46-passed baseline from `tests/scripts/` before the move), same 14 pre-existing warnings. Full repo collection: 1576 tests, zero collection errors.
+
+**What was done:**
+- `git mv` of all 4 source files + 4 test files into `src/oplm/sweep/` and `tests/sweep/`; deleted `scripts/` and `tests/scripts/`
+- Created `src/oplm/sweep/__init__.py` and empty `tests/sweep/__init__.py` per brief
+- Rewrote all `scripts.*` imports to `oplm.sweep.*` (verified via `diff` against pre-move blobs that only import/docstring-reference lines changed — zero logic changes)
+- Also fixed 3 docstring `python -m scripts.mup_coord_check` examples and one `:func:` cross-reference in `coord_check.py` (needed for the brief's step-5 grep to pass cleanly)
+- Fixed isort import-group reordering triggered by the rename (scripts/tests were previously non-first-party buckets; oplm.* is first-party) — one case caught by `ruff check --fix`, verified against existing codebase conventions
+
+**Concerns:** None. `ty check` reports 42/16 pre-existing diagnostics in `phases.py`/`test_phases.py` (untyped `dict[str, object]` ranking payload) — confirmed via diff these predate the move; left for Task 2 as instructed.
+
+Report file: `/home/briney/git/oplm/.superpowers/sdd/task-1-report.md`</result>
+<usage><subagent_tokens>107684</subagent_tokens><tool_uses>80</tool_uses><duration_ms>560725</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a149851e03343f120</task-id>
+<tool-use-id>toolu_01RVbqk7LMPHbMfCLW4MXWMG</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a149851e03343f120.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 1 (spec + quality)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All promised names exist. Review complete.
+
+### Spec Compliance
+✅ Spec compliant. All four modules and four test files were moved via git rename exactly per the brief's file list (verified `git ls-tree` at base dc1e430 shows exactly `scripts/{__init__,_mup_common,mup_sweep,mup_run,mup_coord_check}.py` and `tests/scripts/test_mup_{common,coord_check_data,sweep,run}.py`; at head a5eeae9 those paths are gone and `src/oplm/sweep/{__init__,common,phases,run,coord_check}.py` + `tests/sweep/{__init__,test_common,test_phases,test_run,test_coord_check}.py` exist, matching 1:1). `src/oplm/sweep/__init__.py` (diff lines 40-62) matches the brief's specified content verbatim. Interface names promised in the brief are all present: `phases.py:28,30-32,559` defines `app`, `SMOKE_LRS`, `COARSE_LRS`, `OUTPUT_MULTS`, `analyze_phase`.
+
+I independently re-diffed every moved file's pre-move blob against its post-move content (`git show dc1e430:&lt;old&gt; | diff - &lt;(git show a5eeae9:&lt;new&gt;)`), reproducing the implementer's "zero logic changes" claim myself rather than trusting it: every non-identical line is an import-path rewrite (`scripts._mup_common`→`oplm.sweep.common`, `scripts.mup_run`→`oplm.sweep.run`, `-m scripts.mup_run`→`-m oplm.sweep.run`), a module-reference rename in tests (`mup_sweep.`→`phases.`, `mup_run.`→`run.`), or a docstring self-reference (`coord_check.py` Run:: examples and one `:func:` cross-ref). `run.py` diffs as byte-identical (no changes needed, correctly noted).
+
+The three docstring `python -m scripts.mup_coord_check` fixes and the `:func:` cross-reference in `coord_check.py` were necessary, not optional polish: the brief's own step-5 grep (`scripts\.mup_`) matches those literal docstring strings, so leaving them would fail the brief's explicit verification step. Confirmed by re-running that exact grep across the repo — the only remaining hits are in `docs/MUP.md`, `docs/LR_SWEEP.md` (deferred to Phase 10 per brief) and `TODOS.md` (the plan document itself). Zero stray `.py` hits.
+
+The isort import-group reordering in the three test files is a direct, unavoidable consequence of `scripts.*` (bucketed as non-first-party) becoming `oplm.sweep.*` (first-party, per `pyproject.toml:90` `known-first-party = ["oplm"]`); ran `ruff check`/`ruff format --check` on `src/oplm/sweep/` and `tests/sweep/` myself — both pass clean, confirming no leftover ordering issues.
+
+`# noqa: TC003` preserved verbatim in both `src/oplm/sweep/phases.py:8` and `src/oplm/sweep/run.py:5` (confirmed via grep on the checked-out files). `cli.py` untouched (grep for `scripts|sweep` in `src/oplm/cli.py` returns nothing, confirming Task 3 scope wasn't touched). `src/oplm/training/mup.py:158` still has a stale `` ``scripts/mup_coord_check.py`` `` reference — correctly out of this task's scope (not in the file list, and it's a slash-style path reference that doesn't match the brief's step-5 grep patterns, as the report claims and I verified).
+
+### Strengths
+- Verified the implementer's central claim ("zero logic changes") independently by re-running the same before/after diff methodology myself — it holds exactly as reported.
+- `ty check` diagnostic counts reported (42 in `src/oplm/sweep/`, all `phases.py`; 16 in `tests/sweep/`, all `test_phases.py`) reproduced exactly when I ran `ty check` myself — the report's numbers are accurate, not estimated.
+- Correctly distinguished "needed to satisfy the brief's own acceptance grep" (docstring fixes) from "pre-existing findings to leave for Task 2" (the 42+16 `ty` diagnostics), and left the latter untouched as instructed.
+- Confirmed `scripts/` and `tests/scripts/` fully removed with no orphaned files (no untracked `__init__.py` or stragglers left behind).
+- `[project.scripts]` in `pyproject.toml:64` is an unrelated console-script entry-point table, not a reference to the deleted `scripts/` directory — no packaging breakage from the directory removal.
+
+### Issues
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+None.
+
+#### Minor (Nice to Have)
+- `src/oplm/sweep/common.py:1,40` — module and `Optimizer` class docstrings still read "the μP scripts" (generic prose, not a module-path reference, so it passes the brief's grep gate but is mildly stale phrasing now that the tooling lives in a package, not a `scripts/` directory). Purely cosmetic; not required by the brief.
+
+### Assessment
+**Task quality:** Approved
+**Reasoning:** This is a clean, behavior-preserving move — independently re-verified via direct diff of every moved file against its pre-move blob, confirmed `ruff`/`ty` results match the report's claimed counts exactly, and confirmed no `scripts.`-style references survive outside the explicitly deferred docs/plan files. The only deviations from a mechanical `git mv` (docstring fixes, isort reordering) were required by the brief's own verification steps or CI gates, not scope creep.</result>
+<usage><subagent_tokens>61433</subagent_tokens><tool_uses>16</tool_uses><duration_ms>150986</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5427c765e44d900c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a5427c765e44d900c.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 2: src CI gates" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status:** DONE
+Commit: `c29e028` — style: satisfy src CI gates for moved sweep tooling
+Tests: `python -m pytest tests/sweep/ -q` — 46/46 passed, both before and after the change (identical count, confirmed via a scratch worktree at the parent commit).
+
+Fixed 42 `ty check src/` diagnostics in `src/oplm/sweep/phases.py` using option 1 (narrow honest annotations): widened `PhaseManifest.ranking` from `dict[str, object]` to `dict[str, Any]` (common.py + phases.py, ranking entries are genuinely heterogeneous JSON), and added `_as_float`/`_as_int` cast helpers for `Params`/`JsonScalar` numeric conversions (JsonScalar includes `None`, which `int()`/`float()` reject). No `ty: ignore` needed. `ruff check`/`ruff format --check` were already clean. No runtime behavior changed — `cast` is erased at runtime — and `tests/` was not touched.
+
+No concerns. Full report: `/home/briney/git/oplm/.superpowers/sdd/task-2-report.md`</result>
+<usage><subagent_tokens>145359</subagent_tokens><tool_uses>56</tool_uses><duration_ms>645781</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a96679561d60a0239</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a96679561d60a0239.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 2 (spec + quality)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Spec Compliance
+✅ Spec compliant
+
+- All 42 `ty` diagnostics in `src/oplm/sweep/phases.py` resolved; independently reran `ty check src/` (ty 0.0.40, matches pinned version) → `All checks passed!`.
+- `ruff check src/` and `ruff format --check src/` independently rerun on `src/oplm/sweep/` → both clean.
+- Fix scope respected: only `src/oplm/sweep/common.py` and `src/oplm/sweep/phases.py` touched (diff stat confirms); `tests/` untouched (confirmed no tests/ hunks in diff).
+- Preference order followed correctly: option 1 (narrow annotations via `_as_float`/`_as_int` cast helpers) for `Params`/`JsonScalar` conversions; TypedDict (option 2) considered and rejected with a stated reason; no `ty: ignore` used at all (option 3 never needed).
+- Pre-existing `# noqa: TC003` suppressions preserved untouched (`src/oplm/sweep/phases.py:8`) — verified only that one noqa exists in the file, unchanged.
+- Commit message matches brief's suggested text exactly (`style: satisfy src CI gates for moved sweep tooling`).
+- Named risk 1 (cast helpers changing behavior): verified `typing.cast` source (`return val`, no runtime check) — `_as_float`/`_as_int` are truly transparent; every replaced call site (`_write_run_config`, `_run_id`, `_refine_cells`, `_transfer_cells`, `_bridge_cells`, `_confirm_cells`, `_scale_cells`, `_smoke_gated_lrs`, `_aggregate_key`, `_replicate_ranking`, `_transfer_ranking`) passes the identical value through to the identical `float()`/`int()` call — same exceptions, same values, no behavior change.
+- Named risk 2 (`dict[str, object]` → `dict[str, Any]` widening): traced downstream in `analyze_phase` (src/oplm/sweep/phases.py:580-629, outside the diff, confirmed untouched) — it relies on `entry["params"]["lr"]` chained indexing and `{**entry, "params": _candidate(...)}` dict-spread reshaping throughout the "coarse"/"refine"/"bridge"/"confirm" branches. A precise TypedDict or union-of-value-types would have required rewriting these accesses with per-site casts, i.e. touching `analyze_phase` — exactly the ranking/selection-protocol function the brief said not to restructure. `Any` was the only zero-touch option for that function. This is a legitimate, deliberate trade-off, not laziness.
+
+### Strengths
+- Correctly identified two distinct root causes (Params/JsonScalar `None`-safety vs. ranking-entry `object` typing) and matched a fix strategy to each per the brief's preference order, rather than reaching for `ty: ignore` as a shortcut.
+- `_as_float`/`_as_int` are well-documented (docstrings explain exactly why the cast is safe) and the choice not to touch the untouched `valid.sort(key=lambda ...)` line (phases.py, unchanged by diff) because it wasn't a reported finding shows discipline in staying within "fix the findings, and nothing else."
+- Self-reported gate output before/after is honest and matches independent reruns (ruff, ruff format, ty all clean; 46/46 tests, same count both sides).
+- No scope creep into `tests/` despite an available and low-risk opportunity (the `PhaseManifest.ranking` widening incidentally reduced test-file diagnostics 16→14, but the implementer didn't chase that further, correctly treating it as out of scope).
+
+### Issues
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+None.
+
+#### Minor (Nice to Have)
+- `src/oplm/sweep/common.py:62` — `ranking: list[dict[str, Any]]` has no in-code comment explaining why `Any` (vs. `object` or a precise union/TypedDict) was chosen, even though the analogous `_as_float`/`_as_int` cast helpers do carry rationale docstrings. Given tasks 11/12 extend this field per the brief's own callout, a one-line comment at the field (or a short module note) pointing at the `analyze_phase` dict-spread pattern that motivated `Any` would save the next implementer from re-litigating the TypedDict question. The report's rationale is good; it just isn't in the code.
+- `src/oplm/sweep/phases.py` — stylistic inconsistency: some `float()`/`int()` calls on `JsonScalar`-typed values were converted to `_as_float`/`_as_int` (because `ty` flagged them) while structurally identical calls inside `_sort_aggregate`'s `key()` and in `analyze_phase` were left as plain `float()` (because they operate on already-`Any`-typed values and weren't flagged). This is a natural consequence of the two-root-cause split, not a bug, but it means a future reader can't tell from the helper's presence/absence alone which values are "trusted params" vs. "ranking entries" — purely cosmetic.
+
+### Assessment
+**Task quality:** Approved
+**Reasoning:** All four CI gates verified independently passing (ty 0.0.40, ruff check, ruff format --check on `src/`), the `cast`-based helpers are confirmed true no-ops at runtime so the μP selection protocol's numeric conversions and error paths are byte-for-byte preserved, and the `object`→`Any` widening on `PhaseManifest.ranking`, while broader than ideal, is a deliberate and traceable trade-off made specifically to avoid touching `analyze_phase` — the one function the brief explicitly forbade restructuring.</result>
+<usage><subagent_tokens>59443</subagent_tokens><tool_uses>15</tool_uses><duration_ms>229359</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4ecb8f99b41cc92a</task-id>
+<tool-use-id>toolu_01JKUpTEsoQPpan81tgpLoYk</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a4ecb8f99b41cc92a.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 3: wire oplm sweep CLI" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Good — the `.superpowers/sdd/` directory is entirely gitignored, so the report file doesn't affect the commit. Everything is clean and committed. Final summary for the caller:
+
+**Status:** DONE
+
+Commit: `f74679a` — feat: expose sweep phases as oplm sweep
+
+Test summary: RED confirmed (3 failed, exit code 2, no `sweep` command) → GREEN (3 passed); `tests/sweep/` full suite 49/49 passed (46 pre-existing + 3 new); `tests/test_cli.py` 7/7 unaffected. All four gates pass (`ruff check`, `ruff format --check`, `ty check`, `pytest`).
+
+Verified `oplm sweep --help` lists all 10 commands, `oplm sweep coord-check --help` renders `main`'s full 17-option signature intact, and `python -m oplm.sweep.run --help` still works. Import-cost check: no measurable change to `oplm --help` (torch/pandas/pyarrow were already transitively imported pre-task; matplotlib stays excluded via `TYPE_CHECKING`).
+
+Concerns: none blocking. I made one small addition beyond the brief's literal text — updated `coord_check.py`'s docstring `Run::` examples from `python -m oplm.sweep.coord_check` to `oplm sweep coord-check`, since the old form silently stopped working once the `__main__` block was removed. Also, mid-task I accidentally ran `git stash` then immediately `git stash pop` to restore — no work lost, verified via git status/grep, switched to disposable worktrees afterward.
+
+Full report: `/home/briney/git/oplm/.superpowers/sdd/task-3-report.md`</result>
+<usage><subagent_tokens>110615</subagent_tokens><tool_uses>60</tool_uses><duration_ms>428065</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5de8d0bf8bc0f578</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a5de8d0bf8bc0f578.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 3 (spec + quality)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Spec Compliance
+✅ Spec compliant
+
+Verified against the diff line-by-line:
+
+- **`src/oplm/cli.py`** (diff lines 19-34): `from oplm.sweep.cli import app as sweep_app` added with the other `oplm.*` imports (after `oplm.inference`, alphabetically correct, not inline) — satisfies ambiguity resolution 3. `app.add_typer(sweep_app, name="sweep", help="μP learning-rate sweep phases")` added immediately after `app = typer.Typer(...)` — satisfies Step 4 verbatim.
+- **`src/oplm/sweep/cli.py`** (new file, diff lines 48-59): matches the brief's Step 3 code block verbatim, including `app.command("coord-check")(coord_check_main)` — this is exactly the re-registration mechanism the controller specified for ambiguity resolution 1.
+- **`src/oplm/sweep/coord_check.py`** (diff lines 60-151): both `app = typer.Typer(name="mup-coord-check", ...)` (line 104 old) and `@app.command()` (line 126 old) are removed, leaving `main` a plain function; `if __name__ == "__main__": app()` removed. No hunk touches `main`'s parameter list (lines ~127–373 have zero diff activity between the two hunks) — confirms the `Annotated[...]` signature was not altered. Stat math (`12 = 3 insertions + 9 deletions`) accounts exactly for the 3-line docstring swap + 1-line `app=` removal + 1-line decorator removal + 4-line `__main__` block removal, with no unaccounted changes hiding elsewhere in the file.
+- **`src/oplm/sweep/phases.py`** (diff lines 152-170): only the trailing `if __name__ == "__main__": app()` block removed (4 deletions, matches stat). `phases.app` itself untouched.
+- **`src/oplm/sweep/run.py`**: absent from the diff and from the file-stat summary entirely — its `__main__` block was correctly left alone, satisfying ambiguity resolution 2.
+- **`tests/sweep/test_cli.py`** (diff lines 171-201): verbatim copy of the brief's Step 1 test, no deviation.
+
+Named-risk 1 (decorator removal): mechanism and signature-preservation both verified as above — no findings.
+
+Named-risk 2 (docstring scope): the three `Run::` examples in `coord_check.py`'s module docstring were changed from `python -m oplm.sweep.coord_check ...` to `oplm sweep coord-check ...` (diff lines 75-83). Judgment: this is necessary, not scope creep — removing the `__main__` block (which the brief mandates) makes `python -m oplm.sweep.coord_check ...` a silent no-op (module imports run, `sys.argv` is never parsed, exit 0, nothing happens), so leaving the old examples in place would document a broken invocation. The change is a 1:1 prefix substitution touching only the three example lines; no other docstring content was altered.
+
+Named-risk 3 (stash coherence): `git status --short` and `git stash list` confirm clean tree / empty stash. Grepped the repo for any other reference to `coord_check.app` or `from oplm.sweep.coord_check import app` — none found (`tests/sweep/test_coord_check.py` only imports private helpers `_DEFAULT_SEQUENCES`, `_build_cfg_fn`, `_load_sequences`, never `app`/`main`). Diff stat (39 insertions / 13 deletions across 5 files) reconciles exactly against the per-file hunks with no discrepancy. The change is complete and coherent.
+
+### Strengths
+- Implementation is a near-literal match to the brief's prescribed code (Steps 1, 3, 4) — no invented abstractions, no deviation from the specified `app.command(...)` re-registration mechanism.
+- TDD evidence is credible, not generic: the reported RED failure is Click/Typer's exit-code-2 "no such command," which is precisely what a missing `sweep` subcommand produces — not an import error or an unrelated assertion failure, so it genuinely pins the requirement.
+- Confirmed via grep that no other module references the now-removed `coord_check.app`, so the removal doesn't leave dangling references anywhere in `src/` or `tests/`.
+- Correctly identified and left `run.py` untouched, and verified via an actual `git diff` on that file (per report) rather than assuming.
+- Report's self-review is unusually rigorous (import-cost comparison via disposable worktree, console-script end-to-end check) — beyond what was asked but harmless, since none of it touched the source tree.
+
+### Issues
+
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+None.
+
+#### Minor (Nice to Have)
+- `src/oplm/sweep/cli.py:5-7` — `app.command("coord-check")(coord_check_main)` mutates the shared `phases.app` Typer instance in place (it's the same object re-exported, not a copy). This means any import of `oplm.sweep.cli` (e.g. transitively via `oplm.cli`) permanently adds `coord-check` onto `phases.app` for the rest of the process, which is also what `tests/sweep/test_phases.py` uses directly via `CliRunner` (e.g. `tests/sweep/test_phases.py:82,121,140...`). This doesn't break anything today (those tests only invoke specific named commands), but it's a shared-mutable-global pattern worth being aware of for future test isolation. This is the brief's own prescribed design (Step 3 code is verbatim), not an implementer choice, so it's not a defect in this task's execution.
+- `docs/LR_SWEEP.md:70-76` and `docs/MUP.md:186-194` still show the pre-existing stale `python -m scripts.mup_coord_check ...` invocation (from before the `a5eeae9` package move, predating this task). The implementer fixed the in-module docstring but these top-level docs remain stale — out of this task's stated file scope, so not a finding against this diff, but worth a note for whoever eventually sweeps the docs.
+
+### Assessment
+**Task quality:** Approved
+**Reasoning:** The diff is a precise, minimal realization of the brief and all three controller-resolved ambiguities, with correct TDD evidence and no behavioral changes to μP logic (ranking, phase ordering, selection protocol untouched, confirmed by absence of any diff hunk in those code regions). The one deviation from literal brief text (docstring fix) is justified and honestly flagged by the implementer.</result>
+<usage><subagent_tokens>44678</subagent_tokens><tool_uses>9</tool_uses><duration_ms>178120</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a53ba70506fdcc8ec</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a53ba70506fdcc8ec.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 4: LR grid and gates" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status:** DONE
+
+Commit: `6bfc779` — feat: recenter LR grid and derive smoke gates from the manifest
+
+Test summary: RED confirmed (5 new tests failed for expected reasons against old grid/gates), then GREEN — `tests/sweep` 54 passed, full non-slow suite 1501 passed; all four gates (`ruff check src/`, `ruff format --check src/`, `ty check src/`, `python -m pytest tests/sweep -q`) pass clean.
+
+Concerns:
+- One judgment call worth a look: kept `float(...)` (not `_as_float`) in the `analyze_phase` smoke branch since it operates on `Any`-typed `phase.ranking` entries, matching the adjacent unmodified `coarse` branch's convention and the brief's own code — explained in the report's self-review section.
+- `docs/LR_SWEEP.md` still shows the old smoke grid in prose; confirmed via `progress.md` that's deferred to Task 15, left untouched here.
+
+Report: `/home/briney/git/oplm/.superpowers/sdd/task-4-report.md`</result>
+<usage><subagent_tokens>119855</subagent_tokens><tool_uses>60</tool_uses><duration_ms>609852</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0316f384e654bae7</task-id>
+<tool-use-id>toolu_01EL9gPwzv5oNg15uwhA7dRG</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a0316f384e654bae7.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 4 (spec + quality)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Spec Compliance
+
+- ✅ Spec compliant. Both grids match the required values character for character, the gate rewrite implements all three required behaviors, and no LR literal survives in either gate function.
+- Grid values — `src/oplm/sweep/phases.py:35-36`: `SMOKE_LRS = (0.0004, 0.0016, 0.0063)` and `COARSE_LRS = (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)`. Checked digit by digit against the brief: `0.00063` is the six-e-4 value (three zeros), not `0.0063`. Numerically verified the relationship: `COARSE_LRS[0]==SMOKE_LRS[0]`, `COARSE_LRS[-1]==SMOKE_LRS[-1]`, `COARSE_LRS[7//2]==COARSE_LRS[3]==0.0016==SMOKE_LRS[1]`, and consecutive ratios `[1.575, 1.587, 1.6, 1.5625, 1.6, 1.575]` — uniform ~1.6× spacing preserved, `0.0016` is also the geometric mean of the endpoints (1.587e-3).
+- CLI defaults derive from the constants, not hand-typed strings — `src/oplm/sweep/phases.py:694` (`_grid_default(SMOKE_LRS)`) and `:734` (`_grid_default(COARSE_LRS)`); `_grid_default` is defined at `:40`, module scope, above both commands, so Typer's definition-time evaluation is satisfied.
+- Gate behavior 1 (fewer than two cells raises) — `src/oplm/sweep/phases.py:468-469`. Behavior 2 (two *lowest* must be finite) — `:467` sorts ascending, `:470-472` iterates `phase_lrs[:2]`. Behavior 3 (drop the *highest* when non-finite) — `:473-475`.
+- Returned list is the caller's `lrs`, filtered — `:475` is `[lr for lr in lrs if lr != highest]`, filtering the parameter, not `phase_lrs`. Confirmed at the call site: `coarse` does `lr_values = parse_floats(lrs, name="--lrs")` then `lr_values = _smoke_gated_lrs(source, lr_values)`. Also pinned behaviorally by `tests/sweep/test_phases.py:304-311` — the smoke fixture has 3 LRs while the expectation is the 7-value coarse grid, so a substitution of the phase's own LR set would fail that test.
+- No hard-coded rates — I regex-scanned `inspect.getsource` of both functions for `\d+\.\d+`: **zero** decimal literals in either `analyze_phase` or `_smoke_gated_lrs` (stronger than the shipped test's 4-string check).
+- ⚠️ Cannot verify from diff: `docs/LR_SWEEP.md:118` still documents the smoke grid as `0.0025,0.01,0.04`. An operator copying that line would launch the old grid. The report's deferral claim checks out — `TODOS.md:2877` schedules `docs/LR_SWEEP.md` for a later task — but the controller should confirm that task lands before anyone runs from the docs.
+
+### Strengths
+
+- The grid change is pinned end-to-end, not just at the constant. `tests/sweep/test_phases.py:204` (`smoke`, no `--lrs`) and `:300-301` (`coarse`, no `--lrs`) assert exact float equality on `run.params["lr"]` after a full round trip through `_grid_default` → Typer default → `parse_floats` → manifest JSON → `load_phase`. That means `{:g}` rendering cannot silently drift a value; I separately confirmed the rendered defaults are exactly `0.0004,0.0016,0.0063` and `0.0004,0.00063,0.001,0.0016,0.0025,0.004,0.0063`.
+- "Lacks a finite metric" is literally true, not just presence-checking: `src/oplm/sweep/common.py:158-166` rejects missing files, non-numeric values, bools, and `math.isfinite` failures. A NaN/inf smoke cell is correctly treated as divergence by both gates.
+- The risk-5 "judgment call" is a non-event, and in the implementer's favor: `src/oplm/sweep/phases.py:624` (`scores = {float(entry["params"]["lr"]): ...}`) is a **context line** in the diff — it was not touched. `_as_float` is correctly retained at the real `Params`/`JsonScalar` boundary (`:466`). No `None`-conversion hazard is reintroduced: `entry["params"]["lr"]` is never `None`, and the nullable value (`entry["score"]`) is stored unconverted.
+- The two gates are cleanly separated by data source — `_smoke_gated_lrs` reads result files, `analyze_phase` reads `ranking` — and the divergence-drop logic correctly lives only in the former, so a diverged top LR does not block smoke analysis.
+- `_smoke_gated_lrs`'s error message names both the offending LR and the metric (`:472`), and the `&lt;2` message names the manifest path (`:469`).
+- Test-intent audit: every modified pre-existing assertion still tests what it tested. `test_smoke_generates_three_production_cells` still asserts the exact 3-cell grid and the middle cell's `cfg.train.lr` (`:204`, `:220`); `test_coarse_uses_smoke_divergence_gate` still asserts full-grid vs. drop-highest across both parametrizations (`:295-301`); `test_coarse_rejects_nonfinite_required_smoke_cells` still parametrizes over the two *required* (lowest) LRs and still asserts the failing LR appears in the output (`:330`, `:352`). Nothing weakened or deleted.
+- Correctly left alone: `test_coarse_selects_interior_winner_and_neighbors` (`tests/sweep/test_phases.py:872`) and `test_coarse_edge_winner_blocks_refinement` (`:895`) use arbitrary example grids to test ranking logic the brief forbids changing — updating them would have been scope creep.
+- Grepped the whole repo: no production code or config outside `docs/` still references the old grid string, and `SMOKE_LRS`/`COARSE_LRS` have no other consumers.
+- Style gates verified independently of the report: `from __future__ import annotations` at `src/oplm/sweep/phases.py:3`; zero lines &gt;100 chars in either changed file.
+
+### Issues
+
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+None.
+
+#### Minor (Nice to Have)
+
+1. **No positive test that `analyze_phase` accepts a smoke phase whose *highest* LR diverged** — `tests/sweep/test_phases.py:361-364` is the only test that runs `analyze_phase` on a `smoke` manifest, and it is a negative test. I checked the other `analyze_phase` call sites (`:889`, `:909`, `:923`, `:1031`, `:1039`): all are `coarse`/`confirm`/`replicate` phases. Consequence: an implementation that required *all* smoke LRs finite (instead of `ordered[:2]`, `src/oplm/sweep/phases.py:628`) would pass the entire suite, yet would halt the sweep on exactly the outcome the `0.0063` upper guard exists to produce. The shipped code is correct — I read the branch — but the regression guard is missing. One test: build `results={0.0004: 1.4, 0.0016: 1.1, 0.0063: None}`, populate `ranking` via `analyze_phase`, assert it returns rather than raises.
+2. **`test_no_phase_logic_hardcodes_a_learning_rate` only partially pins its requirement** (`tests/sweep/test_phases.py:326-337`) — plan-mandated, it is verbatim from the brief, so this is a note rather than a defect. Three escape hatches: (a) it checks only `0.0025, 0.01, 0.0016, 0.0004`, so hard-coding `0.0063` — the value the gate actually drops — or `0.00063`/`0.004` would pass; (b) it scans *source text*, so the original defect shape (`for lr in SMOKE_LRS[:2]`) contains no decimal literal and would **not** trip it; (c) as the controller anticipated, a literal moved into a helper called by these two functions escapes `inspect.getsource`. The behavior is genuinely pinned instead by `test_smoke_gate_follows_a_custom_grid` (`:340-348`), which fails against any module-constant-driven gate. Strengthening the literal list to all of `COARSE_LRS` would cost nothing.
+3. **The report's RED rationale for that test is factually wrong** (`.superpowers/sdd/task-4-report.md:67-69`): it claims `inspect.getsource` found `SMOKE_LRS`'s *repr*. `getsource` returns source text; the removed `_smoke_gated_lrs` body (diff lines 83-95) contains `SMOKE_LRS[:2]`/`SMOKE_LRS[-1]` and no decimals. The test did fail in RED, but solely via `analyze_phase`'s literal `scores.get(0.0025)`. The other four RED failures are specific and match what their tests assert (constant equality; `runs_by_lr.get(0.0025)` → `None` → wrong `ValueError`; message-regex mismatch on `"0.008"`; message-regex mismatch on `"two lowest"`).
+4. **`analyze_phase`'s messages don't name the metric** (`src/oplm/sweep/phases.py:632`): "finite validation loss" is generic where `_smoke_gated_lrs:472` interpolates `phase.metric`, and `:627` names neither the path nor the metric. Not a regression (the old message was equally generic), but the sibling gate sets a better bar.
+5. **The "two lowest must be finite" policy is now duplicated** across `:470-472` (result files) and `:628-634` (ranking), with different wording, and can drift. The differing data sources make extraction unattractive; a cross-reference comment would be enough.
+6. **`_smoke_gated_lrs` leaves interior cells unchecked for smoke grids larger than three points.** With the default 3-point `SMOKE_LRS`, `phase_lrs[:2] + phase_lrs[-1]` covers the whole grid, so this is invisible today; a custom 5-point `--lrs` would let a diverged middle cell pass silently into the coarse grid. Matches the brief's specified semantics, so out of scope — recording it so the constraint is known.
+7. **`_grid_default` uses `{:g}`** (`src/oplm/sweep/phases.py:42`): 6 significant digits, and it switches to exponent form below `1e-4`. Every current value round-trips exactly (verified), but a future grid value with &gt;6 sig digits would render lossily and break the float-`!=` drop at `:475`. `{!r}` would be lossless.
+
+### Assessment
+
+**Task quality:** Approved
+
+**Reasoning:** Both grids are exactly right (verified digit by digit and numerically, including the min/midpoint/max relation and the 1.6× spacing), the CLI defaults derive from the constants and are pinned end-to-end by exact-float manifest assertions, all three gate behaviors are implemented in the correct direction against the caller's `lrs`, and neither gate contains any decimal literal. Remaining items are test-coverage and message-polish notes, the most consequential being the absent positive test for `analyze_phase` accepting a diverged top LR.</result>
+<usage><subagent_tokens>63494</subagent_tokens><tool_uses>11</tool_uses><duration_ms>337352</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>acebf138fd4b322a6</task-id>
+<tool-use-id>toolu_0163HMCq1zmvh7RLsKHh1g33</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/acebf138fd4b322a6.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix Task 4 test-coverage findings" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Committed and verified. Report already appended to `.superpowers/sdd/task-4-report.md` (that directory is gitignored, so it isn't part of the git commit, matching how other reports in that directory are handled).
+
+**Status:** DONE
+Commit: `1a86298` — test: pin smoke upper-guard accept path and broaden LR literal coverage
+Test summary: `python -m pytest tests/sweep/test_phases.py -q` → 40 passed (39 before → 40 after, +1 test)
+Concerns: none — `src/` diff is empty (verified via `git diff --stat -- src/`); ruff check/format and `ty check src/` all clean
+Report: `/home/briney/git/oplm/.superpowers/sdd/task-4-report.md` (new section `## Fix pass: review findings M1 (missing positive test) and M2 (literal coverage)` appended at the end)</result>
+<usage><subagent_tokens>72863</subagent_tokens><tool_uses>36</tool_uses><duration_ms>346934</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad326ecb23744bc96</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/ad326ecb23744bc96.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-review Task 4 fix pass" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Everything checks out. Final review below.
+
+### Spec Compliance
+✅ Spec compliant
+
+- Finding 1: `test_analyze_smoke_accepts_diverged_highest_lr` added (tests/sweep/test_phases.py:378-389 in working tree), reuses `_write_smoke_phase`, uses the exact prescribed `results={0.0004: 1.4, 0.0016: 1.1, 0.0063: None}`, asserts on `analyzed.ranking` content (not just absence-of-exception).
+- Finding 2: literal set in `test_no_phase_logic_hardcodes_a_learning_rate` (test_phases.py:343) is derived via `{str(lr) for lr in (*phases.COARSE_LRS, *phases.SMOKE_LRS)} | {"0.01"}`, replacing the hand-typed 4-literal tuple; `inspect.getsource` scoping to `_smoke_gated_lrs`/`analyze_phase` untouched.
+- Test-only diff confirmed: `git diff --stat 6bfc779..HEAD -- src/` empty (independently re-verified).
+- No line exceeds 100 chars (checked via awk over the whole file); no existing assertion weakened/removed (diff is purely additive plus a 1-line literal-tuple swap).
+
+### Strengths
+- The demonstration methodology for Finding 1 is sound, not just claimed: I traced `analyze_phase`'s smoke branch (src/oplm/sweep/phases.py:623-634) — with `ordered[:2]` swapped for `ordered`, `scores = {0.0004:1.4, 0.0016:1.1, 0.0063:None}` yields `missing = [0.0063]`, which raises `ValueError`. The new test calls `analyze_phase` expecting a normal return, so it genuinely flips from pass to fail under that exact regression — this is a real, load-bearing test, not one that happens to pass either way.
+- The second assertion (`analyzed.ranking[0]["params"]["lr"] == 0.0016`) is non-vacuous and correctly predicts real sort behavior: `_direct_ranking` (phases.py:492-499) sorts `score is None` last and by ascending score otherwise, so 1.1 &lt; 1.4 correctly ranks 0.0016 first. This isn't a "didn't raise" test — it pins two independent facts (all three cells retained with correct scores, and correct winner ordering).
+- Finding 2's literal set is genuinely derived (`{str(lr) for lr in (*phases.COARSE_LRS, *phases.SMOKE_LRS)}`), not hand-typed, so it cannot silently drift when the grid is recentered again. Retaining `"0.01"` for the historical defect, with a docstring explanation, correctly satisfies "don't weaken or delete an existing assertion" even though `0.01` no longer appears in either grid.
+- Docstring explicitly and accurately documents the known residual gap (source-text scanning can't catch a literal moved to a helper, or a `SMOKE_LRS[:2]`-shaped defect with no decimal literal) and correctly attributes that coverage to the pre-existing `test_smoke_gate_follows_a_custom_grid` — an honest, verifiable limitation statement rather than overclaiming.
+- Placement next to the existing negative smoke test (`test_analyze_smoke_requires_two_lowest_finite`) keeps related behavior adjacent and readable.
+
+### Issues
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+None.
+
+#### Minor (Nice to Have)
+- tests/sweep/test_phases.py:343 — the retained `"0.01"` literal is a slightly odd hybrid (constants-derived set unioned with one hand-typed string); a one-line comment inline at the union (beyond the docstring) would make the rationale visible without needing to scroll to the docstring, but this is purely cosmetic since the docstring already explains it clearly.
+
+### Assessment
+**Task quality:** Approved
+**Reasoning:** Both findings are fixed correctly and verifiably — the new positive test demonstrably fails against the exact regression shape named in the review (confirmed by tracing the gate logic directly), asserts meaningful, behaviorally-grounded facts about `ranking` rather than a bare non-raise, and the literal-coverage test is now derived from the live grid constants so it cannot drift.</result>
+<usage><subagent_tokens>42867</subagent_tokens><tool_uses>15</tool_uses><duration_ms>101668</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa806d25cf2ee25fe</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/aa806d25cf2ee25fe.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 5: SlurmConfig schema" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status:** DONE
+
+Commit: `3268ea1` — "feat: add slurm config schema and phase/preset resolution"
+
+Test summary: `tests/slurm/test_config.py` 10/10 passed; full non-slow suite 1512 passed, 83 deselected. All four gates green (`ruff check src/`, `ruff format --check src/`, `ty check src/`, pytest).
+
+Concerns: The brief's verbatim code failed `ty check src/` (3 errors + 2 stale ignore-comment warnings). I fixed these without changing behavior — moved/corrected `# ty: ignore[...]` codes onto the exact diagnostic lines (ty requires same-line placement), split one dict-building expression into two statements to keep lines under 100 chars, and dropped one now-unnecessary ignore. All four YAML resolution shapes (scalar, per-preset, per-phase+preset, per-phase-only) verified passing, including exact-preset-beats-wildcard. No `oplm.sweep` import anywhere in the new module. Both new files confirmed to parse under `feature_version=(3,11)`.
+
+Report: `/home/briney/git/oplm/.superpowers/sdd/task-5-report.md`</result>
+<usage><subagent_tokens>64115</subagent_tokens><tool_uses>43</tool_uses><duration_ms>347766</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa50e14e6840540fe</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/aa50e14e6840540fe.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 5 (spec + quality)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Spec Compliance
+✅ Spec compliant, with two verified defects noted below (Important, not blocking on "missing/extra/misunderstood" grounds — the schema, fields, `from_mapping`, `load_slurm_config`, and `PhaseTable.resolve` all match the brief's interfaces exactly; no rendering/submission/CLI scope creep; no `oplm.sweep` import; no μP/phase/preset semantics baked into `PhaseTable` itself).
+
+- Fields on `SlurmConfig` (src/oplm/slurm/config.py:134-152) match the brief's interface list verbatim, same order, same defaults.
+- `PhaseTable[T].resolve(*, phase, preset)` (config.py:66-84), `SlurmConfig.from_mapping` (config.py:122-151), `load_slurm_config` (config.py:154-167) all present with correct signatures.
+- `tests/slurm/test_config.py` is byte-identical to the brief's Step-1 code (diffed directly, only markdown fences differ).
+- No `oplm.sweep` import anywhere in the diff; `PhaseTable` treats `phase`/`preset` as opaque strings.
+
+⚠️ Cannot verify from diff alone: whether the plan's later "layering" test (enforcing no `oplm.sweep` import) will actually target this module — out of scope for this task, noted only for completeness.
+
+### Strengths
+- Resolution priority (phase table before `default`; exact preset before `*` wildcard within a table) is implemented correctly — traced by hand against all four YAML shapes and confirmed by re-running `pytest tests/slurm/test_config.py -q` (10 passed) plus independent `ty check`/`ruff` runs (all green, matching the report's claims exactly).
+- Scalar guard uses `is not None` (config.py:75), not truthiness — correctly returns a legitimate `0`/`False` scalar instead of falling through to table lookup.
+- `_positive_int` (config.py:93-99) explicitly guards `isinstance(value, bool)` before the `int` check and produces an actionable message naming the field and value — verified empirically: `_positive_int({'gpus_per_node': True}, 'gpus_per_node')` raises `"slurm config gpus_per_node must be a positive int, got True"`.
+- Docstring's integration claims (config.py:1-7, that `load_config` tolerates an unknown `slurm:` key and `serialize_config` omits it) are accurate — verified against `src/oplm/config.py:487` (`OmegaConf.set_struct(base, False)`) and `:598-603` (`serialize_config`'s dict only has `model`/`train`/`data` keys).
+- Named-risk-1 claims about `ty` diagnostics are accurate: reproduced the brief's verbatim code in a scratch copy and confirmed `ty check` reports exactly 3 errors (2× `invalid-assignment` on the `tables[...] =` lines, 1× `no-matching-overload` on `dict(OmegaConf.to_container(...))`) plus 2 unused-ignore warnings — matching the report's count precisely. The diff's fixed version passes `ty check src/` cleanly (re-confirmed independently).
+- Both `invalid-assignment` ignores (config.py:87, config.py:90) are narrowly targeted at the exact diagnostic lines and each carries an explanatory comment ("untyped YAML").
+- All four gates (`ruff check`, `ruff format --check`, `ty check`, `pytest tests/slurm/test_config.py`) independently re-run here, all green — matches the report.
+- Splitting the dict-building expression and the `OmegaConf.to_container` call into two statements is a pure mechanical refactor — confirmed behaviorally identical.
+
+### Issues
+
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+1. **`max_batch_size` validation silently accepts `bool`, inconsistent with `_positive_int` (Named Risk 3, plan-mandated).** In `SlurmConfig.from_mapping` (config.py:129-133 in current file / diff lines 161-166), `int(value)` blindly coerces without a bool guard. Verified empirically:
+   ```
+   SlurmConfig.from_mapping({..., "max_batch_size": {"170M": True}})
+   -&gt; succeeds, cfg.max_batch_size == {"170M": 1}   # no error
+   ```
+   `False` happens to get caught, but only because `int(False) == 0 &lt; 1` — coincidence, not a type check. This directly contradicts the review's expectation ("the `max_batch_size` check should reject bool") and is inconsistent with `_positive_int`, which explicitly excludes bool three lines away. A YAML author writing a bare `true`/`false`/`yes`/`no` for a preset's batch size (an easy YAML footgun) gets a silently-wrong batch size instead of a validation error — the same class of "silently wrong, not a crash" risk the brief calls out for resolution bugs, here applied to validation. Note: this exact code is character-identical to the brief's own sample (not an implementer-introduced deviation), but it ships in the final diff regardless of origin. Fix: add `isinstance(value, bool)` rejection alongside the `int(value)` coercion, mirroring `_positive_int`.
+   Related, same root cause: a non-numeric string value (e.g. `{"170M": "oops"}`) raises Python's raw `ValueError: invalid literal for int() with base 10: 'oops'` instead of the module's actionable `"slurm config max_batch_size ..."` message — an actionability gap, verified empirically.
+
+2. **`no-matching-overload` ignore lacks the required "why" comment (Named Risk 1, plan-mandated).** config.py:167 (`return SlurmConfig.from_mapping(dict(container))  # ty: ignore[no-matching-overload]`) has the correct diagnostic code (verified: the real error is exactly `no-matching-overload`) but no explanatory comment, unlike the two ignores in `from_value` which each carry "untyped YAML" style explanations. The brief/global instructions state: "Do not add a type-checker ignore without a specific error code AND a comment explaining why" — the code is present, the explanation is not. Fix: add a trailing or preceding comment, e.g. `# ty: ignore[no-matching-overload]  # OmegaConf.to_container's return type doesn't match dict.__init__'s overloads`.
+
+#### Minor (Nice to Have)
+- **Report's stated rationale for dropping the scalar-branch ignore is inaccurate.** The report claims the `# ty: ignore[invalid-argument-type]` on config.py's scalar-branch return "turned out to be unnecessary once the other two fixes were in place" (task-5-report.md:140-143). Empirically, this ignore is flagged as unused in the fully-unfixed verbatim brief code too (tested with all three original problems still present) — it was never load-bearing, independent of the other two fixes. The action (removing it) is correct and doesn't mask a real error, but the causal narrative in the report is unverified/wrong. No code change needed, just a documentation accuracy nit.
+- **Untested priority interaction: phase-level wildcard vs. default-level exact match (Named Risk 2).** No test constructs a case where a phase has a bare/wildcard entry (e.g. `coarse: 8`) while `default` has a differing exact-preset value for the same preset (e.g. `default: {170M: 1}`), which would confirm the phase table's wildcard wins over `default`'s exact match (per the stated priority: phase table checked in full before falling to `default`). I traced this by hand in `resolve()` (config.py:66-84) and confirmed correct behavior, but it is currently unpinned by any test — a regression here (e.g., checking wildcards last across both tables instead of within each) would not be caught.
+- **`container_mounts` iterates strings character-by-character if given a bare string instead of a list** (config.py:143, `tuple(str(mount) for mount in _require(raw, "container_mounts"))`) — not a named risk and inherited from the brief verbatim, but worth flagging as a latent footgun with no validation.
+- **`max_batch_size` is effectively optional** (`raw.get("max_batch_size", {})`, config.py:130) while structurally similar fields use `_require`. Matches brief verbatim; likely intentional (not all phases need batch gating) but not stated anywhere — cannot verify intent from this diff alone.
+
+### Assessment
+**Task quality:** Needs fixes
+**Reasoning:** Resolution logic (the subtle core of this task) is correct and well-tested; the `ty`-related deviations are honestly reported and mostly sound. However, two concrete, verified gaps remain: `max_batch_size` doesn't reject `bool` inputs (silently miscoerces `True`→`1`), and one surviving `ty: ignore` lacks the plan-mandated explanatory comment — both directly called out as risks to verify, and both confirmed present by empirical testing rather than assumption.</result>
+<usage><subagent_tokens>80607</subagent_tokens><tool_uses>21</tool_uses><duration_ms>462684</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a45193423d9eb1ff1</task-id>
+<tool-use-id>toolu_01Xp8Lk7xjs87fHFHuP18vr4</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a45193423d9eb1ff1.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix Task 5 review findings" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All work is committed and the report is appended.
+
+**Status:** DONE
+Commit: `30c4c12` — "fix: reject bool max_batch_size, explain ty ignore, pin resolve order"
+Tests: `python -m pytest tests/slurm/test_config.py -q` → 13 passed (10 original + 3 new)
+Concerns: none — all four gates (ruff check, ruff format --check, ty check, pytest) pass; no `oplm.sweep` import; Finding 3's test confirmed to fail against a hand-simulated wrong-ordering `resolve()` before being added to the suite.
+Report: `/home/briney/git/oplm/.superpowers/sdd/task-5-report.md` (under heading `## Fix pass: review findings (max_batch_size bool/message, ignore rationale, resolution-priority test)`)</result>
+<usage><subagent_tokens>52476</subagent_tokens><tool_uses>22</tool_uses><duration_ms>182447</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a1622b8dcfb457590</task-id>
+<tool-use-id>toolu_01GgdPsNunfRoE1xdpByLaWG</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a1622b8dcfb457590.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-review Task 5 fix pass" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Spec Compliance
+✅ Spec compliant — all three findings addressed correctly; no regressions found in existing validators.
+
+### Strengths
+- `_reject_bool` is a genuinely shared helper (not copy-pasted): both `_positive_int` (src/oplm/slurm/config.py:104-111) and `_coerce_positive_int` (src/oplm/slurm/config.py:114-129) call it, and it produces byte-identical message text to the old inline `isinstance(value, bool)` branch, so the existing `_positive_int` callers (`gpus_per_node`, `cpus_per_task`, `max_concurrent`) are provably unaffected.
+- The new `test_phase_wildcard_beats_default_exact_preset` (tests/slurm/test_config.py:68-77) genuinely distinguishes the two orderings — traced by hand: correct `resolve()` returns 8 (checks `coarse`'s own table fully — exact then `*` — before ever touching `default`), the "wrong" ordering the report describes returns 1 (default's exact-preset `170M` wins because it checks exact-preset across both tables in one pass). Confirmed live: `python -m pytest tests/slurm/test_config.py -q` → 13 passed.
+- The `ty: ignore` rationale comment (src/oplm/slurm/config.py:202) matches the file's existing convention (preceding-line style, same as the sibling ignore at line 57) and states a specific, checkable reason.
+- `max_batch_size` optionality is preserved: `raw.get("max_batch_size", {})` still defaults to `{}` with zero exceptions raised when absent.
+- Valid inputs unaffected: plain ints still round-trip through `_coerce_positive_int` unchanged (traced 256 → 256).
+
+### Issues
+
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+None.
+
+#### Minor (Nice to Have)
+- src/oplm/slurm/config.py:159-169 — the aggregation of multiple bad `max_batch_size` entries dropped the original `sorted(...)` determinism; messages are now joined in raw dict-iteration order instead of a stable sorted-by-preset order. Not a correctness bug (Python dicts preserve YAML declaration order), but a minor loss of a previously-explicit guarantee for a multi-bad-preset error message.
+- `_positive_int` and `_coerce_positive_int` still each independently construct the `"{description} must be a positive int, got {value!r}"` string and the `&lt; 1` check (src/oplm/slurm/config.py:109-110 vs 126-128). The fixer did extract the bool guard as asked, but the "positive int, got X" formatting/range-check itself remains duplicated across the two functions. A single shared `_format_not_positive(description, value)` (or having `_positive_int` call `_coerce_positive_int` plus an extra literal-int check) would close this fully. Cosmetic only — behavior is correct and pinned by tests.
+
+### Assessment
+**Task quality:** Approved
+**Reasoning:** All three findings are fixed with correct, traceable logic; the new priority test genuinely fails against the wrong ordering (verified by hand-trace, not just by report claim); the bool guard is complete and doesn't regress the pinned `_positive_int` message format; remaining nits are cosmetic duplication/ordering, not correctness or trust issues.</result>
+<usage><subagent_tokens>45574</subagent_tokens><tool_uses>5</tool_uses><duration_ms>114716</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a6fb11e263dcd06a8</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a6fb11e263dcd06a8.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 6: batch planning" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status:** DONE
+
+Commit: `382bb10` — "feat: derive per-device batch and accumulation from node count"
+
+Test summary: `python -m pytest tests/slurm/test_config.py -q` → 23 passed (11 pre-existing + 12 new); full suite `python -m pytest -m "not slow" -q` → 1525 passed. All four gates green (ruff check, ruff format --check, ty check, pytest).
+
+Concern (minor, fixed, worth flagging): the brief's Step 3 code had a bug — its final `raise` referenced an undefined variable `nodes` (leftover from the pre-signature-change version), which would have caused `NameError` instead of `ValueError` and would fail `ty check`. I fixed it to reference `world_size` (the actual parameter) and documented this deviation in the report. This is the only place I didn't use the brief's code 100% verbatim.
+
+Report: `/home/briney/git/oplm/.superpowers/sdd/task-6-report.md`</result>
+<usage><subagent_tokens>62093</subagent_tokens><tool_uses>30</tool_uses><duration_ms>302413</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad12d9bb128fde889</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/ad12d9bb128fde889.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 6 (spec + quality)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Spec Compliance
+- ✅ Spec compliant. `BatchPlan` (config.py:189‑195) and `resolve_batch_plan` (config.py:198‑244) match the brief's interface exactly (frozen dataclass, three named fields; keyword-only signature; `world_size` not `nodes`+`gpus_per_node`). `src/oplm/slurm/__init__.py` exports both, alphabetically consistent with existing style. No rendering/submission/CLI code, no `oplm.sweep` import, added — confirmed by `grep -rn "sweep" src/oplm/slurm/` (only the pre-existing module docstring hits) and by the diff stat (only `config.py`, `__init__.py`, `test_config.py` touched).
+- ⚠️ Cannot verify from diff alone: how a future Slurm-rendering task will surface the "no accumulation" error to an operator (log placement, retry behavior) — out of scope for this task but worth the controller's eye when Phase 4 wires this in, given the Important #1 finding below.
+
+### Strengths
+- Named Risk 1 verified correct: the only reference to the old parameter name is gone. `config.py:241-244` uses `world_size` throughout, and `ruff check` / `ty check` both pass on the file (independently re-run, see below) — confirmed no other stale `nodes`/`gpus_per_node` reference survives in the added code (docstring's `nodes * gpus_per_node` at config.py:207 is explanatory prose about the caller, not a variable reference, and is correct/expected).
+- The core invariant (`per_device_batch * gradient_accumulation_steps * world_size == global_examples`) is enforced by construction (two exact-division checks, no rounding anywhere in the accepted path) and holds in every case I hand-checked, including cases outside the test table (see Important #2).
+- Independently re-ran the required gates on the touched files: `ruff check`, `ruff format --check`, `ty check` all pass clean.
+- Docstring is Google-style with Args/Returns/Raises, under the 100-char limit (line 198 measured at 99 chars).
+
+### Issues
+
+#### Critical (Must Fix)
+None. No case was found where the function silently returns a plan whose product diverges from the requested global batch.
+
+#### Important (Should Fix)
+1. **Unreachable error branch / misleading `Raises` contract — plan-mandated.** `config.py:241-244`. Given the earlier guard `max_batch_size &lt; 1` raises (line 221), `max_batch_size` is always `&gt;= 1` by the time the loop runs. At `accum = base` (config.py:231), `base % base == 0` always holds and `per_device = base // base == 1`, which always satisfies `per_device &lt;= max_batch_size`. So the loop **always** returns at or before `accum = base`, and the final `raise` at line 241 is dead code — it can never fire for any input that reaches it. Verified empirically:
+   ```
+   resolve_batch_plan(global_examples=970, world_size=10, max_batch_size=1)
+   -&gt; BatchPlan(per_device_batch=1, gradient_accumulation_steps=97, world_size=10)
+   ```
+   (base=97 is prime, cap=1 is the tightest legal cap — the theoretically "hardest" case still resolves rather than raising.) This means the docstring's `Raises` clause (config.py:217-219, "...or no accumulation brings the per-device batch within `max_batch_size`") documents a condition that structurally cannot occur. It also means the implementer's report claim of having "hand-ran the fixed function locally... via a scratch call with an unsatisfiable cap" describes something that isn't possible under this algorithm — no `max_batch_size &gt;= 1` is ever unsatisfiable. This is inherited verbatim from the brief's Step 3 code (only the `{nodes}`→`{world_size}` token was changed), so it is plan-mandated, not introduced by the implementer, but it still ships in this diff as-is. Fix: either drop the unreachable branch (and correct the docstring/tests to stop implying it can happen), or make it genuinely reachable by adding a real constraint the cap is meant to enforce (e.g., cap the accumulation count itself, or treat `max_batch_size` as a lower bound too) — whichever direction is intended, the current contract text is inaccurate.
+
+2. **Test suite doesn't exercise the divisor-search itself — plan-mandated.** `tests/slurm/test_config.py:130-156`. Every table row and `test_cap_forces_accumulation` resolves at `accum=1` or `accum=2`, and in every case `ceil(base / cap)` already happens to be an exact divisor of `base` (all tested `global_examples` are powers of two: 2048/8192). A plausible wrong implementation that computes `accum = ceil(base / max_batch_size)` and `per_device = ceil(base / accum)` **without** ever checking `base % accum == 0` would pass all 10 new tests, yet would violate the exact-batch invariant for realistic non-power-of-two inputs — e.g. `global_examples=970, world_size=10` (`base=97`, prime): such a rounding implementation would compute `accum=4, per_device≈24` (product ≠ 970), while the correct (and actually-shipped) implementation must walk to `accum=97, per_device=1`. This is exactly the failure mode the brief is most worried about ("a cell that quietly trains at 512 instead of 2048"), and no test in the suite would catch a regression that reintroduced it. The implementation itself is correct (verified above), but the test suite's protection against this specific class of bug is weaker than "23 passed" suggests. Recommend adding one case with a non-highly-composite `base` (e.g. a prime or near-prime) that forces the loop to reject several non-divisor candidates before landing on the right one.
+
+#### Minor (Nice to Have)
+- **`_reject_bool` not reused for `resolve_batch_plan`'s own arguments** — config.py:221. `bool` is an `int` subclass, so `resolve_batch_plan(world_size=True, ...)` silently behaves as `world_size=1` (`True &lt; 1` is `False`), unlike the module's other validation (`_positive_int`/`_coerce_positive_int`, config.py:93-129) which explicitly guards this exact case. The implementer's rationale (callers pass computed ints, not raw YAML) is reasonable given today's call sites and is not a functional bug, but it's an inconsistency with the module's own established defensive posture, worth a one-line `_reject_bool` call per argument if this is ever exposed to less-trusted callers.
+- **Test file lint noise.** Confirmed by direct run: `ruff check tests/slurm/test_config.py` reports `E402` (import at line 113, mid-file, not at top) and three `E501` (lines 120-122, 101 &gt; 100 chars). Not gated by CI (`ruff check src/` only), but it is real lint noise in committed code and the import could have been hoisted to the top-of-file import block without changing test semantics or the brief's intent.
+- **Report bookkeeping error.** `task-6-report.md:60-61` claims "11 pre-existing Task 5 tests + 12 new ones: 6 parametrized rows + 6 standalone tests." Actual, via `pytest --collect-only`: 13 pre-existing + 10 new (6 parametrized + 4 standalone) = 23. The total (23) is right; the breakdown is wrong — a small but real inaccuracy in a report section whose purpose is to substantiate the count.
+- **Sweep vocabulary in a module required to carry none.** `config.py:191`, `"""Per-device batch and accumulation for one cell."""` — "cell" is the term used throughout `oplm.sweep.phases` for one hyperparameter point in the grid. No import or structural coupling exists, so this is cosmetic, but it's worth a note for the whole-branch review given the explicit constraint "must contain no μP, sweep-phase, ranking, or selection concepts." Verbatim from the brief, not introduced by the implementer.
+
+### Assessment
+**Task quality:** Needs fixes
+**Reasoning:** The arithmetic is correct and the Named-Risk-1 bugfix is exactly right, but the code ships a dead/unreachable error branch whose docstring overpromises a check that can never fire, and the test suite (also brief-mandated) doesn't actually discriminate the shipped divisor-search from a plausible rounding-based implementation that would violate the sweep's core "same global batch everywhere" premise. Both are inherited verbatim from the brief rather than introduced by the implementer, but per this review's calibration they still count as Important and should go back through the brief/task owner before this is trusted as final.</result>
+<usage><subagent_tokens>72303</subagent_tokens><tool_uses>17</tool_uses><duration_ms>368862</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa43ed01ac11b2cac</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/aa43ed01ac11b2cac.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix Task 6 review findings" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All work is committed (the `.claude`/`.cursor`/`.entire` untracked items are pre-existing environment artifacts, unrelated to this task, left untouched).
+
+**Status:** DONE
+Commit: `9146135` — "fix: close batch-plan review findings (dead branch, bool leak, tests)"
+Tests: `tests/slurm/test_config.py` 27 passed; full suite `1529 passed, 83 deselected`; all four required gates (pytest, ruff check/format src, ty check src, ruff check test file) clean.
+Concerns: None — Finding 1's dead branch removed via a `next()`-based rewrite (no leftover unreachable code, `ty`-clean without a placeholder raise) rather than literally deleting the trailing raise, since that alone would leave `ty` unable to prove exhaustive return. Recommend against a max-accumulation guard (documented as recommendation only, not implemented).
+Report: `/home/briney/git/oplm/.superpowers/sdd/task-6-report.md` (appended under "Fix pass: review findings...")</result>
+<usage><subagent_tokens>70863</subagent_tokens><tool_uses>38</tool_uses><duration_ms>372433</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af4908c6df1c97a4c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/af4908c6df1c97a4c.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-review Task 6 fix pass" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Spec Compliance
+✅ Spec compliant. All five requested findings are addressed correctly; no unrequested functionality (no max-accumulation guard) was added.
+
+### Strengths
+- `src/oplm/slurm/config.py:241-245` — the `next()` rewrite is behaviorally equivalent to the original loop: the generator iterates `accum` over `range(1, base+1)` in the same increasing order, applies the same two-condition filter (`base % accum == 0` then `base // accum &lt;= max_batch_size`) in the same short-circuited order, and `next()` returns the first (i.e. smallest) match — so "smallest valid accumulation," "reject non-divisors rather than rounding," and guard ordering are all preserved. Verified independently: without the fixer's rewrite, deleting only the trailing `raise` does trip `ty`'s `invalid-return-type` (reproduced locally), so the restructuring was a real necessity, not an excuse to touch unrelated logic.
+- `tests/slurm/test_config.py:245-257` — `test_prime_base_forces_search_past_non_divisor_candidates` genuinely discriminates: hand-traced the real implementation to `BatchPlan(per_device_batch=1, gradient_accumulation_steps=97, world_size=10)`, and confirmed the ceil-based implementation the finding warns about would produce `(25, 4, 10)` (product 1000 ≠ 970) — the `==` assertion would fail against it. Both the exact-value and invariant assertions are present.
+- `src/oplm/slurm/config.py:225-227` — `_reject_bool` applied to all three args, in the same bool-then-range order as the existing `_positive_int` helper; `tests/slurm/test_config.py:203-214` exercises all three fields and each raised message contains the field name via `_reject_bool`'s `description` string.
+- Lint cleanup: import hoisted to top-of-file, parametrized rows wrapped one-element-per-line. Verified via `awk` line-length scan: zero lines over 100 chars in either changed file. Independently reran `ruff check` and `ty check` on both files — clean, matching the report.
+- Docstring `Raises` clause now lists only reachable failures; `BatchPlan`'s docstring no longer says "cell." `grep -rn "cell\b" src/oplm/slurm/` shows the only remaining hit is a pre-existing module-level docstring line untouched by this diff (out of scope for finding 5, which named `BatchPlan` specifically).
+- Test count: 18 `def test_` in the file, 3 of which are parametrized (3 + 6 + 3 cases) — arithmetic gives 27, consistent with the reported `27 passed` without re-running the suite.
+- 3.11 compatibility: `ast.parse(..., feature_version=(3,11))` succeeds; no PEP 695 syntax introduced.
+
+### Issues
+
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+None.
+
+#### Minor (Nice to Have)
+- `src/oplm/slurm/config.py:241-249` — `base // accum` is computed twice: once inside the generator's filter condition, once again in `per_device_batch=base // accum`. Cheap either way, but a `next((accum, base // accum) for accum in ... if ...)` or storing `per_device` from the single computation would avoid the redundancy and read slightly cleaner.
+- `src/oplm/slurm/config.py:241-245` — `next()` is called with no default, relying on the proof (stated in the adjacent comment and docstring) that the generator can never be empty. That proof is correct today, but if a future edit changes the earlier guards independently, the failure mode degrades from a documented `ValueError` to a bare, undocumented `StopIteration`. Given the explicit instruction not to invent a new guard/branch, leaving this as-is is the right call — just flagging it as a latent fragility worth a one-line comment pointer (already present) rather than a code change.
+- `TODOS.md:1015-1017` (commit `bb07a46`) — updates the planning doc's illustrative code snippet's error message wording (`{nodes} nodes` → `at world size {world_size}`). Not one of the five scoped findings; harmless (text-only, no behavior), but technically a touch outside the requested scope. Worth a one-line mention in the fix report (it wasn't), though not worth blocking on.
+
+### Assessment
+**Task quality:** Approved
+**Reasoning:** All five findings are closed correctly and verifiably; the `next()` restructuring was necessary (confirmed by reproducing the `ty` error the fixer cites) and preserves the exact search semantics; the new divisor-search test genuinely discriminates against the ceil-based bug it targets; no unrequested guard or scope creep beyond a harmless doc-wording touch.</result>
+<usage><subagent_tokens>53398</subagent_tokens><tool_uses>13</tool_uses><duration_ms>169596</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a25f57787e4bebc57</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a25f57787e4bebc57.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 7: render job scripts" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status:** DONE
+
+Commit: `c9902fd` — "feat: render single and array slurm job scripts"
+
+Test summary: `tests/slurm/test_render.py` 11/11 pass (RED confirmed `ModuleNotFoundError` before implementation, GREEN after); full `tests/slurm/` 38/38 pass; full repo suite 1584 passed, 1 skipped, no regressions. All gates clean (`ruff check src/`, `ruff format --check src/`, `ty check src/`, `ruff check tests/slurm/`), 3.11 AST parse check OK, `bash -n` clean on all rendered artifacts.
+
+Deviations from brief (both prose-only, reported in detail in the report file):
+1. Reworded "cell"/"ranking" language in `render.py`'s own comments/docstrings to "job"/"run" (per instruction that `oplm.slurm` must carry no sweep/ranking vocabulary) — kept the pinned `array_cells_file` field name and `.cells` filename convention since those are fixed interface/test contract.
+2. Moved `Path`/`SlurmConfig` imports into `TYPE_CHECKING` block to satisfy `ruff` TCH001/TCH003 (lint-only, no behavior change, matches existing codebase pattern).
+
+No concerns. Report: `/home/briney/git/oplm/.superpowers/sdd/task-7-report.md`</result>
+<usage><subagent_tokens>96305</subagent_tokens><tool_uses>53</tool_uses><duration_ms>592932</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3ab5eb31e6969d93</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a3ab5eb31e6969d93.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 7 (spec + quality)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Working tree unchanged by this review (only pre-existing untracked scaffolding shown, none touched).
+
+### Spec Compliance
+- ✅ Spec compliant. `JobSpec` (`src/oplm/slurm/render.py:33-42`), `SubmitEntry` (`:44-49`), `render_job` (`:105-133`), `accelerate_command` (`:142-160`), `render_submit_script` (`:163-186` — line numbers per the working-tree file; diff line numbers are `render.py:44-63`, `123-198`) match the brief's Interfaces section verbatim, field-for-field and signature-for-signature.
+- No extra scope: no submission (`sbatch` is never invoked, only rendered as text), no status/CLI code, no sweep-phase ranking/selection logic anywhere in the diff.
+- No `oplm.sweep` import (grepped; only imports are `dataclasses`, `typing.TYPE_CHECKING`, and TYPE_CHECKING-gated `pathlib.Path` / `oplm.slurm.config.SlurmConfig`).
+- Independently reran `ruff check`, `ruff format --check`, and `ty check` on the two new files: all pass, confirming the report's gate claims rather than trusting them blind.
+- ⚠️ Cannot verify from diff alone: whether a later task's actual call site truly requires the field to be named `array_cells_file`/`phase_dir` rather than a neutral name — see Risk 3 below, which is verifiable only as far as "the brief itself pins these names," not "a later task's real usage confirms it."
+
+### Strengths
+- Interfaces reproduced exactly; TDD evidence (RED/GREEN) is consistent with the diff.
+- `_header`/`_array_lookup`/`render_job` are cleanly factored; a cluster operator could read the generated script top-to-bottom as a normal hand-written sbatch script (confirmed via the rendered example in the report and my own runtime smoke test).
+- The `TYPE_CHECKING` move for `Path`/`SlurmConfig` is safe and matches an established codebase convention (`src/oplm/train.py:14-19` uses the identical pattern); ruff's `TCH` ruleset is indeed enabled in `pyproject.toml:86`, so the change was necessary, not gratuitous.
+- The `RUN_ID=$(awk ...)` lookup (no `export`) correctly propagates `awk`'s exit status under `set -e` — verified empirically (a plain `VAR=$(failing_cmd)` aborts the script; only `export VAR=$(failing_cmd)` masks it). This is a real point of craftsmanship that contrasts with the MASTER_ADDR issue below.
+- Empty-`RUN_ID` guard (`render.py:112-115` in diff) verified to fire correctly for an out-of-range array index: ran the exact snippet under `set -euo pipefail`, got `exit 1` with the stderr message, nothing after it executed.
+
+### Issues
+
+#### Critical (Must Fix)
+None.
+
+#### Important (Should Fix)
+- **`render.py:150` (diff), plan-mandated — `export MASTER_ADDR=$(hostname --ip-address)` masks failure under `set -e`.** Empirically verified: `export VAR=$(cmd)` is a command invocation (`export`), not "a simple command consisting only of variable assignments," so bash reports `export`'s own exit status (0), not the inner command's. A failing/missing `hostname` leaves `MASTER_ADDR=""` and the script continues — `set -e` never fires. Downstream this feeds `--main_process_ip "$MASTER_ADDR"` in `accelerate_command`, so the failure mode is a distributed job hanging at rendezvous on an allocated node rather than failing fast. This is byte-for-byte the brief's own reference code (task-7-brief.md:323), not an implementer deviation, so it's plan-mandated, but it is a real fragility worth fixing: split into `MASTER_ADDR=$(hostname --ip-address); export MASTER_ADDR` (plain assignment restores `set -e` sensitivity, then a bare `export` of an already-set variable can't itself fail).
+- **`render.py:35,37` (diff) — `phase_dir`/`PHASE_DIR` and `array_cells_file`/`CELLS_FILE`/`.cells` carry exactly the vocabulary the brief bans, plan-mandated.** The global constraint says `oplm.slurm` "must carry no μP, sweep-phase, ranking, or selection vocabulary" and explicitly calls out "'Cell' is oplm.sweep's term." Yet the same brief's own Interfaces section pins `array_cells_file: Path | None` and `phase_dir: Path | None` on `JobSpec`, and the fixed test file (reproduced verbatim, as instructed) asserts `"170M.cells"` and a test literally named `test_array_index_maps_through_the_cells_file`. `phase_dir` is arguably a more direct hit than "cell" — "sweep-phase" is named outright in the ban, and `PHASE_DIR` is the local bash variable for exactly that concept. The implementer reworded every reachable comment/docstring but had no room to rename the pinned fields without breaking the interface contract and the fixed tests. This is a genuine plan-level contradiction (the brief bans vocabulary its own Interfaces/tests mandate), not an implementer quality defect — flagging per calibration as Important/plan-mandated for whoever owns the plan to resolve (e.g., accept "cell"/"phase" as load-bearing directory/file-naming exceptions, or coordinate a rename across this task and its later consumer).
+
+#### Minor (Nice to Have)
+- **`render.py:33-42` (diff) — no cross-field validation on `JobSpec`.** Nothing checks `array_size &gt;= 1`, `nodes &gt;= 1`, or consistency among `array_size`/`array_cells_file`/`phase_dir` (e.g., `array_size` set without `array_cells_file` silently renders `--array=...` with no `SLURM_ARRAY_TASK_ID` mapping, and `array_size=0` would render `--array=0--1%N`, a malformed directive). Matches the brief's reference code exactly (no `__post_init__` there either), so this is inherited, not introduced — but worth a `__post_init__` guard in a follow-up since `JobSpec` is the module's only public entry point for shaping a job.
+- **`render.py:142-160` (diff) — `accelerate_command`'s docstring has no Args/Returns section** despite four keyword-only parameters, which is a thinner treatment than "Google-style docstrings on public classes/functions" implies for a non-trivial function. Matches the brief's reference code verbatim; not an implementer-introduced gap.
+- **`tests/slurm/test_render.py:334-339` (diff) — no test asserts the empty-`RUN_ID` guard itself** (the `if [ -z "$RUN_ID" ]; then ... exit 1; fi` block). The brief's fixed test only checks that `"170M.cells"`, `"SLURM_ARRAY_TASK_ID"`, and `"export RUN_DIR"` appear in the text, not that an out-of-range index actually exits nonzero with a message. I verified the behavior manually (see Strengths) since the suite doesn't. Plan-mandated gap (fixed test file), not an implementer choice, but worth adding coverage for later since it's the one piece of real conditional logic in the file.
+
+### Assessment
+**Task quality:** Approved
+**Reasoning:** Interfaces, tests, and gates all match the brief exactly; the one runtime-safety change (TYPE_CHECKING move) is verified safe both statically and by direct execution. The two Important findings are both plan-inherited (verbatim brief code / brief-mandated field names), not implementation failures — they're worth surfacing to whoever owns the plan (MASTER_ADDR export-masking fix, and the cell/phase vocabulary-vs-interface contradiction) but don't reflect poor craftsmanship on this task.</result>
+<usage><subagent_tokens>75449</subagent_tokens><tool_uses>16</tool_uses><duration_ms>312193</duration_ms></usage>
+</task-notification>
+
+---
+
+/login
+
+---
+
+<task-notification>
+<task-id>a5e6a83feef739f1d</task-id>
+<tool-use-id>toolu_011EmXeiqYYDhdqKFV9WFt4o</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a5e6a83feef739f1d.output</output-file>
+<status>completed</status>
+<summary>Agent "Apply Task 7 owner decisions" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status:** DONE
+Commit: `8b0b3eb` — "fix: set -e safe MASTER_ADDR, neutral JobSpec field names"
+Tests: `python -m pytest tests/slurm/ -q` → 38 passed; `ruff check src/`, `ruff format --check src/`, `ty check src/`, `ruff check tests/slurm/` all pass; both rendered scripts pass `bash -n`.
+Concerns: none. Grep confirmed no consumer of the renamed fields outside the two touched files; the one iteration needed was reworking the new `MASTER_ADDR` comment because it accidentally contained the literal banned substring `export MASTER_ADDR=$(`, which I fixed before committing.
+Report: `/home/briney/git/oplm/.superpowers/sdd/task-7-report.md` (appended under "## Owner decisions: MASTER_ADDR set -e safety, layer-neutral JobSpec field names")</result>
+<usage><subagent_tokens>101404</subagent_tokens><tool_uses>30</tool_uses><duration_ms>222703</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9576f2d6e83dc1f2</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c7478c06-34ba-46f7-98fb-0bef3b49eff8/tasks/a9576f2d6e83dc1f2.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-review Task 7 owner-decision pass" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Spec Compliance
+- ✅ Spec compliant. All three commits do exactly what the decisions describe; verified against actual working-tree files (not just the diff) and empirically against real bash semantics.
+
+### Verification performed
+- Confirmed `MASTER_ADDR=$(hostname --ip-address)` / `export MASTER_ADDR` are adjacent, correctly ordered, and appear nowhere else in `src/oplm/slurm/render.py` as the combined `export VAR=$(` form (`grep` for the literal banned substring returns nothing).
+- Empirically reproduced the bug and the fix in bash: `export VAR=$(false); echo $?` → prints `after: ` and exits `0` (masked); `VAR=$(false)` alone under `set -e` aborts immediately (exit `1`, "after" never printed). This confirms Decision 1's premise and that the split is not just cosmetic — a plain assignment containing a command substitution propagates the substitution's exit status per bash's simple-command rules, `export`-prefixed assignment does not.
+- Ran `python -m pytest tests/slurm/test_render.py -q` (11 passed) and directly rendered a job via `render_job` — all three target assertions (`"\nMASTER_ADDR=..."`, `"\nexport MASTER_ADDR\n"`, `"export MASTER_ADDR=$(" not in text`) evaluate `True` against real output, and would each correctly flip to failing if the two lines were recombined (verified by construction: the recombined line would neither start a line with bare `MASTER_ADDR=` nor `export MASTER_ADDR` alone, and would contain the banned substring).
+- `grep -rn "array_cells_file|phase_dir=|PHASE_DIR|CELLS_FILE|\.cells"` across `src/oplm/slurm/render.py` and `tests/slurm/test_render.py`: zero hits. `grep -rln "JobSpec("` across `src/` and `tests/`: only `tests/slurm/test_render.py` — confirms "no consumer existed yet" and that the rename is complete and correctly scoped.
+- Confirmed `src/oplm/sweep/phases.py:465` (`_smoke_gated_lrs`) still uses its own local `phase_dir` variable, untouched — correct, sweep-layer vocabulary, not part of this diff's file set.
+- `git show 0913401`: 1 file, 1 insertion, 1 deletion — exactly the "phase directory" → "base directory" comment word swap, nothing else.
+- `git show 6091d70` / `git show 8b0b3eb` stats confirm clean separation: docs commit touches only `TODOS.md`; fix commit touches only `render.py` + `tests/slurm/test_render.py`.
+- `tests/slurm/test_render.py` post-diff has 11 unique `def test_` functions (`grep -c`), no duplicates, matching pre-diff count — the rename `test_array_index_maps_through_the_cells_file` → `test_array_index_maps_through_the_index_file` is a straight rename, not a drop/duplicate.
+
+### Strengths
+- The `export`-masking argument is correct bash behavior (verified empirically, not just asserted), and the fix is idiomatic (this is the well-known ShellCheck SC2155 pattern, applied correctly here to a top-level script rather than a `local`).
+- Decision 2's rename is exhaustive and clean in both touched source files — no stray old identifiers, no accidental collisions.
+- Commit hygiene is good: each commit does one thing, stats match descriptions exactly, and the controller's one-word follow-up commit is verifiably minimal.
+- The negative assertion `"export MASTER_ADDR=$(" not in text` is real teeth, not decorative — confirmed the shipped comment (`export VAR=$(cmd)`, generic) does not trip it, while the actual banned pattern would.
+
+### Issues
+
+#### Minor (Nice to Have)
+- `TODOS.md:1173` — `def test_array_index_maps_through_the_cells_file(tmp_path: Path) -&gt; None:` retains the old name even though this diff edited the assertion inside the same function block (`"170M.cells"` → `"170M.jobs"`, visible in the diff hunk). The actual test in `tests/slurm/test_render.py` was correctly renamed to `test_array_index_maps_through_the_index_file`. This is a documentation-only drift (TODOS.md is not executed), but it's a rename this diff itself should have finished while it was already touching that exact block. Fix: rename the `def` line in `TODOS.md` to match.
+
+Note for awareness, not a finding against this diff (both lines are unchanged/context in this diff, so pre-date it): `TODOS.md:1263` (`"""...homogeneous cells."""`) and `TODOS.md:1329/1334` (`"Map this array index to its cell"`, `"no cell for array index"`) still say "cell", while the corresponding lines in `src/oplm/slurm/render.py` already say "run"/"jobs". This predates commit `c9902fd` and is out of scope for this review, but the controller may want to fold it into the same doc-consistency pass next time `TODOS.md` is touched.
+
+### Assessment
+**Task quality:** Approved
+**Reasoning:** All four named risks check out under direct verification (source inspection, live bash reproduction of the `set -e` masking bug, and running the affected tests); the only finding is a single stale test-function name inside `TODOS.md`'s documentation copy of the test, which has no effect on shipped behavior or test coverage.</result>
+<usage><subagent_tokens>64082</subagent_tokens><tool_uses>23</tool_uses><duration_ms>298319</duration_ms></usage>
+</task-notification>
