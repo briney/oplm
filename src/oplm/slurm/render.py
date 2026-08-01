@@ -187,7 +187,7 @@ def render_submit_script(entries: list[SubmitEntry]) -> str:
         "#!/bin/bash",
         "set -euo pipefail",
         "",
-        "# Run from the phase directory regardless of the caller's cwd.",
+        "# Run from the base directory regardless of the caller's cwd.",
         'cd "$(dirname "$0")/.."',
         "",
     ]
