@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -284,6 +285,14 @@ class SweepMetricsCallback(TrainerCallback):
             * trainer.cfg.train.gradient_accumulation_steps
             * trainer.accelerator.num_processes
         )
+        # oplm.__version__ is a stale hand-set constant; the installed distribution
+        # version is what actually ran. Generated sweep scripts install oplm
+        # unpinned, so this is what makes version drift across a multi-week sweep
+        # detectable after the fact instead of invisible.
+        try:
+            oplm_version: str | None = version("oplm")
+        except PackageNotFoundError:  # only from a bare (non-installed) checkout
+            oplm_version = None
         payload = {
             "final_train_loss": self._ema_loss,
             "eval": dict(self._eval),
@@ -291,6 +300,7 @@ class SweepMetricsCallback(TrainerCallback):
             "width": trainer.cfg.model.hidden_size,
             "steps": getattr(trainer, "total_steps", trainer.cfg.train.max_steps),
             "global_batch": global_batch,
+            "oplm_version": oplm_version,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(payload, indent=2))

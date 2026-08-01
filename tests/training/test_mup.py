@@ -14,17 +14,22 @@ That ratio is ``1/√m_W`` for hidden matrices and ``1.0`` for readouts/embeddin
 
 from __future__ import annotations
 
+import json
 import math
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from oplm.config import TrainConfig
+from oplm.config import OplmConfig, TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM, OplmForSequenceClassification
-from oplm.training.mup import mup_fanin_mult, mup_lr_multiplier
+from oplm.training.mup import SweepMetricsCallback, mup_fanin_mult, mup_lr_multiplier
 from oplm.training.optim import build_optimizers, partition_optimizer_params
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # Base width 64 with width 256 gives m = 4 and (via the 256-rounded FFN sizes
 # i0 = 256, i = 768) m_ffn = 3 — so the down_proj multiplier is genuinely
@@ -354,3 +359,78 @@ def test_mup_is_noop_at_base_width() -> None:
     for name in on_p:
         assert torch.equal(on_p[name], off_p[name]), name
     assert on.lm_head.output_mult == 1.0
+
+
+# ---------------------------------------------------------------------------
+# SweepMetricsCallback.on_train_end — result.json version provenance
+# ---------------------------------------------------------------------------
+
+
+class _StubAccelerator:
+    """Exposes only what ``on_train_end`` reads off the accelerator: ``num_processes``."""
+
+    def __init__(self, num_processes: int = 1) -> None:
+        self.num_processes = num_processes
+
+
+class _StubTrainer:
+    """Minimal trainer stand-in for :meth:`SweepMetricsCallback.on_train_end`.
+
+    Exposes exactly the attributes that method reads (``src/oplm/training/mup.py``):
+    ``cfg.train.{batch_size,gradient_accumulation_steps,lr}``, ``cfg.model.hidden_size``,
+    ``accelerator.num_processes``, and ``total_steps`` (read via ``getattr(..., default=
+    cfg.train.max_steps)``, so the real ``Trainer`` — which always sets it in
+    ``__init__`` — takes the ``total_steps`` branch). Notably, ``on_train_end`` never
+    reads ``global_step``.
+    """
+
+    def __init__(
+        self,
+        *,
+        batch_size: int = 4,
+        gradient_accumulation_steps: int = 2,
+        lr: float = 0.01,
+        hidden_size: int = 128,
+        num_attention_heads: int = 2,
+        num_processes: int = 1,
+        total_steps: int = 7,
+    ) -> None:
+        self.cfg = OplmConfig(
+            model=OplmModelConfig(hidden_size=hidden_size, num_attention_heads=num_attention_heads),
+            train=TrainConfig(
+                batch_size=batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                lr=lr,
+            ),
+        )
+        self.accelerator = _StubAccelerator(num_processes)
+        self.total_steps = total_steps
+
+
+def test_result_json_records_installed_version(tmp_path: Path) -> None:
+    """oplm.__version__ is stale (0.0.1); result.json must carry the installed dist version."""
+    from importlib.metadata import version
+
+    callback = SweepMetricsCallback(tmp_path / "result.json")
+    callback.on_train_end(_StubTrainer())
+
+    payload = json.loads((tmp_path / "result.json").read_text())
+    assert payload["oplm_version"] == version("oplm")
+
+
+def test_result_json_version_is_none_when_package_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare checkout (no installed distribution) records ``oplm_version: None``, not a crash."""
+    import oplm.training.mup as mup_module
+
+    def _raise(_name: str) -> str:
+        raise mup_module.PackageNotFoundError
+
+    monkeypatch.setattr(mup_module, "version", _raise)
+
+    callback = SweepMetricsCallback(tmp_path / "result.json")
+    callback.on_train_end(_StubTrainer())
+
+    payload = json.loads((tmp_path / "result.json").read_text())
+    assert payload["oplm_version"] is None
