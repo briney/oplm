@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from oplm.slurm.config import PhaseTable, SlurmConfig
+from oplm.slurm.config import BatchPlan, PhaseTable, SlurmConfig, resolve_batch_plan
 
 RAW = {
     "partition": "hpc-mid",
@@ -110,19 +110,46 @@ def test_non_numeric_max_batch_size_rejected() -> None:
         SlurmConfig.from_mapping(raw)
 
 
-from oplm.slurm.config import BatchPlan, resolve_batch_plan
-
-
 @pytest.mark.parametrize(
     ("global_examples", "nodes", "cap", "expected"),
     [
         # The spec's node table: every row resolves to accum == 1.
-        (2048, 1, 256, BatchPlan(per_device_batch=256, gradient_accumulation_steps=1, world_size=8)),
-        (2048, 4, 256, BatchPlan(per_device_batch=64, gradient_accumulation_steps=1, world_size=32)),
-        (2048, 8, 256, BatchPlan(per_device_batch=32, gradient_accumulation_steps=1, world_size=64)),
-        (2048, 8, 128, BatchPlan(per_device_batch=32, gradient_accumulation_steps=1, world_size=64)),
-        (8192, 4, 256, BatchPlan(per_device_batch=256, gradient_accumulation_steps=1, world_size=32)),
-        (8192, 8, 256, BatchPlan(per_device_batch=128, gradient_accumulation_steps=1, world_size=64)),
+        (
+            2048,
+            1,
+            256,
+            BatchPlan(per_device_batch=256, gradient_accumulation_steps=1, world_size=8),
+        ),
+        (
+            2048,
+            4,
+            256,
+            BatchPlan(per_device_batch=64, gradient_accumulation_steps=1, world_size=32),
+        ),
+        (
+            2048,
+            8,
+            256,
+            BatchPlan(per_device_batch=32, gradient_accumulation_steps=1, world_size=64),
+        ),
+        (
+            2048,
+            8,
+            128,
+            BatchPlan(per_device_batch=32, gradient_accumulation_steps=1, world_size=64),
+        ),
+        (
+            8192,
+            4,
+            256,
+            BatchPlan(per_device_batch=256, gradient_accumulation_steps=1, world_size=32),
+        ),
+        (
+            8192,
+            8,
+            256,
+            BatchPlan(per_device_batch=128, gradient_accumulation_steps=1, world_size=64),
+        ),
     ],
 )
 def test_batch_plan_matches_the_spec_table(
@@ -156,3 +183,33 @@ def test_indivisible_global_batch_raises() -> None:
 def test_global_batch_smaller_than_world_raises() -> None:
     with pytest.raises(ValueError, match="not divisible"):
         resolve_batch_plan(global_examples=4, world_size=8, max_batch_size=256)
+
+
+def test_prime_base_forces_search_past_non_divisor_candidates() -> None:
+    """970 / 10 = 97 (prime): only accum in {1, 97} divides it evenly.
+
+    A ceil-based implementation (``accum = ceil(base / cap)``, ``per_device = ceil(base /
+    accum)``, with no check that ``accum`` actually divides ``base``) would compute
+    ``accum = ceil(97 / 32) = 4`` and ``per_device = ceil(97 / 4) = 25``, giving a product of
+    ``25 * 4 * 10 = 1000 != 970`` -- silently violating the exact-global-batch invariant that
+    makes sweep cells comparable. The real search must reject accum=2..96 (every one a
+    non-divisor of 97) before landing on accum=97, per_device=1.
+    """
+    plan = resolve_batch_plan(global_examples=970, world_size=10, max_batch_size=32)
+    assert plan == BatchPlan(per_device_batch=1, gradient_accumulation_steps=97, world_size=10)
+    assert plan.per_device_batch * plan.gradient_accumulation_steps * plan.world_size == 970
+
+
+@pytest.mark.parametrize("field", ["global_examples", "world_size", "max_batch_size"])
+def test_resolve_batch_plan_rejects_bool(field: str) -> None:
+    """`bool` is an `int` subclass; a bare range check would silently accept it and store it.
+
+    Confirmed as a real leak (not just a theoretical one): before this fix,
+    ``resolve_batch_plan(global_examples=8, world_size=True, max_batch_size=8)`` returned
+    ``BatchPlan(per_device_batch=8, gradient_accumulation_steps=1, world_size=True)`` -- a
+    `bool` stored in an `int` field, ready to propagate into anything rendered downstream.
+    """
+    kwargs: dict[str, int] = {"global_examples": 2048, "world_size": 8, "max_batch_size": 256}
+    kwargs[field] = True
+    with pytest.raises(ValueError, match=field):
+        resolve_batch_plan(**kwargs)

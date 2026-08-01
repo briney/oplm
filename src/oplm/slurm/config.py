@@ -188,7 +188,7 @@ class SlurmConfig:
 
 @dataclass(frozen=True)
 class BatchPlan:
-    """Per-device batch and accumulation for one cell."""
+    """Per-device batch and accumulation for one training job."""
 
     per_device_batch: int
     gradient_accumulation_steps: int
@@ -206,6 +206,10 @@ def resolve_batch_plan(*, global_examples: int, world_size: int, max_batch_size:
     Takes ``world_size`` rather than a node count so both callers land on an exact global batch:
     Slurm passes ``nodes * gpus_per_node``, while ``--local`` passes its actual process count.
 
+    ``accum == base`` (i.e. ``per_device_batch == 1``) always divides evenly and always satisfies
+    the cap once ``max_batch_size >= 1``, so the search never exhausts its range: at worst it
+    degenerates to per-device batch 1 with accumulation equal to the full per-replica batch.
+
     Args:
         global_examples: Target global batch in examples per optimizer step.
         world_size: Total training processes.
@@ -215,9 +219,12 @@ def resolve_batch_plan(*, global_examples: int, world_size: int, max_batch_size:
         The resolved plan.
 
     Raises:
-        ValueError: If the global batch is not divisible by the world size, or no accumulation
-            brings the per-device batch within ``max_batch_size``.
+        ValueError: If any argument is non-positive or a ``bool``, or if the global batch is not
+            divisible by the world size.
     """
+    _reject_bool(global_examples, "resolve_batch_plan global_examples")
+    _reject_bool(world_size, "resolve_batch_plan world_size")
+    _reject_bool(max_batch_size, "resolve_batch_plan max_batch_size")
     if global_examples < 1 or world_size < 1 or max_batch_size < 1:
         raise ValueError(
             "global_examples, world_size, and max_batch_size must all be >= 1; got "
@@ -228,19 +235,18 @@ def resolve_batch_plan(*, global_examples: int, world_size: int, max_batch_size:
             f"global batch {global_examples} is not divisible by world size {world_size}"
         )
     base = global_examples // world_size
-    for accum in range(1, base + 1):
-        if base % accum != 0:
-            continue
-        per_device = base // accum
-        if per_device <= max_batch_size:
-            return BatchPlan(
-                per_device_batch=per_device,
-                gradient_accumulation_steps=accum,
-                world_size=world_size,
-            )
-    raise ValueError(
-        f"no accumulation brings per-device batch within {max_batch_size} for "
-        f"global batch {global_examples} on world size {world_size}"
+    # accum == base always divides base evenly and yields per_device == 1, which satisfies
+    # max_batch_size >= 1 (checked above), so this search always has a match: at worst it
+    # degenerates to per-device batch 1 with accumulation equal to the full per-replica batch.
+    accum = next(
+        accum
+        for accum in range(1, base + 1)
+        if base % accum == 0 and base // accum <= max_batch_size
+    )
+    return BatchPlan(
+        per_device_batch=base // accum,
+        gradient_accumulation_steps=accum,
+        world_size=world_size,
     )
 
 
