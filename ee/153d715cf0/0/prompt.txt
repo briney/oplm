@@ -1,0 +1,195 @@
+We fairly recently built the code (together with a run script) for performing a multi-step uP learning rate sweep. I'd like to refactor that slightly with a few learnings and to run in a different environment. First, I'd like to run this on our CoreWeave cluster (which runs SUNK, their Slurm on Kubernetes system), This means refactoring the run script (which sequentially launches training runs and is designed to be run on a single 8xB200 node) into a series of slurm jobs. An example job script (not necessarily matched to one of the jobs that we'll run for uP, just a generic OPLM training run but which shows the actual location of the training/eval datasets on our CoreWeave cluster). Not sure what the best way to do this is -- launch a bunch of slurm jobs that write their output to a local directory, then run a Python script that processes the results once all jobs are completed? What are the best practices for something like this?
+
+Second, I think our range for the lr sweep is too high. In the 170M course sweeep (10k steps), 0,0025 and 0.004 showed the best results (they were very similar to each other, although 0.0025 squeaked ahead at the end), both significantly outperforming 0.0063, 0.01, and 0.016. That suggests that the optimal lr is at or below the low end of our current sweep range. We should adjust this accordingly.
+
+Let's brainstorm first, then make a plan to implement these changes.
+
+#!/bin/bash
+
+# --- job ---
+#SBATCH --job-name=oplm-50M_scaling-test_global-batch-2048
+#SBATCH --partition=hpc-mid
+
+# --- resources ---
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=512G
+
+# --- logs ---
+#SBATCH --output=/mnt/home/%u/logs/%x_%A.out
+#SBATCH --error=/mnt/home/%u/logs/%x_%A.err
+
+# --- container ---
+#SBATCH --container-image=/mnt/data/containers/deeplearning_v2026-05-26.sqsh
+#SBATCH --container-mounts=/mnt/home/${SLURM_JOB_USER}:/mnt/home/${SLURM_JOB_USER},/mnt/data:/mnt/data,/tmp:/tmp
+#SBATCH --no-container-mount-home
+
+# --- notifications ---
+# SBATCH --mail-type=ALL
+# SBATCH --mail-user='slack:USER-ID' # TODO - fill with your slack UID to get notifications
+
+set -euo pipefail
+
+# source env file
+# if you've copied the example .env file,
+# this will create the work dir (JOB_WORK_DIR), set object storage / wandb keys, etc
+source /mnt/home/${SLURM_JOB_USER}/.env
+
+# cd into the work dir
+cd "$JOB_WORK_DIR"
+
+# unique port to avoid collisions if multiple jobs run concurrently
+export MAIN_PROCESS_PORT=$((29500 + (${SLURM_JOB_ID:-0} + ${SLURM_ARRAY_TASK_ID:-0}) % 1000))
+
+# install OPLM
+python -m pip install oplm[train]
+
+# train
+accelerate launch \
+    --multi_gpu \
+    --mixed_precision bf16 \
+    --main_process_port $MAIN_PROCESS_PORT \
+    -m oplm.train \
+    --name oplm-50M_uniref70-omg70-deepclust30-bigg2_global-bs-2048 \
+    --preset 50M \
+    model.max_position_embeddings=512 \
+    model.gradient_checkpointing=true \
+    model.gradient_checkpointing_mode="selective" \
+    train.batch_size=256 \
+    train.max_steps=100000 \
+    train.scheduler="wsd_linear" \
+    train.stable_steps=95000 \
+    train.wandb_project="oplm-scaling" \
+    train.save_every=100000 \
+    train.eval_every.steps=5000 \
+    train.compile=true \
+    train.output_dir="/mnt/home/briney/projects/oplm/scaling/50M/oplm-50M_uniref70-omg70-deepclust30-bigg2_global-bs-2048/" \
+    data.train.uniref70.path="/mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/train" \
+    data.train.uniref70.fraction=0.35 \
+    data.train.omg70.path="/mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/train" \
+    data.train.omg70.fraction=0.45 \
+    data.train.deepclust30.path="/mnt/data/datasets/plm-training-data/deepclust30-bigg2/train" \
+    data.train.deepclust30.fraction=0.20 \
+    data.eval.uniref70.path="/mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/eval.parquet" \
+    data.eval.uniref70.type="sequence" \
+    data.eval.omg70.path="/mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/eval.parquet" \
+    data.eval.omg70.type="sequence" \
+    data.eval.deepclust30.path="/mnt/data/datasets/plm-training-data/deepclust30-bigg2/eval.parquet" \
+    data.eval.deepclust30.type="sequence" \
+    data.eval.casp14.path="/mnt/data/datasets/plm-training-data/casp/casp14" \
+    data.eval.casp14.type="structure" \
+    data.eval.proteingym_clinical.path="/mnt/data/datasets/plm-training-data/ProteinGym/eval/clinical_substitutions" \
+    data.eval.proteingym_clinical.type="proteingym_clinical" \
+    data.eval.proteingym_clinical.scoring="wt_marginals" \
+    data.eval.proteingym_clinical.top_k_fraction=0.1 \
+    data.eval.proteingym_dms.path="/mnt/data/datasets/plm-training-data/ProteinGym/eval/dms_substitutions" \
+    data.eval.proteingym_dms.type="proteingym" \
+    data.eval.proteingym_dms.scoring="wt_marginals" \
+    data.eval.proteingym_dms.top_k_fraction=0.1 \
+
+---
+
+The scale sweep is 100k steps, correct? For the larger models (anything 400M+), this will take an exremely long time. For reference, the 170M param model took ~12 hours for 10k steps. I think it makes sense to pull out the scale phase (which I believe is 100k steps), since many of these runs will need to be multi-node.
+
+---
+
+I like the idea of generating the sbatch scripts for the transfer, bridge, confirm, and scale phases. Here's an example multi-node sbatch job file that's been successfully used in our CoreWeave environment:
+
+#!/bin/bash
+
+# --- job ---
+#SBATCH REDACTED
+#SBATCH --partition=hpc-mid
+
+# --- nodes & resources ---
+# 2 nodes, with one task per node. 8 gpus, 128 cpus, and all of the memory per node.
+# Also requires a whole-node lock, meaning the node won't recieve any other jobs.
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=128
+#SBATCH --mem=0
+#SBATCH --exclusive
+
+# --- logs ---
+#SBATCH --output=/mnt/home/%u/logs/%x_%A.out
+#SBATCH --error=/mnt/home/%u/logs/%x_%A.err
+
+# Note: no container is used for the initial job. Containers are specified below,
+# so that the training job runs inside a container.
+
+set -euo pipefail
+
+# source env file
+# if you've copied the example .env file,
+# this will create the work dir (JOB_WORK_DIR), set object storage / wandb keys, etc
+source /mnt/home/${SLURM_JOB_USER}/.env
+
+# JOB_WORK_DIR lives on node-local /tmp, and .env only created it on this
+# (batch) node. Create it on every node so the container can use it as its
+# working directory.
+srun --nodes=$SLURM_NNODES --ntasks-per-node=1 mkdir -p "$JOB_WORK_DIR"
+
+# distributed rendezvous (sbatch body runs on the rank-0 node)
+export MASTER_ADDR=$(hostname --ip-address)
+export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))
+export NCCL_DEBUG=INFO
+export OMP_NUM_THREADS=1
+
+# Each node runs one srun task; we pass its machine rank explicitly via
+# --machine_rank $SLURM_PROCID, and all ranks rendezvous on $MASTER_ADDR:$MASTER_PORT
+srun --nodes=$SLURM_NNODES --ntasks-per-node=1 \
+  --export=ALL \
+  --container-image=/mnt/data/containers/deeplearning_v2026-05-26.sqsh \
+  --container-mounts=/mnt/home/${SLURM_JOB_USER}:/mnt/home/${SLURM_JOB_USER},/mnt/data:/mnt/data,/tmp:/tmp \
+  --container-workdir="$JOB_WORK_DIR" \
+  --no-container-mount-home \
+  bash -c 'pip install oplm[train] && \
+    accelerate launch \
+    --multi_gpu \
+    --mixed_precision bf16 \
+    --num_machines $SLURM_NNODES \
+    --num_processes $((SLURM_NNODES * 8)) \
+    --machine_rank $SLURM_PROCID \
+    --main_process_ip "$MASTER_ADDR" \
+    --main_process_port $MASTER_PORT \
+    -m oplm.train \
+    --name REDACTED \
+    --preset 400M \
+    model.max_position_embeddings=512 \
+    model.gradient_checkpointing=true \
+    model.gradient_checkpointing_mode="full" \
+    train.batch_size=256 \
+    train.max_steps=100000 \
+    train.scheduler="wsd_linear" \
+    train.stable_steps=95000 \
+    train.wandb_project="oplm-scaling" \
+    train.save_every=100000 \
+    train.eval_every.steps=5000 \
+    train.compile=true \
+    train.output_dir="/mnt/home/briney/projects/oplm/scaling/400M/REDACTED/" \
+    data.train.uniref70.path="/mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/train" \
+    data.train.uniref70.fraction=0.35 \
+    data.train.omg70.path="/mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/train" \
+    data.train.omg70.fraction=0.45 \
+    data.train.deepclust30.path="/mnt/data/datasets/plm-training-data/deepclust30-bigg2/train" \
+    data.train.deepclust30.fraction=0.20 \
+    data.eval.uniref70.path="/mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/eval.parquet" \
+    data.eval.uniref70.type="sequence" \
+    data.eval.omg70.path="/mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/eval.parquet" \
+    data.eval.omg70.type="sequence" \
+    data.eval.deepclust30.path="/mnt/data/datasets/plm-training-data/deepclust30-bigg2/eval.parquet" \
+    data.eval.deepclust30.type="sequence" \
+    data.eval.casp14.path="/mnt/data/datasets/plm-training-data/casp/casp14" \
+    data.eval.casp14.type="structure" \
+    data.eval.proteingym_clinical.path="/mnt/data/datasets/plm-training-data/ProteinGym/eval/clinical_substitutions" \
+    data.eval.proteingym_clinical.type="proteingym_clinical" \
+    data.eval.proteingym_clinical.scoring="wt_marginals" \
+    data.eval.proteingym_dms.path="/mnt/data/datasets/plm-training-data/ProteinGym/eval/dms_substitutions" \
+    data.eval.proteingym_dms.type="proteingym" \
+    data.eval.proteingym_dms.scoring="wt_marginals" \
+    data.eval.proteingym_dms.top_k_fraction=0.1'
+
+---
+
+Looks great, go ahead

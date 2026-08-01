@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "ee153d715cf0",
+  "strategy": "manual-commit",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "docs/superpowers/specs/2026-07-31-mup-sweep-slurm-design.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ee/153d715cf0/0/metadata.json",
+      "transcript": "/ee/153d715cf0/0/full.jsonl",
+      "compact_transcript": "/ee/153d715cf0/0/transcript.jsonl",
+      "content_hash": "/ee/153d715cf0/0/content_hash.txt",
+      "prompt": "/ee/153d715cf0/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 73,
+    "cache_creation_tokens": 113735,
+    "cache_read_tokens": 3140643,
+    "output_tokens": 52211,
+    "api_call_count": 37
+  }
+}
