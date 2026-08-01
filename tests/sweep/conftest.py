@@ -7,6 +7,7 @@ drives the matching phase generator and returns the resulting `phase.json` path.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -14,7 +15,7 @@ from omegaconf import OmegaConf
 from typer.testing import CliRunner
 
 from oplm.sweep import phases
-from oplm.sweep.common import PhaseManifest, write_phase
+from oplm.sweep.common import PhaseManifest, load_phase, write_phase
 from tests.slurm.test_config import RAW as SLURM_RAW
 
 if TYPE_CHECKING:
@@ -61,6 +62,19 @@ def _write_selected(path: Path, phase: str, selected: list[dict[str, float]]) ->
     return path
 
 
+def _fabricate_finite_result(phase_path: Path, *, loss: float = 1.5) -> None:
+    """Write a finite `result.json` for a freshly generated phase's first (only) run.
+
+    Generation alone always leaves `.selected` empty -- only `analyze_phase` (run against real
+    `result.json` files) populates it. Fixtures that need an already-confirmed winner fabricate
+    one result and analyze it, mirroring what a real completed run would leave on disk.
+    """
+    phase = load_phase(phase_path)
+    result_path = phase_path.parent / phase.runs[0].result
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps({"eval": {phase.metric: loss}}))
+
+
 @pytest.fixture
 def coarse_phase(tmp_path: Path) -> Path:
     """A generated `coarse` phase: single preset (170M), one array job."""
@@ -91,7 +105,12 @@ def transfer_phase(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def confirm_phase(tmp_path: Path) -> Path:
-    """A generated `confirm` phase (800M), sourced from a bridge winner."""
+    """An analyzed `confirm` phase (800M) with its single candidate confirmed.
+
+    Sourced from a bridge winner, then given a fabricated finite result and analyzed, so
+    `.selected` carries the confirmed winner exactly as `oplm sweep scale` expects to read it --
+    not just the empty `.selected` a bare `generate` step leaves behind.
+    """
     config = _write_base_config(tmp_path)
     source = _write_selected(
         tmp_path / "bridge" / "phase.json",
@@ -104,4 +123,7 @@ def confirm_phase(tmp_path: Path) -> Path:
         ["confirm", "--config", str(config), "--from", str(source), "--out", str(out)],
     )
     assert result.exit_code == 0, result.output
-    return out / "phase.json"
+    phase_path = out / "phase.json"
+    _fabricate_finite_result(phase_path)
+    phases.analyze_phase(phase_path)
+    return phase_path

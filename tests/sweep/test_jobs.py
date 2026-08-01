@@ -118,7 +118,8 @@ def test_local_and_submit_are_mutually_exclusive(tmp_path: Path) -> None:
 
 
 def test_scale_command_has_no_submit_flag(tmp_path: Path) -> None:
-    """`scale` is excluded from `--submit` per the plan (Task 14 rewrites it separately)."""
+    """`scale` generates only -- it has no `--submit` (or `--local`) flag at all."""
     result = runner.invoke(phases.app, ["scale", "--help"])
     assert result.exit_code == 0
     assert "--submit" not in result.output
+    assert "--local" not in result.output

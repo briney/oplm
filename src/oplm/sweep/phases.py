@@ -609,32 +609,6 @@ def _confirm_cells(
     ]
 
 
-def _scale_cells(
-    candidates: list[Params],
-    *,
-    presets: list[str],
-    global_examples: int,
-    seed: int,
-    steps: int,
-    warmup: int,
-) -> list[Params]:
-    candidate = candidates[0]
-    return [
-        _cell(
-            preset=preset,
-            lr=_as_float(candidate["lr"]),
-            output_mult=_as_float(candidate["output_mult"]),
-            depth_exponent=_as_float(candidate["depth_exponent"]),
-            seed=seed,
-            global_examples=global_examples,
-            max_steps=steps,
-            warmup_steps=warmup,
-            batch_mult=_as_float(candidate["batch_mult"]),
-        )
-        for preset in presets
-    ]
-
-
 def _smoke_gated_lrs(source: Path, lrs: list[float]) -> list[float]:
     """Drop the smoke phase's highest LR from ``lrs`` when it failed to produce a finite metric.
 
@@ -1374,48 +1348,60 @@ def scale(
     config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
     source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
     out: Annotated[Path, typer.Option("--out", file_okay=False)],
-    metric: Annotated[str | None, typer.Option("--metric")] = None,
-    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
-    presets: Annotated[str, typer.Option("--presets")] = "50M,170M,400M,800M,1B",
-    global_examples: Annotated[int, typer.Option("--global-examples")] = 8192,
-    seed: Annotated[int, typer.Option("--seed")] = 42,
-    steps: Annotated[int, typer.Option("--steps")] = 100000,
-    warmup: Annotated[int, typer.Option("--warmup")] = 5000,
-    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
-    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
-    accelerate_config: Annotated[
-        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
-    ] = None,
-    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
+    presets: Annotated[str, typer.Option("--presets")] = "170M,400M,800M,1B",
 ) -> None:
-    """Generate winner-only scaling runs across the production preset ray."""
+    """Write per-preset production scaling job scripts carrying the confirmed μP winner.
+
+    Unlike every other phase in this module, ``scale`` runs no proxy cells and owns no ranking:
+    it generates only. These are 100k-step production runs at the full preset ray -- days to
+    weeks each, and multi-node -- so the operator reviews and submits the generated scripts on
+    their own schedule; nothing here is ever submitted automatically.
+
+    ``config`` is an ordinary training config (see ``configs/scaling.yaml``) with no μP sweep
+    concepts in it. This command's only job is to merge the confirmed ``lr``, ``output_mult``,
+    and ``depth_exponent`` from ``source``'s selected winner into it and render one job per
+    preset through :mod:`oplm.slurm`, so someone reproducing a scaling run never needs to touch
+    the sweep. ``batch_mult`` is part of the winner's identity in ``phase.json`` (it distinguishes
+    candidates carrying different batch corrections during ranking) but has no corresponding
+    training config field: the ``bridge`` phase that produced it already folded the correction
+    into the winner's ``lr``, so there is nothing left here to merge.
+    """
     try:
-        cells = _scale_cells(
-            _input_candidates(
-                source,
-                candidates,
-                ("lr", "output_mult", "depth_exponent", "batch_mult"),
-            ),
-            presets=_parse_strings(presets, name="--presets"),
-            global_examples=global_examples,
-            seed=seed,
-            steps=steps,
-            warmup=warmup,
-        )
-        phase_path, commands = _generate_phase(
-            name="scale",
-            base_config=config,
-            out=out,
-            metric=metric,
-            source=source,
-            cells=cells,
-            num_processes=num_processes,
-            local=local,
-            accelerate_config=accelerate_config,
-            diagnostics=diagnostics,
-        )
-        if local:
-            _run_local(commands)
-            analyze_phase(phase_path)
+        selected = load_phase(source).selected
+        if not selected:
+            raise ValueError(f"source phase {source} has no selected winner; analyze it first")
+        winner = selected[0]
+        config = config.resolve()
+        slurm = load_slurm_config(config)
+        out = out.resolve()
+        jobs = out / "jobs"
+        jobs.mkdir(parents=True, exist_ok=True)
+        for preset in _parse_strings(presets, name="--presets"):
+            run_dir = out / preset
+            run_dir.mkdir(parents=True, exist_ok=True)
+            overrides = [
+                f"model.mup_output_mult={_as_float(winner['output_mult'])}",
+                f"train.lr={_as_float(winner['lr'])}",
+                f"train.mup_depth_lr_exponent={_as_float(winner['depth_exponent'])}",
+                f"train.output_dir={run_dir / 'output'}",
+                f"train.wandb_run_name=oplm-{preset}-scale",
+            ]
+            cfg = load_config(["--config", str(config), "--preset", preset, *overrides])
+            run_yaml = run_dir / "run.yaml"
+            run_yaml.write_text(serialize_config(cfg))
+            name = f"oplm-{preset}-scale"
+            spec = JobSpec(
+                name=name,
+                nodes=_resolve_nodes(slurm, phase="scale", preset=preset),
+                time_limit=_resolve_time_limit(slurm, phase="scale", preset=preset),
+                command=accelerate_command(
+                    module="oplm.train",
+                    gpus_per_node=slurm.gpus_per_node,
+                    args=f"--config {run_yaml}",
+                ),
+            )
+            (jobs / f"{name}.sbatch").write_text(render_job(spec, slurm))
+        typer.echo(f"wrote {len(list(jobs.glob('*.sbatch')))} scaling scripts to {jobs}")
+        typer.echo("review and submit them yourself; `scale` does not submit")
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc

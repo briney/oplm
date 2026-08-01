@@ -22,17 +22,6 @@ if TYPE_CHECKING:
 
 runner = CliRunner()
 
-# `oplm sweep scale`'s default `--presets` still includes 50M (it stops doing so only once
-# Task 14 rewrites `scale` to delegate to `oplm.slurm`). No production `slurm:` block in this
-# repo -- not even `configs/scaling.yaml` -- defines a node count or batch cap for 50M, so this
-# is purely a test-fixture patch to keep the existing `scale` generation tests exercising that
-# default list until that rewrite lands.
-_SLURM_RAW = {
-    **SLURM_RAW,
-    "nodes": {**SLURM_RAW["nodes"], "default": {**SLURM_RAW["nodes"]["default"], "50M": 1}},
-    "max_batch_size": {**SLURM_RAW["max_batch_size"], "50M": 256},
-}
-
 
 def _base_config_text(slurm_raw: Mapping[str, Any] | None = None) -> str:
     """Model/train/data/slurm YAML shared by the `base_config` fixture and `_generate_one_cell`.
@@ -42,13 +31,11 @@ def _base_config_text(slurm_raw: Mapping[str, Any] | None = None) -> str:
     `slurm:` block that `_generate_phase` now requires to resolve a batch plan.
 
     Args:
-        slurm_raw: The raw `slurm:` mapping to embed. Defaults to `_SLURM_RAW`
-            (`tests/slurm/test_config.py::RAW`, patched with a 50M entry). Pass the unpatched
-            `SLURM_RAW` to reproduce a preset genuinely missing from the tables, as
-            `configs/scaling.yaml` does for 50M.
+        slurm_raw: The raw `slurm:` mapping to embed. Defaults to `SLURM_RAW`
+            (`tests/slurm/test_config.py::RAW`).
     """
     if slurm_raw is None:
-        slurm_raw = _SLURM_RAW
+        slurm_raw = SLURM_RAW
     body = """
 model:
   norm_strategy: sandwich
@@ -652,19 +639,6 @@ def test_later_phase_default_cell_counts() -> None:
         )
         == 2
     )
-    assert (
-        len(
-            phases._scale_cells(
-                bridge_finalists[:1],
-                presets=["50M", "170M", "400M", "800M", "1B"],
-                global_examples=8192,
-                seed=42,
-                steps=100000,
-                warmup=5000,
-            )
-        )
-        == 5
-    )
 
 
 def test_replicate_generates_only_new_seeds_from_source_runs(
@@ -846,11 +820,12 @@ def test_phase_json_records_batch_plan_audit_trail(base_config: Path, tmp_path: 
 def test_missing_preset_in_slurm_tables_is_a_clean_cli_error(tmp_path: Path) -> None:
     """A preset absent from the `nodes`/`max_batch_size` tables must not surface as a raw KeyError.
 
-    Reproduces the review finding using `scale`'s packaged default `--presets`
-    ("50M,170M,400M,800M,1B") against a `slurm:` block shaped like the real
-    `configs/scaling.yaml` (170M/400M/800M/1B only, no 50M) -- exactly the combination that
-    crashes `oplm sweep scale` today with an uncaught `KeyError` instead of the clean
-    `typer.BadParameter` every other validation failure produces.
+    `scale`'s packaged default `--presets` used to include `50M`, and no `slurm:` block in the
+    repo -- not even `configs/scaling.yaml` -- defines a node count or batch cap for it, so it was
+    dropped from the default. An operator can still pass it explicitly, though (e.g. `--presets
+    50M,170M`); this reproduces that combination against a `slurm:` block shaped like the real
+    `configs/scaling.yaml` (170M/400M/800M/1B only, no 50M) and checks it still fails with the
+    clean `typer.BadParameter` every other validation failure produces, not an uncaught `KeyError`.
     """
     config_path = tmp_path / "base.yaml"
     config_path.write_text(_base_config_text(SLURM_RAW))
@@ -870,6 +845,8 @@ def test_missing_preset_in_slurm_tables_is_a_clean_cli_error(tmp_path: Path) -> 
             str(source),
             "--out",
             str(tmp_path / "scale"),
+            "--presets",
+            "50M,170M",
         ],
     )
 
@@ -977,51 +954,7 @@ def test_confirm_preserves_bridge_depth_and_batch_corrections(
     } == {("800M", 8192, 42, 10000, 1000)}
 
 
-def test_scale_uses_only_confirmed_winner_across_default_presets(
-    base_config: Path, tmp_path: Path
-) -> None:
-    source = _write_selected_phase(
-        tmp_path,
-        "confirm",
-        [
-            {"lr": 0.014, "output_mult": 0.5, "depth_exponent": 0.5, "batch_mult": 1.4},
-            {"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.25, "batch_mult": 1.0},
-        ],
-    )
-    out = tmp_path / "scale"
-
-    result = runner.invoke(
-        phases.app,
-        [
-            "scale",
-            "--config",
-            str(base_config),
-            "--from",
-            str(source),
-            "--out",
-            str(out),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    params = [run.params for run in load_phase(out / "phase.json").runs]
-    assert [cell["preset"] for cell in params] == ["50M", "170M", "400M", "800M", "1B"]
-    assert {
-        (
-            cell["lr"],
-            cell["output_mult"],
-            cell["depth_exponent"],
-            cell["batch_mult"],
-            cell["global_examples"],
-            cell["seed"],
-            cell["max_steps"],
-            cell["warmup_steps"],
-        )
-        for cell in params
-    } == {(0.014, 0.5, 0.5, 1.4, 8192, 42, 100000, 5000)}
-
-
-@pytest.mark.parametrize("command", ["replicate", "transfer", "bridge", "confirm", "scale"])
+@pytest.mark.parametrize("command", ["replicate", "transfer", "bridge", "confirm"])
 def test_later_phase_commands_require_selected_candidates(
     base_config: Path, tmp_path: Path, command: str
 ) -> None:
