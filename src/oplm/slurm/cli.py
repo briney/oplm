@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime.
 from typing import Annotated, Any
 
@@ -115,11 +114,13 @@ def status(
     if not ids:
         console.print("no jobs submitted yet")
         raise typer.Exit()
-    if shutil.which("squeue") is None:
-        # running_job_ids returns an empty set both when nothing is running AND when squeue
-        # is unavailable; without this check, every job here would print as "finished or
-        # unknown" purely because the scheduler can't be queried, which looks identical to
-        # everything actually having finished. Say so explicitly instead.
+    query = running_job_ids(list(ids.values()))
+    if not query.reachable:
+        # `query.ids` is empty both when nothing is running AND when the scheduler could not be
+        # reached (squeue absent, or its controller wedged past the query timeout); without this
+        # check, every job here would print as "finished or unknown" purely because the
+        # scheduler can't be queried, which looks identical to everything actually having
+        # finished. Say so explicitly instead.
         console.print(
             "[yellow]squeue not found[/yellow]: cannot query the scheduler; "
             "listing submitted job ids only"
@@ -127,7 +128,6 @@ def status(
         for var, job_id in ids.items():
             console.print(f"{var}: {job_id}")
         raise typer.Exit()
-    live = running_job_ids(list(ids.values()))
     for var, job_id in ids.items():
-        state = "active" if job_id in live else "finished or unknown"
+        state = "active" if job_id in query.ids else "finished or unknown"
         console.print(f"{var} ({job_id}): {state}")

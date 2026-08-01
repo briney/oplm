@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -95,28 +96,66 @@ def _parse_squeue_stdout(stdout: str) -> set[str]:
     return {line.strip().split("_", 1)[0] for line in stdout.splitlines() if line.strip()}
 
 
-def running_job_ids(job_ids: Sequence[str], *, timeout: float = SQUEUE_TIMEOUT_SECONDS) -> set[str]:
-    """Return the subset of ``job_ids`` still known to the scheduler.
+def _decode_stdout(stdout: bytes | str | None) -> str:
+    """Decode a captured subprocess stdout payload, tolerating ``bytes``, ``str``, or ``None``.
 
-    An empty return means one of three things: no queried job is currently known to the
-    scheduler (the normal steady state — an id ages out of ``squeue`` once that job finishes,
-    this is not an error), ``squeue`` is unavailable (e.g. off-cluster), or the query timed out
-    against a wedged controller (see below) -- in all three cases callers degrade to
-    filesystem-only status rather than crashing or hanging. A caller that must distinguish these
-    cases has to check scheduler availability itself (e.g. its own ``shutil.which("squeue")``)
-    rather than infer it from an empty result here.
+    ``subprocess.TimeoutExpired.stdout`` is ``bytes`` even when the parent ``subprocess.run`` call
+    passed ``text=True``: that flag only governs how a *completed* call's output is decoded (via
+    ``Popen.communicate``'s text wrapping on the happy path). A ``TimeoutExpired`` is raised while
+    still waiting on the process, and carries whatever raw bytes had already been read from the
+    pipe before it was killed, with no text decoding applied -- verified empirically on this
+    project's interpreter (CPython 3.12.13): a ``TimeoutExpired`` from a ``text=True`` call still
+    has ``stdout`` of type ``bytes``. Malformed trailing bytes (a line truncated mid-character by
+    the kill) are replaced rather than raising, since partial output is inherently best-effort.
+    """
+    if stdout is None:
+        return ""
+    if isinstance(stdout, bytes):
+        return stdout.decode("utf-8", errors="replace")
+    return stdout
+
+
+@dataclass(frozen=True)
+class SchedulerQuery:
+    """The result of asking the scheduler which of a set of job ids are still live.
+
+    ``reachable`` is ``False`` when ``squeue`` is absent from PATH or the query timed out against
+    a wedged controller -- in both cases ``ids`` carries no information about job state, and a
+    caller must not treat the resulting empty ``ids`` as "nothing is running" (conflating the two
+    is what let a wedged controller produce confident, wrong resubmit guidance for jobs that may
+    still be queued or running). ``reachable`` is ``True`` even when ``squeue`` exited non-zero
+    with partial results: that is its ordinary behavior once any one queried id has aged out, not
+    scheduler unavailability.
+
+    Attributes:
+        ids: The subset of the queried job ids the scheduler reported as still known to it.
+        reachable: Whether the scheduler could be asked at all.
+    """
+
+    ids: set[str]
+    reachable: bool
+
+
+def running_job_ids(
+    job_ids: Sequence[str], *, timeout: float = SQUEUE_TIMEOUT_SECONDS
+) -> SchedulerQuery:
+    """Ask the scheduler which of ``job_ids`` it still knows about.
 
     ``squeue --jobs`` exits non-zero if *any* of the queried ids has aged out, even though it still
     prints the ids that remain live to stdout. This function parses stdout regardless of exit
-    status, so a poll against a mix of running and finished ids still reports the running ones. A
-    non-zero exit is logged as a warning (with ``squeue``'s stderr) so a genuine query failure is
-    visible, but whatever ids were parsed from stdout are still returned.
+    status, so a poll against a mix of running and finished ids still reports the running ones,
+    with ``reachable=True`` -- a non-zero exit here is ``squeue``'s normal steady state (an id
+    ages out once that job finishes), not a failure. It is still logged as a warning (with
+    ``squeue``'s stderr) so a genuine query failure is visible.
 
     A wedged scheduler controller can leave ``squeue`` hanging indefinitely; ``timeout`` bounds
-    that wait so an interactive command like ``oplm sweep status`` degrades to the already-present
-    "scheduler unreachable" path instead of hanging forever. A timeout is logged as a warning, the
-    same as a non-zero exit, and whatever partial stdout the process managed to emit (typically
-    none, since the process is killed on POSIX before it can be collected) is still parsed.
+    that wait so an interactive command like ``oplm sweep status`` degrades to
+    ``reachable=False`` instead of hanging forever. Whatever partial stdout the process had
+    already emitted before being killed is decoded (see ``_decode_stdout``) and parsed into
+    ``ids`` -- a live job id ``squeue`` reported just before wedging must not be thrown away.
+
+    ``squeue`` being entirely absent from PATH (e.g. off-cluster) also yields
+    ``reachable=False``, with an empty ``ids``.
 
     Args:
         job_ids: Base job ids to look up (array jobs report as ``<id>_<index>`` in ``squeue``;
@@ -125,10 +164,13 @@ def running_job_ids(job_ids: Sequence[str], *, timeout: float = SQUEUE_TIMEOUT_S
             ``SQUEUE_TIMEOUT_SECONDS``; overridable so tests need not wait 30 seconds.
 
     Returns:
-        The subset of ``job_ids`` that ``squeue`` still reports.
+        A ``SchedulerQuery`` pairing the live subset of ``job_ids`` with whether the scheduler
+        could be reached at all.
     """
-    if not job_ids or shutil.which("squeue") is None:
-        return set()
+    if not job_ids:
+        return SchedulerQuery(ids=set(), reachable=True)
+    if shutil.which("squeue") is None:
+        return SchedulerQuery(ids=set(), reachable=False)
     try:
         result = subprocess.run(
             ["squeue", "--noheader", "--format=%i", "--jobs", ",".join(job_ids)],
@@ -141,10 +183,8 @@ def running_job_ids(job_ids: Sequence[str], *, timeout: float = SQUEUE_TIMEOUT_S
         logger.warning(
             "squeue timed out after %.0fs while querying %d job id(s)", timeout, len(job_ids)
         )
-        # `text=True` makes this `str` at runtime; `TimeoutExpired` is only typed `AnyStr | None`
-        # generically, and POSIX leaves it `None` anyway (see docstring above).
-        partial_stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        return _parse_squeue_stdout(partial_stdout)
+        partial_ids = _parse_squeue_stdout(_decode_stdout(exc.stdout))
+        return SchedulerQuery(ids=partial_ids, reachable=False)
     if result.returncode != 0:
         logger.warning(
             "squeue exited %d while querying %d job id(s): %s",
@@ -152,4 +192,4 @@ def running_job_ids(job_ids: Sequence[str], *, timeout: float = SQUEUE_TIMEOUT_S
             len(job_ids),
             result.stderr.strip(),
         )
-    return _parse_squeue_stdout(result.stdout)
+    return SchedulerQuery(ids=_parse_squeue_stdout(result.stdout), reachable=True)

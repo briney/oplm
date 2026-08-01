@@ -128,12 +128,16 @@ def test_running_job_ids_parses_squeue(tmp_path: Path, monkeypatch: pytest.Monke
     _install_stub(
         tmp_path, monkeypatch, "squeue", "#!/bin/bash\nprintf '812345_3\\n812347\\n'\n"
     )
-    assert running_job_ids(["812345", "812346", "812347"]) == {"812345", "812347"}
+    query = running_job_ids(["812345", "812346", "812347"])
+    assert query.ids == {"812345", "812347"}
+    assert query.reachable is True
 
 
-def test_running_job_ids_empty_when_squeue_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_running_job_ids_unreachable_when_squeue_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PATH", "")
-    assert running_job_ids(["812345"]) == set()
+    query = running_job_ids(["812345"])
+    assert query.ids == set()
+    assert query.reachable is False
 
 
 def test_running_job_ids_returns_live_ids_on_nonzero_exit(
@@ -142,7 +146,8 @@ def test_running_job_ids_returns_live_ids_on_nonzero_exit(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """squeue exits nonzero when any queried id has aged out, but still prints live ids to
-    stdout; those must still be reported rather than discarded."""
+    stdout; those must still be reported rather than discarded, and this is `reachable=True` --
+    a normal steady state, not scheduler unavailability."""
     _install_stub(
         tmp_path,
         monkeypatch,
@@ -153,7 +158,9 @@ def test_running_job_ids_returns_live_ids_on_nonzero_exit(
         "exit 1\n",
     )
     with caplog.at_level(logging.WARNING):
-        assert running_job_ids(["812345", "999999"]) == {"812345"}
+        query = running_job_ids(["812345", "999999"])
+    assert query.ids == {"812345"}
+    assert query.reachable is True
     assert "Invalid job id specified" in caplog.text
 
 
@@ -162,8 +169,9 @@ def test_running_job_ids_empty_stdout_and_nonzero_exit_returns_empty_set(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A genuine query failure (no ids parsed, nonzero exit) returns an empty set and logs a
-    warning, rather than silently looking identical to a successful empty query."""
+    """A genuine query failure (no ids parsed, nonzero exit) returns an empty `ids` and logs a
+    warning, rather than silently looking identical to a successful empty query. Still
+    `reachable=True`: squeue answered, it just had nothing live to report."""
     _install_stub(
         tmp_path,
         monkeypatch,
@@ -171,7 +179,9 @@ def test_running_job_ids_empty_stdout_and_nonzero_exit_returns_empty_set(
         "#!/bin/bash\necho 'squeue: error: Invalid job id specified' >&2\nexit 1\n",
     )
     with caplog.at_level(logging.WARNING):
-        assert running_job_ids(["999999"]) == set()
+        query = running_job_ids(["999999"])
+    assert query.ids == set()
+    assert query.reachable is True
     assert "Invalid job id specified" in caplog.text
 
 
@@ -180,19 +190,43 @@ def test_running_job_ids_returns_on_timeout_instead_of_hanging(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A wedged scheduler controller must not hang `running_job_ids` forever.
+    """A wedged scheduler controller must not hang `running_job_ids` forever, and must be
+    reported as `reachable=False` so callers do not mistake the empty `ids` for "nothing is
+    running" -- that conflation is Critical 1: a wedged controller yielding confident, wrong
+    resubmit guidance.
 
-    Regression guard for Finding 3: the `squeue` subprocess call had no timeout at all, so a
-    wedged controller would hang `oplm sweep status` indefinitely instead of degrading to the
-    `unknown` path that already exists for an unreachable scheduler. `timeout` is passed
-    explicitly (well under the sleeping stub's duration) so the test stays fast rather than
-    waiting out the real 30s default.
+    Regression guard for Finding 3 (the original hang) and Critical 1 (the reachability signal):
+    the `squeue` subprocess call had no timeout at all, so a wedged controller would hang `oplm
+    sweep status` indefinitely instead of degrading to the `unknown` path that already exists for
+    an unreachable scheduler. `timeout` is passed explicitly (well under the sleeping stub's
+    duration) so the test stays fast rather than waiting out the real 30s default.
     """
     _install_stub(tmp_path, monkeypatch, "squeue", "#!/bin/bash\nsleep 2\n")
     started = time.monotonic()
     with caplog.at_level(logging.WARNING):
-        result = running_job_ids(["812345"], timeout=0.1)
+        query = running_job_ids(["812345"], timeout=0.1)
     elapsed = time.monotonic() - started
-    assert result == set()
+    assert query.ids == set()
+    assert query.reachable is False
     assert elapsed < 2, f"running_job_ids blocked for {elapsed:.2f}s past its 0.1s timeout"
     assert "timed out" in caplog.text
+
+
+def test_running_job_ids_keeps_partial_stdout_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live job id `squeue` printed before wedging must not be discarded.
+
+    Regression guard for Critical 2: `subprocess.TimeoutExpired.stdout` is `bytes` even under
+    `text=True` (verified empirically on this project's interpreter, CPython 3.12.13); a prior
+    `isinstance(exc.stdout, str)` guard was therefore always `False` and the genuinely-reported
+    live id was thrown away, discarding exactly the signal that would have prevented a duplicate
+    resubmission of that job.
+    """
+    _install_stub(tmp_path, monkeypatch, "squeue", "#!/bin/bash\nprintf '900001\\n'\nsleep 2\n")
+    started = time.monotonic()
+    query = running_job_ids(["900001", "900002"], timeout=0.2)
+    elapsed = time.monotonic() - started
+    assert query.ids == {"900001"}
+    assert elapsed < 2, f"running_job_ids blocked for {elapsed:.2f}s past its 0.2s timeout"

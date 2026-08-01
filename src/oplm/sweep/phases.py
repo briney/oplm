@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import shlex
-import shutil
 import subprocess
 from datetime import UTC, datetime
 from importlib.metadata import version
@@ -950,16 +949,21 @@ def status(
     phase = load_phase(path)
     job_ids = phase.job_ids or {}
     any_submitted = bool(job_ids)
-    scheduler_reachable = shutil.which("squeue") is not None
 
     open_presets = _open_presets(path.parent, phase.runs, phase.metric)
     live: set[str] = set()
-    if open_presets and any_submitted and scheduler_reachable:
+    # Default to reachable: with no open presets or nothing submitted, the scheduler is never
+    # queried at all, and `_cell_state` never consults this flag when `submitted` is False for
+    # every cell (see its docstring), so this value is inert in that case.
+    scheduler_reachable = True
+    if open_presets and any_submitted:
         query_ids = [job_ids[f"A_{preset}"] for preset in open_presets if f"A_{preset}" in job_ids]
-        live = running_job_ids(query_ids)
+        query = running_job_ids(query_ids)
+        live = query.ids
+        scheduler_reachable = query.reachable
     if open_presets and any_submitted and not scheduler_reachable:
         console.print(
-            "[yellow]squeue not found[/yellow]: cannot query the scheduler; cells with no "
+            "[yellow]scheduler unreachable[/yellow]: cannot query the scheduler; cells with no "
             "result on disk are marked [bold]unknown[/bold] rather than assumed finished"
         )
 
