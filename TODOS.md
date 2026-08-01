@@ -1046,8 +1046,8 @@ git commit -m "feat: derive per-device batch and accumulation from node count"
 
 **Interfaces:**
 - Produces: `JobSpec` frozen dataclass: `name: str`, `nodes: int`, `time_limit: str`,
-  `command: str`, `array_size: int | None = None`, `array_cells_file: Path | None = None`,
-  `gres: bool = True`, `phase_dir: Path | None = None`.
+  `command: str`, `array_size: int | None = None`, `array_index_file: Path | None = None`,
+  `gres: bool = True`, `base_dir: Path | None = None`.
 - Produces: `render_job(spec: JobSpec, slurm: SlurmConfig) -> str`.
 - Produces: `accelerate_command(*, module: str, gpus_per_node: int, args: str,
   mixed_precision: str = "bf16") -> str`.
@@ -1081,8 +1081,8 @@ def _array_spec(tmp_path: Path) -> JobSpec:
         time_limit="168:00:00",
         command='python -m oplm.sweep.run --config "$RUN_DIR/run.yaml"',
         array_size=7,
-        array_cells_file=tmp_path / "jobs" / "170M.cells",
-        phase_dir=tmp_path,
+        array_index_file=tmp_path / "jobs" / "170M.jobs",
+        base_dir=tmp_path,
     )
 
 
@@ -1139,8 +1139,13 @@ def test_workdir_is_created_on_every_node(tmp_path: Path) -> None:
 
 def test_rendezvous_variables(tmp_path: Path) -> None:
     text = render_job(_array_spec(tmp_path), SLURM)
-    assert "export MASTER_ADDR=$(hostname --ip-address)" in text
-    # SLURM_JOB_ID is unique per array task, so concurrent cells cannot collide.
+    # Assignment and export are split so a `hostname` failure trips `set -e`; with
+    # `export VAR=$(cmd)` bash reports export's status (always 0) and the job would
+    # proceed with an empty MASTER_ADDR and hang at rendezvous.
+    assert "\nMASTER_ADDR=$(hostname --ip-address)\n" in text
+    assert "\nexport MASTER_ADDR\n" in text
+    assert "export MASTER_ADDR=$(" not in text
+    # SLURM_JOB_ID is unique per array task, so concurrent jobs cannot collide.
     assert "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))" in text
     assert "export OMP_NUM_THREADS=1" in text
 
@@ -1153,8 +1158,8 @@ def test_slurm_vars_expand_inside_the_container(tmp_path: Path) -> None:
         time_limit="168:00:00",
         command=accelerate_command(module="oplm.sweep.run", gpus_per_node=8, args="--config x"),
         array_size=7,
-        array_cells_file=tmp_path / "jobs" / "170M.cells",
-        phase_dir=tmp_path,
+        array_index_file=tmp_path / "jobs" / "170M.jobs",
+        base_dir=tmp_path,
     )
     text = render_job(spec, SLURM)
     inner = text.split("bash -c '", 1)[1]
@@ -1167,7 +1172,7 @@ def test_slurm_vars_expand_inside_the_container(tmp_path: Path) -> None:
 
 def test_array_index_maps_through_the_cells_file(tmp_path: Path) -> None:
     text = render_job(_array_spec(tmp_path), SLURM)
-    assert "170M.cells" in text
+    assert "170M.jobs" in text
     assert "SLURM_ARRAY_TASK_ID" in text
     assert "export RUN_DIR" in text
 
@@ -1262,9 +1267,9 @@ class JobSpec:
     time_limit: str
     command: str
     array_size: int | None = None
-    array_cells_file: Path | None = None
+    array_index_file: Path | None = None
     gres: bool = True
-    phase_dir: Path | None = None
+    base_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1317,19 +1322,19 @@ def _header(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
 
 
 def _array_lookup(spec: JobSpec) -> list[str]:
-    if spec.array_cells_file is None or spec.phase_dir is None:
+    if spec.array_index_file is None or spec.base_dir is None:
         return []
     return [
         "",
         "# Map this array index to its cell. One run id per line; index = line number - 1.",
-        f'PHASE_DIR="{spec.phase_dir}"',
-        f'CELLS_FILE="{spec.array_cells_file}"',
-        'RUN_ID=$(awk "NR==$((SLURM_ARRAY_TASK_ID + 1))" "$CELLS_FILE")',
+        f'BASE_DIR="{spec.base_dir}"',
+        f'INDEX_FILE="{spec.array_index_file}"',
+        'RUN_ID=$(awk "NR==$((SLURM_ARRAY_TASK_ID + 1))" "$INDEX_FILE")',
         'if [ -z "$RUN_ID" ]; then',
         '  echo "no cell for array index $SLURM_ARRAY_TASK_ID" >&2',
         "  exit 1",
         "fi",
-        'export RUN_DIR="$PHASE_DIR/runs/$RUN_ID"',
+        'export RUN_DIR="$BASE_DIR/runs/$RUN_ID"',
     ]
 
 
@@ -1360,7 +1365,8 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         "",
         "# Distributed rendezvous. The sbatch body runs on the rank-0 node, and SLURM_JOB_ID is",
         "# unique per array task, so concurrent cells cannot collide on a port.",
-        "export MASTER_ADDR=$(hostname --ip-address)",
+        "MASTER_ADDR=$(hostname --ip-address)",
+        "export MASTER_ADDR",
         "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))",
         "export NCCL_DEBUG=INFO",
         "export OMP_NUM_THREADS=1",
@@ -2181,10 +2187,10 @@ from pathlib import Path
 def test_single_preset_phase_emits_one_array(coarse_phase: Path) -> None:
     jobs = coarse_phase.parent / "jobs"
     assert (jobs / "170M.sbatch").exists()
-    assert (jobs / "170M.cells").exists()
+    assert (jobs / "170M.jobs").exists()
     assert (jobs / "analyze.sbatch").exists()
     assert (jobs / "submit.sh").exists()
-    cells = (jobs / "170M.cells").read_text().splitlines()
+    cells = (jobs / "170M.jobs").read_text().splitlines()
     assert len(cells) == 7
     assert "#SBATCH --array=0-6%4" in (jobs / "170M.sbatch").read_text()
 
@@ -2208,7 +2214,7 @@ def test_analyze_job_is_cpu_only(coarse_phase: Path) -> None:
 
 def test_cells_file_order_matches_manifest(coarse_phase: Path) -> None:
     manifest = json.loads(coarse_phase.read_text())
-    cells = (coarse_phase.parent / "jobs" / "170M.cells").read_text().split()
+    cells = (coarse_phase.parent / "jobs" / "170M.jobs").read_text().split()
     assert cells == [run["id"] for run in manifest["runs"]]
 
 
@@ -2312,8 +2318,8 @@ def _write_jobs(
     entries: list[SubmitEntry] = []
     for preset in presets:
         group = [run for run in runs if str(run.params["preset"]) == preset]
-        cells_file = jobs / f"{preset}.cells"
-        cells_file.write_text("\n".join(run.id for run in group) + "\n")
+        index_file = jobs / f"{preset}.jobs"
+        index_file.write_text("\n".join(run.id for run in group) + "\n")
         spec = JobSpec(
             name=f"oplm-{phase}-{preset}",
             nodes=slurm.nodes.resolve(phase=phase, preset=preset),
@@ -2324,8 +2330,8 @@ def _write_jobs(
                 args='--config "$RUN_DIR/run.yaml" --result "$RUN_DIR/result.json"',
             ),
             array_size=len(group),
-            array_cells_file=cells_file,
-            phase_dir=out,
+            array_index_file=index_file,
+            base_dir=out,
         )
         script = jobs / f"{preset}.sbatch"
         script.write_text(render_job(spec, slurm))
