@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import stat
 from pathlib import Path
@@ -95,6 +96,33 @@ def test_submit_job_raises_on_sbatch_failure(
         submit_job(job)
 
 
+def test_submit_job_raises_on_empty_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sbatch exiting 0 with no stdout (transient hiccup, swallowed output) must not yield ''."""
+    _install_stub(tmp_path, monkeypatch, "sbatch", "#!/bin/bash\nexit 0\n")
+    job = tmp_path / "job.sbatch"
+    job.write_text("#!/bin/bash\n")
+    with pytest.raises(RuntimeError, match=r"job\.sbatch"):
+        submit_job(job)
+
+
+def test_submit_job_raises_on_non_numeric_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sbatch exiting 0 with non-numeric stdout (format change, wrapper text) must be caught."""
+    _install_stub(
+        tmp_path,
+        monkeypatch,
+        "sbatch",
+        "#!/bin/bash\necho 'sbatch: warning: something odd happened'\n",
+    )
+    job = tmp_path / "job.sbatch"
+    job.write_text("#!/bin/bash\n")
+    with pytest.raises(RuntimeError, match=r"job\.sbatch"):
+        submit_job(job)
+
+
 def test_running_job_ids_parses_squeue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_stub(
         tmp_path, monkeypatch, "squeue", "#!/bin/bash\nprintf '812345_3\\n812347\\n'\n"
@@ -105,3 +133,42 @@ def test_running_job_ids_parses_squeue(tmp_path: Path, monkeypatch: pytest.Monke
 def test_running_job_ids_empty_when_squeue_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PATH", "")
     assert running_job_ids(["812345"]) == set()
+
+
+def test_running_job_ids_returns_live_ids_on_nonzero_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """squeue exits nonzero when any queried id has aged out, but still prints live ids to
+    stdout; those must still be reported rather than discarded."""
+    _install_stub(
+        tmp_path,
+        monkeypatch,
+        "squeue",
+        "#!/bin/bash\n"
+        "printf '812345\\n'\n"
+        "echo 'squeue: error: Invalid job id specified' >&2\n"
+        "exit 1\n",
+    )
+    with caplog.at_level(logging.WARNING):
+        assert running_job_ids(["812345", "999999"]) == {"812345"}
+    assert "Invalid job id specified" in caplog.text
+
+
+def test_running_job_ids_empty_stdout_and_nonzero_exit_returns_empty_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A genuine query failure (no ids parsed, nonzero exit) returns an empty set and logs a
+    warning, rather than silently looking identical to a successful empty query."""
+    _install_stub(
+        tmp_path,
+        monkeypatch,
+        "squeue",
+        "#!/bin/bash\necho 'squeue: error: Invalid job id specified' >&2\nexit 1\n",
+    )
+    with caplog.at_level(logging.WARNING):
+        assert running_job_ids(["999999"]) == set()
+    assert "Invalid job id specified" in caplog.text

@@ -31,7 +31,9 @@ def submit_job(script: Path, *, depends_on: Sequence[str] = ()) -> str:
         The Slurm job id.
 
     Raises:
-        RuntimeError: If ``sbatch`` exits non-zero.
+        RuntimeError: If ``sbatch`` exits non-zero, or if it exits zero but its stdout does not
+            contain a plausible (non-empty, all-digit) Slurm job id — e.g. a transient scheduler
+            hiccup or a site wrapper that swallows output.
     """
     argv = ["sbatch", "--parsable"]
     if depends_on:
@@ -43,7 +45,13 @@ def submit_job(script: Path, *, depends_on: Sequence[str] = ()) -> str:
             f"sbatch failed for {script} (exit {result.returncode}): {result.stderr.strip()}"
         )
     # --parsable prints "<jobid>" or "<jobid>;<cluster>".
-    return result.stdout.strip().split(";", 1)[0]
+    job_id = result.stdout.strip().split(";", 1)[0]
+    if not job_id.isdigit():
+        raise RuntimeError(
+            f"sbatch exited 0 for {script} but did not print a valid job id: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+    return job_id
 
 
 def submit_all(entries: Sequence[SubmitEntry], *, base_dir: Path) -> dict[str, str]:
@@ -76,12 +84,18 @@ def submit_all(entries: Sequence[SubmitEntry], *, base_dir: Path) -> dict[str, s
 def running_job_ids(job_ids: Sequence[str]) -> set[str]:
     """Return the subset of ``job_ids`` still known to the scheduler.
 
-    Returns an empty set when ``squeue`` is unavailable (e.g. off-cluster) or when the query
-    itself fails, so callers degrade to filesystem-only status rather than crashing. Note that
-    this makes an empty return ambiguous: it means either "queried the scheduler and none of
-    these ids are live" or "could not query the scheduler at all." A caller that needs to tell
-    those apart must check for the scheduler's availability itself rather than infer it from an
-    empty result here.
+    An empty return means one of two things: no queried job is currently known to the scheduler
+    (the normal steady state — an id ages out of ``squeue`` once that job finishes, this is not an
+    error), or ``squeue`` is unavailable (e.g. off-cluster), so callers degrade to filesystem-only
+    status rather than crashing. A caller that must distinguish those two cases has to check
+    scheduler availability itself (e.g. its own ``shutil.which("squeue")``) rather than infer it
+    from an empty result here.
+
+    ``squeue --jobs`` exits non-zero if *any* of the queried ids has aged out, even though it still
+    prints the ids that remain live to stdout. This function parses stdout regardless of exit
+    status, so a poll against a mix of running and finished ids still reports the running ones. A
+    non-zero exit is logged as a warning (with ``squeue``'s stderr) so a genuine query failure is
+    visible, but whatever ids were parsed from stdout are still returned.
 
     Args:
         job_ids: Base job ids to look up (array jobs report as ``<id>_<index>`` in ``squeue``;
@@ -99,6 +113,11 @@ def running_job_ids(job_ids: Sequence[str]) -> set[str]:
         check=False,
     )
     if result.returncode != 0:
-        return set()
+        logger.warning(
+            "squeue exited %d while querying %d job id(s): %s",
+            result.returncode,
+            len(job_ids),
+            result.stderr.strip(),
+        )
     # Array elements report as "<arrayjobid>_<index>"; match on the base id.
     return {line.strip().split("_", 1)[0] for line in result.stdout.splitlines() if line.strip()}
