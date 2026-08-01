@@ -7,23 +7,40 @@ from typing import TYPE_CHECKING
 
 import pytest
 import typer
+import yaml
 from typer.testing import CliRunner
 
 from oplm.config import load_config
 from oplm.sweep import phases
 from oplm.sweep.common import PhaseManifest, RunSpec, load_phase, write_phase
+from tests.slurm.test_config import RAW as SLURM_RAW
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 runner = CliRunner()
 
+# `oplm sweep scale`'s default `--presets` still includes 50M (it stops doing so only once
+# Task 14 rewrites `scale` to delegate to `oplm.slurm`). No production `slurm:` block in this
+# repo -- not even `configs/scaling.yaml` -- defines a node count or batch cap for 50M, so this
+# is purely a test-fixture patch to keep the existing `scale` generation tests exercising that
+# default list until that rewrite lands.
+_SLURM_RAW = {
+    **SLURM_RAW,
+    "nodes": {**SLURM_RAW["nodes"], "default": {**SLURM_RAW["nodes"]["default"], "50M": 1}},
+    "max_batch_size": {**SLURM_RAW["max_batch_size"], "50M": 256},
+}
 
-@pytest.fixture
-def base_config(tmp_path: Path) -> Path:
-    path = tmp_path / "base.yaml"
-    path.write_text(
-        """
+
+def _base_config_text() -> str:
+    """Model/train/data/slurm YAML shared by the `base_config` fixture and `_generate_one_cell`.
+
+    Carries the μP requirements every generated cell validates (`optimizer: muon`,
+    `muon_adjust_lr_fn: original`, `weight_decay: 0.01`) and exactly one eval task, plus the
+    `slurm:` block (`tests/slurm/test_config.py::RAW`, patched with a 50M entry) that
+    `_generate_phase` now requires to resolve a batch plan.
+    """
+    body = """
 model:
   norm_strategy: sandwich
   canon_enabled: true
@@ -44,8 +61,48 @@ data:
       type: sequence
       every: {steps: 500}
 """.lstrip()
-    )
+    return body + yaml.safe_dump({"slurm": _SLURM_RAW}, sort_keys=False)
+
+
+@pytest.fixture
+def base_config(tmp_path: Path) -> Path:
+    path = tmp_path / "base.yaml"
+    path.write_text(_base_config_text())
     return path
+
+
+def _generate_one_cell(tmp_path: Path, *, max_steps: int = 1000) -> Path:
+    """Generate a single coarse-phase cell and return its ``runs/<id>/run.yaml``.
+
+    Drives the same `coarse` generator every production sweep uses, at a single learning rate
+    (one cell) and a 2048 global batch, so callers can load the resulting config and assert on
+    what `_write_run_config` pinned into it.
+    """
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(_base_config_text())
+    out = tmp_path / "coarse"
+    warmup_steps = max(1, max_steps // 10)
+    result = runner.invoke(
+        phases.app,
+        [
+            "coarse",
+            "--config",
+            str(config_path),
+            "--out",
+            str(out),
+            "--lrs",
+            "0.0016",
+            "--global-examples",
+            "2048",
+            "--steps",
+            str(max_steps),
+            "--warmup",
+            str(warmup_steps),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    phase = load_phase(out / "phase.json")
+    return out / phase.runs[0].config
 
 
 def _write_selected_phase(
@@ -108,7 +165,11 @@ def test_smoke_generates_three_production_cells(base_config: Path, tmp_path: Pat
     assert cfg.train.max_epochs is None
     assert cfg.train.warmup_steps == 100
     assert cfg.train.stable_steps == 900
-    assert cfg.train.gradient_accumulation_steps == 8
+    # Batch and accumulation now come from the node plan (170M -> 1 node -> world_size 8,
+    # 2048 global examples, 256 max_batch_size), not from num_processes and the base config's
+    # train.batch_size (see test_cells_pin_batch_from_the_plan).
+    assert cfg.train.batch_size == 256
+    assert cfg.train.gradient_accumulation_steps == 1
     # Diagnostics are off unless --diagnostics is passed (see test below).
     assert cfg.train.stability_diagnostics is False
 
@@ -131,6 +192,29 @@ def test_diagnostics_flag_toggles_stability_diagnostics(base_config: Path, tmp_p
     on_cfg = load_config(["--config", str(on / load_phase(on / "phase.json").runs[0].config)])
     assert off_cfg.train.stability_diagnostics is False
     assert on_cfg.train.stability_diagnostics is True
+
+
+def test_cells_pin_full_gradient_checkpointing(tmp_path: Path) -> None:
+    run_yaml = _generate_one_cell(tmp_path)
+    cfg = load_config(["--config", str(run_yaml)])
+    assert cfg.model.gradient_checkpointing is True
+    assert cfg.model.gradient_checkpointing_mode == "full"
+
+
+def test_cells_pin_batch_from_the_plan(tmp_path: Path) -> None:
+    """Per-device batch comes from the node plan, not from the base config."""
+    run_yaml = _generate_one_cell(tmp_path)
+    cfg = load_config(["--config", str(run_yaml)])
+    assert cfg.train.batch_size == 256
+    assert cfg.train.gradient_accumulation_steps == 1
+
+
+def test_cells_checkpoint_often_enough_to_resume(tmp_path: Path) -> None:
+    """save_every defaults to 10_000, which would checkpoint a 10k cell only at the end."""
+    run_yaml = _generate_one_cell(tmp_path, max_steps=10_000)
+    cfg = load_config(["--config", str(run_yaml)])
+    assert cfg.train.save_every == 1250
+    assert cfg.train.save_total_limit == 1
 
 
 def test_generation_rejects_nonproduction_weight_decay(base_config: Path, tmp_path: Path) -> None:
@@ -168,6 +252,14 @@ def test_generation_rejects_nonproduction_optimizer(
 
 
 def test_generation_rejects_nonintegral_accumulation(base_config: Path, tmp_path: Path) -> None:
+    """A global batch indivisible by the plan's world size is rejected, not silently rounded.
+
+    Batch/accumulation are now derived by `resolve_batch_plan` from the node table rather than
+    from `num_processes` and the base config's `train.batch_size`, so the rejection now comes
+    from world-size divisibility (170M resolves to 1 node * 8 gpus_per_node = 8) rather than
+    from `per_device_batch * world_size`. The intent -- reject a non-integral global batch at
+    generation time -- is unchanged.
+    """
     result = runner.invoke(
         phases.app,
         [
@@ -181,7 +273,7 @@ def test_generation_rejects_nonintegral_accumulation(base_config: Path, tmp_path
         ],
     )
     assert result.exit_code != 0
-    assert "global examples" in result.output
+    assert "not divisible by world size" in result.output
 
 
 def test_refine_uses_coarse_selected_lrs(base_config: Path, tmp_path: Path) -> None:

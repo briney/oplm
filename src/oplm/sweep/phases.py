@@ -11,13 +11,13 @@ from typing import Annotated, Any, cast
 import typer
 
 from oplm.config import get_preset_config, load_config, serialize_config
+from oplm.slurm.config import BatchPlan, SlurmConfig, load_slurm_config, resolve_batch_plan
 from oplm.sweep.common import (
     JsonScalar,
     Params,
     PhaseManifest,
     RunSpec,
     accelerate_argv,
-    gradient_accumulation_steps,
     load_phase,
     parse_candidates,
     parse_floats,
@@ -111,7 +111,7 @@ def _write_run_config(
     run_dir: Path,
     params: Params,
     *,
-    num_processes: int,
+    plan: BatchPlan,
     diagnostics: bool = False,
 ) -> Path:
     max_steps = _as_int(params["max_steps"])
@@ -136,12 +136,10 @@ def _write_run_config(
         raise ValueError(
             f"μP sweep requires train.weight_decay=0.01, got {base.train.weight_decay}"
         )
-    grad_accum = gradient_accumulation_steps(
-        _as_int(params["global_examples"]),
-        per_device_batch=base.train.batch_size,
-        world_size=num_processes,
-    )
     run_name = run_dir.name
+    # Checkpoint eight times per cell so a requeue loses at most ~12% of the run, and keep only
+    # the newest: these checkpoints exist solely to make requeue cheap.
+    save_every = max(1, max_steps // 8)
     overrides = [
         f"model.hidden_size={preset_model.hidden_size}",
         f"model.num_hidden_layers={preset_model.num_hidden_layers}",
@@ -150,16 +148,24 @@ def _write_run_config(
         "model.mup_enable=true",
         "model.mup_base_width=768",
         f"model.mup_output_mult={params['output_mult']}",
+        # Full checkpointing is what makes the derived per-device batches fit at 400M+. Both
+        # keys are pinned so a change to packaged defaults cannot alter the memory profile
+        # mid-sweep.
+        "model.gradient_checkpointing=true",
+        "model.gradient_checkpointing_mode=full",
         f"train.lr={params['lr']}",
         f"train.mup_depth_lr_exponent={params['depth_exponent']}",
         "train.mup_depth_reference_layers=24",
         f"train.seed={params['seed']}",
-        f"train.gradient_accumulation_steps={grad_accum}",
+        f"train.batch_size={plan.per_device_batch}",
+        f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
         f"train.max_steps={params['max_steps']}",
         "train.max_epochs=null",
         f"train.warmup_steps={params['warmup_steps']}",
         f"train.stable_steps={max_steps - warmup_steps}",
         "train.scheduler=wsd_linear",
+        f"train.save_every={save_every}",
+        "train.save_total_limit=1",
         f"train.output_dir={run_dir / 'output'}",
         f"train.wandb_run_name={run_name}",
         # Explicitly pin diagnostics so the flag overrides whatever the base config
@@ -220,6 +226,7 @@ def _generate_phase(
     source: Path | None,
     cells: list[Params],
     num_processes: int,
+    local: bool,
     accelerate_config: Path | None,
     diagnostics: bool = False,
 ) -> tuple[Path, list[list[str]]]:
@@ -228,21 +235,37 @@ def _generate_phase(
     source = source.resolve() if source is not None else None
     accelerate_config = accelerate_config.resolve() if accelerate_config is not None else None
     out.mkdir(parents=True, exist_ok=True)
+    slurm: SlurmConfig = load_slurm_config(base_config)
     runs: list[RunSpec] = []
     commands: list[list[str]] = []
     for params in cells:
         run_id = _run_id(params)
         run_dir = out / "runs" / run_id
-        config = _write_run_config(
-            base_config, run_dir, params, num_processes=num_processes, diagnostics=diagnostics
+        preset = str(params["preset"])
+        nodes = slurm.nodes.resolve(phase=name, preset=preset)
+        # --local runs on this machine's processes, not the phase's node allocation. Deriving
+        # the plan from the node table there would silently shrink the global batch (a 400M
+        # cell is planned for 4 nodes; on 8 local processes that is 512, not 2048) and break
+        # every cross-cell comparison.
+        world_size = num_processes if local else nodes * slurm.gpus_per_node
+        plan = resolve_batch_plan(
+            global_examples=_as_int(params["global_examples"]),
+            world_size=world_size,
+            max_batch_size=slurm.max_batch_size[preset],
         )
+        config = _write_run_config(base_config, run_dir, params, plan=plan, diagnostics=diagnostics)
         result = run_dir / "result.json"
         runs.append(
             RunSpec(
                 run_id,
                 str(relative_path(config, out)),
                 str(relative_path(result, out)),
-                params,
+                {
+                    **params,
+                    "nodes": nodes,
+                    "per_device_batch": plan.per_device_batch,
+                    "gradient_accumulation_steps": plan.gradient_accumulation_steps,
+                },
             )
         )
         commands.append(
@@ -715,6 +738,7 @@ def smoke(
                 parse_floats(lrs, name="--lrs"), global_examples, seed, steps, warmup
             ),
             num_processes=num_processes,
+            local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
         )
@@ -756,6 +780,7 @@ def coarse(
             source=source,
             cells=_coarse_cells(lr_values, global_examples, seed, steps, warmup),
             num_processes=num_processes,
+            local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
         )
@@ -803,6 +828,7 @@ def refine(
             source=source,
             cells=cells,
             num_processes=num_processes,
+            local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
         )
@@ -844,6 +870,7 @@ def replicate(
             source=source,
             cells=cells,
             num_processes=num_processes,
+            local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
         )
@@ -894,6 +921,7 @@ def transfer(
             source=source,
             cells=cells,
             num_processes=num_processes,
+            local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
         )
@@ -945,6 +973,7 @@ def bridge(
             source=source,
             cells=cells,
             num_processes=num_processes,
+            local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
         )
@@ -994,6 +1023,7 @@ def confirm(
             source=source,
             cells=cells,
             num_processes=num_processes,
+            local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
         )
@@ -1045,6 +1075,7 @@ def scale(
             source=source,
             cells=cells,
             num_processes=num_processes,
+            local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
         )
