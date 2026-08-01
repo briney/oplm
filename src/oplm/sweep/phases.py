@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import shlex
+import shutil
 import subprocess
 from datetime import UTC, datetime
 from importlib.metadata import version
@@ -11,6 +12,8 @@ from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime
 from typing import Annotated, Any, cast
 
 import typer
+from rich.console import Console
+from rich.table import Table
 
 from oplm.config import get_preset_config, load_config, serialize_config
 from oplm.slurm.config import BatchPlan, SlurmConfig, load_slurm_config, resolve_batch_plan
@@ -21,7 +24,7 @@ from oplm.slurm.render import (
     render_job,
     render_submit_script,
 )
-from oplm.slurm.submit import submit_all
+from oplm.slurm.submit import running_job_ids, submit_all
 from oplm.sweep.common import (
     JsonScalar,
     Params,
@@ -37,6 +40,7 @@ from oplm.sweep.common import (
 )
 
 app = typer.Typer(name="mup-sweep", help=__doc__, add_completion=False)
+console = Console()
 
 # Grid re-centered after the 170M coarse sweep ranked 0.0025 ~ 0.004 >> 0.0063 > 0.01 > 0.016,
 # putting the winner on the old grid's lower boundary. Same 1.6x spacing, shifted one half-decade
@@ -867,6 +871,121 @@ def analyze(
 ) -> None:
     """Rank completed cells and update one phase manifest in place."""
     analyze_phase(phase_json)
+
+
+def _open_presets(phase_dir: Path, runs: list[RunSpec], metric: str) -> set[str]:
+    """Presets with at least one cell that has neither a finite metric nor a result file.
+
+    These are the only presets whose array job id is worth asking the scheduler about: a preset
+    whose every cell is already complete or non-finite never needs a "still running?" answer, so
+    querying its id would only add scheduler load (and risk tripping the "some id has aged out"
+    warning `running_job_ids` logs) for no benefit.
+    """
+    return {
+        str(run.params["preset"])
+        for run in runs
+        if result_metric(phase_dir, run, metric) is None and not (phase_dir / run.result).exists()
+    }
+
+
+def _cell_state(
+    *,
+    value: float | None,
+    has_result: bool,
+    job_id: str | None,
+    live: set[str],
+    scheduler_reachable: bool,
+    submitted: bool,
+) -> str:
+    """One cell's state: ``complete`` / ``non-finite`` / ``running`` / ``missing`` / ``unknown``.
+
+    ``unknown`` only arises when the phase *was* submitted (so a definitive answer exists in
+    principle) but the scheduler cannot currently be asked. A phase that was simply never
+    submitted is unambiguously ``missing`` regardless of whether `squeue` happens to be on PATH.
+    """
+    if value is not None:
+        return "complete"
+    if has_result:
+        return "non-finite"
+    if not scheduler_reachable:
+        return "unknown" if submitted else "missing"
+    if job_id is not None and job_id in live:
+        return "running"
+    return "missing"
+
+
+@app.command()
+def status(
+    phase_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Report per-cell state for one phase and print the resubmit line for incomplete cells.
+
+    States: ``complete`` (a finite metric is on disk), ``non-finite`` (a `result.json` exists but
+    its metric is missing/NaN/inf -- expected for a diverged learning rate, not an error),
+    ``running`` (no result yet, and the scheduler still reports that preset's array job), or
+    ``missing`` (no result, and the scheduler does not know about it). If the phase was submitted
+    but `squeue` cannot be queried right now, unresolved cells are reported as ``unknown`` instead
+    of being guessed as ``missing`` -- an operator seeing every cell as "missing" would resubmit
+    work that may already be running.
+
+    The resubmit line lists, per preset, the zero-based array indices that need rerunning
+    (``non-finite`` and ``missing`` cells) -- the same numbering that preset's ``.jobs`` index
+    file uses, so it can be passed directly to ``sbatch --array=``. ``running`` and ``unknown``
+    cells are excluded: resubmitting a job that may already be queued or executing would risk a
+    duplicate run.
+    """
+    path = phase_json.resolve()
+    phase = load_phase(path)
+    job_ids = phase.job_ids or {}
+    submitted = bool(job_ids)
+    scheduler_reachable = shutil.which("squeue") is not None
+
+    open_presets = _open_presets(path.parent, phase.runs, phase.metric)
+    live: set[str] = set()
+    if open_presets and submitted and scheduler_reachable:
+        query_ids = [job_ids[f"A_{preset}"] for preset in open_presets if f"A_{preset}" in job_ids]
+        live = running_job_ids(query_ids)
+    if open_presets and submitted and not scheduler_reachable:
+        console.print(
+            "[yellow]squeue not found[/yellow]: cannot query the scheduler; cells with no "
+            "result on disk are marked [bold]unknown[/bold] rather than assumed finished"
+        )
+
+    table = Table(title=f"{phase.phase} ({phase.metric})")
+    table.add_column("preset")
+    table.add_column("idx", justify="right")
+    table.add_column("cell")
+    table.add_column("state")
+    table.add_column(phase.metric, justify="right")
+
+    seen: dict[str, int] = {}
+    incomplete: dict[str, list[int]] = {}
+    for run in phase.runs:
+        preset = str(run.params["preset"])
+        index = seen.get(preset, 0)
+        seen[preset] = index + 1
+        value = result_metric(path.parent, run, phase.metric)
+        has_result = (path.parent / run.result).exists()
+        state = _cell_state(
+            value=value,
+            has_result=has_result,
+            job_id=job_ids.get(f"A_{preset}"),
+            live=live,
+            scheduler_reachable=scheduler_reachable,
+            submitted=submitted,
+        )
+        if state in ("non-finite", "missing"):
+            incomplete.setdefault(preset, []).append(index)
+        shown = f"{value:.4f}" if value is not None else "-"
+        table.add_row(preset, str(index), run.id, state, shown)
+    console.print(table)
+
+    if not incomplete:
+        console.print("[green]nothing to resubmit[/green]")
+        return
+    for preset, indices in sorted(incomplete.items(), key=lambda item: _preset_sort_key(item[0])):
+        listed = ",".join(str(index) for index in indices)
+        console.print(f"resubmit {preset}: sbatch --array={listed} jobs/{preset}.sbatch")
 
 
 def _run_local(commands: list[list[str]]) -> None:
