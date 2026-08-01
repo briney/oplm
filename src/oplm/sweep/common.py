@@ -61,6 +61,9 @@ class PhaseManifest:
     runs: list[RunSpec]
     ranking: list[dict[str, Any]]
     selected: list[Params]
+    oplm_version: str | None = None
+    generated_at: str | None = None
+    job_ids: dict[str, str] | None = None
 
 
 def parse_widths(raw: str) -> list[int]:
@@ -152,6 +155,11 @@ def load_phase(path: Path) -> PhaseManifest:
         runs=[RunSpec(**run) for run in raw["runs"]],
         ranking=list(raw["ranking"]),
         selected=list(raw["selected"]),
+        # `.get(...)` defaults, not `raw[...]`, so a `phase.json` written before this task
+        # (which introduced these three provenance fields) still loads.
+        oplm_version=raw.get("oplm_version"),
+        generated_at=raw.get("generated_at"),
+        job_ids=raw.get("job_ids"),
     )
 
 

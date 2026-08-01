@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 import shlex
 import subprocess
+from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime.
 from typing import Annotated, Any, cast
 
@@ -12,6 +14,14 @@ import typer
 
 from oplm.config import get_preset_config, load_config, serialize_config
 from oplm.slurm.config import BatchPlan, SlurmConfig, load_slurm_config, resolve_batch_plan
+from oplm.slurm.render import (
+    JobSpec,
+    SubmitEntry,
+    accelerate_command,
+    render_job,
+    render_submit_script,
+)
+from oplm.slurm.submit import submit_all
 from oplm.sweep.common import (
     JsonScalar,
     Params,
@@ -258,6 +268,108 @@ def _resolve_max_batch_size(slurm: SlurmConfig, preset: str) -> int:
         ) from exc
 
 
+def _preset_sort_key(preset: str) -> tuple[float, str]:
+    """Order presets by size so `400M` precedes `1B`."""
+    scale = {"M": 1e6, "B": 1e9}.get(preset[-1].upper(), 1.0)
+    try:
+        return (float(preset[:-1]) * scale, preset)
+    except ValueError:
+        return (float("inf"), preset)
+
+
+def _resolve_time_limit(slurm: SlurmConfig, *, phase: str, preset: str | None) -> str:
+    """Resolve the time limit for a phase/preset pair, with an actionable error if missing.
+
+    Mirrors `_resolve_nodes`: a bare `KeyError` from `PhaseTable.resolve` would not be caught by
+    the `except ValueError` wrapper every phase command uses, and would surface as an uncaught
+    traceback instead of the clean `typer.BadParameter` every other validation failure produces.
+    """
+    try:
+        return slurm.time_limit.resolve(phase=phase, preset=preset)
+    except KeyError as exc:
+        raise ValueError(
+            f"phase {phase!r} preset {preset!r} has no entry in the slurm `time_limit` table"
+        ) from exc
+
+
+def _write_jobs(
+    out: Path,
+    phase: str,
+    runs: list[RunSpec],
+    slurm: SlurmConfig,
+    phase_json: Path,
+) -> list[SubmitEntry]:
+    """Write one array job per preset plus a dependent analyze job.
+
+    Slurm job arrays require homogeneous resources and node count varies by preset, so a phase
+    spanning several presets (``transfer``) emits one array each, with a single analyze job
+    depending on all of them. Dependencies use ``afterany`` (see
+    :func:`oplm.slurm.render.render_submit_script`), so a diverged cell -- expected, ineligible
+    data to the ranking step -- cannot strand the analyze job in ``DependencyNeverSatisfied``.
+
+    Args:
+        out: The phase's resolved output directory (``phase.json``'s parent).
+        phase: The phase name, used to resolve per-phase node/time-limit overrides and to name
+            the generated scripts.
+        runs: Every cell generated for this phase, in manifest order. Grouped here by
+            ``params["preset"]``; the per-preset ``.jobs`` index file preserves that order so
+            array index ``i`` always maps to the same run ``phase.json`` would report at
+            position ``i`` within the group.
+        slurm: The phase's cluster settings.
+        phase_json: Absolute path to this phase's ``phase.json``, passed verbatim to the
+            analyze job's ``oplm sweep analyze`` command.
+
+    Returns:
+        The submission entries, in dependency order (one per preset array, then ``ANALYZE``).
+    """
+    jobs = out / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    presets = sorted({str(run.params["preset"]) for run in runs}, key=_preset_sort_key)
+    entries: list[SubmitEntry] = []
+    for preset in presets:
+        group = [run for run in runs if str(run.params["preset"]) == preset]
+        index_file = jobs / f"{preset}.jobs"
+        index_file.write_text("\n".join(run.id for run in group) + "\n")
+        spec = JobSpec(
+            name=f"oplm-{phase}-{preset}",
+            nodes=_resolve_nodes(slurm, phase=phase, preset=preset),
+            time_limit=_resolve_time_limit(slurm, phase=phase, preset=preset),
+            command=accelerate_command(
+                module="oplm.sweep.run",
+                gpus_per_node=slurm.gpus_per_node,
+                args='--config "$RUN_DIR/run.yaml" --result "$RUN_DIR/result.json"',
+            ),
+            array_size=len(group),
+            array_index_file=index_file,
+            base_dir=out,
+        )
+        script = jobs / f"{preset}.sbatch"
+        script.write_text(render_job(spec, slurm))
+        entries.append(SubmitEntry(var=f"A_{preset}", script=Path("jobs") / script.name))
+
+    analyze_spec = JobSpec(
+        name=f"oplm-{phase}-analyze",
+        nodes=1,
+        time_limit=_resolve_time_limit(slurm, phase="analyze", preset=None),
+        command=f'oplm sweep analyze "{phase_json}"',
+        gres=False,
+    )
+    analyze_script = jobs / "analyze.sbatch"
+    analyze_script.write_text(render_job(analyze_spec, slurm))
+    entries.append(
+        SubmitEntry(
+            var="ANALYZE",
+            script=Path("jobs") / analyze_script.name,
+            depends_on=tuple(entry.var for entry in entries),
+        )
+    )
+
+    submit_path = jobs / "submit.sh"
+    submit_path.write_text(render_submit_script(entries))
+    submit_path.chmod(0o755)
+    return entries
+
+
 def _generate_phase(
     *,
     name: str,
@@ -270,7 +382,10 @@ def _generate_phase(
     local: bool,
     accelerate_config: Path | None,
     diagnostics: bool = False,
+    submit: bool = False,
 ) -> tuple[Path, list[list[str]]]:
+    if local and submit:
+        raise ValueError("--local and --submit are mutually exclusive")
     base_config = base_config.resolve()
     out = out.resolve()
     source = source.resolve() if source is not None else None
@@ -321,19 +436,25 @@ def _generate_phase(
             )
         )
     phase_path = out / "phase.json"
-    write_phase(
-        phase_path,
-        PhaseManifest(
-            version=1,
-            phase=name,
-            metric=_resolve_metric(base_config, metric),
-            source=str(relative_path(source, out)) if source is not None else None,
-            runs=runs,
-            ranking=[],
-            selected=[],
-        ),
+    manifest = PhaseManifest(
+        version=1,
+        phase=name,
+        metric=_resolve_metric(base_config, metric),
+        source=str(relative_path(source, out)) if source is not None else None,
+        runs=runs,
+        ranking=[],
+        selected=[],
+        # importlib.metadata, not oplm.__version__: the latter is a hand-maintained stub
+        # ("0.0.1") that has drifted from pyproject's real version.
+        oplm_version=version("oplm"),
+        generated_at=datetime.now(tz=UTC).isoformat(),
     )
+    write_phase(phase_path, manifest)
     (out / "commands.txt").write_text("\n".join(shlex.join(command) for command in commands) + "\n")
+    entries = _write_jobs(out, name, runs, slurm, phase_path)
+    if submit:
+        manifest.job_ids = submit_all(entries, base_dir=out)
+        write_phase(phase_path, manifest)
     return phase_path, commands
 
 
@@ -765,6 +886,7 @@ def smoke(
     warmup: Annotated[int, typer.Option("--warmup")] = 100,
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -785,6 +907,7 @@ def smoke(
             local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
+            submit=submit,
         )
         if local:
             _run_local(commands)
@@ -806,6 +929,7 @@ def coarse(
     warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k coarse run
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -827,6 +951,7 @@ def coarse(
             local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
+            submit=submit,
         )
         if local:
             _run_local(commands)
@@ -849,6 +974,7 @@ def refine(
     warmup: Annotated[int, typer.Option("--warmup")] = 2000,  # 10% of the 20k refine run
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -875,6 +1001,7 @@ def refine(
             local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
+            submit=submit,
         )
         if local:
             _run_local(commands)
@@ -893,6 +1020,7 @@ def replicate(
     seeds: Annotated[str, typer.Option("--seeds")] = "42,43,44",
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -917,6 +1045,7 @@ def replicate(
             local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
+            submit=submit,
         )
         if local:
             _run_local(commands)
@@ -941,6 +1070,7 @@ def transfer(
     warmup: Annotated[str, typer.Option("--warmup")] = "1000,2000,1000",
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -968,6 +1098,7 @@ def transfer(
             local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
+            submit=submit,
         )
         if local:
             _run_local(commands)
@@ -990,6 +1121,7 @@ def bridge(
     warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k bridge run
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -1020,6 +1152,7 @@ def bridge(
             local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
+            submit=submit,
         )
         if local:
             _run_local(commands)
@@ -1041,6 +1174,7 @@ def confirm(
     warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k confirm run
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
     accelerate_config: Annotated[
         Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
     ] = None,
@@ -1070,6 +1204,7 @@ def confirm(
             local=local,
             accelerate_config=accelerate_config,
             diagnostics=diagnostics,
+            submit=submit,
         )
         if local:
             _run_local(commands)

@@ -51,6 +51,29 @@ def test_phase_manifest_roundtrips(tmp_path: Path) -> None:
     assert load_phase(path) == phase
 
 
+def test_load_phase_defaults_provenance_fields_for_legacy_manifests(tmp_path: Path) -> None:
+    """A `phase.json` written before `oplm_version`/`generated_at`/`job_ids` existed must still
+    load, with all three defaulting to `None`."""
+    path = tmp_path / "phase.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "phase": "coarse",
+                "metric": "eval/heldout/loss",
+                "source": None,
+                "runs": [],
+                "ranking": [],
+                "selected": [],
+            }
+        )
+    )
+    manifest = load_phase(path)
+    assert manifest.oplm_version is None
+    assert manifest.generated_at is None
+    assert manifest.job_ids is None
+
+
 def test_result_metric_requires_finite_validation_loss(tmp_path: Path) -> None:
     run = RunSpec("run", "runs/run/run.yaml", "runs/run/result.json", {"lr": 0.01})
     result = tmp_path / run.result
