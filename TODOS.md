@@ -369,11 +369,19 @@ def test_grid_constants_are_recentered() -> None:
 
 
 def test_no_phase_logic_hardcodes_a_learning_rate() -> None:
-    """The old gates tested scores.get(0.0025) / scores.get(0.01) literally."""
-    source = Path(phases.__file__).read_text()
-    body = source.split("COARSE_LRS", 1)[1].split("\n", 1)[1]
-    for literal in ("0.0025", "0.01", "0.0016", "0.0004"):
-        assert literal not in body, f"phase logic still references the literal {literal}"
+    """The old gates tested scores.get(0.0025) / scores.get(0.01) literally.
+
+    Scoped to the two gate functions rather than the whole module: `_write_run_config`
+    legitimately mentions 0.01 when validating `train.weight_decay`, which is unrelated.
+    """
+    import inspect
+
+    for func in (phases._smoke_gated_lrs, phases.analyze_phase):
+        body = inspect.getsource(func)
+        for literal in ("0.0025", "0.01", "0.0016", "0.0004"):
+            assert literal not in body, (
+                f"{func.__name__} still references the literal learning rate {literal}"
+            )
 
 
 def test_smoke_gate_follows_a_custom_grid(tmp_path: Path) -> None:
@@ -879,8 +887,10 @@ git commit -m "feat: add slurm config schema and phase/preset resolution"
 **Interfaces:**
 - Produces: `BatchPlan` frozen dataclass with `per_device_batch: int`,
   `gradient_accumulation_steps: int`, `world_size: int`.
-- Produces: `resolve_batch_plan(*, global_examples: int, nodes: int, gpus_per_node: int,
-  max_batch_size: int) -> BatchPlan`.
+- Produces: `resolve_batch_plan(*, global_examples: int, world_size: int,
+  max_batch_size: int) -> BatchPlan`. It takes `world_size` rather than `nodes` so the `--local`
+  path can pass its actual process count and still land on an exact global batch; Slurm callers
+  pass `nodes * gpus_per_node`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -907,7 +917,7 @@ def test_batch_plan_matches_the_spec_table(
 ) -> None:
     assert (
         resolve_batch_plan(
-            global_examples=global_examples, nodes=nodes, gpus_per_node=8, max_batch_size=cap
+            global_examples=global_examples, world_size=nodes * 8, max_batch_size=cap
         )
         == expected
     )
@@ -915,18 +925,24 @@ def test_batch_plan_matches_the_spec_table(
 
 def test_cap_forces_accumulation() -> None:
     # 2048 / 8 = 256 per device at accum 1, over a cap of 128, so accum must rise to 2.
-    plan = resolve_batch_plan(global_examples=2048, nodes=1, gpus_per_node=8, max_batch_size=128)
+    plan = resolve_batch_plan(global_examples=2048, world_size=8, max_batch_size=128)
     assert plan == BatchPlan(per_device_batch=128, gradient_accumulation_steps=2, world_size=8)
+
+
+def test_local_world_size_still_lands_on_the_global_batch() -> None:
+    """--local passes its actual process count, so a 400M cell keeps a 2048 global batch."""
+    plan = resolve_batch_plan(global_examples=2048, world_size=8, max_batch_size=256)
+    assert plan.per_device_batch * plan.gradient_accumulation_steps * plan.world_size == 2048
 
 
 def test_indivisible_global_batch_raises() -> None:
     with pytest.raises(ValueError, match="not divisible"):
-        resolve_batch_plan(global_examples=2048, nodes=3, gpus_per_node=8, max_batch_size=256)
+        resolve_batch_plan(global_examples=2048, world_size=24, max_batch_size=256)
 
 
 def test_global_batch_smaller_than_world_raises() -> None:
     with pytest.raises(ValueError, match="not divisible"):
-        resolve_batch_plan(global_examples=4, nodes=1, gpus_per_node=8, max_batch_size=256)
+        resolve_batch_plan(global_examples=4, world_size=8, max_batch_size=256)
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -949,19 +965,21 @@ class BatchPlan:
 
 
 def resolve_batch_plan(
-    *, global_examples: int, nodes: int, gpus_per_node: int, max_batch_size: int
+    *, global_examples: int, world_size: int, max_batch_size: int
 ) -> BatchPlan:
-    """Derive per-device batch and accumulation from the global batch and node count.
+    """Derive per-device batch and accumulation from the global batch and world size.
 
     Picks the smallest accumulation that yields an integer per-device batch no larger than
     ``max_batch_size``. Node counts are chosen for wall time, so per-device batch is derived
     rather than configured; an infeasible combination is an error, never a silently adjusted
     global batch.
 
+    Takes ``world_size`` rather than a node count so both callers land on an exact global batch:
+    Slurm passes ``nodes * gpus_per_node``, while ``--local`` passes its actual process count.
+
     Args:
         global_examples: Target global batch in examples per optimizer step.
-        nodes: Node count for this cell.
-        gpus_per_node: Processes per node.
+        world_size: Total training processes.
         max_batch_size: Memory cap on per-device batch for this preset.
 
     Returns:
@@ -971,16 +989,14 @@ def resolve_batch_plan(
         ValueError: If the global batch is not divisible by the world size, or no accumulation
             brings the per-device batch within ``max_batch_size``.
     """
-    if global_examples < 1 or nodes < 1 or gpus_per_node < 1 or max_batch_size < 1:
+    if global_examples < 1 or world_size < 1 or max_batch_size < 1:
         raise ValueError(
-            "global_examples, nodes, gpus_per_node, and max_batch_size must all be >= 1; got "
-            f"{global_examples=}, {nodes=}, {gpus_per_node=}, {max_batch_size=}"
+            "global_examples, world_size, and max_batch_size must all be >= 1; got "
+            f"{global_examples=}, {world_size=}, {max_batch_size=}"
         )
-    world_size = nodes * gpus_per_node
     if global_examples % world_size != 0:
         raise ValueError(
-            f"global batch {global_examples} is not divisible by world size {world_size} "
-            f"({nodes} nodes x {gpus_per_node} GPUs)"
+            f"global batch {global_examples} is not divisible by world size {world_size}"
         )
     base = global_examples // world_size
     for accum in range(1, base + 1):
@@ -2086,23 +2102,32 @@ from oplm.slurm.config import BatchPlan, SlurmConfig, load_slurm_config, resolve
 ```
 
 In `_generate_phase`, load the slurm block once and compute the plan per cell before writing its
-config:
+config. The world size comes from the node table for the Slurm path and from `--num-processes` for
+`--local`, so both land on an exact global batch:
 
 ```python
     slurm = load_slurm_config(base_config)
     ...
         preset = str(params["preset"])
         nodes = slurm.nodes.resolve(phase=name, preset=preset)
+        # --local runs on this machine's processes, not the phase's node allocation. Deriving
+        # the plan from the node table there would silently shrink the global batch (a 400M cell
+        # is planned for 4 nodes; on 8 local processes that is 512, not 2048) and break every
+        # cross-cell comparison.
+        world_size = num_processes if local else nodes * slurm.gpus_per_node
         plan = resolve_batch_plan(
             global_examples=int(params["global_examples"]),
-            nodes=nodes,
-            gpus_per_node=slurm.gpus_per_node,
+            world_size=world_size,
             max_batch_size=slurm.max_batch_size[preset],
         )
 ```
 
-Pass `plan=plan` to `_write_run_config`, and record `nodes`, `plan.per_device_batch`, and
-`plan.gradient_accumulation_steps` into each `RunSpec.params`.
+`_generate_phase` therefore takes a `local: bool` parameter alongside the existing
+`num_processes`. Pass `plan=plan` to `_write_run_config`, and record `nodes`,
+`plan.per_device_batch`, and `plan.gradient_accumulation_steps` into each `RunSpec.params`.
+
+Keep `num_processes`, `accelerate_argv`, and `commands.txt` exactly as they are — they serve the
+`--local` path and remain the human-readable record of what each cell runs.
 
 `gradient_accumulation_steps` in `oplm/sweep/common.py` is now unused by `phases.py`. Leave the
 function in place — `test_common.py` covers it and it documents the divisibility contract — but do
