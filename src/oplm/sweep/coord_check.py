@@ -8,11 +8,11 @@ width; the ``--no-mup`` control fans out. Run this before trusting any LR sweep.
 
 Run::
 
-    python -m oplm.sweep.coord_check --config configs/mup-production.yaml \
+    oplm sweep coord-check --config configs/mup-production.yaml \
         --widths 128,256,512,1024 --optimizer muon
-    python -m oplm.sweep.coord_check --config configs/mup-production.yaml \
+    oplm sweep coord-check --config configs/mup-production.yaml \
         --no-mup --widths 128,256,512,1024   # control
-    python -m oplm.sweep.coord_check --config configs/mup-production.yaml \
+    oplm sweep coord-check --config configs/mup-production.yaml \
         --scaling preset_ray --widths 256,512,1024
 
 Outputs, into ``--out`` (a directory): a tidy CSV of ``(width, module, step,
@@ -67,7 +67,6 @@ if TYPE_CHECKING:
 
     from oplm.model import OplmConfig
 
-app = typer.Typer(name="mup-coord-check", help=__doc__, add_completion=False)
 console = Console()
 
 # Heuristic line for the printed growth table: μP should hold RMS roughly flat
@@ -275,7 +274,6 @@ def _print_growth_table(rows: list[_GrowthRow], lo: int, hi: int, *, mup: bool) 
         )
 
 
-@app.command()
 def main(
     config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
     widths: Annotated[
@@ -382,7 +380,3 @@ def main(
             border_style="dim",
         )
     )
-
-
-if __name__ == "__main__":
-    app()

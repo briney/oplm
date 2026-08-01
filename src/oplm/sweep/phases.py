@@ -1018,7 +1018,3 @@ def scale(
             analyze_phase(phase_path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-
-
-if __name__ == "__main__":
-    app()
