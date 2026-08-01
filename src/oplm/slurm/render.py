@@ -32,9 +32,9 @@ class JobSpec:
     time_limit: str
     command: str
     array_size: int | None = None
-    array_cells_file: Path | None = None
+    array_index_file: Path | None = None
     gres: bool = True
-    phase_dir: Path | None = None
+    base_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -87,19 +87,19 @@ def _header(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
 
 
 def _array_lookup(spec: JobSpec) -> list[str]:
-    if spec.array_cells_file is None or spec.phase_dir is None:
+    if spec.array_index_file is None or spec.base_dir is None:
         return []
     return [
         "",
         "# Map this array index to its run. One run id per line; index = line number - 1.",
-        f'PHASE_DIR="{spec.phase_dir}"',
-        f'CELLS_FILE="{spec.array_cells_file}"',
-        'RUN_ID=$(awk "NR==$((SLURM_ARRAY_TASK_ID + 1))" "$CELLS_FILE")',
+        f'BASE_DIR="{spec.base_dir}"',
+        f'INDEX_FILE="{spec.array_index_file}"',
+        'RUN_ID=$(awk "NR==$((SLURM_ARRAY_TASK_ID + 1))" "$INDEX_FILE")',
         'if [ -z "$RUN_ID" ]; then',
         '  echo "no run for array index $SLURM_ARRAY_TASK_ID" >&2',
         "  exit 1",
         "fi",
-        'export RUN_DIR="$PHASE_DIR/runs/$RUN_ID"',
+        'export RUN_DIR="$BASE_DIR/runs/$RUN_ID"',
     ]
 
 
@@ -130,7 +130,12 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         "",
         "# Distributed rendezvous. The sbatch body runs on the rank-0 node, and SLURM_JOB_ID is",
         "# unique per array task, so concurrent jobs cannot collide on a port.",
-        "export MASTER_ADDR=$(hostname --ip-address)",
+        "# Assignment and export are split rather than combined into one `export VAR=$(cmd)`",
+        "# line: bash would then report export's own exit status (always 0) instead of the",
+        "# command substitution's, so `set -e` could not catch a failing hostname lookup and the",
+        "# job would hang at rendezvous with an empty MASTER_ADDR.",
+        "MASTER_ADDR=$(hostname --ip-address)",
+        "export MASTER_ADDR",
         "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))",
         "export NCCL_DEBUG=INFO",
         "export OMP_NUM_THREADS=1",

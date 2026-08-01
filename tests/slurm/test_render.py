@@ -26,8 +26,8 @@ def _array_spec(tmp_path: Path) -> JobSpec:
         time_limit="168:00:00",
         command='python -m oplm.sweep.run --config "$RUN_DIR/run.yaml"',
         array_size=7,
-        array_cells_file=tmp_path / "jobs" / "170M.cells",
-        phase_dir=tmp_path,
+        array_index_file=tmp_path / "jobs" / "170M.jobs",
+        base_dir=tmp_path,
     )
 
 
@@ -84,8 +84,12 @@ def test_workdir_is_created_on_every_node(tmp_path: Path) -> None:
 
 def test_rendezvous_variables(tmp_path: Path) -> None:
     text = render_job(_array_spec(tmp_path), SLURM)
-    assert "export MASTER_ADDR=$(hostname --ip-address)" in text
-    # SLURM_JOB_ID is unique per array task, so concurrent cells cannot collide.
+    # `export MASTER_ADDR=$(...)` reports export's own exit status (always 0), so a failing
+    # `hostname` would not trip `set -e`; the assignment and export must be split.
+    assert "\nMASTER_ADDR=$(hostname --ip-address)\n" in text
+    assert "\nexport MASTER_ADDR\n" in text
+    assert "export MASTER_ADDR=$(" not in text
+    # SLURM_JOB_ID is unique per array task, so concurrent jobs cannot collide.
     assert "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))" in text
     assert "export OMP_NUM_THREADS=1" in text
 
@@ -98,8 +102,8 @@ def test_slurm_vars_expand_inside_the_container(tmp_path: Path) -> None:
         time_limit="168:00:00",
         command=accelerate_command(module="oplm.sweep.run", gpus_per_node=8, args="--config x"),
         array_size=7,
-        array_cells_file=tmp_path / "jobs" / "170M.cells",
-        phase_dir=tmp_path,
+        array_index_file=tmp_path / "jobs" / "170M.jobs",
+        base_dir=tmp_path,
     )
     text = render_job(spec, SLURM)
     inner = text.split("bash -c '", 1)[1]
@@ -110,9 +114,9 @@ def test_slurm_vars_expand_inside_the_container(tmp_path: Path) -> None:
     assert "pip install oplm[train]" in inner
 
 
-def test_array_index_maps_through_the_cells_file(tmp_path: Path) -> None:
+def test_array_index_maps_through_the_index_file(tmp_path: Path) -> None:
     text = render_job(_array_spec(tmp_path), SLURM)
-    assert "170M.cells" in text
+    assert "170M.jobs" in text
     assert "SLURM_ARRAY_TASK_ID" in text
     assert "export RUN_DIR" in text
 
