@@ -1170,7 +1170,7 @@ def test_slurm_vars_expand_inside_the_container(tmp_path: Path) -> None:
     assert "pip install oplm[train]" in inner
 
 
-def test_array_index_maps_through_the_cells_file(tmp_path: Path) -> None:
+def test_array_index_maps_through_the_index_file(tmp_path: Path) -> None:
     text = render_job(_array_spec(tmp_path), SLURM)
     assert "170M.jobs" in text
     assert "SLURM_ARRAY_TASK_ID" in text
@@ -1207,7 +1207,7 @@ def test_submit_script_wires_afterany_across_arrays() -> None:
         "ANALYZE=$(sbatch --parsable --dependency=afterany:$A_400M:$A_800M:$A_1B "
         "jobs/analyze.sbatch)" in text
     )
-    # afterok would wedge the analyze job the first time a cell diverges.
+    # afterok would wedge the downstream job the first time an upstream one fails.
     assert "afterok" not in text
 
 
@@ -1260,7 +1260,7 @@ _HOME_MOUNT = "/mnt/home/${SLURM_JOB_USER}:/mnt/home/${SLURM_JOB_USER}"
 
 @dataclass(frozen=True)
 class JobSpec:
-    """One Slurm job: a single run, or an array over homogeneous cells."""
+    """One Slurm job: a single run, or an array over homogeneous jobs."""
 
     name: str
     nodes: int
@@ -1326,12 +1326,12 @@ def _array_lookup(spec: JobSpec) -> list[str]:
         return []
     return [
         "",
-        "# Map this array index to its cell. One run id per line; index = line number - 1.",
+        "# Map this array index to its run. One run id per line; index = line number - 1.",
         f'BASE_DIR="{spec.base_dir}"',
         f'INDEX_FILE="{spec.array_index_file}"',
         'RUN_ID=$(awk "NR==$((SLURM_ARRAY_TASK_ID + 1))" "$INDEX_FILE")',
         'if [ -z "$RUN_ID" ]; then',
-        '  echo "no cell for array index $SLURM_ARRAY_TASK_ID" >&2',
+        '  echo "no run for array index $SLURM_ARRAY_TASK_ID" >&2',
         "  exit 1",
         "fi",
         'export RUN_DIR="$BASE_DIR/runs/$RUN_ID"',
@@ -1364,7 +1364,7 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         'srun --nodes=$SLURM_NNODES --ntasks-per-node=1 mkdir -p "$JOB_WORK_DIR"',
         "",
         "# Distributed rendezvous. The sbatch body runs on the rank-0 node, and SLURM_JOB_ID is",
-        "# unique per array task, so concurrent cells cannot collide on a port.",
+        "# unique per array task, so concurrent jobs cannot collide on a port.",
         "MASTER_ADDR=$(hostname --ip-address)",
         "export MASTER_ADDR",
         "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))",
@@ -1409,15 +1409,15 @@ def accelerate_command(
 def render_submit_script(entries: list[SubmitEntry]) -> str:
     """Render a ``submit.sh`` that submits every job and wires dependencies.
 
-    Dependencies use ``afterany``, not ``afterok``: a divergent cell is expected data, and ranking
+    Dependencies use ``afterany``, not ``afterok``: an upstream failure is expected data, and the caller
     already treats a missing or non-finite result as ineligible. Under ``afterok`` the first
-    blown-up cell would leave the analyze job in ``DependencyNeverSatisfied`` forever.
+    failed upstream job would leave it in ``DependencyNeverSatisfied`` forever.
     """
     lines = [
         "#!/bin/bash",
         "set -euo pipefail",
         "",
-        "# Run from the phase directory regardless of the caller's cwd.",
+        "# Run from the base directory regardless of the caller's cwd.",
         'cd "$(dirname "$0")/.."',
         "",
     ]
