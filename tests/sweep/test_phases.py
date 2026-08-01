@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING
 
 import pytest
 import typer
-from scripts import mup_sweep
-from scripts._mup_common import PhaseManifest, RunSpec, load_phase, write_phase
 from typer.testing import CliRunner
 
 from oplm.config import load_config
+from oplm.sweep import phases
+from oplm.sweep.common import PhaseManifest, RunSpec, load_phase, write_phase
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -79,7 +79,7 @@ def _write_result(phase_dir: Path, run: RunSpec, loss: float) -> None:
 def test_smoke_generates_three_production_cells(base_config: Path, tmp_path: Path) -> None:
     out = tmp_path / "smoke"
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         ["smoke", "--config", str(base_config), "--out", str(out)],
     )
     assert result.exit_code == 0, result.output
@@ -118,11 +118,11 @@ def test_diagnostics_flag_toggles_stability_diagnostics(base_config: Path, tmp_p
     off = tmp_path / "off"
     on = tmp_path / "on"
     assert (
-        runner.invoke(mup_sweep.app, ["smoke", "--config", str(base_config), "--out", str(off)])
+        runner.invoke(phases.app, ["smoke", "--config", str(base_config), "--out", str(off)])
     ).exit_code == 0
     assert (
         runner.invoke(
-            mup_sweep.app,
+            phases.app,
             ["smoke", "--config", str(base_config), "--out", str(on), "--diagnostics"],
         )
     ).exit_code == 0
@@ -137,7 +137,7 @@ def test_generation_rejects_nonproduction_weight_decay(base_config: Path, tmp_pa
     text = base_config.read_text().replace("weight_decay: 0.01", "weight_decay: 0.0")
     base_config.write_text(text)
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         ["smoke", "--config", str(base_config), "--out", str(tmp_path / "smoke")],
     )
     assert result.exit_code != 0
@@ -160,7 +160,7 @@ def test_generation_rejects_nonproduction_optimizer(
 ) -> None:
     base_config.write_text(base_config.read_text().replace(old, new))
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         ["smoke", "--config", str(base_config), "--out", str(tmp_path / "smoke")],
     )
     assert result.exit_code != 0
@@ -169,7 +169,7 @@ def test_generation_rejects_nonproduction_optimizer(
 
 def test_generation_rejects_nonintegral_accumulation(base_config: Path, tmp_path: Path) -> None:
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "smoke",
             "--config",
@@ -205,7 +205,7 @@ def test_refine_uses_coarse_selected_lrs(base_config: Path, tmp_path: Path) -> N
     )
     out = tmp_path / "refine"
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "refine",
             "--config",
@@ -262,7 +262,7 @@ def test_coarse_uses_smoke_divergence_gate(
     source = _write_smoke_phase(tmp_path, {0.0025: 1.4, 0.01: 1.1, 0.04: high_metric})
     out = tmp_path / "coarse"
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "coarse",
             "--config",
@@ -285,7 +285,7 @@ def test_coarse_rejects_nonfinite_required_smoke_cells(
     metrics[failed_lr] = None
     source = _write_smoke_phase(tmp_path, metrics)
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "coarse",
             "--config",
@@ -314,7 +314,7 @@ def test_generation_requires_metric_for_ambiguous_eval_config(
         )
     )
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         ["smoke", "--config", str(base_config), "--out", str(tmp_path / "smoke")],
     )
     assert result.exit_code != 0
@@ -329,7 +329,7 @@ def test_generation_rejects_explicit_non_loss_metric(
     base_config: Path, tmp_path: Path, metric: str
 ) -> None:
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "smoke",
             "--config",
@@ -349,7 +349,7 @@ def test_generation_accepts_explicit_configured_loss_metric(
 ) -> None:
     out = tmp_path / "smoke"
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "smoke",
             "--config",
@@ -373,7 +373,7 @@ def test_generation_resolves_relative_accelerate_config(
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "smoke",
             "--config",
@@ -414,10 +414,10 @@ def test_later_phase_default_cell_counts() -> None:
         for index, candidate in enumerate(candidates)
     ]
 
-    assert len(mup_sweep._replicate_cells(source_runs, candidates, [42, 43, 44])) == 4
+    assert len(phases._replicate_cells(source_runs, candidates, [42, 43, 44])) == 4
     assert (
         len(
-            mup_sweep._transfer_cells(
+            phases._transfer_cells(
                 candidates,
                 presets=["400M", "800M", "1B"],
                 steps=[10000, 20000, 10000],
@@ -431,7 +431,7 @@ def test_later_phase_default_cell_counts() -> None:
     )
 
     transferred = [{"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.25}]
-    bridge = mup_sweep._bridge_cells(
+    bridge = phases._bridge_cells(
         transferred,
         multipliers=[0.7, 1.0, 1.4, 2.0],
         global_examples=8192,
@@ -448,7 +448,7 @@ def test_later_phase_default_cell_counts() -> None:
     ]
     assert (
         len(
-            mup_sweep._confirm_cells(
+            phases._confirm_cells(
                 bridge_finalists,
                 global_examples=8192,
                 seed=42,
@@ -460,7 +460,7 @@ def test_later_phase_default_cell_counts() -> None:
     )
     assert (
         len(
-            mup_sweep._scale_cells(
+            phases._scale_cells(
                 bridge_finalists[:1],
                 presets=["50M", "170M", "400M", "800M", "1B"],
                 global_examples=8192,
@@ -501,7 +501,7 @@ def test_replicate_generates_only_new_seeds_from_source_runs(
     out = tmp_path / "replicate"
 
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "replicate",
             "--config",
@@ -547,7 +547,7 @@ def test_transfer_generates_paired_candidates_across_default_models(
     out = tmp_path / "transfer"
 
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "transfer",
             "--config",
@@ -591,7 +591,7 @@ def test_bridge_uses_only_explicit_top_transfer_candidate(
     out = tmp_path / "bridge"
 
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "bridge",
             "--config",
@@ -634,7 +634,7 @@ def test_confirm_preserves_bridge_depth_and_batch_corrections(
     out = tmp_path / "confirm"
 
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "confirm",
             "--config",
@@ -687,7 +687,7 @@ def test_scale_uses_only_confirmed_winner_across_default_presets(
     out = tmp_path / "scale"
 
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "scale",
             "--config",
@@ -723,7 +723,7 @@ def test_later_phase_commands_require_selected_candidates(
 ) -> None:
     source = _write_selected_phase(tmp_path, f"empty-{command}", [])
     result = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             command,
             "--config",
@@ -762,7 +762,7 @@ def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
         ],
     )
     replicate = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "replicate",
             "--config",
@@ -779,7 +779,7 @@ def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
     assert "must include source seed 42" in replicate.output
 
     transfer = runner.invoke(
-        mup_sweep.app,
+        phases.app,
         [
             "transfer",
             "--config",
@@ -800,9 +800,9 @@ def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
     assert "same number of values" in normalized
 
     with pytest.raises(typer.BadParameter, match="must list at least one value"):
-        mup_sweep._parse_ints(",", name="--seeds")
+        phases._parse_ints(",", name="--seeds")
     with pytest.raises(typer.BadParameter, match="must list at least one value"):
-        mup_sweep._parse_strings(",", name="--presets")
+        phases._parse_strings(",", name="--presets")
 
 
 def test_coarse_selects_interior_winner_and_neighbors(tmp_path: Path) -> None:
@@ -822,7 +822,7 @@ def test_coarse_selects_interior_winner_and_neighbors(tmp_path: Path) -> None:
     for run in runs:
         _write_result(tmp_path, run, abs(float(run.params["lr"]) - 0.01) + 1.0)
 
-    mup_sweep.analyze_phase(path)
+    phases.analyze_phase(path)
 
     analyzed = load_phase(path)
     assert [candidate["lr"] for candidate in analyzed.selected] == [0.0063, 0.01, 0.016]
@@ -842,7 +842,7 @@ def test_coarse_edge_winner_blocks_refinement(tmp_path: Path) -> None:
     write_phase(path, PhaseManifest(1, "coarse", "eval/heldout/loss", None, runs, [], []))
     for index, run in enumerate(runs):
         _write_result(tmp_path, run, 1.0 + index)
-    mup_sweep.analyze_phase(path)
+    phases.analyze_phase(path)
     assert load_phase(path).selected == []
 
 
@@ -856,7 +856,7 @@ def test_missing_and_nonfinite_results_are_ineligible(tmp_path: Path) -> None:
     write_phase(path, PhaseManifest(1, "confirm", "eval/heldout/loss", None, runs, [], []))
     _write_result(tmp_path, runs[0], 1.0)
     _write_result(tmp_path, runs[2], float("nan"))
-    mup_sweep.analyze_phase(path)
+    phases.analyze_phase(path)
     analyzed = load_phase(path)
     scores = {entry["id"]: entry["score"] for entry in analyzed.ranking}
     assert scores == {"ok": 1.0, "missing": None, "nan": None}
@@ -964,7 +964,7 @@ def test_replicate_ranks_three_seed_mean_and_reuses_source_seed(tmp_path: Path) 
         losses={0.01: [1.0, 1.1, 1.2], 0.016: [0.9, 1.5, 1.6]},
     )
     assert source_path.exists()
-    mup_sweep.analyze_phase(replicate_path)
+    phases.analyze_phase(replicate_path)
     analyzed = load_phase(replicate_path)
     assert analyzed.selected[0]["lr"] == 0.01
     assert analyzed.ranking[0]["score"] == pytest.approx(1.1)
@@ -972,7 +972,7 @@ def test_replicate_ranks_three_seed_mean_and_reuses_source_seed(tmp_path: Path) 
 
 def test_transfer_sums_per_model_ranks_and_requires_all_models(tmp_path: Path) -> None:
     path = _transfer_fixture(tmp_path)
-    mup_sweep.analyze_phase(path)
+    phases.analyze_phase(path)
     analyzed = load_phase(path)
     assert analyzed.selected[0] == {
         "lr": 0.01,
@@ -1000,5 +1000,5 @@ def test_local_execution_is_sequential_and_stops_on_failure(
     monkeypatch.setattr(subprocess, "run", fake_run)
     commands = [["run", "one"], ["run", "two"], ["run", "three"]]
     with pytest.raises(subprocess.CalledProcessError):
-        mup_sweep._run_local(commands)
+        phases._run_local(commands)
     assert seen == commands[:2]

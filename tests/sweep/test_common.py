@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 
 import pytest
-from scripts._mup_common import (
+
+from oplm.sweep.common import (
     PhaseManifest,
     RunSpec,
     accelerate_argv,
@@ -78,7 +79,7 @@ def test_accelerate_command_targets_one_resolved_cell(tmp_path: Path) -> None:
         "--num_processes",
         "8",
         "-m",
-        "scripts.mup_run",
+        "oplm.sweep.run",
         "--config",
         str(tmp_path / "run.yaml"),
         "--result",

@@ -8,11 +8,11 @@ width; the ``--no-mup`` control fans out. Run this before trusting any LR sweep.
 
 Run::
 
-    python -m scripts.mup_coord_check --config configs/mup-production.yaml \
+    python -m oplm.sweep.coord_check --config configs/mup-production.yaml \
         --widths 128,256,512,1024 --optimizer muon
-    python -m scripts.mup_coord_check --config configs/mup-production.yaml \
+    python -m oplm.sweep.coord_check --config configs/mup-production.yaml \
         --no-mup --widths 128,256,512,1024   # control
-    python -m scripts.mup_coord_check --config configs/mup-production.yaml \
+    python -m oplm.sweep.coord_check --config configs/mup-production.yaml \
         --scaling preset_ray --widths 256,512,1024
 
 Outputs, into ``--out`` (a directory): a tidy CSV of ``(width, module, step,
@@ -50,7 +50,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from scripts._mup_common import (
+from oplm.sweep.common import (
     HEAD_DIM,
     PRESET_ASPECT_RATIO,
     Optimizer,
@@ -103,7 +103,7 @@ def _build_cfg_fn(
     ``head_dim`` is held at 64 (only the head count grows). ``"width"`` keeps
     depth at ``depth``; ``"preset_ray"`` co-scales depth with width at the preset
     aspect ratio (``--depth`` is then ignored). Shared with the sweep harness via
-    :func:`scripts._mup_common.num_layers_for` so the gate and the runs match.
+    :func:`oplm.sweep.common.num_layers_for` so the gate and the runs match.
     """
     from oplm.config import load_config
 

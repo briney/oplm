@@ -4,10 +4,10 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
-from scripts import mup_run
-from tests.training.conftest import tiny_train_cfg
 
 from oplm.config import serialize_config
+from oplm.sweep import run
+from tests.training.conftest import tiny_train_cfg
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,7 +34,7 @@ def test_mup_run_writes_validation_result(training_parquet: Path, tmp_path: Path
     result_json = tmp_path / "result.json"
     run_yaml.write_text(serialize_config(cfg))
 
-    mup_run.main(config=run_yaml, result=result_json)
+    run.main(config=run_yaml, result=result_json)
 
     payload = json.loads(result_json.read_text())
     assert payload["steps"] == 2

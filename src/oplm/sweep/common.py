@@ -178,7 +178,7 @@ def accelerate_argv(
             "--num_processes",
             str(num_processes),
             "-m",
-            "scripts.mup_run",
+            "oplm.sweep.run",
             "--config",
             str(config),
             "--result",

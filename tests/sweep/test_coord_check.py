@@ -11,8 +11,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
-from scripts._mup_common import Scaling
-from scripts.mup_coord_check import _DEFAULT_SEQUENCES, _build_cfg_fn, _load_sequences
+
+from oplm.sweep.common import Scaling
+from oplm.sweep.coord_check import _DEFAULT_SEQUENCES, _build_cfg_fn, _load_sequences
 
 if TYPE_CHECKING:
     from pathlib import Path

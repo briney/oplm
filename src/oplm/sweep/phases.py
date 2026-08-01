@@ -11,7 +11,7 @@ from typing import Annotated
 import typer
 
 from oplm.config import get_preset_config, load_config, serialize_config
-from scripts._mup_common import (
+from oplm.sweep.common import (
     Params,
     PhaseManifest,
     RunSpec,
