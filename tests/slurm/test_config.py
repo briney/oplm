@@ -108,3 +108,51 @@ def test_non_numeric_max_batch_size_rejected() -> None:
     raw = {**RAW, "max_batch_size": {"170M": "oops"}}
     with pytest.raises(ValueError, match=r"max_batch_size\['170M'\].*oops"):
         SlurmConfig.from_mapping(raw)
+
+
+from oplm.slurm.config import BatchPlan, resolve_batch_plan
+
+
+@pytest.mark.parametrize(
+    ("global_examples", "nodes", "cap", "expected"),
+    [
+        # The spec's node table: every row resolves to accum == 1.
+        (2048, 1, 256, BatchPlan(per_device_batch=256, gradient_accumulation_steps=1, world_size=8)),
+        (2048, 4, 256, BatchPlan(per_device_batch=64, gradient_accumulation_steps=1, world_size=32)),
+        (2048, 8, 256, BatchPlan(per_device_batch=32, gradient_accumulation_steps=1, world_size=64)),
+        (2048, 8, 128, BatchPlan(per_device_batch=32, gradient_accumulation_steps=1, world_size=64)),
+        (8192, 4, 256, BatchPlan(per_device_batch=256, gradient_accumulation_steps=1, world_size=32)),
+        (8192, 8, 256, BatchPlan(per_device_batch=128, gradient_accumulation_steps=1, world_size=64)),
+    ],
+)
+def test_batch_plan_matches_the_spec_table(
+    global_examples: int, nodes: int, cap: int, expected: BatchPlan
+) -> None:
+    assert (
+        resolve_batch_plan(
+            global_examples=global_examples, world_size=nodes * 8, max_batch_size=cap
+        )
+        == expected
+    )
+
+
+def test_cap_forces_accumulation() -> None:
+    # 2048 / 8 = 256 per device at accum 1, over a cap of 128, so accum must rise to 2.
+    plan = resolve_batch_plan(global_examples=2048, world_size=8, max_batch_size=128)
+    assert plan == BatchPlan(per_device_batch=128, gradient_accumulation_steps=2, world_size=8)
+
+
+def test_local_world_size_still_lands_on_the_global_batch() -> None:
+    """--local passes its actual process count, so a 400M cell keeps a 2048 global batch."""
+    plan = resolve_batch_plan(global_examples=2048, world_size=8, max_batch_size=256)
+    assert plan.per_device_batch * plan.gradient_accumulation_steps * plan.world_size == 2048
+
+
+def test_indivisible_global_batch_raises() -> None:
+    with pytest.raises(ValueError, match="not divisible"):
+        resolve_batch_plan(global_examples=2048, world_size=24, max_batch_size=256)
+
+
+def test_global_batch_smaller_than_world_raises() -> None:
+    with pytest.raises(ValueError, match="not divisible"):
+        resolve_batch_plan(global_examples=4, world_size=8, max_batch_size=256)

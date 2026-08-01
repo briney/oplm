@@ -186,6 +186,64 @@ class SlurmConfig:
         )
 
 
+@dataclass(frozen=True)
+class BatchPlan:
+    """Per-device batch and accumulation for one cell."""
+
+    per_device_batch: int
+    gradient_accumulation_steps: int
+    world_size: int
+
+
+def resolve_batch_plan(*, global_examples: int, world_size: int, max_batch_size: int) -> BatchPlan:
+    """Derive per-device batch and accumulation from the global batch and world size.
+
+    Picks the smallest accumulation that yields an integer per-device batch no larger than
+    ``max_batch_size``. Node counts are chosen for wall time, so per-device batch is derived
+    rather than configured; an infeasible combination is an error, never a silently adjusted
+    global batch.
+
+    Takes ``world_size`` rather than a node count so both callers land on an exact global batch:
+    Slurm passes ``nodes * gpus_per_node``, while ``--local`` passes its actual process count.
+
+    Args:
+        global_examples: Target global batch in examples per optimizer step.
+        world_size: Total training processes.
+        max_batch_size: Memory cap on per-device batch for this preset.
+
+    Returns:
+        The resolved plan.
+
+    Raises:
+        ValueError: If the global batch is not divisible by the world size, or no accumulation
+            brings the per-device batch within ``max_batch_size``.
+    """
+    if global_examples < 1 or world_size < 1 or max_batch_size < 1:
+        raise ValueError(
+            "global_examples, world_size, and max_batch_size must all be >= 1; got "
+            f"{global_examples=}, {world_size=}, {max_batch_size=}"
+        )
+    if global_examples % world_size != 0:
+        raise ValueError(
+            f"global batch {global_examples} is not divisible by world size {world_size}"
+        )
+    base = global_examples // world_size
+    for accum in range(1, base + 1):
+        if base % accum != 0:
+            continue
+        per_device = base // accum
+        if per_device <= max_batch_size:
+            return BatchPlan(
+                per_device_batch=per_device,
+                gradient_accumulation_steps=accum,
+                world_size=world_size,
+            )
+    raise ValueError(
+        f"no accumulation brings per-device batch within {max_batch_size} for "
+        f"global batch {global_examples} on world size {world_size}"
+    )
+
+
 def load_slurm_config(config_path: Path) -> SlurmConfig:
     """Read the ``slurm:`` block out of an oplm training config.
 
