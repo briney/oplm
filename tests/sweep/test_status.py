@@ -40,6 +40,7 @@ from oplm.cli import app
 from oplm.slurm.submit import running_job_ids as _real_running_job_ids
 from oplm.sweep import phases
 from oplm.sweep.common import load_phase, write_phase
+from tests.cli_output import plain
 from tests.slurm.test_submit import _install_stub
 from tests.sweep.conftest import _write_base_config, _write_selected
 
@@ -74,11 +75,12 @@ def test_status_reports_cell_states_and_resubmit_line(coarse_phase: Path) -> Non
 
     result = runner.invoke(app, ["sweep", "status", str(coarse_phase)])
     assert result.exit_code == 0, result.output
-    assert "complete" in result.stdout
-    assert "non-finite" in result.stdout
-    assert "missing" in result.stdout
+    output = plain(result.stdout)
+    assert "complete" in output
+    assert "non-finite" in output
+    assert "missing" in output
     # Indices 1..6 need rerunning: the non-finite one and the five with no result.
-    assert "--array=1,2,3,4,5,6" in result.stdout
+    assert "--array=1,2,3,4,5,6" in output
 
 
 def test_status_multi_preset_indices_match_jobs_files(transfer_phase: Path) -> None:
@@ -99,9 +101,10 @@ def test_status_multi_preset_indices_match_jobs_files(transfer_phase: Path) -> N
 
     result = runner.invoke(app, ["sweep", "status", str(transfer_phase)])
     assert result.exit_code == 0, result.output
-    assert "complete" in result.stdout
-    assert "non-finite" in result.stdout
-    assert "missing" in result.stdout
+    output = plain(result.stdout)
+    assert "complete" in output
+    assert "non-finite" in output
+    assert "missing" in output
 
     for preset, runs in runs_by_preset.items():
         jobs_file_ids = (phase_dir / "jobs" / f"{preset}.jobs").read_text().split()
@@ -110,8 +113,7 @@ def test_status_multi_preset_indices_match_jobs_files(transfer_phase: Path) -> N
         assert jobs_file_ids == [run.id for run in runs]
         expected_indices = ",".join(str(i) for i in range(1, len(runs)))
         assert (
-            f"resubmit {preset}: sbatch --array={expected_indices} jobs/{preset}.sbatch"
-            in result.stdout
+            f"resubmit {preset}: sbatch --array={expected_indices} jobs/{preset}.sbatch" in output
         )
 
 
@@ -146,11 +148,12 @@ def test_status_distinguishes_running_from_missing_per_preset(
 
     status_result = runner.invoke(app, ["sweep", "status", str(phase_path)])
     assert status_result.exit_code == 0, status_result.output
-    assert "running" in status_result.stdout
+    output = plain(status_result.stdout)
+    assert "running" in output
     # 400M's un-run cells are "running" and must not be offered for resubmission.
-    assert "resubmit 400M" not in status_result.stdout
-    assert "resubmit 800M: sbatch --array=0,1,2,3 jobs/800M.sbatch" in status_result.stdout
-    assert "resubmit 1B: sbatch --array=0,1,2,3 jobs/1B.sbatch" in status_result.stdout
+    assert "resubmit 400M" not in output
+    assert "resubmit 800M: sbatch --array=0,1,2,3 jobs/800M.sbatch" in output
+    assert "resubmit 1B: sbatch --array=0,1,2,3 jobs/1B.sbatch" in output
 
 
 def test_status_reports_unreachable_scheduler_explicitly(
@@ -176,12 +179,13 @@ def test_status_reports_unreachable_scheduler_explicitly(
     monkeypatch.setenv("PATH", "")  # squeue (and everything else) unreachable
     status_result = runner.invoke(app, ["sweep", "status", str(phase_path)])
     assert status_result.exit_code == 0, status_result.output
-    assert "cannot query the scheduler" in status_result.stdout
-    assert "unknown" in status_result.stdout
+    output = plain(status_result.stdout)
+    assert "cannot query the scheduler" in output
+    assert "unknown" in output
     # The critical assertion: never silently "missing" when the scheduler couldn't be asked.
-    assert "missing" not in status_result.stdout
+    assert "missing" not in output
     # The non-finite cell's state never depended on the scheduler; still flagged for resubmit.
-    assert "resubmit 170M: sbatch --array=1 jobs/170M.sbatch" in status_result.stdout
+    assert "resubmit 170M: sbatch --array=1 jobs/170M.sbatch" in output
 
 
 def test_status_missing_state_independent_of_scheduler_when_never_submitted(
@@ -216,15 +220,16 @@ def test_status_partial_submission_missing_not_unknown_for_unsubmitted_preset(
     monkeypatch.setenv("PATH", "")  # squeue unreachable
     result = runner.invoke(app, ["sweep", "status", str(transfer_phase)])
     assert result.exit_code == 0, result.output
+    output = plain(result.stdout)
 
     # 400M really was submitted: with the scheduler unreachable its cells are genuinely
     # ambiguous, so `unknown` (and no resubmit line for it) is correct.
-    assert "unknown" in result.stdout
-    assert "resubmit 400M" not in result.stdout
+    assert "unknown" in output
+    assert "resubmit 400M" not in output
     # 800M/1B were never submitted at all: unambiguously missing, and must still be offered for
     # resubmission -- this is the line the bug made disappear.
-    assert "resubmit 800M: sbatch --array=0,1,2,3 jobs/800M.sbatch" in result.stdout
-    assert "resubmit 1B: sbatch --array=0,1,2,3 jobs/1B.sbatch" in result.stdout
+    assert "resubmit 800M: sbatch --array=0,1,2,3 jobs/800M.sbatch" in output
+    assert "resubmit 1B: sbatch --array=0,1,2,3 jobs/1B.sbatch" in output
 
 
 def test_status_flags_running_preset_as_skipped_not_silently_omitted(

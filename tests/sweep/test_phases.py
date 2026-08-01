@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from oplm.config import load_config
 from oplm.sweep import phases
 from oplm.sweep.common import PhaseManifest, RunSpec, load_phase, write_phase
+from tests.cli_output import plain
 from tests.slurm.test_config import RAW as SLURM_RAW
 
 if TYPE_CHECKING:
@@ -499,7 +500,7 @@ def test_generation_requires_metric_for_ambiguous_eval_config(
         ["smoke", "--config", str(base_config), "--out", str(tmp_path / "smoke")],
     )
     assert result.exit_code != 0
-    assert "--metric is required" in result.output
+    assert "--metric is required" in plain(result.output)
 
 
 @pytest.mark.parametrize(
@@ -522,7 +523,7 @@ def test_generation_rejects_explicit_non_loss_metric(
         ],
     )
     assert result.exit_code != 0
-    assert "--metric must be eval/heldout/loss" in result.output
+    assert "--metric must be eval/heldout/loss" in plain(result.output)
 
 
 def test_generation_accepts_explicit_configured_loss_metric(
@@ -1013,7 +1014,7 @@ def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
         ],
     )
     assert replicate.exit_code != 0
-    assert "must include source seed 42" in replicate.output
+    assert "must include source seed 42" in plain(replicate.output)
 
     transfer = runner.invoke(
         phases.app,
@@ -1032,9 +1033,9 @@ def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
         ],
     )
     assert transfer.exit_code != 0
-    # Normalize Rich's error-panel wrapping (border chars + line breaks) before matching.
-    normalized = " ".join(transfer.output.replace("│", " ").split())
-    assert "same number of values" in normalized
+    # `plain()` normalizes both Rich's error-panel wrapping (border chars + line breaks) and
+    # any ANSI color codes before matching.
+    assert "same number of values" in plain(transfer.output)
 
     with pytest.raises(typer.BadParameter, match="must list at least one value"):
         phases._parse_ints(",", name="--seeds")

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from typer.testing import CliRunner
 
 from oplm.cli import app
+from tests.cli_output import plain
 from tests.slurm.test_submit import _install_stub
 
 if TYPE_CHECKING:
@@ -165,7 +166,7 @@ def test_submit_writes_job_ids_into_the_manifest(
 
     result = runner.invoke(app, ["slurm", "submit", str(out)])
     assert result.exit_code == 0, result.stdout
-    assert "JOB_0: 812345" in result.stdout
+    assert "JOB_0: 812345" in plain(result.stdout)
 
     manifest = json.loads((out / "jobs.json").read_text())
     assert manifest["job_ids"] == {"JOB_0": "812345"}
@@ -223,13 +224,14 @@ def test_status_reports_scheduler_unavailable_when_squeue_is_missing(
 
     result = runner.invoke(app, ["slurm", "status", str(out)])
     assert result.exit_code == 0, result.stdout
+    output = plain(result.stdout)
     # Cause-neutral wording: this branch also fires when squeue exists but its controller
     # wedged past the query timeout, so the message must not claim squeue is missing.
-    assert "scheduler unreachable" in result.stdout
-    assert "squeue not found" not in result.stdout
-    assert "JOB_0: 812345" in result.stdout
-    assert "active" not in result.stdout
-    assert "finished" not in result.stdout
+    assert "scheduler unreachable" in output
+    assert "squeue not found" not in output
+    assert "JOB_0: 812345" in output
+    assert "active" not in output
+    assert "finished" not in output
 
 
 def test_status_distinguishes_active_from_finished_jobs(
@@ -249,5 +251,6 @@ def test_status_distinguishes_active_from_finished_jobs(
 
     result = runner.invoke(app, ["slurm", "status", str(out)])
     assert result.exit_code == 0, result.stdout
-    assert "JOB_0 (812345): active" in result.stdout
-    assert "JOB_1 (812346): finished or unknown" in result.stdout
+    output = plain(result.stdout)
+    assert "JOB_0 (812345): active" in output
+    assert "JOB_1 (812346): finished or unknown" in output
