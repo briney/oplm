@@ -327,12 +327,23 @@ def test_no_phase_logic_hardcodes_a_learning_rate() -> None:
 
     Scoped to the two gate functions rather than the whole module: `_write_run_config`
     legitimately mentions 0.01 when validating `train.weight_decay`, which is unrelated.
+
+    Checked literals are derived from the current grid constants (COARSE_LRS, SMOKE_LRS) so
+    this test cannot drift from the grid, plus "0.01" -- the literal from the historical
+    defect this test was written to catch, kept even though it is no longer part of either
+    grid so that regression stays pinned.
+
+    Known limitation (not solved here): this scans source text, so it cannot catch a literal
+    that moved into a helper function, nor a defect shaped like `SMOKE_LRS[:2]`, which
+    contains no decimal literal at all. That behavior is pinned by
+    `test_smoke_gate_follows_a_custom_grid` instead.
     """
     import inspect
 
+    literals = {str(lr) for lr in (*phases.COARSE_LRS, *phases.SMOKE_LRS)} | {"0.01"}
     for func in (phases._smoke_gated_lrs, phases.analyze_phase):
         body = inspect.getsource(func)
-        for literal in ("0.0025", "0.01", "0.0016", "0.0004"):
+        for literal in sorted(literals):
             assert literal not in body, (
                 f"{func.__name__} still references the literal learning rate {literal}"
             )
@@ -362,6 +373,24 @@ def test_analyze_smoke_requires_two_lowest_finite(tmp_path: Path) -> None:
     source = _write_smoke_phase(tmp_path, results={0.002: 3.1, 0.008: None, 0.032: 3.5})
     with pytest.raises(ValueError, match="two lowest"):
         phases.analyze_phase(source)
+
+
+def test_analyze_smoke_accepts_diverged_highest_lr(tmp_path: Path) -> None:
+    """The highest smoke LR is an upper guard: it is expected to be allowed to diverge.
+
+    Divergence there is informative data, not a failure, so `analyze_phase` must return
+    the analyzed manifest rather than raise even though the top cell has no finite metric.
+    """
+    source = _write_smoke_phase(tmp_path, results={0.0004: 1.4, 0.0016: 1.1, 0.0063: None})
+
+    analyzed = phases.analyze_phase(source)
+
+    scores = {entry["params"]["lr"]: entry["score"] for entry in analyzed.ranking}
+    # All three cells are still represented in the ranking -- the diverged cell is kept
+    # (with a None score) rather than dropped, and the two finite lowest LRs are untouched.
+    assert scores == {0.0004: 1.4, 0.0016: 1.1, 0.0063: None}
+    # The best finite score, not the diverged cell, ranks first.
+    assert analyzed.ranking[0]["params"]["lr"] == 0.0016
 
 
 def test_generation_requires_metric_for_ambiguous_eval_config(
