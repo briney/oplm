@@ -19,8 +19,12 @@ train:
   weight_decay: 0.01
   mup_depth_reference_layers: 24
   scheduler: wsd_linear
+  # 5k warmup + 85k stable + 10k decay = 100k max_steps. Keep warmup_steps + stable_steps
+  # strictly less than max_steps -- a 10% decay tail is the repo convention for real training
+  # runs. (The sweep-phase convention of stable_steps = max_steps - warmup_steps is deliberate
+  # for short proxy runs, where it produces NO decay; that convention does not belong here.)
   max_steps: 100000
-  stable_steps: 95000
+  stable_steps: 85000
   warmup_steps: 5000
   save_every: 10000
   save_total_limit: 3
