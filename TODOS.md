@@ -700,7 +700,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, TypeVar
+
+# PEP 695 (`class PhaseTable[T]:`) is Python 3.12+; this project supports 3.11 and CI runs
+# 3.11/3.12/3.13, so use the TypeVar + Generic form.
+T = TypeVar("T")
 
 _DEFAULT_KEY = "default"
 # Stands in for "any preset" when a phase entry carries a bare value rather than a preset map,
@@ -709,7 +713,7 @@ _ANY_KEY = "*"
 
 
 @dataclass(frozen=True)
-class PhaseTable[T]:
+class PhaseTable(Generic[T]):
     """A setting that may be a scalar, per-preset, or per-phase-and-preset.
 
     Four accepted YAML forms::
