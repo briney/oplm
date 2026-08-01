@@ -14,8 +14,9 @@ coarse sweep actually identified.
 Two independent changes, delivered together because both touch the same generator:
 
 1. **Execution.** Replace the sequential local runner with per-phase Slurm job arrays plus a
-   dependent analyze job. Move the sweep tooling into the installable package so a job script
-   needs nothing but `pip install oplm[train]`.
+   dependent analyze job. Move the tooling into the installable package so a job script needs
+   nothing but `pip install oplm[train]`, and split job generation into a general `oplm.slurm`
+   layer usable by any training run, not only by the sweep.
 2. **Search range.** Shift the coarse LR grid down one half-decade and derive the phase gates
    from the grid actually used rather than from hardcoded constants.
 
@@ -56,6 +57,9 @@ chosen below should be revisited if the baseline is wrong.
 
 ## Design principles
 
+- **General tooling does not depend on sweep tooling.** `oplm.slurm` turns a training config into
+  job scripts and knows nothing about μP, phases, or ranking. `oplm.sweep` imports it, never the
+  reverse.
 - **One artifact contract for local and Slurm.** Phase directories keep their existing layout and
   meaning. Slurm adds a `jobs/` subtree; it does not change `phase.json`, ranking, or selection.
 - **Generation and submission are separate steps.** Every phase generates reviewable scripts.
@@ -75,28 +79,45 @@ chosen below should be revisited if the baseline is wrong.
 - Retry policy beyond Slurm `--requeue` plus checkpoint resume.
 - Cross-cluster portability. The `slurm:` block is validated but its defaults target CoreWeave.
 
-## Change 1 — Package the sweep tooling
+## Change 1 — Package and layer the tooling
 
 `scripts/` is not shipped: `pyproject.toml` has no `[tool.hatch.build]` section, so hatchling
 packages only `src/oplm`. Every generated sweep command invokes `-m scripts.mup_run`, which does
 not exist after `pip install oplm[train]` inside the container.
 
-Move the tooling into the wheel:
+Move the tooling into the wheel, and split it into a **general** Slurm layer and a
+**sweep-specific** layer:
 
 ```
-src/oplm/sweep/
+src/oplm/slurm/             # NEW: any training config -> Slurm job scripts
 ├── __init__.py
-├── common.py       # was scripts/_mup_common.py
-├── phases.py       # was scripts/mup_sweep.py  (generators + analyze)
-├── coord_check.py  # was scripts/mup_coord_check.py
-├── run.py          # was scripts/mup_run.py    (+ auto-resume)
-├── slurm.py        # NEW: config model, sbatch rendering, submission, status
-└── cli.py          # NEW: `oplm sweep ...` typer sub-app
+├── config.py               # `slurm:` block model (scalar or per-preset/per-phase)
+├── render.py               # sbatch/srun templates, arrays, dependency wiring
+├── submit.py               # sbatch --parsable, status, resubmit
+└── cli.py                  # `oplm slurm ...` typer sub-app
+
+src/oplm/sweep/             # sweep-specific; imports oplm.slurm
+├── __init__.py
+├── common.py               # was scripts/_mup_common.py
+├── phases.py               # was scripts/mup_sweep.py  (generators + analyze)
+├── coord_check.py          # was scripts/mup_coord_check.py
+├── run.py                  # was scripts/mup_run.py    (+ auto-resume)
+└── cli.py                  # `oplm sweep ...` typer sub-app
 ```
 
-`cli.py` is wired into `src/oplm/cli.py` with `add_typer`, exposing `oplm sweep smoke|coarse|
-refine|replicate|transfer|bridge|confirm|scale|analyze|status|coord-check`. Cells are launched as
-`-m oplm.sweep.run`.
+Both `cli.py` modules are wired into `src/oplm/cli.py` with `add_typer`:
+
+- `oplm slurm generate|submit|status` — turn any oplm training config plus a `slurm:` block into
+  job scripts, submit them, and report state. Knows nothing about μP.
+- `oplm sweep smoke|coarse|refine|replicate|transfer|bridge|confirm|scale|analyze|status|
+  coord-check` — the phase funnel, delegating all rendering and submission to `oplm.slurm`.
+
+Cells are launched as `-m oplm.sweep.run`.
+
+The split exists because this repository is meant to make every training step reproducible from
+the outside. Someone recreating the 400M scaling run should reach a training config and a job
+generator without passing through μP sweep concepts, and the job generator should be usable for
+work that has nothing to do with a learning-rate sweep.
 
 `scripts/` is deleted. `tests/scripts/test_mup_sweep.py` moves to `tests/sweep/test_phases.py`,
 mirroring the new source layout.
@@ -106,8 +127,9 @@ single 8×B200 workstation runs.
 
 ## Change 2 — Slurm configuration
 
-Cluster settings live in a `slurm:` block in the existing sweep config
-(`configs/mup-production.yaml`), so one file describes the whole sweep.
+Cluster settings live in a `slurm:` block in **any** oplm training config — the sweep config
+(`configs/mup-production.yaml`) for sweep phases, a scaling config (`configs/scaling.yaml`) for
+production runs. `oplm.slurm.config` owns the schema; nothing about it is sweep-specific.
 
 This requires no loader changes. `load_config` calls `OmegaConf.set_struct(base, False)`, so the
 unknown top-level key merges and is reachable as `cfg.slurm`; `serialize_config` omits it, so each
@@ -118,8 +140,8 @@ before adopting this layout.
 slurm:
   partition: hpc-mid
   time_limit:
-    default: "24:00:00"
-    confirm: "48:00:00"
+    default: "168:00:00"   # 1 week, the partition maximum
+    analyze: "01:00:00"
   cpus_per_task: 128
   gpus_per_node: 8
   exclusive: true
@@ -137,11 +159,16 @@ slurm:
     default: {170M: 1, 400M: 4, 800M: 8, 1B: 8}
     bridge:  {170M: 4}
     confirm: {800M: 8}
-    scale:   {170M: 4, 400M: 8, 800M: 16, 1B: 16}
   max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
 ```
 
-The block is parsed into a validated dataclass in `slurm.py`, not consumed as a raw dict.
+`configs/scaling.yaml` carries its own `slurm:` block with its own node counts
+(`{170M: 4, 400M: 8, 800M: 16, 1B: 16}`), since the scaling runs are not sweep phases.
+
+The block is parsed into a validated dataclass in `oplm/slurm/config.py`, not consumed as a raw
+dict. `nodes` and `time_limit` each accept three forms: a scalar (one value for every job), a
+per-preset mapping, or a `default` plus per-phase mapping. Standalone training configs normally
+use the scalar form; only the sweep needs per-phase overrides.
 
 ### Node counts are explicit; batch is derived
 
@@ -168,12 +195,30 @@ Under the defaults above every cell resolves to `accum = 1`:
 | 8192 | 170M | 4 | 256 | 1 | ~12 h (`bridge`) |
 | 8192 | 800M | 8 | 128 | 1 | ~28 h (`confirm`) |
 
-Note that `confirm` at ~28 h exceeds the 24 h default `time_limit`. `time_limit` therefore takes
-the same `default` + per-phase override shape as `nodes`, and `confirm` is raised to 48 h rather
-than being left to depend on requeue for its primary path.
-
 This replaces the current behavior, where `_write_run_config` reads `base.train.batch_size` and
 computes accumulation from it. The generator now pins `train.batch_size` per cell.
+
+### Full gradient checkpointing
+
+Every cell pins `model.gradient_checkpointing=true`. The config default is `False`
+(`configuration_oplm.py:104`); `gradient_checkpointing_mode` already defaults to `"full"`
+(`configuration_oplm.py:105`), so only the enable flag needs setting, but both are pinned
+explicitly so a change to the packaged defaults cannot silently alter the memory profile
+mid-sweep.
+
+Full checkpointing is what makes the per-device batches above fit at 400M and larger. It also
+recomputes all activations, costing roughly 30–40% more compute than selective mode. The wall-time
+estimates in this spec derive from a single 170M measurement whose checkpointing setting is not
+recorded, so they should be treated as order-of-magnitude guidance only.
+
+### Time limits are deliberately generous
+
+`time_limit` takes the same `default` + per-phase override shape as `nodes`, and the default is
+the partition maximum of one week for every GPU cell (`analyze` gets one hour). Given that the
+underlying wall-time estimates are uncertain to at least a factor of two, requesting a tight limit
+risks truncating a multi-day cell near completion — a far worse outcome than the only cost of a
+generous request, which is reduced backfill priority on a shared partition. Operators can lower
+specific phases if queueing becomes a problem.
 
 ## Change 3 — Per-phase artifacts and execution
 
@@ -319,21 +364,36 @@ This resolves a live contradiction: the production job scripts configure six eva
 (`mup_sweep.py:161`) errors unless there is exactly one or `--metric` is passed. Structure and DMS
 eval cost also does not inform ranking, so paying it on ~50 cells is waste.
 
-## Change 6 — `scale` becomes generate-only
+## Change 6 — `scale` becomes a thin caller over `oplm.slurm`
 
-`scale` no longer runs or submits anything. It reads the confirmed winner from
-`sweeps/confirm/phase.json` and writes one multi-node `.sbatch` per preset, which the operator
-reviews and submits on their own schedule.
+`scale` no longer runs or submits anything, and it no longer owns any job-rendering code.
 
-Production-specific settings come from a `scale:` sub-block in the same sweep config — the full
-eval suite, WSD schedule (`stable_steps`, `max_steps`), `wandb_project`, and output-directory
-root. Keeping it in the one file preserves the property that the sweep is described by a single
-artifact, and the alternative (pointing at a separate production config) adds a file whose drift
-from the sweep config would be silent.
+Production settings live in their own ordinary training config, `configs/scaling.yaml` — the full
+eval suite, WSD schedule (`stable_steps`, `max_steps`), `wandb_project`, output-directory root,
+and its own `slurm:` block. It is a normal oplm config with no μP sweep concepts in it, readable
+and runnable on its own:
 
-The value retained by keeping `scale` in the tool at all is provenance: the winning `lr`,
-`output_mult`, `depth_exponent`, and `batch_mult` flow into five job scripts without
-hand-transcription, at the point in the workflow where a transcription error is most expensive.
+```bash
+oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
+```
+
+`oplm sweep scale` then does one thing: read the confirmed winner from `sweeps/confirm/phase.json`,
+merge `lr`, `output_mult`, `depth_exponent`, and `batch_mult` into that config, and delegate
+rendering to `oplm.slurm` for each preset.
+
+```bash
+oplm sweep scale --from sweeps/confirm/phase.json --config configs/scaling.yaml \
+  --presets 170M,400M,800M,1B --out sweeps/scale
+```
+
+This keeps the provenance that justified retaining `scale` at all — four hyperparameters reach
+five job scripts without hand-transcription, at the point where a transcription error is most
+expensive — while leaving the scaling runs reproducible by someone who never touches the sweep.
+
+Rejected alternative: a `scale:` sub-block inside the sweep config. It keeps the sweep describable
+by one file, but it hides general-purpose job generation inside μP-specific tooling and reads as
+sweep machinery to a newcomer, which is the wrong trade for a repository whose purpose is to make
+every training step reproducible from the outside.
 
 ## Testing strategy
 
@@ -363,28 +423,44 @@ would reintroduce.
 **Integration.** The existing `--local` end-to-end pilot run is retained: a small model trains for
 a few steps and completes one eval through the real phase machinery.
 
+**Layering.** `tests/slurm/` covers rendering, derivation, and submission against plain training
+configs with no μP involvement, proving the general layer stands alone. `tests/sweep/` covers
+phase generation, ranking, selection, and gates. A test asserts `oplm.slurm` does not import
+`oplm.sweep`, so the dependency cannot silently invert.
+
 **Migration.** Existing phase-generation, ranking, and selection tests move to `tests/sweep/` and
 must pass unchanged apart from import paths and the new grid values.
 
 ## Documentation changes
 
+- `docs/SLURM.md` (new): the general layer — the `slurm:` block schema, single- and multi-node
+  rendering, arrays and dependencies, `generate`/`submit`/`status`, requeue and resume. Written for
+  someone running an ordinary oplm training job on a Slurm cluster, with no μP content.
 - `docs/LR_SWEEP.md`: replace the local eight-GPU sequence and the short "SUNK/Slurm use" section
-  with the Slurm workflow; document the `slurm:` block, the node/batch table, the per-phase
-  submit-versus-review convention, `status`, and the new grid. Correct the "exactly one eval task"
-  instruction to the lean-proxy/full-scale split.
+  with the Slurm workflow, referencing `SLURM.md` rather than restating it; document the node/batch
+  table, the per-phase submit-versus-review convention, and the new grid. Correct the "exactly one
+  eval task" instruction to the lean-proxy/full-scale split.
+- `docs/TRAIN.md`: link `SLURM.md` from the distributed-launch section.
 - `docs/MUP.md`: update the pointer at line 221 to the new command surface.
-- `AGENTS.md`: note that sweep tooling lives in `src/oplm/sweep/`, not `scripts/`.
+- `AGENTS.md`: note that job generation lives in `src/oplm/slurm/` and sweep tooling in
+  `src/oplm/sweep/`, and that `scripts/` is gone.
+- `configs/scaling.yaml`: add as a committed, runnable example of a production scaling config with
+  its own `slurm:` block.
 
 ## Acceptance criteria
 
-1. `pip install oplm[train]` provides `oplm sweep` and `python -m oplm.sweep.run`; no generated
-   command references `scripts.`.
-2. Every phase except `scale` generates `jobs/` with per-preset arrays, an analyze job wired with
+1. `pip install oplm[train]` provides `oplm slurm`, `oplm sweep`, and `python -m oplm.sweep.run`;
+   no generated command references `scripts.`.
+2. `oplm slurm generate --config configs/scaling.yaml --preset 400M` produces a working multi-node
+   job script with no sweep artifacts involved, and `oplm.slurm` does not import `oplm.sweep`.
+3. Every phase except `scale` generates `jobs/` with per-preset arrays, an analyze job wired with
    `--dependency=afterany`, and a `submit.sh`; `transfer` emits three arrays and one analyze job.
-3. Derived per-device batch and accumulation match the table above and are recorded in
+4. Derived per-device batch and accumulation match the table above and are recorded in
    `phase.json`; an indivisible configuration raises at generation time.
-4. A requeued cell resumes from its newest checkpoint rather than from step 0.
-5. `COARSE_LRS` and `SMOKE_LRS` are the new values, and no phase logic references a literal
+5. Every cell pins `model.gradient_checkpointing=true` and `gradient_checkpointing_mode=full`.
+6. A requeued cell resumes from its newest checkpoint rather than from step 0.
+7. `COARSE_LRS` and `SMOKE_LRS` are the new values, and no phase logic references a literal
    learning rate.
-6. `oplm sweep scale` writes per-preset scripts carrying the confirmed winner and submits nothing.
-7. CI gates pass on `src/`: `ruff check`, `ruff format --check`, `ty check`, `pytest`.
+8. `oplm sweep scale` merges the confirmed winner into `configs/scaling.yaml`, writes per-preset
+   scripts through `oplm.slurm`, and submits nothing.
+9. CI gates pass on `src/`: `ruff check`, `ruff format --check`, `ty check`, `pytest`.
