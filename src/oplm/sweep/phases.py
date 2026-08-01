@@ -6,12 +6,13 @@ import math
 import shlex
 import subprocess
 from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime.
-from typing import Annotated
+from typing import Annotated, Any, cast
 
 import typer
 
 from oplm.config import get_preset_config, load_config, serialize_config
 from oplm.sweep.common import (
+    JsonScalar,
     Params,
     PhaseManifest,
     RunSpec,
@@ -30,6 +31,26 @@ app = typer.Typer(name="mup-sweep", help=__doc__, add_completion=False)
 SMOKE_LRS = (0.0025, 0.01, 0.04)
 COARSE_LRS = (0.0025, 0.004, 0.0063, 0.01, 0.016, 0.025, 0.04)
 OUTPUT_MULTS = (0.5, 1.0, 2.0)
+
+
+def _as_float(value: JsonScalar) -> float:
+    """Coerce a JSON-sourced scalar that is known by construction to be numeric.
+
+    ``Params`` values are typed as ``JsonScalar`` (``str | int | float | bool | None``)
+    because they cross a JSON boundary, but the sweep phase helpers only ever populate
+    the numeric fields (``lr``, ``output_mult``, etc.) with real numbers. This narrows
+    that honest-but-wide type at the point of use; it performs the same conversion
+    ``float()`` always did and raises the same error if the assumption is ever wrong.
+    """
+    return float(cast("str | int | float", value))
+
+
+def _as_int(value: JsonScalar) -> int:
+    """Coerce a JSON-sourced scalar that is known by construction to be numeric.
+
+    See :func:`_as_float` for why the cast is needed.
+    """
+    return int(cast("str | int | float", value))
 
 
 def _parse_ints(raw: str, *, name: str) -> list[int]:
@@ -84,8 +105,8 @@ def _write_run_config(
     num_processes: int,
     diagnostics: bool = False,
 ) -> Path:
-    max_steps = int(params["max_steps"])
-    warmup_steps = int(params["warmup_steps"])
+    max_steps = _as_int(params["max_steps"])
+    warmup_steps = _as_int(params["warmup_steps"])
     if warmup_steps < 0 or warmup_steps >= max_steps:
         raise ValueError(
             "warmup_steps must satisfy 0 <= warmup_steps < max_steps, "
@@ -107,7 +128,7 @@ def _write_run_config(
             f"μP sweep requires train.weight_decay=0.01, got {base.train.weight_decay}"
         )
     grad_accum = gradient_accumulation_steps(
-        int(params["global_examples"]),
+        _as_int(params["global_examples"]),
         per_device_batch=base.train.batch_size,
         world_size=num_processes,
     )
@@ -175,9 +196,9 @@ def _input_candidates(source: Path, raw: str | None, names: tuple[str, ...]) -> 
 
 def _run_id(params: Params) -> str:
     return (
-        f"{params['preset']}-lr{float(params['lr']):g}"
-        f"-om{float(params['output_mult']):g}"
-        f"-a{float(params['depth_exponent']):g}-s{int(params['seed'])}"
+        f"{params['preset']}-lr{_as_float(params['lr']):g}"
+        f"-om{_as_float(params['output_mult']):g}"
+        f"-a{_as_float(params['depth_exponent']):g}-s{_as_int(params['seed'])}"
     )
 
 
@@ -275,7 +296,7 @@ def _refine_cells(
     return [
         _cell(
             preset="170M",
-            lr=float(candidate["lr"]),
+            lr=_as_float(candidate["lr"]),
             output_mult=output_mult,
             depth_exponent=0.0,
             seed=seed,
@@ -324,8 +345,8 @@ def _transfer_cells(
     return [
         _cell(
             preset=preset,
-            lr=float(candidate["lr"]),
-            output_mult=float(candidate["output_mult"]),
+            lr=_as_float(candidate["lr"]),
+            output_mult=_as_float(candidate["output_mult"]),
             depth_exponent=exponent,
             seed=seed,
             global_examples=global_examples,
@@ -351,9 +372,9 @@ def _bridge_cells(
     return [
         _cell(
             preset="170M",
-            lr=float(candidate["lr"]) * multiplier,
-            output_mult=float(candidate["output_mult"]),
-            depth_exponent=float(candidate["depth_exponent"]),
+            lr=_as_float(candidate["lr"]) * multiplier,
+            output_mult=_as_float(candidate["output_mult"]),
+            depth_exponent=_as_float(candidate["depth_exponent"]),
             seed=seed,
             global_examples=global_examples,
             max_steps=steps,
@@ -375,14 +396,14 @@ def _confirm_cells(
     return [
         _cell(
             preset="800M",
-            lr=float(candidate["lr"]),
-            output_mult=float(candidate["output_mult"]),
-            depth_exponent=float(candidate["depth_exponent"]),
+            lr=_as_float(candidate["lr"]),
+            output_mult=_as_float(candidate["output_mult"]),
+            depth_exponent=_as_float(candidate["depth_exponent"]),
             seed=seed,
             global_examples=global_examples,
             max_steps=steps,
             warmup_steps=warmup,
-            batch_mult=float(candidate["batch_mult"]),
+            batch_mult=_as_float(candidate["batch_mult"]),
         )
         for candidate in candidates
     ]
@@ -401,14 +422,14 @@ def _scale_cells(
     return [
         _cell(
             preset=preset,
-            lr=float(candidate["lr"]),
-            output_mult=float(candidate["output_mult"]),
-            depth_exponent=float(candidate["depth_exponent"]),
+            lr=_as_float(candidate["lr"]),
+            output_mult=_as_float(candidate["output_mult"]),
+            depth_exponent=_as_float(candidate["depth_exponent"]),
             seed=seed,
             global_examples=global_examples,
             max_steps=steps,
             warmup_steps=warmup,
-            batch_mult=float(candidate["batch_mult"]),
+            batch_mult=_as_float(candidate["batch_mult"]),
         )
         for preset in presets
     ]
@@ -416,7 +437,7 @@ def _scale_cells(
 
 def _smoke_gated_lrs(source: Path, lrs: list[float]) -> list[float]:
     phase = load_phase(source)
-    runs_by_lr = {float(run.params["lr"]): run for run in phase.runs}
+    runs_by_lr = {_as_float(run.params["lr"]): run for run in phase.runs}
     phase_dir = source.resolve().parent
     for lr in SMOKE_LRS[:2]:
         run = runs_by_lr.get(lr)
@@ -432,8 +453,8 @@ def _candidate(params: Params, keys: tuple[str, ...]) -> Params:
     return {key: params[key] for key in keys if key in params}
 
 
-def _direct_ranking(phase_dir: Path, phase: PhaseManifest) -> list[dict[str, object]]:
-    entries = [
+def _direct_ranking(phase_dir: Path, phase: PhaseManifest) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = [
         {
             "id": run.id,
             "params": run.params,
@@ -461,9 +482,9 @@ def _source_phase(phase_path: Path, phase: PhaseManifest) -> tuple[Path, PhaseMa
 def _aggregate_key(params: Params) -> tuple[float, float, float, float | None]:
     batch_mult = params.get("batch_mult")
     return (
-        float(params["lr"]),
-        float(params["output_mult"]),
-        float(params.get("depth_exponent", 0.0)),
+        _as_float(params["lr"]),
+        _as_float(params["output_mult"]),
+        _as_float(params.get("depth_exponent", 0.0)),
         float(batch_mult) if batch_mult is not None else None,
     )
 
@@ -480,8 +501,8 @@ def _aggregate_params(key: tuple[float, float, float, float | None]) -> Params:
     return params
 
 
-def _sort_aggregate(entries: list[dict[str, object]]) -> list[dict[str, object]]:
-    def key(entry: dict[str, object]) -> tuple[bool, float, float, float, float, float]:
+def _sort_aggregate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def key(entry: dict[str, Any]) -> tuple[bool, float, float, float, float, float]:
         params = entry["params"]
         batch_mult = params.get("batch_mult")
         return (
@@ -496,29 +517,29 @@ def _sort_aggregate(entries: list[dict[str, object]]) -> list[dict[str, object]]
     return sorted(entries, key=key)
 
 
-def _select_count(ranking: list[dict[str, object]], count: int) -> list[Params]:
+def _select_count(ranking: list[dict[str, Any]], count: int) -> list[Params]:
     eligible = [entry for entry in ranking if entry["score"] is not None]
     if len(eligible) < count:
         return []
     return [dict(entry["params"]) for entry in eligible[:count]]
 
 
-def _replicate_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, object]]:
+def _replicate_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, Any]]:
     source_path, source = _source_phase(phase_path, phase)
     locations = [
         *((source_path.parent, run) for run in source.runs),
         *((phase_path.parent, run) for run in phase.runs),
     ]
     keys = {_aggregate_key(run.params) for run in phase.runs}
-    entries: list[dict[str, object]] = []
+    entries: list[dict[str, Any]] = []
     for key in keys:
         matching = [
             (phase_dir, run) for phase_dir, run in locations if _aggregate_key(run.params) == key
         ]
-        seeds = {int(run.params["seed"]) for _, run in matching}
+        seeds = {_as_int(run.params["seed"]) for _, run in matching}
         values = [result_metric(phase_dir, run, phase.metric) for phase_dir, run in matching]
         score = (
-            sum(float(value) for value in values) / len(values)
+            sum(_as_float(value) for value in values) / len(values)
             if 42 in seeds
             and len(seeds) == len(matching)
             and len(seeds) >= 2
@@ -529,7 +550,7 @@ def _replicate_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str,
     return _sort_aggregate(entries)
 
 
-def _transfer_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, object]]:
+def _transfer_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, Any]]:
     keys = {_aggregate_key(run.params) for run in phase.runs}
     presets = {str(run.params["preset"]) for run in phase.runs}
     per_model_rank: dict[tuple[str, tuple[float, float, float, float | None]], int] = {}
@@ -544,11 +565,13 @@ def _transfer_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, 
         for rank, (_, run) in enumerate(valid, start=1):
             per_model_rank[(preset, _aggregate_key(run.params))] = rank
 
-    entries: list[dict[str, object]] = []
+    entries: list[dict[str, Any]] = []
     for key in keys:
         ranks = [per_model_rank.get((preset, key)) for preset in presets]
         score = (
-            sum(int(rank) for rank in ranks) if all(rank is not None for rank in ranks) else None
+            sum(_as_int(rank) for rank in ranks)
+            if all(rank is not None for rank in ranks)
+            else None
         )
         params = _aggregate_params(key)
         params.pop("batch_mult", None)

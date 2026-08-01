@@ -17,6 +17,7 @@ import math
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 import typer
 
@@ -58,7 +59,7 @@ class PhaseManifest:
     metric: str
     source: str | None
     runs: list[RunSpec]
-    ranking: list[dict[str, object]]
+    ranking: list[dict[str, Any]]
     selected: list[Params]
 
 
