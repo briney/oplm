@@ -65,6 +65,18 @@ def test_exact_preset_beats_wildcard() -> None:
     assert table.resolve(phase="coarse", preset="170M") == 1
 
 
+def test_phase_wildcard_beats_default_exact_preset() -> None:
+    """A phase's own wildcard must win over `default`'s exact-preset entry.
+
+    This pins the priority ordering: `resolve` must exhaust the phase's own table (exact, then
+    wildcard) before ever consulting `default`. A regression that instead checked exact-preset
+    matches across both tables before falling back to wildcards would return `default`'s `1`
+    here instead of `coarse`'s wildcard `8`.
+    """
+    table = PhaseTable.from_value({"default": {"170M": 1}, "coarse": 8}, name="nodes")
+    assert table.resolve(phase="coarse", preset="170M") == 8
+
+
 def test_missing_required_field_raises() -> None:
     raw = {key: value for key, value in RAW.items() if key != "partition"}
     with pytest.raises(ValueError, match="partition"):
@@ -81,4 +93,18 @@ def test_non_positive_ints_rejected(field: str) -> None:
 def test_non_positive_max_batch_size_rejected() -> None:
     raw = {**RAW, "max_batch_size": {"170M": 0}}
     with pytest.raises(ValueError, match="max_batch_size"):
+        SlurmConfig.from_mapping(raw)
+
+
+def test_bool_max_batch_size_rejected() -> None:
+    """`bool` is an `int` subclass; a bare `int(value)` coercion would silently accept it."""
+    raw = {**RAW, "max_batch_size": {"170M": True}}
+    with pytest.raises(ValueError, match=r"max_batch_size\['170M'\].*True"):
+        SlurmConfig.from_mapping(raw)
+
+
+def test_non_numeric_max_batch_size_rejected() -> None:
+    """A non-numeric value must raise this module's actionable message, not a raw int() error."""
+    raw = {**RAW, "max_batch_size": {"170M": "oops"}}
+    with pytest.raises(ValueError, match=r"max_batch_size\['170M'\].*oops"):
         SlurmConfig.from_mapping(raw)

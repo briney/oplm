@@ -90,13 +90,43 @@ def _require(raw: Mapping[str, Any], key: str) -> Any:
     return raw[key]
 
 
+def _reject_bool(value: Any, description: str) -> None:
+    """Raise if ``value`` is a ``bool``.
+
+    ``bool`` is an ``int`` subclass, so a bare type/range check silently accepts it (and YAML
+    coerces bare ``true``/``false``/``yes``/``no``/``on``/``off`` to booleans), which would
+    otherwise coerce to 0 or 1 without ever tripping a "not an int" guard.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{description} must be a positive int, got {value!r}")
+
+
 def _positive_int(raw: Mapping[str, Any], key: str, default: int | None = None) -> int:
     value = raw.get(key, default)
     if value is None:
         raise ValueError(f"slurm config is missing required field {key!r}")
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    _reject_bool(value, f"slurm config {key}")
+    if not isinstance(value, int) or value < 1:
         raise ValueError(f"slurm config {key} must be a positive int, got {value!r}")
     return value
+
+
+def _coerce_positive_int(value: Any, description: str) -> int:
+    """Coerce ``value`` to a positive int for fields that accept int-like YAML scalars.
+
+    Unlike ``_positive_int`` (which requires a literal ``int``), this also accepts values
+    coercible via ``int()`` (e.g. numeric strings), but still rejects ``bool`` outright and
+    turns a non-numeric value into an actionable message instead of a raw ``ValueError`` from
+    ``int()``.
+    """
+    _reject_bool(value, description)
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{description} must be a positive int, got {value!r}") from exc
+    if coerced < 1:
+        raise ValueError(f"{description} must be a positive int, got {value!r}")
+    return coerced
 
 
 @dataclass(frozen=True)
@@ -126,12 +156,17 @@ class SlurmConfig:
         Raises:
             ValueError: On a missing required field or an out-of-range value.
         """
-        max_batch = {
-            str(preset): int(value) for preset, value in dict(raw.get("max_batch_size", {})).items()
-        }
-        bad = sorted(preset for preset, value in max_batch.items() if value < 1)
+        max_batch: dict[str, int] = {}
+        bad: list[str] = []
+        for preset, value in dict(raw.get("max_batch_size", {})).items():
+            try:
+                max_batch[str(preset)] = _coerce_positive_int(
+                    value, f"slurm config max_batch_size[{preset!r}]"
+                )
+            except ValueError as exc:
+                bad.append(str(exc))
         if bad:
-            raise ValueError(f"slurm config max_batch_size must be >= 1; bad presets: {bad}")
+            raise ValueError("; ".join(bad))
         return cls(
             partition=str(_require(raw, "partition")),
             time_limit=PhaseTable.from_value(_require(raw, "time_limit"), name="time_limit"),
@@ -164,4 +199,5 @@ def load_slurm_config(config_path: Path) -> SlurmConfig:
     if block is None:
         raise ValueError(f"{config_path} has no `slurm:` block")
     container = OmegaConf.to_container(block, resolve=True)
+    # OmegaConf.to_container's declared return type doesn't match any dict.__init__ overload.
     return SlurmConfig.from_mapping(dict(container))  # ty: ignore[no-matching-overload]
