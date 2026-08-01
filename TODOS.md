@@ -1015,7 +1015,7 @@ def resolve_batch_plan(
             )
     raise ValueError(
         f"no accumulation brings per-device batch within {max_batch_size} for "
-        f"global batch {global_examples} on {nodes} nodes"
+        f"global batch {global_examples} at world size {world_size}"
     )
 ```
 
