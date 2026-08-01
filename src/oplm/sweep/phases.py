@@ -217,6 +217,47 @@ def _run_id(params: Params) -> str:
     )
 
 
+def _defined_presets(tables: dict[str, dict[str, Any]]) -> list[str]:
+    """Every preset named anywhere across a `PhaseTable`'s per-phase tables, `*` excluded."""
+    return sorted({preset for table in tables.values() for preset in table if preset != "*"})
+
+
+def _resolve_nodes(slurm: SlurmConfig, *, phase: str, preset: str) -> int:
+    """Resolve the node count for a phase/preset pair, with an actionable error if missing.
+
+    `PhaseTable.resolve` raises a bare `KeyError` when no table entry covers `preset`, and every
+    phase command in this module catches only `ValueError` to convert it into a clean
+    `typer.BadParameter`. Re-raising as `ValueError` here routes a missing preset -- e.g. the
+    packaged `scale` default `50M`, which `configs/scaling.yaml` does not define -- through that
+    same clean error path instead of an uncaught traceback.
+    """
+    try:
+        return slurm.nodes.resolve(phase=phase, preset=preset)
+    except KeyError as exc:
+        defined = _defined_presets(slurm.nodes.tables)
+        raise ValueError(
+            f"preset {preset!r} has no entry in the slurm `nodes` table for phase {phase!r}; "
+            f"defined presets: {', '.join(defined) if defined else '(none)'}"
+        ) from exc
+
+
+def _resolve_max_batch_size(slurm: SlurmConfig, preset: str) -> int:
+    """Resolve the max_batch_size cap for `preset`, with an actionable error if missing.
+
+    Mirrors `_resolve_nodes`: a plain `slurm.max_batch_size[preset]` raises a bare `KeyError`
+    with no context, which would surface as an uncaught traceback instead of the clean
+    `typer.BadParameter` every other validation failure produces.
+    """
+    try:
+        return slurm.max_batch_size[preset]
+    except KeyError as exc:
+        defined = sorted(slurm.max_batch_size)
+        raise ValueError(
+            f"preset {preset!r} has no entry in the slurm `max_batch_size` table; "
+            f"defined presets: {', '.join(defined) if defined else '(none)'}"
+        ) from exc
+
+
 def _generate_phase(
     *,
     name: str,
@@ -242,7 +283,7 @@ def _generate_phase(
         run_id = _run_id(params)
         run_dir = out / "runs" / run_id
         preset = str(params["preset"])
-        nodes = slurm.nodes.resolve(phase=name, preset=preset)
+        nodes = _resolve_nodes(slurm, phase=name, preset=preset)
         # --local runs on this machine's processes, not the phase's node allocation. Deriving
         # the plan from the node table there would silently shrink the global batch (a 400M
         # cell is planned for 4 nodes; on 8 local processes that is 512, not 2048) and break
@@ -251,7 +292,7 @@ def _generate_phase(
         plan = resolve_batch_plan(
             global_examples=_as_int(params["global_examples"]),
             world_size=world_size,
-            max_batch_size=slurm.max_batch_size[preset],
+            max_batch_size=_resolve_max_batch_size(slurm, preset),
         )
         config = _write_run_config(base_config, run_dir, params, plan=plan, diagnostics=diagnostics)
         result = run_dir / "result.json"
@@ -272,7 +313,10 @@ def _generate_phase(
             accelerate_argv(
                 config=config,
                 result=result,
-                num_processes=num_processes,
+                # `plan.world_size` is the cell's true world size: equal to `num_processes` under
+                # --local, but `nodes * gpus_per_node` otherwise -- so commands.txt always agrees
+                # with run.yaml's batch_size/gradient_accumulation_steps on the same global batch.
+                num_processes=plan.world_size,
                 accelerate_config=accelerate_config,
             )
         )

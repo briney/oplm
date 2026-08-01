@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 import typer
-import yaml
+from omegaconf import OmegaConf
 from typer.testing import CliRunner
 
 from oplm.config import load_config
@@ -16,7 +16,9 @@ from oplm.sweep.common import PhaseManifest, RunSpec, load_phase, write_phase
 from tests.slurm.test_config import RAW as SLURM_RAW
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
+    from typing import Any
 
 runner = CliRunner()
 
@@ -32,14 +34,21 @@ _SLURM_RAW = {
 }
 
 
-def _base_config_text() -> str:
+def _base_config_text(slurm_raw: Mapping[str, Any] | None = None) -> str:
     """Model/train/data/slurm YAML shared by the `base_config` fixture and `_generate_one_cell`.
 
     Carries the μP requirements every generated cell validates (`optimizer: muon`,
     `muon_adjust_lr_fn: original`, `weight_decay: 0.01`) and exactly one eval task, plus the
-    `slurm:` block (`tests/slurm/test_config.py::RAW`, patched with a 50M entry) that
-    `_generate_phase` now requires to resolve a batch plan.
+    `slurm:` block that `_generate_phase` now requires to resolve a batch plan.
+
+    Args:
+        slurm_raw: The raw `slurm:` mapping to embed. Defaults to `_SLURM_RAW`
+            (`tests/slurm/test_config.py::RAW`, patched with a 50M entry). Pass the unpatched
+            `SLURM_RAW` to reproduce a preset genuinely missing from the tables, as
+            `configs/scaling.yaml` does for 50M.
     """
+    if slurm_raw is None:
+        slurm_raw = _SLURM_RAW
     body = """
 model:
   norm_strategy: sandwich
@@ -61,7 +70,7 @@ data:
       type: sequence
       every: {steps: 500}
 """.lstrip()
-    return body + yaml.safe_dump({"slurm": _SLURM_RAW}, sort_keys=False)
+    return body + OmegaConf.to_yaml(OmegaConf.create({"slurm": dict(slurm_raw)}))
 
 
 @pytest.fixture
@@ -760,6 +769,116 @@ def test_transfer_generates_paired_candidates_across_default_models(
     }
     assert {cell["depth_exponent"] for cell in params} == {0.0, 0.5, 0.75, 1.0}
     assert {(cell["global_examples"], cell["seed"]) for cell in params} == {(2048, 42)}
+
+
+def _generate_multinode_cell(base_config: Path, tmp_path: Path) -> Path:
+    """Generate a single 400M transfer cell and return its phase directory.
+
+    400M defaults to 4 nodes in the shared slurm fixture (`tests/slurm/test_config.py::RAW`),
+    so at the default `--num-processes 8` this reproduces the review finding: the true world
+    size (4 nodes * 8 gpus_per_node = 32) disagrees with the flat CLI flag (8).
+    """
+    source = _write_selected_phase(tmp_path, "replicate", [{"lr": 0.01, "output_mult": 1.0}])
+    out = tmp_path / "transfer"
+    result = runner.invoke(
+        phases.app,
+        [
+            "transfer",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(out),
+            "--presets",
+            "400M",
+            "--steps",
+            "10000",
+            "--warmup",
+            "1000",
+            "--exponents",
+            "0",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return out
+
+
+def test_commands_txt_num_processes_matches_the_cells_true_world_size(
+    base_config: Path, tmp_path: Path
+) -> None:
+    """`commands.txt`'s `--num_processes` must agree with the cell's own global batch.
+
+    Reproduces the review finding on a 400M cell planned for 4 nodes: before the fix,
+    `accelerate_argv` was built from the flat `--num-processes` CLI flag (default 8), so
+    `commands.txt` recorded `--num_processes 8` while `run.yaml` pinned `batch_size=64,
+    accum=1` -- a plan that is only correct at world_size=32 (4 nodes * 8 gpus_per_node).
+    64 * 1 * 8 = 512, a quarter of the intended 2048 global batch.
+    """
+    out = _generate_multinode_cell(base_config, tmp_path)
+    phase = load_phase(out / "phase.json")
+    run = phase.runs[0]
+    cfg = load_config(["--config", str(out / run.config)])
+    command = shlex.split((out / "commands.txt").read_text().splitlines()[0])
+    num_processes = int(command[command.index("--num_processes") + 1])
+
+    assert run.params["nodes"] == 4
+    assert num_processes == 32  # 4 nodes * 8 gpus_per_node, not the --num-processes 8 default
+    assert (
+        cfg.train.batch_size * cfg.train.gradient_accumulation_steps * num_processes
+        == run.params["global_examples"]
+    )
+
+
+def test_phase_json_records_batch_plan_audit_trail(base_config: Path, tmp_path: Path) -> None:
+    """`phase.json`'s per-run params must record the batch plan used to generate the cell.
+
+    A typo (`per_device_batch` -> `batch_size`) or a dropped spread in `_generate_phase` would
+    pass the rest of the suite while corrupting the record later tasks read from `phase.json`.
+    """
+    out = _generate_multinode_cell(base_config, tmp_path)
+    run = load_phase(out / "phase.json").runs[0]
+    assert run.params["nodes"] == 4
+    assert run.params["per_device_batch"] == 64
+    assert run.params["gradient_accumulation_steps"] == 1
+
+
+def test_missing_preset_in_slurm_tables_is_a_clean_cli_error(tmp_path: Path) -> None:
+    """A preset absent from the `nodes`/`max_batch_size` tables must not surface as a raw KeyError.
+
+    Reproduces the review finding using `scale`'s packaged default `--presets`
+    ("50M,170M,400M,800M,1B") against a `slurm:` block shaped like the real
+    `configs/scaling.yaml` (170M/400M/800M/1B only, no 50M) -- exactly the combination that
+    crashes `oplm sweep scale` today with an uncaught `KeyError` instead of the clean
+    `typer.BadParameter` every other validation failure produces.
+    """
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(_base_config_text(SLURM_RAW))
+    source = _write_selected_phase(
+        tmp_path,
+        "confirm",
+        [{"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.0, "batch_mult": 1.0}],
+    )
+
+    result = runner.invoke(
+        phases.app,
+        [
+            "scale",
+            "--config",
+            str(config_path),
+            "--from",
+            str(source),
+            "--out",
+            str(tmp_path / "scale"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, KeyError)
+    assert "50M" in result.output
+    assert "nodes" in result.output
+    # The defined presets are named so the operator knows what to pass instead.
+    assert "170M" in result.output
 
 
 def test_bridge_uses_only_explicit_top_transfer_candidate(
