@@ -15,6 +15,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Wall-clock budget for a single `squeue` query. `status` is an interactive command; a wedged
+# controller must degrade to the `unknown` path already in place rather than hang forever. Not
+# applied to `sbatch` -- see the comment at that call site for why.
+SQUEUE_TIMEOUT_SECONDS = 30.0
+
 
 def submit_job(script: Path, *, depends_on: Sequence[str] = ()) -> str:
     """Submit one script with ``sbatch --parsable`` and return its job id.
@@ -39,6 +44,10 @@ def submit_job(script: Path, *, depends_on: Sequence[str] = ()) -> str:
     if depends_on:
         argv.append(f"--dependency=afterany:{':'.join(depends_on)}")
     argv.append(str(script))
+    # Deliberately no timeout here (unlike `running_job_ids`'s `squeue` call): a timed-out
+    # `sbatch` could still have submitted the job before we gave up waiting, and a caller that
+    # then retries on a `RuntimeError` would double-submit. `squeue` is a read-only query with no
+    # such risk, so it gets a timeout and this does not.
     result = subprocess.run(argv, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(
@@ -81,15 +90,21 @@ def submit_all(entries: Sequence[SubmitEntry], *, base_dir: Path) -> dict[str, s
     return ids
 
 
-def running_job_ids(job_ids: Sequence[str]) -> set[str]:
+def _parse_squeue_stdout(stdout: str) -> set[str]:
+    # Array elements report as "<arrayjobid>_<index>"; match on the base id.
+    return {line.strip().split("_", 1)[0] for line in stdout.splitlines() if line.strip()}
+
+
+def running_job_ids(job_ids: Sequence[str], *, timeout: float = SQUEUE_TIMEOUT_SECONDS) -> set[str]:
     """Return the subset of ``job_ids`` still known to the scheduler.
 
-    An empty return means one of two things: no queried job is currently known to the scheduler
-    (the normal steady state — an id ages out of ``squeue`` once that job finishes, this is not an
-    error), or ``squeue`` is unavailable (e.g. off-cluster), so callers degrade to filesystem-only
-    status rather than crashing. A caller that must distinguish those two cases has to check
-    scheduler availability itself (e.g. its own ``shutil.which("squeue")``) rather than infer it
-    from an empty result here.
+    An empty return means one of three things: no queried job is currently known to the
+    scheduler (the normal steady state — an id ages out of ``squeue`` once that job finishes,
+    this is not an error), ``squeue`` is unavailable (e.g. off-cluster), or the query timed out
+    against a wedged controller (see below) -- in all three cases callers degrade to
+    filesystem-only status rather than crashing or hanging. A caller that must distinguish these
+    cases has to check scheduler availability itself (e.g. its own ``shutil.which("squeue")``)
+    rather than infer it from an empty result here.
 
     ``squeue --jobs`` exits non-zero if *any* of the queried ids has aged out, even though it still
     prints the ids that remain live to stdout. This function parses stdout regardless of exit
@@ -97,21 +112,39 @@ def running_job_ids(job_ids: Sequence[str]) -> set[str]:
     non-zero exit is logged as a warning (with ``squeue``'s stderr) so a genuine query failure is
     visible, but whatever ids were parsed from stdout are still returned.
 
+    A wedged scheduler controller can leave ``squeue`` hanging indefinitely; ``timeout`` bounds
+    that wait so an interactive command like ``oplm sweep status`` degrades to the already-present
+    "scheduler unreachable" path instead of hanging forever. A timeout is logged as a warning, the
+    same as a non-zero exit, and whatever partial stdout the process managed to emit (typically
+    none, since the process is killed on POSIX before it can be collected) is still parsed.
+
     Args:
         job_ids: Base job ids to look up (array jobs report as ``<id>_<index>`` in ``squeue``;
             this matches on the base id).
+        timeout: Seconds to wait for ``squeue`` before giving up. Defaults to
+            ``SQUEUE_TIMEOUT_SECONDS``; overridable so tests need not wait 30 seconds.
 
     Returns:
         The subset of ``job_ids`` that ``squeue`` still reports.
     """
     if not job_ids or shutil.which("squeue") is None:
         return set()
-    result = subprocess.run(
-        ["squeue", "--noheader", "--format=%i", "--jobs", ",".join(job_ids)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["squeue", "--noheader", "--format=%i", "--jobs", ",".join(job_ids)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "squeue timed out after %.0fs while querying %d job id(s)", timeout, len(job_ids)
+        )
+        # `text=True` makes this `str` at runtime; `TimeoutExpired` is only typed `AnyStr | None`
+        # generically, and POSIX leaves it `None` anyway (see docstring above).
+        partial_stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        return _parse_squeue_stdout(partial_stdout)
     if result.returncode != 0:
         logger.warning(
             "squeue exited %d while querying %d job id(s): %s",
@@ -119,5 +152,4 @@ def running_job_ids(job_ids: Sequence[str]) -> set[str]:
             len(job_ids),
             result.stderr.strip(),
         )
-    # Array elements report as "<arrayjobid>_<index>"; match on the base id.
-    return {line.strip().split("_", 1)[0] for line in result.stdout.splitlines() if line.strip()}
+    return _parse_squeue_stdout(result.stdout)

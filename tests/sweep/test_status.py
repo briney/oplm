@@ -15,6 +15,14 @@ covered explicitly:
 - A phase that was never submitted has no such ambiguity: "missing" regardless of whether
   `squeue` happens to be on PATH
   (`test_status_missing_state_independent_of_scheduler_when_never_submitted`).
+- Submitted-ness must also be resolved *per preset*, not phase-wide: a preset that was never
+  submitted is "missing" -- and gets resubmit guidance -- even when a sibling preset in the same
+  phase was submitted
+  (`test_status_partial_submission_missing_not_unknown_for_unsubmitted_preset`).
+- A preset withheld from resubmit guidance (every open cell "running" or "unknown") must be
+  called out explicitly, not silently dropped
+  (`test_status_flags_running_preset_as_skipped_not_silently_omitted`,
+  `test_status_flags_unknown_preset_as_skipped_not_silently_omitted`).
 """
 
 from __future__ import annotations
@@ -26,7 +34,7 @@ from typer.testing import CliRunner
 
 from oplm.cli import app
 from oplm.sweep import phases
-from oplm.sweep.common import load_phase
+from oplm.sweep.common import load_phase, write_phase
 from tests.slurm.test_submit import _install_stub
 from tests.sweep.conftest import _write_base_config, _write_selected
 
@@ -181,3 +189,92 @@ def test_status_missing_state_independent_of_scheduler_when_never_submitted(
     assert "missing" in result.stdout
     assert "unknown" not in result.stdout
     assert "cannot query the scheduler" not in result.stdout
+
+
+def test_status_partial_submission_missing_not_unknown_for_unsubmitted_preset(
+    transfer_phase: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A never-submitted preset must be 'missing' -- and get resubmit guidance -- even when a
+    sibling preset in the same phase was submitted.
+
+    Regression guard for Finding 1: `_cell_state` used to receive a phase-wide `submitted =
+    bool(job_ids)` flag. Once *any* preset had a job id, every other (never-submitted) preset's
+    open cells read as `unknown` instead of `missing`, and `unknown` is excluded from the
+    resubmit line -- so the never-submitted preset silently vanished from resubmit guidance
+    entirely. This manifest mirrors the finding's live repro: `job_ids` names 400M (and the
+    downstream analyze job) but not 800M/1B, with `squeue` off PATH.
+    """
+    manifest = load_phase(transfer_phase)
+    manifest.job_ids = {"A_400M": "900001", "ANALYZE": "900099"}
+    write_phase(transfer_phase, manifest)
+
+    monkeypatch.setenv("PATH", "")  # squeue unreachable
+    result = runner.invoke(app, ["sweep", "status", str(transfer_phase)])
+    assert result.exit_code == 0, result.output
+
+    # 400M really was submitted: with the scheduler unreachable its cells are genuinely
+    # ambiguous, so `unknown` (and no resubmit line for it) is correct.
+    assert "unknown" in result.stdout
+    assert "resubmit 400M" not in result.stdout
+    # 800M/1B were never submitted at all: unambiguously missing, and must still be offered for
+    # resubmission -- this is the line the bug made disappear.
+    assert "resubmit 800M: sbatch --array=0,1,2,3 jobs/800M.sbatch" in result.stdout
+    assert "resubmit 1B: sbatch --array=0,1,2,3 jobs/1B.sbatch" in result.stdout
+
+
+def test_status_flags_running_preset_as_skipped_not_silently_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preset withheld from resubmit guidance because every open cell is 'running' must say so.
+
+    Regression guard for Finding 2: omitting the preset's resubmit line with no other comment
+    reads as "nothing needed here", indistinguishable from "complete" to an operator skimming
+    the output.
+    """
+    config = _write_base_config(tmp_path)
+    source = _write_selected(
+        tmp_path / "replicate" / "phase.json",
+        "replicate",
+        [{"lr": 0.01, "output_mult": 1.0}],
+    )
+    _install_fake_sbatch(tmp_path, monkeypatch)
+    out = tmp_path / "transfer"
+    result = runner.invoke(
+        phases.app,
+        ["transfer", "--config", str(config), "--from", str(source), "--out", str(out), "--submit"],
+    )
+    assert result.exit_code == 0, result.output
+    phase_path = out / "phase.json"
+    manifest = load_phase(phase_path)
+    assert manifest.job_ids is not None
+    live_id = manifest.job_ids["A_400M"]
+    _install_stub(tmp_path, monkeypatch, "squeue", f"#!/bin/bash\nprintf '{live_id}\\n'\n")
+
+    status_result = runner.invoke(app, ["sweep", "status", str(phase_path)])
+    assert status_result.exit_code == 0, status_result.output
+    assert "resubmit 400M" not in status_result.stdout
+    assert "skip 400M" in status_result.stdout
+    assert "still running" in status_result.stdout
+
+
+def test_status_flags_unknown_preset_as_skipped_not_silently_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preset withheld because every open cell is 'unknown' must say so, and distinguish the
+    reason (scheduler unreachable) from the 'running' case above."""
+    config = _write_base_config(tmp_path)
+    _install_fake_sbatch(tmp_path, monkeypatch)
+    out = tmp_path / "coarse"
+    result = runner.invoke(
+        phases.app,
+        ["coarse", "--config", str(config), "--out", str(out), "--submit"],
+    )
+    assert result.exit_code == 0, result.output
+    phase_path = out / "phase.json"
+
+    monkeypatch.setenv("PATH", "")  # squeue unreachable; no results on disk at all
+    status_result = runner.invoke(app, ["sweep", "status", str(phase_path)])
+    assert status_result.exit_code == 0, status_result.output
+    assert "resubmit 170M" not in status_result.stdout
+    assert "skip 170M" in status_result.stdout
+    assert "scheduler unreachable" in status_result.stdout

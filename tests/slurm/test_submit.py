@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -172,3 +173,26 @@ def test_running_job_ids_empty_stdout_and_nonzero_exit_returns_empty_set(
     with caplog.at_level(logging.WARNING):
         assert running_job_ids(["999999"]) == set()
     assert "Invalid job id specified" in caplog.text
+
+
+def test_running_job_ids_returns_on_timeout_instead_of_hanging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wedged scheduler controller must not hang `running_job_ids` forever.
+
+    Regression guard for Finding 3: the `squeue` subprocess call had no timeout at all, so a
+    wedged controller would hang `oplm sweep status` indefinitely instead of degrading to the
+    `unknown` path that already exists for an unreachable scheduler. `timeout` is passed
+    explicitly (well under the sleeping stub's duration) so the test stays fast rather than
+    waiting out the real 30s default.
+    """
+    _install_stub(tmp_path, monkeypatch, "squeue", "#!/bin/bash\nsleep 2\n")
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        result = running_job_ids(["812345"], timeout=0.1)
+    elapsed = time.monotonic() - started
+    assert result == set()
+    assert elapsed < 2, f"running_job_ids blocked for {elapsed:.2f}s past its 0.1s timeout"
+    assert "timed out" in caplog.text

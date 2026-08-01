@@ -899,9 +899,16 @@ def _cell_state(
 ) -> str:
     """One cell's state: ``complete`` / ``non-finite`` / ``running`` / ``missing`` / ``unknown``.
 
-    ``unknown`` only arises when the phase *was* submitted (so a definitive answer exists in
-    principle) but the scheduler cannot currently be asked. A phase that was simply never
-    submitted is unambiguously ``missing`` regardless of whether `squeue` happens to be on PATH.
+    ``submitted`` must reflect *this cell's own preset* (``f"A_{preset}" in job_ids``), not
+    whether the phase as a whole has any job ids at all -- a phase-wide flag would make a
+    never-submitted preset read as ``unknown`` (and thus be excluded from resubmit guidance,
+    see the ``status`` docstring) merely because some *other* preset in the same phase was
+    submitted.
+
+    ``unknown`` only arises when this cell's preset *was* submitted (so a definitive answer
+    exists in principle) but the scheduler cannot currently be asked. A preset that was simply
+    never submitted is unambiguously ``missing`` regardless of whether `squeue` happens to be on
+    PATH.
     """
     if value is not None:
         return "complete"
@@ -930,22 +937,27 @@ def status(
 
     The resubmit line lists, per preset, the zero-based array indices that need rerunning
     (``non-finite`` and ``missing`` cells) -- the same numbering that preset's ``.jobs`` index
-    file uses, so it can be passed directly to ``sbatch --array=``. ``running`` and ``unknown``
-    cells are excluded: resubmitting a job that may already be queued or executing would risk a
-    duplicate run.
+    file uses, so it can be passed directly to ``sbatch --array=``. A preset is withheld from
+    resubmit guidance when *every* one of its open cells is ``running`` or ``unknown``, for two
+    different reasons: a ``running`` cell may already be queued or executing, so resubmitting it
+    risks a duplicate run; an ``unknown`` cell's true state cannot be determined at all (the
+    scheduler could not be asked), so resubmitting it might be redundant or might be exactly the
+    first-time submission it needs -- the tool simply cannot tell. Either way, an explicit
+    ``skip`` line is printed for that preset so its absence from the resubmit guidance reads as
+    "withheld", not "complete".
     """
     path = phase_json.resolve()
     phase = load_phase(path)
     job_ids = phase.job_ids or {}
-    submitted = bool(job_ids)
+    any_submitted = bool(job_ids)
     scheduler_reachable = shutil.which("squeue") is not None
 
     open_presets = _open_presets(path.parent, phase.runs, phase.metric)
     live: set[str] = set()
-    if open_presets and submitted and scheduler_reachable:
+    if open_presets and any_submitted and scheduler_reachable:
         query_ids = [job_ids[f"A_{preset}"] for preset in open_presets if f"A_{preset}" in job_ids]
         live = running_job_ids(query_ids)
-    if open_presets and submitted and not scheduler_reachable:
+    if open_presets and any_submitted and not scheduler_reachable:
         console.print(
             "[yellow]squeue not found[/yellow]: cannot query the scheduler; cells with no "
             "result on disk are marked [bold]unknown[/bold] rather than assumed finished"
@@ -960,6 +972,7 @@ def status(
 
     seen: dict[str, int] = {}
     incomplete: dict[str, list[int]] = {}
+    states_by_preset: dict[str, list[str]] = {}
     for run in phase.runs:
         preset = str(run.params["preset"])
         index = seen.get(preset, 0)
@@ -972,20 +985,40 @@ def status(
             job_id=job_ids.get(f"A_{preset}"),
             live=live,
             scheduler_reachable=scheduler_reachable,
-            submitted=submitted,
+            submitted=f"A_{preset}" in job_ids,
         )
+        states_by_preset.setdefault(preset, []).append(state)
         if state in ("non-finite", "missing"):
             incomplete.setdefault(preset, []).append(index)
         shown = f"{value:.4f}" if value is not None else "-"
         table.add_row(preset, str(index), run.id, state, shown)
     console.print(table)
 
-    if not incomplete:
+    # A preset with open cells that never made it into `incomplete` was withheld entirely --
+    # every open cell is `running` or `unknown` -- not resolved. Say so explicitly per preset,
+    # rather than letting it silently disappear from the resubmit guidance below.
+    skipped: dict[str, str] = {}
+    for preset, states in states_by_preset.items():
+        if preset in incomplete:
+            continue
+        unknown_count = states.count("unknown")
+        running_count = states.count("running")
+        if unknown_count:
+            skipped[preset] = (
+                f"{unknown_count} cell(s) unknown -- scheduler unreachable, no resubmit "
+                "guidance offered"
+            )
+        elif running_count:
+            skipped[preset] = f"{running_count} cell(s) still running -- no resubmit needed"
+
+    if not incomplete and not skipped:
         console.print("[green]nothing to resubmit[/green]")
         return
     for preset, indices in sorted(incomplete.items(), key=lambda item: _preset_sort_key(item[0])):
         listed = ",".join(str(index) for index in indices)
         console.print(f"resubmit {preset}: sbatch --array={listed} jobs/{preset}.sbatch")
+    for preset, reason in sorted(skipped.items(), key=lambda item: _preset_sort_key(item[0])):
+        console.print(f"[yellow]skip {preset}[/yellow]: {reason}")
 
 
 def _run_local(commands: list[list[str]]) -> None:
