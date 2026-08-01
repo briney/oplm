@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "a05c77a35846",
+  "strategy": "manual-commit",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tests/slurm/__init__.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/a0/5c77a35846/0/metadata.json",
+      "transcript": "/a0/5c77a35846/0/full.jsonl",
+      "compact_transcript": "/a0/5c77a35846/0/transcript.jsonl",
+      "content_hash": "/a0/5c77a35846/0/content_hash.txt",
+      "prompt": "/a0/5c77a35846/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 235,
+    "cache_creation_tokens": 335919,
+    "cache_read_tokens": 24017117,
+    "output_tokens": 231780,
+    "api_call_count": 121
+  }
+}
