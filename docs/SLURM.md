@@ -205,7 +205,8 @@ allocation actually has. That is also why there is no separate single-node code 
 `SLURM_NNODES=1` the same `srun --nodes=$SLURM_NNODES` degrades to a single-process launch
 correctly, with nothing to special-case.
 
-Two lines above the `srun` set up distributed rendezvous once per job, on the rank-0 (batch) node:
+Three lines above the `srun` set up distributed rendezvous once per job, on the rank-0 (batch)
+node:
 
 ```bash
 MASTER_ADDR=$(hostname --ip-address)

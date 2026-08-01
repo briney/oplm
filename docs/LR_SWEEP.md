@@ -69,6 +69,7 @@ slurm:
   nodes:
     default: {170M: 1, 400M: 4, 800M: 8, 1B: 8}
     bridge: {170M: 4}
+    replicate: {170M: 4}
     confirm: {800M: 8}
   max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
 ```
@@ -77,7 +78,7 @@ The file merges over the packaged defaults. Add any production-specific masking,
 compile, or checkpoint overrides to this same file before launch. Keep exactly one named
 sequence eval task **for every proxy phase** (`smoke` through `confirm`) so the harness can infer
 its `eval/<name>/loss` metric — `scale` is the one exception; it trains production checkpoints, so
-it uses the full multi-task eval suite from `configs/scaling.yaml` (seven tasks: three sequence
+it uses the full multi-task eval suite from `configs/scaling.yaml` (six tasks: three sequence
 losses plus `casp14` structure eval and two ProteinGym tasks), not this single-task metric.
 
 Keep weight decay fixed at `0.01` for the complete workflow. The generator also resolves each
@@ -145,7 +146,8 @@ oplm sweep bridge --config configs/mup-production.yaml \
   --from sweeps/transfer/phase.json --out sweeps/bridge
 bash sweeps/bridge/jobs/submit.sh
 oplm sweep replicate --config configs/mup-production.yaml \
-  --from sweeps/bridge/phase.json --out sweeps/bridge-replicate --submit
+  --from sweeps/bridge/phase.json --out sweeps/bridge-replicate
+bash sweeps/bridge-replicate/jobs/submit.sh
 oplm sweep confirm --config configs/mup-production.yaml \
   --from sweeps/bridge-replicate/phase.json --out sweeps/confirm
 bash sweeps/confirm/jobs/submit.sh
@@ -184,16 +186,28 @@ Under the `slurm:` block above, every cell resolves to `gradient_accumulation_st
 estimates are derived from a single 170M measurement (~12 h per 10,000 steps at global batch
 2048) scaled by parameter count and node count; cells also now pin full gradient checkpointing
 (`model.gradient_checkpointing_mode=full`), which was not necessarily in effect when that
-measurement was taken. Treat the wall-time column as order-of-magnitude guidance, not a promise:
+measurement was taken. Treat the wall-time column as order-of-magnitude guidance, not a promise.
+
+The `nodes` table's `replicate` entry governs **both** `replicate` invocations: the generator
+resolves node count from the phase name `replicate` regardless of which source phase fed it, so
+one `{170M: 4}` override reshapes the first `replicate` (source `refine`, still the 2,048 proxy
+batch) exactly as much as the second (source `bridge`, the 8,192 production batch). At the
+production batch this is exactly what's wanted — it makes the second `replicate` match `bridge`'s
+shape. At the proxy batch it also pulls the first `replicate` off the single-node group below it
+onto 4 nodes at a quarter the per-device batch, which is why it now gets its own row:
 
 | Phase | Preset | Global batch | Nodes | Per-device batch | Est. wall time |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `smoke`/`coarse`/`refine`/`replicate` | 170M | 2048 | 1 | 256 | ~12 h (`coarse`, 10k steps) |
+| `smoke`/`coarse`/`refine` | 170M | 2048 | 1 | 256 | ~12 h (`coarse`, 10k steps) |
+| first `replicate` | 170M | 2048 | 4 | 64 | ~6 h (20k steps, inherited from `refine`) |
 | `transfer` | 400M | 2048 | 4 | 64 | ~7 h (10k steps) |
 | `transfer` | 800M | 2048 | 8 | 32 | ~14 h (20k steps) |
 | `transfer` | 1B | 2048 | 8 | 32 | ~13 h (10k steps) |
 | `bridge` | 170M | 8192 | 4 | 256 | ~12 h (10k steps) |
+| second `replicate` | 170M | 8192 | 4 | 256 | ~12 h (10k steps, matches `bridge`) |
 | `confirm` | 800M | 8192 | 8 | 128 | ~28 h (10k steps) |
+
+Every row above still resolves to `gradient_accumulation_steps=1`.
 
 Full gradient checkpointing is what makes the 400M+ per-device batches above fit in memory; it
 costs roughly 30–40% more compute than selective checkpointing.
