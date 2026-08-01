@@ -123,10 +123,15 @@ generate the next phase until the current one has completed and been ranked. `sc
 — see the note at the end of this section.
 
 For the cheap, fast proxy phases (`smoke`, `coarse`, `refine`, and the first `replicate`), pass
-`--submit` so generation and submission happen in one step. For the expensive, multi-day,
-multi-node phases (`transfer`, `bridge`, the second `replicate`, `confirm`), omit `--submit`,
-inspect the generated `jobs/*.sbatch` scripts and `jobs/submit.sh`, then run `bash
-sweeps/<phase>/jobs/submit.sh` yourself once you're ready to commit the allocation:
+`--submit` so generation and submission happen in one step. For the expensive, multi-day phases
+(`transfer`, `bridge`, the second `replicate`, `confirm`), omit `--submit`, inspect the generated
+`jobs/*.sbatch` scripts and `jobs/submit.sh`, then run `bash sweeps/<phase>/jobs/submit.sh`
+yourself once you're ready to commit the allocation:
+
+The split is by *cost*, not by node count. Both `replicate` invocations share the phase name
+`replicate`, so the `nodes` override above applies to both: the first one is cheap (a few hours)
+but still lands on four nodes. Check the [node table](#node-counts-and-derived-per-device-batch)
+before auto-submitting if four nodes is a hard allocation to get on your cluster.
 
 ```bash
 # Cheap phases: generate and submit in one step.
