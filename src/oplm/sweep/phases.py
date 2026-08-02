@@ -124,6 +124,7 @@ def _write_run_config(
     run_dir: Path,
     params: Params,
     *,
+    phase: str,
     plan: BatchPlan,
     diagnostics: bool = False,
 ) -> Path:
@@ -149,7 +150,11 @@ def _write_run_config(
         raise ValueError(
             f"μP sweep requires train.weight_decay=0.01, got {base.train.weight_decay}"
         )
-    run_name = run_dir.name
+    # Prefix the W&B run name with the phase. The run id alone is not unique across phases --
+    # SMOKE_LRS is a subset of COARSE_LRS, so a smoke cell and a coarse cell at the same LR
+    # produce the identical id and would appear as duplicate names in the W&B project, telling
+    # apart only by step count. The on-disk run directory keeps the bare id.
+    run_name = f"{phase}-{run_dir.name}"
     # Checkpoint eight times per cell so a requeue loses at most ~12% of the run, and keep only
     # the newest: these checkpoints exist solely to make requeue cheap.
     save_every = max(1, max_steps // 8)
@@ -412,7 +417,9 @@ def _generate_phase(
             world_size=world_size,
             max_batch_size=_resolve_max_batch_size(slurm, preset),
         )
-        config = _write_run_config(base_config, run_dir, params, plan=plan, diagnostics=diagnostics)
+        config = _write_run_config(
+            base_config, run_dir, params, phase=name, plan=plan, diagnostics=diagnostics
+        )
         result = run_dir / "result.json"
         runs.append(
             RunSpec(

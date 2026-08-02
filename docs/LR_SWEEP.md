@@ -166,6 +166,25 @@ sweep finishes.
 `bash sweeps/<phase>/jobs/submit.sh` is a plain shell script, and every path inside the generated
 `.sbatch` files is absolute, so they run correctly from anywhere.
 
+### Weights & Biases
+
+Set the project once in your production config; every generated cell inherits it, so the whole
+sweep lands in one place:
+
+```yaml
+train:
+  wandb_project: oplm-mup-sweep
+```
+
+There is no `--wandb-project` flag on the phase commands — the config is the single source, which
+is what keeps every phase in the same project without you remembering a flag each time.
+
+The generator sets each cell's run name to `<phase>-<preset>-lr<lr>-om<output_mult>-a<depth_exponent>-s<seed>`,
+e.g. `coarse-170M-lr0.0025-om1-a0-s42`, so a run's full identity is legible from the W&B sidebar.
+The phase prefix matters: `SMOKE_LRS` is a subset of `COARSE_LRS`, so without it the three smoke
+cells and their coarse counterparts would appear under identical names, separable only by step
+count. `scale` runs are named `oplm-<preset>-scale`.
+
 ### Monitoring without installing oplm
 
 The dependent `analyze` job ranks each phase automatically inside the container (see below), so
