@@ -1,0 +1,159 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "d2a64b5a92f9",
+  "session_id": "c7478c06-34ba-46f7-98fb-0bef3b49eff8",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-02T01:59:32.472365793Z",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-5[1m]",
+  "turn_id": "cfc6ffa69e6b",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 716,
+    "cache_creation_tokens": 2101895,
+    "cache_read_tokens": 158954267,
+    "output_tokens": 491571,
+    "api_call_count": 380
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "prompt-skill-claude-code-login-2026-08-01T16:41:16.382487683Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "login"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "d2b543fdd354",
+      "timestamp": "2026-08-01T16:41:16.382487683Z",
+      "native": {
+        "command": "/login"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/login",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_01TvJjBGm4rbVWNgW8EYifQx",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "superpowers:brainstorming"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "cfc6ffa69e6b",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 17,
+        "end": 18,
+        "entry_ids": [
+          "06e4dda3-7881-4de0-bb0e-d7e0c0e5e358"
+        ],
+        "tool_use_id": "toolu_01TvJjBGm4rbVWNgW8EYifQx"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01TvJjBGm4rbVWNgW8EYifQx"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: superpowers:brainstorming",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_01VBVfh8fWmiNYMLvqaEqtjc",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "superpowers:writing-plans"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "cfc6ffa69e6b",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 299,
+        "end": 300,
+        "entry_ids": [
+          "2dfca0aa-1905-4a78-9ec8-38af867318ef"
+        ],
+        "tool_use_id": "toolu_01VBVfh8fWmiNYMLvqaEqtjc"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01VBVfh8fWmiNYMLvqaEqtjc"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: superpowers:writing-plans",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_01U3eHqXBdf5UHwPLNyjy9qa",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "superpowers:subagent-driven-development"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "cfc6ffa69e6b",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 361,
+        "end": 362,
+        "entry_ids": [
+          "566fb16f-b95b-4442-8b61-5cd79be86ea0"
+        ],
+        "tool_use_id": "toolu_01U3eHqXBdf5UHwPLNyjy9qa"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01U3eHqXBdf5UHwPLNyjy9qa"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: superpowers:subagent-driven-development",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 66
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 325,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/agents/entire-search.md": 25,
+        ".claude/plans/i-d-like-to-add-dreamy-creek.md": 162,
+        ".claude/settings.json": 84,
+        ".claude/settings.local.json": 14,
+        ".cursor/hooks.json": 40
+      }
+    }
+  ]
+}

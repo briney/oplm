@@ -1,0 +1,24 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "d2a64b5a92f9",
+  "strategy": "manual-commit",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 1,
+  "files_touched": null,
+  "sessions": [
+    {
+      "metadata": "/d2/a64b5a92f9/0/metadata.json",
+      "transcript": "/d2/a64b5a92f9/0/full.jsonl",
+      "compact_transcript": "/d2/a64b5a92f9/0/transcript.jsonl",
+      "content_hash": "/d2/a64b5a92f9/0/content_hash.txt",
+      "prompt": "/d2/a64b5a92f9/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 716,
+    "cache_creation_tokens": 2101895,
+    "cache_read_tokens": 158954267,
+    "output_tokens": 491571,
+    "api_call_count": 380
+  }
+}
