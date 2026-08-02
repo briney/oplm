@@ -8,6 +8,7 @@ This is the *how-to*. Related references:
 
 - [CONFIG.md](CONFIG.md) — every `model.*` / `train.*` / `data.*` field.
 - [MUP.md](MUP.md) — μP learning-rate transfer across width (tune `lr` once, reuse at scale).
+- [SLURM.md](SLURM.md) — running training as a Slurm job (multi-node launch, arrays, resume).
 - [EVAL_HARNESS.md](EVAL_HARNESS.md) — evaluation during training.
 - [DATA_TOOLING.md](DATA_TOOLING.md) — dataset formats and the masking scheme.
 - [OVERVIEW.md](OVERVIEW.md) — Part IV documents the trainer's internal design.
@@ -175,6 +176,13 @@ accelerate launch -m oplm.train --config my_run.yaml
 
 `batch_size` is **per process**, so the global batch is
 `batch_size × num_processes × gradient_accumulation_steps`.
+
+### Slurm clusters
+
+For multi-node training on a Slurm cluster, `oplm.slurm` turns any training config plus a
+`slurm:` block into ready-to-submit `sbatch` scripts (the same `accelerate launch` form as
+above, wired up with `srun`, container mounts, and job dependencies) — see
+[SLURM.md](SLURM.md) for the full schema and worked examples.
 
 ### DeepSpeed (opt-in)
 
@@ -525,6 +533,7 @@ train:
 ## See also
 
 - [CONFIG.md](CONFIG.md) — full configuration reference.
+- [SLURM.md](SLURM.md) — Slurm job generation and submission.
 - [EVAL_HARNESS.md](EVAL_HARNESS.md) — evaluation tasks and metrics.
 - [DATA_TOOLING.md](DATA_TOOLING.md) — data formats and masking.
 - [OVERVIEW.md](OVERVIEW.md) — Part IV: trainer internals and design rationale.

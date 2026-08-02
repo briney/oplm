@@ -11,8 +11,12 @@ from rich.table import Table
 
 from oplm.config import AVAILABLE_PRESETS, load_config
 from oplm.inference import load_model_for_inference, resolve_inference_config
+from oplm.slurm.cli import app as slurm_app
+from oplm.sweep.cli import app as sweep_app
 
 app = typer.Typer(name="oplm", help="Open Protein Language Model")
+app.add_typer(sweep_app, name="sweep", help="μP learning-rate sweep phases")
+app.add_typer(slurm_app, name="slurm", help="Generate and submit Slurm jobs")
 console = Console()
 
 _PRESET_HELP = f"Model size preset ({', '.join(AVAILABLE_PRESETS)})"

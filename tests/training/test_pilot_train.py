@@ -98,6 +98,38 @@ def test_pilot_train_runs_end_to_end(training_parquet: Path, tmp_path: Path) -> 
     assert all(math.isfinite(v) for v in all_values)
 
 
+def test_stability_diagnostics_emit_during_real_run(training_parquet: Path, tmp_path: Path) -> None:
+    """With stability_diagnostics on, a live run emits finite ``diag/*`` metrics.
+
+    Exercises the integration path the stub unit tests cannot: auto-attachment in
+    ``Trainer.__init__``, the grad-norm capture in the loop, and the periodic
+    eager probe forward over a real Accelerate-prepared dataloader batch.
+    """
+    from oplm.training.trainer import Trainer
+
+    cfg = _cfg(training_parquet, tmp_path, max_steps=4)
+    cfg.train.log_every = 2  # ensure a training-loss log fires within the run
+    cfg.train.stability_diagnostics = True
+    cfg.train.stability_probe_every = 1
+
+    trainer = Trainer(cfg)
+    logged: list[dict[str, float]] = []
+    real_log = trainer.accelerator.log
+
+    def _spy_log(metrics: dict[str, float], step: int | None = None, **kwargs: object) -> None:
+        logged.append(dict(metrics))
+        return real_log(metrics, step=step, **kwargs)
+
+    trainer.accelerator.log = _spy_log  # type: ignore[method-assign]  # test spy
+    trainer.train()
+
+    diag = {k: v for metrics in logged for k, v in metrics.items() if k.startswith("diag/")}
+    assert "diag/residual_rms/max" in diag
+    assert "diag/logit_rms" in diag
+    assert "diag/grad_norm" in diag
+    assert all(math.isfinite(v) for v in diag.values())
+
+
 def test_resume_continues_to_larger_max_steps(training_parquet: Path, tmp_path: Path) -> None:
     """Resuming from the last checkpoint restores the step count and trains to the new target."""
     from oplm.training.trainer import Trainer
@@ -113,5 +145,3 @@ def test_resume_continues_to_larger_max_steps(training_parquet: Path, tmp_path: 
 
     resumed.train()
     assert resumed.global_step == 6
-
-

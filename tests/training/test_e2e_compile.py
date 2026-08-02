@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import pytest
@@ -115,6 +116,48 @@ def test_compile_default_mode_trains(
     assert len(cb.train_logs) == 5
     for _, metrics in cb.train_logs:
         assert torch.isfinite(torch.tensor(metrics["train/loss"]))
+
+
+@_REQUIRES_CUDA
+def test_compile_with_stability_diagnostics_trains(
+    tmp_path: Path, training_parquet: Path, reset_dynamo: None
+) -> None:
+    """compile=True + stability diagnostics: training runs and emits finite ``diag/*``.
+
+    Confirms the hook-free diagnostics coexist with ``torch.compile`` — the
+    compiled training step carries no forward hooks, and the periodic probe runs
+    eagerly on the ``unwrap_model``-peeled module. Grad norm (per step), residual
+    RMS, logit RMS, and attention entropy (per probe) must all be finite.
+    """
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        output_dir=tmp_path,
+        train_data=training_parquet,
+        max_steps=5,
+        log_every=1,
+        max_grad_norm=1.0,  # enable clipping so diag/grad_norm is captured
+        compile=True,
+        compile_mode="default",
+    )
+    cfg.train.stability_diagnostics = True
+    cfg.train.stability_probe_every = 1
+
+    trainer = Trainer(cfg)
+    logged: list[dict[str, float]] = []
+    real_log = trainer.accelerator.log
+
+    def _spy_log(metrics: dict[str, float], step: int | None = None, **kwargs: object) -> None:
+        logged.append(dict(metrics))
+        return real_log(metrics, step=step, **kwargs)
+
+    trainer.accelerator.log = _spy_log  # type: ignore[method-assign]  # test spy
+    trainer.train()
+
+    diag = {k: v for metrics in logged for k, v in metrics.items() if k.startswith("diag/")}
+    for key in ("diag/grad_norm", "diag/residual_rms/max", "diag/logit_rms"):
+        assert key in diag, f"missing {key}"
+    assert all(math.isfinite(v) for v in diag.values())
 
 
 @_REQUIRES_CUDA

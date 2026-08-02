@@ -10,10 +10,28 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tests.training.conftest import configure_accelerator_device, tiny_train_cfg
+
+
+def test_train_end_callback_is_not_emitted_on_nonmain_process() -> None:
+    from oplm.training.trainer import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.accelerator = SimpleNamespace(is_main_process=False)
+    calls: list[Trainer] = []
+
+    class Callback:
+        def on_train_end(self, callback_trainer: Trainer) -> None:
+            calls.append(callback_trainer)
+
+    trainer.callbacks = [Callback()]
+    trainer._emit_train_end()
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------

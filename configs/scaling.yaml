@@ -1,0 +1,88 @@
+# Production scaling runs. Usable on its own:
+#   oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
+# `oplm sweep scale` merges the confirmed muP winner into this file before generating.
+
+model:
+  max_position_embeddings: 512
+  gradient_checkpointing: true
+  gradient_checkpointing_mode: full
+  norm_strategy: sandwich
+  canon_enabled: true
+  canon_positions: [A, B, C, D]
+  residual_gate: channel
+  mup_enable: true
+  mup_base_width: 768
+
+train:
+  optimizer: muon
+  muon_adjust_lr_fn: original
+  weight_decay: 0.01
+  mup_depth_reference_layers: 24
+  scheduler: wsd_linear
+  # 5k warmup + 85k stable + 10k decay = 100k max_steps. Keep warmup_steps + stable_steps
+  # strictly less than max_steps -- a 10% decay tail is the repo convention for real training
+  # runs. (The sweep-phase convention of stable_steps = max_steps - warmup_steps is deliberate
+  # for short proxy runs, where it produces NO decay; that convention does not belong here.)
+  max_steps: 100000
+  stable_steps: 85000
+  warmup_steps: 5000
+  save_every: 10000
+  save_total_limit: 3
+  eval_every: {steps: 5000}
+  compile: true
+  wandb_project: oplm-scaling
+  output_dir: /mnt/home/briney/projects/oplm/scaling
+
+data:
+  train:
+    uniref70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/train
+      fraction: 0.35
+    omg70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/train
+      fraction: 0.45
+    deepclust30:
+      path: /mnt/data/datasets/plm-training-data/deepclust30-bigg2/train
+      fraction: 0.20
+  eval:
+    uniref70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/eval.parquet
+      type: sequence
+    omg70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/eval.parquet
+      type: sequence
+    deepclust30:
+      path: /mnt/data/datasets/plm-training-data/deepclust30-bigg2/eval.parquet
+      type: sequence
+    casp14:
+      path: /mnt/data/datasets/plm-training-data/casp/casp14
+      type: structure
+    proteingym_clinical:
+      path: /mnt/data/datasets/plm-training-data/ProteinGym/eval/clinical_substitutions
+      type: proteingym_clinical
+      scoring: wt_marginals
+      top_k_fraction: 0.1
+    proteingym_dms:
+      path: /mnt/data/datasets/plm-training-data/ProteinGym/eval/dms_substitutions
+      type: proteingym
+      scoring: wt_marginals
+      top_k_fraction: 0.1
+
+slurm:
+  partition: hpc-mid
+  time_limit:
+    default: "168:00:00"
+  cpus_per_task: 128
+  gpus_per_node: 8
+  exclusive: true
+  mem: "0"
+  log_dir: /mnt/home/briney/logs
+  env_file: /mnt/home/briney/.env
+  container_image: /mnt/data/containers/deeplearning_v2026-05-26.sqsh
+  container_mounts:
+    - /mnt/data:/mnt/data
+    - /tmp:/tmp
+  install: pip install oplm[train]
+  max_concurrent: 4
+  nodes: {170M: 4, 400M: 8, 800M: 16, 1B: 16}
+  max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}

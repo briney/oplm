@@ -49,6 +49,21 @@ class Trainer:
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
 
+        # Latest pre-clip gradient norm, captured in the training loop when
+        # clipping is active; read by StabilityDiagnosticsCallback. Stays None
+        # when max_grad_norm <= 0 (no clip) so the diagnostic simply omits it.
+        self._last_grad_norm: torch.Tensor | None = None
+
+        # Opt-in deep-model stability diagnostics (docs/LR_SWEEP.md). Attached
+        # here so plain `oplm train ... train.stability_diagnostics=true` runs
+        # (the probe/control) get it without a bespoke entry point.
+        if cfg.train.stability_diagnostics:
+            from oplm.training.mup import StabilityDiagnosticsCallback
+
+            self.callbacks.append(
+                StabilityDiagnosticsCallback(probe_every=cfg.train.stability_probe_every)
+            )
+
         # Seed everything
         set_seed(cfg.train.seed)
 
@@ -308,7 +323,9 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                     if cfg.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(
+                        # Retain the pre-clip total norm so StabilityDiagnosticsCallback
+                        # can log it (grads are zeroed before the log step fires).
+                        self._last_grad_norm = self.accelerator.clip_grad_norm_(
                             self.model.parameters(),
                             cfg.max_grad_norm,
                         )

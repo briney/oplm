@@ -170,6 +170,12 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local git worktrees
+.worktrees/
+
+# Local agent execution state
+.superpowers/
+
 # PyPI configuration file
 .pypirc
 

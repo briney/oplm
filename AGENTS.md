@@ -47,21 +47,37 @@ ty check src/
 
 ```
 src/oplm/                      # main package (src layout)
-└── model/                     # transformer model package (see docs/MODEL_ARCHITECTURE.md)
-    ├── outputs.py             # LogitsConfig / LogitsOutput dataclasses (ESM-C-style API)
-    ├── norm.py                # LayerNorm / RMSNorm (fp32 internals) + make_norm factory
-    ├── masking.py             # pad-mask helpers, conv-input zeroing
-    ├── rope.py                # RoPE / partial RoPE applied to Q and K
-    ├── embedding.py           # token embedding + mean / CLS pooling
-    ├── ffn.py                 # SwiGLU / GEGLU / squared-ReLU feed-forward + make_ffn factory
-    ├── conv.py                # Canon depthwise 1D convolution (A/C/D in block; B on Q/K/V in attention)
-    ├── attention.py           # attention (SDPA + manual softmax for weights); hosts Canon-B convs on Q/K/V
-    ├── transformer.py         # OplmBlock + OplmStack
-    ├── configuration_oplm.py  # OplmConfig (PretrainedConfig)
-    ├── tokenization_oplm.py   # OplmTokenizerFast (33-token ESM-C-compatible)
-    └── modeling_oplm.py       # all public Oplm* model classes
+├── model/                     # transformer model package (see docs/MODEL_ARCHITECTURE.md)
+│   ├── outputs.py             # LogitsConfig / LogitsOutput dataclasses (ESM-C-style API)
+│   ├── norm.py                # LayerNorm / RMSNorm (fp32 internals) + make_norm factory
+│   ├── masking.py             # pad-mask helpers, conv-input zeroing
+│   ├── rope.py                # RoPE / partial RoPE applied to Q and K
+│   ├── embedding.py           # token embedding + mean / CLS pooling
+│   ├── ffn.py                 # SwiGLU / GEGLU / squared-ReLU feed-forward + make_ffn factory
+│   ├── conv.py                # Canon depthwise 1D convolution (A/C/D in block; B on Q/K/V in attention)
+│   ├── attention.py           # attention (SDPA + manual softmax for weights); hosts Canon-B convs on Q/K/V
+│   ├── transformer.py         # OplmBlock + OplmStack
+│   ├── configuration_oplm.py  # OplmConfig (PretrainedConfig)
+│   ├── tokenization_oplm.py   # OplmTokenizerFast (33-token ESM-C-compatible)
+│   └── modeling_oplm.py       # all public Oplm* model classes
+├── slurm/                      # general Slurm job generation/submission (docs/SLURM.md)
+│   ├── config.py               # `slurm:` block schema, PhaseTable, resolve_batch_plan
+│   ├── render.py                # JobSpec -> sbatch script text, submit.sh, job arrays
+│   ├── submit.py                # sbatch/squeue subprocess calls
+│   └── cli.py                   # `oplm slurm generate|submit|status`
+└── sweep/                      # μP learning-rate sweep phases (docs/LR_SWEEP.md), built on slurm/
+    ├── phases.py                # phase generators (smoke/coarse/.../scale), ranking, analyze/status
+    ├── coord_check.py           # μP coordinate-check CLI (`oplm sweep coord-check`)
+    ├── run.py                   # trains one resolved sweep cell (`oplm.sweep.run`)
+    ├── common.py                # shared phase-manifest / candidate-parsing helpers
+    └── cli.py                   # `oplm sweep <phase>` command surface
 tests/                         # pytest tests, mirrors src/ structure
 ```
+
+There is no unpackaged top-level `scripts/` directory anymore. Its former `mup_sweep.py`,
+`mup_run.py`, and `mup_coord_check.py` modules now live in `src/oplm/sweep/` as `phases.py`,
+`run.py`, and `coord_check.py`, reached through the installed `oplm sweep <phase>` /
+`oplm sweep coord-check` commands instead of an unpackaged module invocation.
 
 ## Code Style
 

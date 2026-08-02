@@ -9,8 +9,7 @@ the model-package single source of truth (so width-aware init stays
   scale per-group AdamW learning rates (Phase 4);
 * :func:`coord_check` — the empirical correctness gate (per-activation RMS vs
   width);
-* :class:`SweepMetricsCallback`, :func:`summarize_sweep`, :func:`best_lr_per_width`
-  — the LR-sweep metric utilities.
+* :class:`SweepMetricsCallback` — the LR-cell metric utility.
 
 See ``docs/MUP.md`` for the recipe table and the coord-check pass/fail oracle.
 """
@@ -18,7 +17,8 @@ See ``docs/MUP.md`` for the recipe table and the coord-check pass/fail oracle.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import logging
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,6 +26,8 @@ import torch
 from torch import nn
 
 from oplm.training.callbacks import TrainerCallback
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -36,13 +38,11 @@ if TYPE_CHECKING:
     from oplm.training.trainer import Trainer
 
 __all__ = [
-    "MupTransferResult",
+    "StabilityDiagnosticsCallback",
     "SweepMetricsCallback",
-    "best_lr_per_width",
     "coord_check",
     "mup_fanin_mult",
     "mup_lr_multiplier",
-    "summarize_sweep",
 ]
 
 # Parameter-name suffixes that identify μP readouts (width-independent LR, ×1):
@@ -247,12 +247,13 @@ def coord_check(
 
 
 class SweepMetricsCallback(TrainerCallback):
-    """Capture a sweep run's losses and write ``metrics.json`` at train end.
+    """Capture a sweep run's losses and write ``result.json`` at train end.
 
     ``trainer_state.json`` carries no loss, so the LR sweep relies on this
     callback. It EMA-smooths the train loss across ``on_log`` events, keeps the
     last value per ``eval/*`` key from ``on_eval_end``, and writes
-    ``{final_train_loss, eval, lr, width, steps}`` on ``on_train_end``.
+    ``{final_train_loss, eval, lr, width, steps, global_batch, oplm_version}``
+    on ``on_train_end``.
     """
 
     def __init__(self, path: str | Path, *, ema_decay: float = 0.9) -> None:
@@ -285,6 +286,14 @@ class SweepMetricsCallback(TrainerCallback):
             * trainer.cfg.train.gradient_accumulation_steps
             * trainer.accelerator.num_processes
         )
+        # oplm.__version__ is a stale hand-set constant; the installed distribution
+        # version is what actually ran. Generated sweep scripts install oplm
+        # unpinned, so this is what makes version drift across a multi-week sweep
+        # detectable after the fact instead of invisible.
+        try:
+            oplm_version: str | None = version("oplm")
+        except PackageNotFoundError:  # only from a bare (non-installed) checkout
+            oplm_version = None
         payload = {
             "final_train_loss": self._ema_loss,
             "eval": dict(self._eval),
@@ -292,71 +301,161 @@ class SweepMetricsCallback(TrainerCallback):
             "width": trainer.cfg.model.hidden_size,
             "steps": getattr(trainer, "total_steps", trainer.cfg.train.max_steps),
             "global_batch": global_batch,
+            "oplm_version": oplm_version,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(payload, indent=2))
 
 
-def summarize_sweep(run_dirs: Sequence[str | Path]) -> pd.DataFrame:
-    """Load each run's ``metrics.json`` into a frame keyed by ``(width, lr)``.
+# ----------------------------------------------------------------------------
+# Training-stability diagnostics
+# ----------------------------------------------------------------------------
 
-    Args:
-        run_dirs: Run directories (or direct paths to a ``metrics.json``) written
-            by :class:`SweepMetricsCallback`.
 
-    Returns:
-        One row per run with ``width``, ``lr``, ``final_train_loss``, ``steps``,
-        and one column per ``eval/*`` metric present.
+def _rms(t: torch.Tensor) -> torch.Tensor:
+    """Root-mean-square of a tensor as a detached 0-dim float tensor."""
+    return t.detach().float().pow(2).mean().sqrt()
+
+
+# Probe-batch caps: keep the diagnostic forward tiny so it cannot OOM even at the
+# largest presets (its activations sit on top of the resident training memory).
+# output_hidden_states uses the memory-efficient SDPA path, so one short sequence
+# is plenty for the residual/logit RMS signal.
+_PROBE_MAX_EXAMPLES = 1
+_PROBE_MAX_TOKENS = 128
+
+
+class StabilityDiagnosticsCallback(TrainerCallback):
+    """Log training-stability signals for deep-model μP diagnosis — hook-free.
+
+    On every training-loss log it emits the pre-clip global grad norm
+    (``diag/grad_norm``, read from ``trainer._last_grad_norm``; absent when
+    ``max_grad_norm <= 0``). This costs nothing and leaves the compiled training
+    step untouched — the per-step tripwire for gradient spikes.
+
+    Every ``probe_every`` training logs it additionally runs one eager diagnostic
+    forward (``output_hidden_states``) on the *unwrapped* model over a small fixed
+    probe batch and records, under the ``diag/`` prefix:
+
+    * per-depth residual-stream RMS (``diag/residual_rms/{max,mean,argmax_layer,
+      final_layer}``) — residual growth and the hidden-state index that drives it
+      (index 0 is the post-embedding state; 1..L are block outputs);
+    * output-logit RMS (``diag/logit_rms``).
+
+    Distributed-safety (this used to hang DDP runs): the probe issues **no
+    collectives**, runs **only on the main process** (weights are DDP-identical
+    across ranks, so rank 0's shard is representative), uses the tested SDPA path
+    (not the memory-heavy ``output_attentions`` manual path), and calls
+    ``torch.cuda.synchronize()`` inside its guard so an async CUDA fault surfaces
+    *there* — caught and the probe self-disabled — rather than corrupting the next
+    NCCL collective and timing out the whole group. It also runs off the compiled
+    training step (eager, unwrapped, ``no_grad``, ``eval`` restored afterward), so
+    there are **no forward hooks** and ``torch.compile`` stays on for training.
+    ``probe_every=0`` logs only the grad norm. Metrics emit through
+    ``accelerator.log`` on the training-loss cadence (eval-only logs are skipped).
     """
-    import pandas as pd
 
-    rows: list[dict[str, object]] = []
-    for run_dir in run_dirs:
-        path = Path(run_dir)
-        metrics_path = path if path.name == "metrics.json" else path / "metrics.json"
-        data = json.loads(metrics_path.read_text())
-        row: dict[str, object] = {
-            "width": data["width"],
-            "lr": data["lr"],
-            "final_train_loss": data.get("final_train_loss"),
-            "steps": data.get("steps"),
+    def __init__(self, *, probe_every: int = 25) -> None:
+        if probe_every < 0:
+            raise ValueError(f"probe_every must be >= 0, got {probe_every}")
+        self.probe_every = probe_every
+        self._probe_batch: dict[str, torch.Tensor] | None = None
+        self._log_count = 0
+        self._probe_disabled = False
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def on_train_start(self, trainer: Trainer) -> None:
+        # Probe on the main process only (see class docstring); other ranks skip
+        # it entirely, so they never capture a batch or run the extra forward.
+        if self.probe_every > 0 and trainer.accelerator.is_main_process:
+            self._probe_batch = self._capture_probe_batch(trainer)
+
+    def on_log(self, trainer: Trainer, metrics: dict[str, float], step: int) -> None:
+        # Fire only on training-step logs, not eval-only emissions, so the diag
+        # cadence tracks train logging.
+        if "train/loss" not in metrics:
+            return
+        self._log_count += 1
+
+        diag: dict[str, float] = {}
+        grad_norm = getattr(trainer, "_last_grad_norm", None)
+        if grad_norm is not None:
+            diag["diag/grad_norm"] = float(grad_norm)
+
+        if (
+            self.probe_every > 0
+            and not self._probe_disabled
+            and self._log_count % self.probe_every == 0
+        ):
+            self._run_probe(trainer, diag)
+
+        if diag:
+            trainer.accelerator.log(diag, step=step)
+
+    # -- probe --------------------------------------------------------------
+
+    @staticmethod
+    def _capture_probe_batch(trainer: Trainer) -> dict[str, torch.Tensor] | None:
+        """Grab one small fixed batch (a fresh iterator; the train iterator is untouched)."""
+        try:
+            batch = next(iter(trainer.dataloader))
+        except (StopIteration, TypeError, KeyError):
+            logger.warning("stability probe: could not capture a batch; disabling it")
+            return None
+        device = trainer.accelerator.device
+        probe = {
+            key: batch[key][:_PROBE_MAX_EXAMPLES, :_PROBE_MAX_TOKENS].to(device)
+            for key in ("input_ids", "attention_mask")
+            if key in batch
         }
-        row.update(data.get("eval") or {})
-        rows.append(row)
-    return pd.DataFrame.from_records(rows)
+        return probe or None
 
+    def _run_probe(self, trainer: Trainer, diag: dict[str, float]) -> None:
+        """Eager, main-process-only diagnostic forward; fill residual + logit RMS."""
+        # Main process only: the extra forward has no collectives, so other ranks
+        # must NOT run it (that is what previously hung DDP — an async CUDA fault
+        # in the probe corrupted a rank's context and timed out the next collective).
+        if not trainer.accelerator.is_main_process:
+            return
+        if self._probe_batch is None or "input_ids" not in self._probe_batch:
+            return
+        model = trainer.accelerator.unwrap_model(trainer.model)
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=self._probe_batch["input_ids"],
+                    attention_mask=self._probe_batch.get("attention_mask"),
+                    output_hidden_states=True,
+                )
+            # Force any async CUDA fault to surface here, inside the guard, rather
+            # than at the next collective (where it would hang the whole group).
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._emit_residual(diag, getattr(outputs, "hidden_states", None))
+            logits = getattr(outputs, "logits", None)
+            if isinstance(logits, torch.Tensor):
+                diag["diag/logit_rms"] = float(_rms(logits))
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never kill training
+            logger.warning("stability probe failed; disabling it: %s", exc)
+            self._probe_disabled = True
+        finally:
+            if was_training:
+                model.train()
 
-@dataclass(frozen=True)
-class MupTransferResult:
-    """Outcome of an LR sweep: the best LR per width plus the μTransfer verdict.
-
-    Attributes:
-        best_lr: Argmin-loss base LR for each width.
-        transferred: ``True`` iff at least two widths were swept and they all agree
-            on the same argmin LR (the empirical width-transfer verdict).
-    """
-
-    best_lr: dict[int, float]
-    transferred: bool
-
-
-def best_lr_per_width(
-    df: pd.DataFrame, *, loss_column: str = "final_train_loss"
-) -> MupTransferResult:
-    """Argmin-loss LR per width and whether the widths agree (the transfer verdict).
-
-    Args:
-        df: A sweep frame from :func:`summarize_sweep` (needs ``width``, ``lr``,
-            and ``loss_column``).
-        loss_column: Column whose minimum selects the best LR per width.
-
-    Returns:
-        A :class:`MupTransferResult`. ``transferred`` is ``True`` only when ≥2
-        widths were swept and every width's argmin LR matches.
-    """
-    best: dict[int, float] = {}
-    for _, group in df.groupby("width"):
-        best_idx = group[loss_column].idxmin()
-        best[int(group.loc[best_idx, "width"])] = float(group.loc[best_idx, "lr"])
-    transferred = len(best) >= 2 and len(set(best.values())) == 1
-    return MupTransferResult(best_lr=best, transferred=transferred)
+    @staticmethod
+    def _emit_residual(diag: dict[str, float], hidden_states: object) -> None:
+        """Reduce the (L+1)-tuple of residual states to max/mean/argmax/final RMS."""
+        if not hidden_states:
+            return
+        values = torch.stack(
+            [_rms(h) for h in hidden_states if isinstance(h, torch.Tensor)]  # ty: ignore[not-iterable]
+        )
+        if values.numel() == 0:
+            return
+        diag["diag/residual_rms/max"] = float(values.max())
+        diag["diag/residual_rms/mean"] = float(values.mean())
+        diag["diag/residual_rms/argmax_layer"] = float(int(values.argmax()))
+        diag["diag/residual_rms/final_layer"] = float(values[-1])

@@ -162,7 +162,8 @@ def test_ablation_features_train_and_partition_together(
     id_to_name = {id(p): n for n, p in model.named_parameters()}
     groups = partition_optimizer_params(model, TrainConfig(optimizer=optimizer))
     no_decay_ids = {id(p) for p in groups.adamw_no_decay_params}
-    muon_ids = {id(p) for p in groups.muon_params}
+    muon_params = [param for group in groups.muon_groups for param in group.params]
+    muon_ids = {id(p) for p in muon_params}
 
     new_1d = {
         n
@@ -193,8 +194,7 @@ def test_ablation_features_train_and_partition_together(
                 assert id(param) not in no_decay_ids, f"{name} should not be AdamW-no-decay"
 
     grouped_ids = [
-        id(p)
-        for p in (*groups.muon_params, *groups.adamw_decay_params, *groups.adamw_no_decay_params)
+        id(p) for p in (*muon_params, *groups.adamw_decay_params, *groups.adamw_no_decay_params)
     ]
     trainable_ids = {id(p) for p in model.parameters() if p.requires_grad}
     assert len(grouped_ids) == len(set(grouped_ids))  # no param counted twice

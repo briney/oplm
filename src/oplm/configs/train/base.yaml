@@ -33,6 +33,9 @@ train:
   muon_momentum: 0.95
   muon_nesterov: true
   muon_ns_steps: 5
+  # Empirical repeated-block LR correction for the production scaling ray.
+  mup_depth_lr_exponent: 0.0
+  mup_depth_reference_layers: 24
   max_grad_norm: 1.0
 
   # Scheduler

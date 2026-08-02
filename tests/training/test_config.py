@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 from importlib.resources import files
 from typing import TYPE_CHECKING, Any
@@ -263,6 +264,32 @@ def test_all_presets_pass_strict_validation(preset: str) -> None:
     """Every packaged size preset loads cleanly under strict key validation."""
     cfg = load_config(["--preset", preset])
     assert isinstance(cfg.model, OplmModelConfig)
+
+
+def test_800m_preset_uses_64_dimensional_heads() -> None:
+    cfg = load_config(["--preset", "800M"])
+    assert cfg.model.hidden_size == 1280
+    assert cfg.model.num_hidden_layers == 40
+    assert cfg.model.num_attention_heads == 20
+    assert cfg.model.head_dim == 64
+
+
+def test_depth_lr_defaults_are_noop_at_170m_reference() -> None:
+    cfg = load_config([])
+    assert cfg.train.mup_depth_lr_exponent == 0.0
+    assert cfg.train.mup_depth_reference_layers == 24
+
+
+@pytest.mark.parametrize("value", [-0.1, math.inf, -math.inf, math.nan])
+def test_depth_lr_exponent_must_be_finite_and_nonnegative(value: float) -> None:
+    with pytest.raises(ValueError, match="mup_depth_lr_exponent"):
+        TrainConfig(mup_depth_lr_exponent=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_depth_lr_reference_layers_must_be_positive(value: int) -> None:
+    with pytest.raises(ValueError, match="mup_depth_reference_layers"):
+        TrainConfig(mup_depth_reference_layers=value)
 
 
 @pytest.mark.parametrize("preset", AVAILABLE_PRESETS)
