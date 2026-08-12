@@ -42,7 +42,7 @@ from oplm.sweep import phases
 from oplm.sweep.common import load_phase, write_phase
 from tests.cli_output import plain
 from tests.slurm.test_submit import _install_stub
-from tests.sweep.conftest import _write_base_config, _write_selected
+from tests.sweep.conftest import _generate_multi_preset_phase, _write_base_config
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -83,10 +83,10 @@ def test_status_reports_cell_states_and_resubmit_line(coarse_phase: Path) -> Non
     assert "--array=1,2,3,4,5,6" in output
 
 
-def test_status_multi_preset_indices_match_jobs_files(transfer_phase: Path) -> None:
+def test_status_multi_preset_indices_match_jobs_files(multi_preset_phase: Path) -> None:
     """400M/800M/1B each get their own zero-based numbering, matching their `.jobs` file."""
-    manifest = load_phase(transfer_phase)
-    phase_dir = transfer_phase.parent
+    manifest = load_phase(multi_preset_phase)
+    phase_dir = multi_preset_phase.parent
     runs_by_preset: dict[str, list] = {}
     for run in manifest.runs:
         runs_by_preset.setdefault(str(run.params["preset"]), []).append(run)
@@ -99,7 +99,7 @@ def test_status_multi_preset_indices_match_jobs_files(transfer_phase: Path) -> N
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(json.dumps({"eval": {"eval/heldout/loss": value}}))
 
-    result = runner.invoke(app, ["sweep", "status", str(transfer_phase)])
+    result = runner.invoke(app, ["sweep", "status", str(multi_preset_phase)])
     assert result.exit_code == 0, result.output
     output = plain(result.stdout)
     assert "complete" in output
@@ -126,20 +126,8 @@ def test_status_distinguishes_running_from_missing_per_preset(
     preset's array job were still live, every other preset's still-missing cells would wrongly
     read as 'running' too.
     """
-    config = _write_base_config(tmp_path)
-    source = _write_selected(
-        tmp_path / "replicate" / "phase.json",
-        "replicate",
-        [{"lr": 0.01, "output_mult": 1.0}],
-    )
     _install_fake_sbatch(tmp_path, monkeypatch)
-    out = tmp_path / "transfer"
-    result = runner.invoke(
-        phases.app,
-        ["transfer", "--config", str(config), "--from", str(source), "--out", str(out), "--submit"],
-    )
-    assert result.exit_code == 0, result.output
-    phase_path = out / "phase.json"
+    phase_path = _generate_multi_preset_phase(tmp_path, submit=True)
     manifest = load_phase(phase_path)
     assert manifest.job_ids is not None
     live_id = manifest.job_ids["A_400M"]
@@ -201,7 +189,7 @@ def test_status_missing_state_independent_of_scheduler_when_never_submitted(
 
 
 def test_status_partial_submission_missing_not_unknown_for_unsubmitted_preset(
-    transfer_phase: Path, monkeypatch: pytest.MonkeyPatch
+    multi_preset_phase: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A never-submitted preset must be 'missing' -- and get resubmit guidance -- even when a
     sibling preset in the same phase was submitted.
@@ -213,12 +201,12 @@ def test_status_partial_submission_missing_not_unknown_for_unsubmitted_preset(
     entirely. This manifest mirrors the finding's live repro: `job_ids` names 400M (and the
     downstream analyze job) but not 800M/1B, with `squeue` off PATH.
     """
-    manifest = load_phase(transfer_phase)
+    manifest = load_phase(multi_preset_phase)
     manifest.job_ids = {"A_400M": "900001", "ANALYZE": "900099"}
-    write_phase(transfer_phase, manifest)
+    write_phase(multi_preset_phase, manifest)
 
     monkeypatch.setenv("PATH", "")  # squeue unreachable
-    result = runner.invoke(app, ["sweep", "status", str(transfer_phase)])
+    result = runner.invoke(app, ["sweep", "status", str(multi_preset_phase)])
     assert result.exit_code == 0, result.output
     output = plain(result.stdout)
 
@@ -241,20 +229,8 @@ def test_status_flags_running_preset_as_skipped_not_silently_omitted(
     reads as "nothing needed here", indistinguishable from "complete" to an operator skimming
     the output.
     """
-    config = _write_base_config(tmp_path)
-    source = _write_selected(
-        tmp_path / "replicate" / "phase.json",
-        "replicate",
-        [{"lr": 0.01, "output_mult": 1.0}],
-    )
     _install_fake_sbatch(tmp_path, monkeypatch)
-    out = tmp_path / "transfer"
-    result = runner.invoke(
-        phases.app,
-        ["transfer", "--config", str(config), "--from", str(source), "--out", str(out), "--submit"],
-    )
-    assert result.exit_code == 0, result.output
-    phase_path = out / "phase.json"
+    phase_path = _generate_multi_preset_phase(tmp_path, submit=True)
     manifest = load_phase(phase_path)
     assert manifest.job_ids is not None
     live_id = manifest.job_ids["A_400M"]
@@ -305,20 +281,8 @@ def test_status_reports_unknown_not_missing_when_squeue_times_out(
     monkeypatched to inject a short timeout (real `squeue` queries default to 30s) so the test
     doesn't have to wait out the wedged stub's full duration.
     """
-    config = _write_base_config(tmp_path)
-    source = _write_selected(
-        tmp_path / "replicate" / "phase.json",
-        "replicate",
-        [{"lr": 0.01, "output_mult": 1.0}],
-    )
     _install_fake_sbatch(tmp_path, monkeypatch)
-    out = tmp_path / "transfer"
-    result = runner.invoke(
-        phases.app,
-        ["transfer", "--config", str(config), "--from", str(source), "--out", str(out), "--submit"],
-    )
-    assert result.exit_code == 0, result.output
-    phase_path = out / "phase.json"
+    phase_path = _generate_multi_preset_phase(tmp_path, submit=True)
     manifest = load_phase(phase_path)
     assert manifest.job_ids is not None
     # Every preset (400M/800M/1B) got submitted; none has any result on disk.

@@ -87,7 +87,7 @@ def coarse_phase(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def transfer_phase(tmp_path: Path) -> Path:
-    """A generated `transfer` phase spanning the default 400M/800M/1B presets."""
+    """A generated `transfer` phase: one finalist's depth-ray LR bracket, all at 170M width."""
     config = _write_base_config(tmp_path)
     source = _write_selected(
         tmp_path / "replicate" / "phase.json",
@@ -101,6 +101,50 @@ def transfer_phase(tmp_path: Path) -> Path:
     )
     assert result.exit_code == 0, result.output
     return out / "phase.json"
+
+
+def _generate_multi_preset_phase(tmp_path: Path, *, submit: bool = False) -> Path:
+    """Generate a phase spanning 400M/800M/1B (four cells each) via `_generate_phase`.
+
+    No CLI phase spans presets anymore (`transfer` became a single-preset depth ray), but the
+    multi-preset array and status machinery in `_write_jobs` and `oplm sweep status` is still
+    live code. This drives the same generation path every phase command calls, with hand-built
+    cells at the three multi-node presets.
+    """
+    config = _write_base_config(tmp_path)
+    cells = [
+        phases._cell(
+            preset=preset,
+            lr=lr,
+            output_mult=1.0,
+            depth_exponent=0.0,
+            seed=42,
+            global_examples=2048,
+            max_steps=10000,
+            warmup_steps=1000,
+        )
+        for preset in ("400M", "800M", "1B")
+        for lr in (0.01, 0.0126, 0.016, 0.02)
+    ]
+    phase_path, _ = phases._generate_phase(
+        name="grid",
+        base_config=config,
+        out=tmp_path / "grid",
+        metric=None,
+        source=None,
+        cells=cells,
+        num_processes=8,
+        local=False,
+        accelerate_config=None,
+        submit=submit,
+    )
+    return phase_path
+
+
+@pytest.fixture
+def multi_preset_phase(tmp_path: Path) -> Path:
+    """A generated phase spanning the 400M/800M/1B presets, one array job each."""
+    return _generate_multi_preset_phase(tmp_path)
 
 
 @pytest.fixture

@@ -49,6 +49,19 @@ SMOKE_LRS = (0.0004, 0.0016, 0.0063)
 COARSE_LRS = (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)
 OUTPUT_MULTS = (0.5, 1.0, 2.0)
 
+# μP reference depth: the 170M anchor's layer count. The repeated-block depth-LR correction
+# (24 / L) ** exponent is exactly 1.0 at this depth, so it anchors the transfer bracket.
+DEPTH_REFERENCE_LAYERS = 24
+
+# Depth-ray transfer check: fixed 768-wide (170M) geometry at depths bracketing the reference,
+# a coarse-grid-spaced (1.6x) LR bracket around each replicated finalist, and the depth-LR
+# exponent pinned at 0.5 -- the value consistent with the frozen 1/sqrt(L) residual branch
+# scaling. The phase verifies that the exponent-corrected LR optimum stays centered as depth
+# varies, rather than sweeping the exponent itself; see docs/LR_SWEEP.md.
+TRANSFER_DEPTHS = (12, 24, 48)
+TRANSFER_LR_MULTS = (0.625, 1.0, 1.6)
+TRANSFER_DEPTH_EXPONENT = 0.5
+
 
 def _grid_default(values: tuple[float, ...]) -> str:
     """Render an LR grid as the comma-separated string a Typer default expects."""
@@ -103,6 +116,9 @@ def _cell(
     max_steps: int,
     warmup_steps: int,
     batch_mult: float | None = None,
+    layers: int | None = None,
+    lr_mult: float | None = None,
+    base_lr: float | None = None,
 ) -> Params:
     params: Params = {
         "preset": preset,
@@ -116,6 +132,14 @@ def _cell(
     }
     if batch_mult is not None:
         params["batch_mult"] = batch_mult
+    # Depth-ray cells override the preset's layer count and record the bracket position:
+    # `lr` is `base_lr * lr_mult`, and ranking groups by (base_lr, output_mult).
+    if layers is not None:
+        params["layers"] = layers
+    if lr_mult is not None:
+        params["lr_mult"] = lr_mult
+    if base_lr is not None:
+        params["base_lr"] = base_lr
     return params
 
 
@@ -124,6 +148,7 @@ def _write_run_config(
     run_dir: Path,
     params: Params,
     *,
+    phase: str,
     plan: BatchPlan,
     diagnostics: bool = False,
 ) -> Path:
@@ -149,13 +174,19 @@ def _write_run_config(
         raise ValueError(
             f"μP sweep requires train.weight_decay=0.01, got {base.train.weight_decay}"
         )
-    run_name = run_dir.name
+    # Prefix the W&B run name with the phase. The run id alone is not unique across phases --
+    # SMOKE_LRS is a subset of COARSE_LRS, so a smoke cell and a coarse cell at the same LR
+    # produce the identical id and would appear as duplicate names in the W&B project, telling
+    # apart only by step count. The on-disk run directory keeps the bare id.
+    run_name = f"{phase}-{run_dir.name}"
     # Checkpoint eight times per cell so a requeue loses at most ~12% of the run, and keep only
     # the newest: these checkpoints exist solely to make requeue cheap.
     save_every = max(1, max_steps // 8)
+    # Depth-ray cells keep the preset's width/heads and override only the layer count.
+    num_layers = _as_int(params["layers"]) if "layers" in params else preset_model.num_hidden_layers
     overrides = [
         f"model.hidden_size={preset_model.hidden_size}",
-        f"model.num_hidden_layers={preset_model.num_hidden_layers}",
+        f"model.num_hidden_layers={num_layers}",
         f"model.num_attention_heads={preset_model.num_attention_heads}",
         "model.head_dim=64",
         "model.mup_enable=true",
@@ -168,7 +199,7 @@ def _write_run_config(
         "model.gradient_checkpointing_mode=full",
         f"train.lr={params['lr']}",
         f"train.mup_depth_lr_exponent={params['depth_exponent']}",
-        "train.mup_depth_reference_layers=24",
+        f"train.mup_depth_reference_layers={DEPTH_REFERENCE_LAYERS}",
         f"train.seed={params['seed']}",
         f"train.batch_size={plan.per_device_batch}",
         f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
@@ -223,10 +254,15 @@ def _input_candidates(source: Path, raw: str | None, names: tuple[str, ...]) -> 
 
 
 def _run_id(params: Params) -> str:
+    # Depth-ray cells insert the layer count and bracket multiplier. The multiplier is not
+    # redundant with the effective lr: the coarse grid is 1.6x-spaced, so one candidate's
+    # x1.6 cell and the next candidate's x1 cell can land on the same effective lr.
+    depth = f"-d{_as_int(params['layers'])}" if "layers" in params else ""
+    mult = f"-x{_as_float(params['lr_mult']):g}" if "lr_mult" in params else ""
     return (
-        f"{params['preset']}-lr{_as_float(params['lr']):g}"
+        f"{params['preset']}{depth}-lr{_as_float(params['lr']):g}"
         f"-om{_as_float(params['output_mult']):g}"
-        f"-a{_as_float(params['depth_exponent']):g}-s{_as_int(params['seed'])}"
+        f"-a{_as_float(params['depth_exponent']):g}{mult}-s{_as_int(params['seed'])}"
     )
 
 
@@ -305,7 +341,7 @@ def _write_jobs(
     """Write one array job per preset plus a dependent analyze job.
 
     Slurm job arrays require homogeneous resources and node count varies by preset, so a phase
-    spanning several presets (``transfer``) emits one array each, with a single analyze job
+    spanning several presets emits one array each, with a single analyze job
     depending on all of them. Dependencies use ``afterany`` (see
     :func:`oplm.slurm.render.render_submit_script`), so a diverged cell -- expected, ineligible
     data to the ranking step -- cannot strand the analyze job in ``DependencyNeverSatisfied``.
@@ -412,7 +448,9 @@ def _generate_phase(
             world_size=world_size,
             max_batch_size=_resolve_max_batch_size(slurm, preset),
         )
-        config = _write_run_config(base_config, run_dir, params, plan=plan, diagnostics=diagnostics)
+        config = _write_run_config(
+            base_config, run_dir, params, phase=name, plan=plan, diagnostics=diagnostics
+        )
         result = run_dir / "result.json"
         runs.append(
             RunSpec(
@@ -533,29 +571,45 @@ def _replicate_cells(
 def _transfer_cells(
     candidates: list[Params],
     *,
-    presets: list[str],
-    steps: list[int],
-    exponents: list[float],
+    depths: list[int],
+    lr_mults: list[float],
+    exponent: float,
     global_examples: int,
     seed: int,
-    warmups: list[int],
+    steps: int,
+    warmup: int,
 ) -> list[Params]:
-    if len(presets) != len(steps) or len(presets) != len(warmups):
-        raise ValueError("--presets, --steps, and --warmup must contain the same number of values")
+    """Cross each finalist with a per-depth LR bracket at fixed 170M width.
+
+    Every cell keeps the 170M preset's width and head count and overrides only the layer
+    count, so depth is the *only* thing that varies across the ray -- no width/heads/horizon
+    confound. The depth-LR exponent is pinned (not swept): the phase measures whether the
+    exponent-corrected LR optimum stays centered in the bracket as depth changes.
+    """
+    if 1.0 not in lr_mults:
+        raise ValueError("--lr-mults must include 1.0 (the transferred candidate itself)")
+    if DEPTH_REFERENCE_LAYERS not in depths:
+        raise ValueError(
+            f"--depths must include the μP reference depth {DEPTH_REFERENCE_LAYERS}, where the "
+            "depth-LR correction is a no-op and the bracket re-checks the finalist itself"
+        )
     return [
         _cell(
-            preset=preset,
-            lr=_as_float(candidate["lr"]),
+            preset="170M",
+            lr=_as_float(candidate["lr"]) * lr_mult,
             output_mult=_as_float(candidate["output_mult"]),
             depth_exponent=exponent,
             seed=seed,
             global_examples=global_examples,
-            max_steps=model_steps,
-            warmup_steps=model_warmup,
+            max_steps=steps,
+            warmup_steps=warmup,
+            layers=depth,
+            lr_mult=lr_mult,
+            base_lr=_as_float(candidate["lr"]),
         )
         for candidate in candidates
-        for preset, model_steps, model_warmup in zip(presets, steps, warmups, strict=True)
-        for exponent in exponents
+        for depth in depths
+        for lr_mult in lr_mults
     ]
 
 
@@ -743,31 +797,62 @@ def _replicate_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str,
 
 
 def _transfer_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, Any]]:
-    keys = {_aggregate_key(run.params) for run in phase.runs}
-    presets = {str(run.params["preset"]) for run in phase.runs}
-    per_model_rank: dict[tuple[str, tuple[float, float, float, float | None]], int] = {}
-    for preset in presets:
-        rows = [
-            (result_metric(phase_path.parent, run, phase.metric), run)
-            for run in phase.runs
-            if run.params["preset"] == preset
-        ]
-        valid = [(loss, run) for loss, run in rows if loss is not None]
-        valid.sort(key=lambda row: (float(row[0]), float(row[1].params["lr"])))
-        for rank, (_, run) in enumerate(valid, start=1):
-            per_model_rank[(preset, _aggregate_key(run.params))] = rank
+    """Rank candidates by whether their transferred LR stays optimal across the depth ray.
+
+    Cells are grouped by candidate (``base_lr``, ``output_mult``). Within each depth, the
+    bracket winner is the ``lr_mult`` with the lowest finite loss; a missing or non-finite
+    bracket point counts as worst, so a diverged edge cell loses to any finite one. A candidate
+    *transfers* when the bracket center (``lr_mult=1.0``) wins at every depth; its score is the
+    mean center loss across depths. A candidate whose center cell is missing or non-finite at
+    any depth, or whose bracket winner is off-center at any depth, scores ``None`` (ineligible)
+    -- the per-depth ``winning_mults`` recorded on the entry show the drift direction.
+    """
+    groups: dict[tuple[float, float], list[RunSpec]] = {}
+    for run in phase.runs:
+        key = (_as_float(run.params["base_lr"]), _as_float(run.params["output_mult"]))
+        groups.setdefault(key, []).append(run)
 
     entries: list[dict[str, Any]] = []
-    for key in keys:
-        ranks = [per_model_rank.get((preset, key)) for preset in presets]
-        score = (
-            sum(_as_int(rank) for rank in ranks)
-            if all(rank is not None for rank in ranks)
-            else None
+    for (base_lr, output_mult), runs in sorted(groups.items()):
+        depths = sorted({_as_int(run.params["layers"]) for run in runs})
+        exponent = _as_float(runs[0].params["depth_exponent"])
+        winning_mults: dict[str, float | None] = {}
+        center_losses: list[float] = []
+        transfers = True
+        for depth in depths:
+            bracket = [
+                (
+                    result_metric(phase_path.parent, run, phase.metric),
+                    _as_float(run.params["lr_mult"]),
+                )
+                for run in runs
+                if _as_int(run.params["layers"]) == depth
+            ]
+            center = next((loss for loss, mult in bracket if mult == 1.0), None)
+            if center is None:
+                winning_mults[str(depth)] = None
+                transfers = False
+                continue
+            _, winner = min(
+                bracket,
+                key=lambda row: (row[0] is None, row[0] if row[0] is not None else 0.0, row[1]),
+            )
+            winning_mults[str(depth)] = winner
+            center_losses.append(center)
+            if winner != 1.0:
+                transfers = False
+        score = sum(center_losses) / len(center_losses) if transfers else None
+        entries.append(
+            {
+                "params": {
+                    "lr": base_lr,
+                    "output_mult": output_mult,
+                    "depth_exponent": exponent,
+                },
+                "score": score,
+                "winning_mults": winning_mults,
+            }
         )
-        params = _aggregate_params(key)
-        params.pop("batch_mult", None)
-        entries.append({"params": params, "score": score})
     return _sort_aggregate(entries)
 
 
@@ -781,7 +866,11 @@ def analyze_phase(path: Path) -> PhaseManifest:
         phase.selected = _select_count(phase.ranking, 2)
     elif phase.phase == "transfer":
         phase.ranking = _transfer_ranking(path, phase)
-        phase.selected = _select_count(phase.ranking, 2)
+        # Only candidates whose bracket center won at every depth are eligible; selecting one
+        # matches what bridge consumes. No eligible candidate means the exponent-corrected LR
+        # did not transfer -- inspect `winning_mults` for the drift direction instead of
+        # proceeding.
+        phase.selected = _select_count(phase.ranking, 1)
     else:
         phase.ranking = _direct_ranking(path.parent, phase)
         eligible = [entry for entry in phase.ranking if entry["score"] is not None]
@@ -1191,13 +1280,13 @@ def transfer(
     out: Annotated[Path, typer.Option("--out", file_okay=False)],
     metric: Annotated[str | None, typer.Option("--metric")] = None,
     candidates: Annotated[str | None, typer.Option("--candidates")] = None,
-    presets: Annotated[str, typer.Option("--presets")] = "400M,800M,1B",
-    steps: Annotated[str, typer.Option("--steps")] = "10000,20000,10000",
-    exponents: Annotated[str, typer.Option("--exponents")] = "0,0.5,0.75,1.0",
+    depths: Annotated[str, typer.Option("--depths")] = _grid_default(TRANSFER_DEPTHS),
+    lr_mults: Annotated[str, typer.Option("--lr-mults")] = _grid_default(TRANSFER_LR_MULTS),
+    exponent: Annotated[float, typer.Option("--exponent")] = TRANSFER_DEPTH_EXPONENT,
     global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
     seed: Annotated[int, typer.Option("--seed")] = 42,
-    # Per-preset warmup (aligned with --presets/--steps), ~10% of each horizon.
-    warmup: Annotated[str, typer.Option("--warmup")] = "1000,2000,1000",
+    steps: Annotated[int, typer.Option("--steps")] = 10000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k transfer cells
     num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
     local: Annotated[bool, typer.Option("--local/--no-local")] = False,
     submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
@@ -1206,16 +1295,23 @@ def transfer(
     ] = None,
     diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
 ) -> None:
-    """Generate the paired LR/output depth-transfer grid."""
+    """Generate the fixed-width depth-ray LR-transfer check.
+
+    Depth is the only axis: every cell keeps the 170M width (768) and head count and varies
+    only the layer count, with the depth-LR exponent pinned (default 0.5, the value consistent
+    with the 1/sqrt(L) residual branch scaling). Each finalist gets a per-depth LR bracket;
+    the candidate transfers when the bracket center wins at every depth.
+    """
     try:
         cells = _transfer_cells(
             _input_candidates(source, candidates, ("lr", "output_mult")),
-            presets=_parse_strings(presets, name="--presets"),
-            steps=_parse_ints(steps, name="--steps"),
-            exponents=parse_floats(exponents, name="--exponents"),
+            depths=_parse_ints(depths, name="--depths"),
+            lr_mults=parse_floats(lr_mults, name="--lr-mults"),
+            exponent=exponent,
             global_examples=global_examples,
             seed=seed,
-            warmups=_parse_ints(warmup, name="--warmup"),
+            steps=steps,
+            warmup=warmup,
         )
         phase_path, commands = _generate_phase(
             name="transfer",
