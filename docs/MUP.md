@@ -138,11 +138,19 @@ effective_block_lr(L) = width_aware_lr * (mup_depth_reference_layers / L) ** mup
 
 `mup_depth_reference_layers` defaults to `24`, and
 `mup_depth_lr_exponent=0.0` makes the correction a no-op. The correction does
-not apply to embeddings, the final stack norm, or the MLM head/readout. The
-production sweep selects one exponent for the complete scaling ray from a
-`0,0.5,0.75,1.0` grid (empirical because Muon is neither Adam nor SGD, so the
-published CompleteP/Depth-μP exponents do not carry over); see
-[LR_SWEEP.md](LR_SWEEP.md#depth-lr-exponent-grid).
+not apply to embeddings, the final stack norm, or the MLM head/readout.
+
+The exponent is a consequence of the residual parameterization, not a free
+hyperparameter: with the branch scaling frozen at `1/√L`
+(`residual_scaling=sqrt_num_layers`), summing per-block updates of size
+`η·(24/L)^e` over `L` blocks gives a total one-step feature update
+`∝ η·L^(1/2−e)`, so depth invariance pins `e = 0.5`. (CompleteP's depth-flat
+Adam LR belongs to its `1/L` branch multiplier, `α = 1` — a different design;
+its exponent does not graft onto a `1/√L` branch.) The production sweep pins
+`0.5` and *verifies* it on a fixed-width depth ray rather than sweeping a grid —
+sandwich norm post-normalizes each branch before the `1/√L` multiplier and the
+learned gate, and Muon is neither Adam nor SGD, so the derivation is checked
+empirically; see [LR_SWEEP.md](LR_SWEEP.md#depth-ray-lr-transfer-check).
 
 ### Multipliers across the presets
 
@@ -233,8 +241,8 @@ transfer, batch bridge, confirmation, and winner-only scaling phases.
   depth scaling (`residual_scaling="sqrt_num_layers"` + `1/√(2L)` residual-writer
   init) is a *separate, weaker* guarantee. Combined width+depth transfer along the
   preset ray (the constant-aspect-ratio scaling the presets ship) is validated
-  **empirically** — coord-check `preset_ray` mode plus a confirmation run — not
-  asserted from theory.
+  **empirically** — coord-check `preset_ray` mode, the fixed-width depth-ray
+  transfer check, and a confirmation run — not asserted from theory.
 - **μP does not transfer across batch size, sequence length, or training horizon.**
   The production runbook therefore keeps the sequence-length distribution fixed,
   measures a proxy-to-production batch bridge, and uses a WSD schedule for the

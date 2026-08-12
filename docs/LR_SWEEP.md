@@ -68,6 +68,7 @@ slurm:
   max_concurrent: 4
   nodes:
     default: {170M: 1, 400M: 4, 800M: 8, 1B: 8}
+    transfer: {170M: 4}
     bridge: {170M: 4}
     replicate: {170M: 4}
     confirm: {800M: 8}
@@ -183,7 +184,10 @@ The generator sets each cell's run name to `<phase>-<preset>-lr<lr>-om<output_mu
 e.g. `coarse-170M-lr0.0025-om1-a0-s42`, so a run's full identity is legible from the W&B sidebar.
 The phase prefix matters: `SMOKE_LRS` is a subset of `COARSE_LRS`, so without it the three smoke
 cells and their coarse counterparts would appear under identical names, separable only by step
-count. `scale` runs are named `oplm-<preset>-scale`.
+count. `transfer`'s depth-ray cells additionally insert the layer count and bracket multiplier
+(`transfer-170M-d48-lr0.004-om1-a0.5-x1.6-s42`) — the multiplier is not redundant with the
+effective LR, since the 1.6×-spaced coarse grid lets one finalist's `x1.6` cell land on another
+finalist's `x1` LR. `scale` runs are named `oplm-<preset>-scale`.
 
 ### Monitoring without installing oplm
 
@@ -230,15 +234,17 @@ job — see [SLURM.md §6](SLURM.md#6-job-arrays-and-the-homogeneous-resource-co
 generate the next phase until the current one has completed and been ranked. `scale` is different
 — see the note at the end of this section.
 
-For the cheap, fast proxy phases (`smoke`, `coarse`, `refine`, and the first `replicate`), pass
-`--submit` so generation and submission happen in one step. For the expensive, multi-day phases
-(`transfer`, `bridge`, the second `replicate`, `confirm`), omit `--submit`, inspect the generated
-`jobs/*.sbatch` scripts and `jobs/submit.sh`, then run `bash sweeps/<phase>/jobs/submit.sh`
-yourself once you're ready to commit the allocation:
+For the cheap, fast proxy phases (`smoke`, `coarse`, `refine`, the first `replicate`, and
+`transfer` — the depth ray runs 170M-class cells on the same 4-node allocation as the first
+`replicate`), pass `--submit` so generation and submission happen in one step. For the expensive, multi-day phases (`bridge`, the
+second `replicate`, `confirm`), omit `--submit`, inspect the generated `jobs/*.sbatch` scripts
+and `jobs/submit.sh`, then run `bash sweeps/<phase>/jobs/submit.sh` yourself once you're ready
+to commit the allocation:
 
 The split is by *cost*, not by node count. Both `replicate` invocations share the phase name
 `replicate`, so the `nodes` override above applies to both: the first one is cheap (a few hours)
-but still lands on four nodes. Check the [node table](#node-counts-and-derived-per-device-batch)
+but still lands on four nodes, and `transfer`'s depth-ray cells do too. Check the
+[node table](#node-counts-and-derived-per-device-batch)
 before auto-submitting if four nodes is a hard allocation to get on your cluster.
 
 ```bash
@@ -252,11 +258,10 @@ oplm sweep refine --config $CONFIG \
   --from $SWEEP/coarse/phase.json --out $SWEEP/refine --submit
 oplm sweep replicate --config $CONFIG \
   --from $SWEEP/refine/phase.json --out $SWEEP/refine-replicate --submit
+oplm sweep transfer --config $CONFIG \
+  --from $SWEEP/refine-replicate/phase.json --out $SWEEP/transfer --submit
 
 # Expensive phases: generate, review, then submit manually.
-oplm sweep transfer --config $CONFIG \
-  --from $SWEEP/refine-replicate/phase.json --out $SWEEP/transfer
-bash $SWEEP/transfer/jobs/submit.sh
 oplm sweep bridge --config $CONFIG \
   --from $SWEEP/transfer/phase.json --out $SWEEP/bridge
 bash $SWEEP/bridge/jobs/submit.sh
@@ -315,17 +320,23 @@ onto 4 nodes at a quarter the per-device batch, which is why it now gets its own
 | --- | --- | ---: | ---: | ---: | ---: |
 | `smoke`/`coarse`/`refine` | 170M | 2048 | 1 | 256 | ~12 h (`coarse`, 10k steps) |
 | first `replicate` | 170M | 2048 | 4 | 64 | ~6 h (20k steps, inherited from `refine`) |
-| `transfer` | 400M | 2048 | 4 | 64 | ~7 h (10k steps) |
-| `transfer` | 800M | 2048 | 8 | 32 | ~14 h (20k steps) |
-| `transfer` | 1B | 2048 | 8 | 32 | ~13 h (10k steps) |
+| `transfer` (depth 12) | 170M | 2048 | 4 | 64 | ~1.5 h (10k steps) |
+| `transfer` (depth 24) | 170M | 2048 | 4 | 64 | ~3 h (10k steps) |
+| `transfer` (depth 48) | 170M | 2048 | 4 | 64 | ~6 h (10k steps) |
 | `bridge` | 170M | 8192 | 4 | 256 | ~12 h (10k steps) |
 | second `replicate` | 170M | 8192 | 4 | 256 | ~12 h (10k steps, matches `bridge`) |
 | `confirm` | 800M | 8192 | 8 | 128 | ~28 h (10k steps) |
 
 Every row above still resolves to `gradient_accumulation_steps=1`.
 
-Full gradient checkpointing is what makes the 400M+ per-device batches above fit in memory; it
-costs roughly 30–40% more compute than selective checkpointing.
+Every `transfer` cell resolves node count and batch cap from the `170M` preset regardless of its
+layer override; the `transfer: {170M: 4}` entry above distributes each cell across 4 nodes
+(32-way data parallel, 64 per device), matching the first `replicate`'s shape. At 64 per device
+even the depth-48 leg — roughly twice the 170M activation footprint per example — has ample
+memory headroom, and full gradient checkpointing is pinned in every cell besides.
+
+Full gradient checkpointing is what makes the 800M-scale per-device batches above fit in memory;
+it costs roughly 30–40% more compute than selective checkpointing.
 
 ### Status and resubmission
 
@@ -379,7 +390,7 @@ The defaults implement this funnel:
 | `coarse` | Rank the seven-point LR grid at 170M for 10,000 steps. |
 | `refine` | Cross the selected local LR region with output multipliers `0.5,1,2`. |
 | first `replicate` | Add seeds 43 and 44 to seed 42 for the two finalists. |
-| `transfer` | Test both finalists and depth exponents `0,0.5,0.75,1.0` at 400M, 800M, and 1B. |
+| `transfer` | Bracket both finalists' LRs (`×0.625,×1,×1.6`) across depths 12/24/48 at fixed 170M width, exponent pinned at 0.5. |
 | `bridge` | Test batch-correction LR multipliers `0.7,1,1.4,2` at the 170M production batch. |
 | second `replicate` | Add seeds 43 and 44 to the bridge finalists. |
 | `confirm` | Rank the production-batch finalists at 800M. |
@@ -395,23 +406,49 @@ distribution); bridge and later phases use 8,192 (roughly 4M). μP does not make
 irrelevant, so the bridge measures this correction rather than assuming a scaling rule.
 
 Each cell warms up over ~10% of its own horizon: 1,000 steps for the 10k phases (smoke uses 100
-over 1k), 2,000 for the 20k `refine` and the 20k 800M `transfer` cell, and 5,000 (~5%) for the
-100k `scale` cells. Warmup *fraction*, like batch size, does not transfer across horizon — so the
-proxy keeps it modest rather than spending half of a short run ramping, which also avoids the
-selection bias where a large warmup fraction tolerates a hotter peak LR than production's ~0.4%
-warmup can sustain. `transfer` takes a per-preset `--warmup` list aligned with
-`--presets`/`--steps`.
+over 1k), 2,000 for the 20k `refine`, and 5,000 (~5%) for the 100k `scale` cells. Warmup
+*fraction*, like batch size, does not transfer across horizon — so the proxy keeps it modest
+rather than spending half of a short run ramping, which also avoids the selection bias where a
+large warmup fraction tolerates a hotter peak LR than production's ~0.4% warmup can sustain.
+`transfer` cells share one horizon (`--steps 10000 --warmup 1000`) across every depth.
 
-## Depth-LR exponent grid
+## Depth-ray LR-transfer check
 
-`transfer` sweeps `mup_depth_lr_exponent` over `0,0.5,0.75,1.0` — the empirical repeated-block
-LR correction `effective_block_lr = width_aware_lr * (24 / L) ** exponent`. The residual-branch
-scaling stays fixed at `1/√L` (`residual_scaling=sqrt_num_layers`); this grid tunes only the
-optimizer-side depth correction, which is the dominant lever for depth transfer. The upper end
-reaches `1.0` deliberately: it is the CompleteP (Adam) value and the strongest correction worth
-testing for a 40–50 layer stack. Because OPLM trains with Muon (an orthogonalized update, not
-Adam or SGD), the transferring exponent is not the published CompleteP/Depth-μP number and must
-be selected empirically here. Override with `--exponents` to widen or refine the grid.
+`transfer` does **not** sweep the depth-LR exponent. The exponent in the repeated-block
+correction `effective_block_lr = width_aware_lr * (24 / L) ** exponent` is a consequence of the
+residual parameterization, not a free hyperparameter: OPLM freezes the residual-branch scaling
+at `1/√L` (`residual_scaling=sqrt_num_layers`), and under that choice a per-block LR of
+`η·(24/L)^e` gives a total one-step feature update across the `L` blocks that scales as
+`η·L^(1/2−e)`. Depth invariance therefore pins `e = 0.5`. `e = 0` under-corrects (updates grow
+as `√L` — the historical 800M blow-up mode), and `e = 1` **over**-corrects (updates shrink as
+`1/√L`, starving deep stacks). Note that `e = 1` is *not* "the CompleteP value" in this
+parameterization: CompleteP's depth-flat Adam LR is tied to its `1/L` branch multiplier
+(`α = 1`); grafting its exponent onto a `1/√L` branch double-counts the depth correction.
+
+The exponent is therefore pinned (default `--exponent 0.5`) and the phase *verifies* it
+empirically instead of selecting it from a grid. The reason verification is still warranted is
+architectural: sandwich norm applies a post-norm to each branch output *before* the `1/√L`
+multiplier and the learned channel gate, so the branch contribution to the stream is
+normalized regardless of weight scale, and Muon's orthogonalized updates change the update-norm
+bookkeeping — both weaken the clean derivation above without suggesting a specific alternative.
+
+The check is a **fixed-width depth ray**: every cell keeps the 170M geometry (hidden 768,
+12 heads) and varies *only* the layer count over `--depths 12,24,48`, crossing each replicated
+finalist with the LR bracket `--lr-mults 0.625,1,1.6` (the coarse grid's own 1.6× spacing)
+applied on top of the exponent correction. Depth 24 is the μP reference depth, where the
+correction is a no-op — that leg re-checks the finalist itself and anchors the bracket, so
+`--depths` must include it. This design isolates depth (no width/heads/horizon confound, unlike
+a preset-ray sweep), spans 4× in depth instead of the production ray's 2×, and runs every cell
+as a 4-node, 32-GPU data-parallel job on 170M-class hardware.
+
+Reading the result: a finalist **transfers** when the bracket center wins at every depth — the
+exponent-corrected LR stayed optimal as depth quadrupled, and the winner proceeds to `bridge`
+carrying `depth_exponent=0.5`. If the winning multiplier drifts systematically with depth
+(hot at 48 ⇒ the correction is too strong; cold ⇒ too weak), the phase selects nothing and the
+per-depth `winning_mults` recorded in `phase.json`'s ranking show the drift direction; the
+drift slope across a 4× depth range is itself the measured exponent correction. Production
+geometry is exercised where it belongs: `confirm` (800M at the production batch) and the deep
+stability probe below.
 
 ## Stability diagnostics
 
@@ -446,10 +483,12 @@ its production value. Set `stability_probe_every=0` for grad-norm-only (cheapest
 
 ## Deep stability probe
 
-The proxy `transfer`/`confirm` horizons are shorter than the ~5,000-step regime where the old
-800M run failed, so they cannot by themselves certify deep stability. After `confirm` selects a
-winner, run one long 800M probe at the production batch, past the historical failure horizon,
-with diagnostics on:
+The funnel's only run at the production 800M geometry before `scale` is `confirm`, and its 10k
+proxy horizon at one seed cannot by itself certify deep stability (the old 800M run was stable
+at init and fell apart before 5,000 steps — a dynamics failure, not an init failure). The
+depth-ray `transfer` deliberately trades production geometry for a clean depth measurement, so
+this probe is what covers the production stack. After `confirm` selects a winner, run one long
+800M probe at the production batch, past the historical failure horizon, with diagnostics on:
 
 ```bash
 oplm train --preset 800M --config configs/mup-production.yaml \
@@ -516,8 +555,12 @@ Selection is based on finite held-out validation loss from `result.json`:
 - ordinary phases rank cells by increasing validation loss;
 - each `replicate` phase ranks a candidate by its mean validation loss across seeds 42, 43,
   and 44, using the seed-42 result from its source phase; and
-- `transfer` ranks each candidate within each model preset, sums those per-model ranks, and
-  prefers the lowest total.
+- `transfer` requires the LR bracket's center (`lr_mult=1.0`) to win within every depth — a
+  missing or non-finite bracket point counts as worst, so a diverged edge cell loses to any
+  finite one, while a missing or non-finite *center* disqualifies the candidate. Transferring
+  candidates rank by mean center loss across depths, and selection carries the base `lr` (never
+  a bracket edge) with the pinned `depth_exponent`. If no candidate transfers, the phase selects
+  nothing; the `winning_mults` on each ranking entry show the per-depth drift direction.
 
 The coarse winner must be interior to its finite LR grid; its neighboring LR values become the
 refinement region. Refinement, replication, transfer, bridge, and confirmation then narrow the

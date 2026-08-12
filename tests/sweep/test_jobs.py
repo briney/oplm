@@ -30,14 +30,25 @@ def test_single_preset_phase_emits_one_array(coarse_phase: Path) -> None:
     assert "#SBATCH --array=0-6%4" in (jobs / "170M.sbatch").read_text()
 
 
-def test_transfer_emits_one_array_per_preset(transfer_phase: Path) -> None:
+def test_multi_preset_phase_emits_one_array_per_preset(multi_preset_phase: Path) -> None:
     """Slurm arrays need homogeneous resources, and node count varies by preset."""
-    jobs = transfer_phase.parent / "jobs"
+    jobs = multi_preset_phase.parent / "jobs"
     for preset, nodes in (("400M", 4), ("800M", 8), ("1B", 8)):
         text = (jobs / f"{preset}.sbatch").read_text()
         assert f"#SBATCH --nodes={nodes}" in text
     submit = (jobs / "submit.sh").read_text()
     assert "--dependency=afterany:$A_400M:$A_800M:$A_1B" in submit
+
+
+def test_transfer_emits_single_170m_array_across_depths(transfer_phase: Path) -> None:
+    """The depth ray keeps every cell on the 170M 4-node allocation: one array total."""
+    jobs = transfer_phase.parent / "jobs"
+    text = (jobs / "170M.sbatch").read_text()
+    assert "#SBATCH --nodes=4" in text
+    assert "#SBATCH --array=0-8%4" in text
+    ids = (jobs / "170M.jobs").read_text().split()
+    assert len(ids) == 9  # 1 candidate x 3 depths x 3 bracket multipliers
+    assert {run_id.split("-")[1] for run_id in ids} == {"d12", "d24", "d48"}
 
 
 def test_analyze_job_is_cpu_only(coarse_phase: Path) -> None:

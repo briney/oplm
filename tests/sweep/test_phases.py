@@ -623,16 +623,18 @@ def test_later_phase_default_cell_counts() -> None:
     ]
 
     assert len(phases._replicate_cells(source_runs, candidates, [42, 43, 44])) == 4
+    # 2 candidates x 3 depths x 3 bracket multipliers.
     assert (
         len(
             phases._transfer_cells(
                 candidates,
-                presets=["400M", "800M", "1B"],
-                steps=[10000, 20000, 10000],
-                exponents=[0.0, 0.25, 0.5],
+                depths=[12, 24, 48],
+                lr_mults=[0.625, 1.0, 1.6],
+                exponent=0.5,
                 global_examples=2048,
                 seed=42,
-                warmups=[1000, 2000, 1000],
+                steps=10000,
+                warmup=1000,
             )
         )
         == 18
@@ -731,7 +733,7 @@ def test_replicate_generates_only_new_seeds_from_source_runs(
     } == {("170M", 0.0, 2048, 20000, 5000)}
 
 
-def test_transfer_generates_paired_candidates_across_default_models(
+def test_transfer_generates_depth_ray_brackets_at_fixed_width(
     base_config: Path, tmp_path: Path
 ) -> None:
     candidates = [
@@ -755,53 +757,72 @@ def test_transfer_generates_paired_candidates_across_default_models(
     )
 
     assert result.exit_code == 0, result.output
-    params = [run.params for run in load_phase(out / "phase.json").runs]
-    # 2 candidates × 3 presets × 4 depth exponents.
-    assert len(params) == 24
-    assert {(cell["lr"], cell["output_mult"]) for cell in params} == {
+    phase = load_phase(out / "phase.json")
+    params = [run.params for run in phase.runs]
+    # 2 candidates × 3 depths × 3 bracket multipliers, all on the 170M single-node preset.
+    assert len(params) == 18
+    assert {cell["preset"] for cell in params} == {"170M"}
+    assert {(cell["base_lr"], cell["output_mult"]) for cell in params} == {
         (0.01, 1.0),
         (0.016, 0.5),
     }
-    # Per-preset warmup is ~10% of each preset's horizon (400M/1B 10k → 1000; 800M 20k → 2000).
-    assert {(cell["preset"], cell["max_steps"], cell["warmup_steps"]) for cell in params} == {
-        ("400M", 10000, 1000),
-        ("800M", 20000, 2000),
-        ("1B", 10000, 1000),
-    }
-    assert {cell["depth_exponent"] for cell in params} == {0.0, 0.5, 0.75, 1.0}
-    assert {(cell["global_examples"], cell["seed"]) for cell in params} == {(2048, 42)}
+    assert {cell["layers"] for cell in params} == {12, 24, 48}
+    assert {cell["lr_mult"] for cell in params} == {0.625, 1.0, 1.6}
+    for cell in params:
+        assert cell["lr"] == pytest.approx(float(cell["base_lr"]) * float(cell["lr_mult"]))
+    # The exponent is pinned, not swept; horizon and warmup are uniform across depths.
+    assert {cell["depth_exponent"] for cell in params} == {0.5}
+    assert {
+        (cell["global_examples"], cell["seed"], cell["max_steps"], cell["warmup_steps"])
+        for cell in params
+    } == {(2048, 42, 10000, 1000)}
+    # Every depth-ray cell distributes across 4 nodes (32-way data parallel, 64 per device).
+    assert {
+        (cell["nodes"], cell["per_device_batch"], cell["gradient_accumulation_steps"])
+        for cell in params
+    } == {(4, 64, 1)}
+
+    # The layer override must land in the resolved run config; width and heads stay at 170M.
+    deep = next(run for run in phase.runs if run.params["layers"] == 48)
+    cfg = load_config(["--config", str(out / deep.config)])
+    assert cfg.model.num_hidden_layers == 48
+    assert cfg.model.hidden_size == 768
+    assert cfg.model.num_attention_heads == 12
+    assert cfg.train.mup_depth_lr_exponent == 0.5
 
 
 def _generate_multinode_cell(base_config: Path, tmp_path: Path) -> Path:
-    """Generate a single 400M transfer cell and return its phase directory.
+    """Generate a single 400M cell and return its phase directory.
 
     400M defaults to 4 nodes in the shared slurm fixture (`tests/slurm/test_config.py::RAW`),
-    so at the default `--num-processes 8` this reproduces the review finding: the true world
-    size (4 nodes * 8 gpus_per_node = 32) disagrees with the flat CLI flag (8).
+    so at the default `num_processes=8` this reproduces the review finding: the true world
+    size (4 nodes * 8 gpus_per_node = 32) disagrees with the flat CLI flag (8). `transfer` no
+    longer generates 400M cells (it became a single-node 170M depth ray), so this drives
+    `_generate_phase` -- the path every phase command calls -- directly, keeping the original
+    4-node repro numbers intact.
     """
-    source = _write_selected_phase(tmp_path, "replicate", [{"lr": 0.01, "output_mult": 1.0}])
-    out = tmp_path / "transfer"
-    result = runner.invoke(
-        phases.app,
-        [
-            "transfer",
-            "--config",
-            str(base_config),
-            "--from",
-            str(source),
-            "--out",
-            str(out),
-            "--presets",
-            "400M",
-            "--steps",
-            "10000",
-            "--warmup",
-            "1000",
-            "--exponents",
-            "0",
-        ],
+    out = tmp_path / "grid"
+    cell = phases._cell(
+        preset="400M",
+        lr=0.01,
+        output_mult=1.0,
+        depth_exponent=0.0,
+        seed=42,
+        global_examples=2048,
+        max_steps=10000,
+        warmup_steps=1000,
     )
-    assert result.exit_code == 0, result.output
+    phases._generate_phase(
+        name="grid",
+        base_config=base_config,
+        out=out,
+        metric=None,
+        source=None,
+        cells=[cell],
+        num_processes=8,
+        local=False,
+        accelerate_config=None,
+    )
     return out
 
 
@@ -1052,16 +1073,31 @@ def test_later_phase_list_validation(base_config: Path, tmp_path: Path) -> None:
             str(source),
             "--out",
             str(tmp_path / "transfer-invalid"),
-            "--presets",
-            "400M,800M",
-            "--steps",
-            "10000",
+            "--lr-mults",
+            "0.625,1.6",
         ],
     )
     assert transfer.exit_code != 0
     # `plain()` normalizes both Rich's error-panel wrapping (border chars + line breaks) and
     # any ANSI color codes before matching.
-    assert "same number of values" in plain(transfer.output)
+    assert "must include 1.0" in plain(transfer.output)
+
+    transfer_depths = runner.invoke(
+        phases.app,
+        [
+            "transfer",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(tmp_path / "transfer-invalid-depths"),
+            "--depths",
+            "12,48",
+        ],
+    )
+    assert transfer_depths.exit_code != 0
+    assert "reference depth 24" in plain(transfer_depths.output)
 
     with pytest.raises(typer.BadParameter, match="must list at least one value"):
         phases._parse_ints(",", name="--seeds")
@@ -1180,41 +1216,52 @@ def _replicate_fixture(tmp_path: Path, *, losses: dict[float, list[float]]) -> t
     return source_path, replicate_path
 
 
+def _transfer_run(base_lr: float, depth: int, mult: float, output_mult: float = 1.0) -> RunSpec:
+    run_id = f"170M-d{depth}-lr{base_lr * mult:g}-om{output_mult:g}-a0.5-x{mult:g}-s42"
+    return RunSpec(
+        run_id,
+        f"runs/{run_id}/run.yaml",
+        f"runs/{run_id}/result.json",
+        {
+            "preset": "170M",
+            "lr": base_lr * mult,
+            "base_lr": base_lr,
+            "lr_mult": mult,
+            "layers": depth,
+            "output_mult": output_mult,
+            "depth_exponent": 0.5,
+            "seed": 42,
+        },
+    )
+
+
 def _transfer_fixture(tmp_path: Path) -> Path:
+    """A depth-ray transfer phase: candidate 0.01 stays centered, 0.016 drifts hot at depth 48."""
     phase_dir = tmp_path / "transfer"
     phase_dir.mkdir()
-    runs: list[RunSpec] = []
-    for lr in (0.01, 0.016):
-        for exponent in (0.0, 0.25, 0.5):
-            for preset in ("400M", "800M", "1B"):
-                run_id = f"{preset}-lr{lr:g}-a{exponent:g}"
-                runs.append(
-                    RunSpec(
-                        run_id,
-                        f"runs/{run_id}/run.yaml",
-                        f"runs/{run_id}/result.json",
-                        {
-                            "preset": preset,
-                            "lr": lr,
-                            "output_mult": 1.0,
-                            "depth_exponent": exponent,
-                            "seed": 42,
-                        },
-                    )
-                )
+    runs = [
+        _transfer_run(base_lr, depth, mult)
+        for base_lr in (0.01, 0.016)
+        for depth in (12, 24, 48)
+        for mult in (0.625, 1.0, 1.6)
+    ]
     path = phase_dir / "phase.json"
     write_phase(
         path,
         PhaseManifest(1, "transfer", "eval/heldout/loss", None, runs, [], []),
     )
-    model_offset = {"400M": 0.0, "800M": 0.01, "1B": 0.02}
     for run in runs:
-        lr = float(run.params["lr"])
-        exponent = float(run.params["depth_exponent"])
-        preset = str(run.params["preset"])
-        if lr == 0.016 and exponent == 0.5 and preset == "1B":
-            continue
-        loss = 1.0 + model_offset[preset] + abs(exponent - 0.25) + (lr - 0.01) * 10
+        base_lr = float(run.params["base_lr"])
+        mult = float(run.params["lr_mult"])
+        depth = int(run.params["layers"])
+        if base_lr == 0.01:
+            # Center wins at every depth; a small depth offset keeps center losses distinct.
+            loss = 1.0 + (0.1 if mult != 1.0 else 0.0) + depth * 1e-4
+        elif depth == 48:
+            # Off-center winner at the deepest leg: the transferred LR did not stay optimal.
+            loss = 1.2 + (0.0 if mult == 1.6 else 0.1)
+        else:
+            loss = 1.2 + (0.0 if mult == 1.0 else 0.1)
         _write_result(phase_dir, run, loss)
     return path
 
@@ -1234,21 +1281,53 @@ def test_replicate_ranks_three_seed_mean_and_reuses_source_seed(tmp_path: Path) 
     assert analyzed.ranking[0]["score"] == pytest.approx(1.1)
 
 
-def test_transfer_sums_per_model_ranks_and_requires_all_models(tmp_path: Path) -> None:
+def test_transfer_selects_candidate_whose_center_wins_at_every_depth(tmp_path: Path) -> None:
     path = _transfer_fixture(tmp_path)
     phases.analyze_phase(path)
     analyzed = load_phase(path)
-    assert analyzed.selected[0] == {
-        "lr": 0.01,
-        "output_mult": 1.0,
-        "depth_exponent": 0.25,
-    }
-    incomplete = next(
-        entry
-        for entry in analyzed.ranking
-        if entry["params"]["lr"] == 0.016 and entry["params"]["depth_exponent"] == 0.5
-    )
-    assert incomplete["score"] is None
+    # Selection carries the *base* lr (the transferred candidate), not any bracket edge.
+    assert analyzed.selected == [{"lr": 0.01, "output_mult": 1.0, "depth_exponent": 0.5}]
+    winner = next(entry for entry in analyzed.ranking if entry["params"]["lr"] == 0.01)
+    assert winner["score"] == pytest.approx(1.0 + (12 + 24 + 48) * 1e-4 / 3)
+    assert winner["winning_mults"] == {"12": 1.0, "24": 1.0, "48": 1.0}
+    # The drifted candidate is ineligible, and the recorded winners show the drift direction.
+    drifted = next(entry for entry in analyzed.ranking if entry["params"]["lr"] == 0.016)
+    assert drifted["score"] is None
+    assert drifted["winning_mults"] == {"12": 1.0, "24": 1.0, "48": 1.6}
+
+
+def test_transfer_missing_center_is_ineligible_and_divergent_edge_loses(tmp_path: Path) -> None:
+    """A missing/non-finite bracket *center* disqualifies; a diverged *edge* merely loses."""
+    phase_dir = tmp_path / "transfer"
+    phase_dir.mkdir()
+    runs = [
+        _transfer_run(base_lr, depth, mult)
+        for base_lr in (0.01, 0.016)
+        for depth in (24, 48)
+        for mult in (0.625, 1.0, 1.6)
+    ]
+    path = phase_dir / "phase.json"
+    write_phase(path, PhaseManifest(1, "transfer", "eval/heldout/loss", None, runs, [], []))
+    for run in runs:
+        base_lr = float(run.params["base_lr"])
+        mult = float(run.params["lr_mult"])
+        depth = int(run.params["layers"])
+        if base_lr == 0.01 and depth == 48 and mult == 1.0:
+            continue  # missing center at the deepest leg
+        if base_lr == 0.016 and depth == 48 and mult == 1.6:
+            _write_result(phase_dir, run, float("nan"))  # diverged hot edge
+            continue
+        _write_result(phase_dir, run, 1.0 + (0.1 if mult != 1.0 else 0.0))
+
+    phases.analyze_phase(path)
+    analyzed = load_phase(path)
+    missing_center = next(entry for entry in analyzed.ranking if entry["params"]["lr"] == 0.01)
+    assert missing_center["score"] is None
+    assert missing_center["winning_mults"]["48"] is None
+    survivor = next(entry for entry in analyzed.ranking if entry["params"]["lr"] == 0.016)
+    assert survivor["score"] == pytest.approx(1.0)
+    assert survivor["winning_mults"] == {"24": 1.0, "48": 1.0}
+    assert analyzed.selected == [{"lr": 0.016, "output_mult": 1.0, "depth_exponent": 0.5}]
 
 
 def test_local_execution_is_sequential_and_stops_on_failure(

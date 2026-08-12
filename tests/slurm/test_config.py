@@ -19,6 +19,7 @@ RAW = {
     "max_concurrent": 4,
     "nodes": {
         "default": {"170M": 1, "400M": 4, "800M": 8, "1B": 8},
+        "transfer": {"170M": 4},
         "bridge": {"170M": 4},
         "confirm": {"800M": 8},
     },
