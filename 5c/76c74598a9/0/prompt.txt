@@ -1,0 +1,15 @@
+Perform a critical analysis of the muP LR sweeping methodology (described in docs/LR_SWEEP.md). The proposed approach sweeps alpha (depth exponent), which I'm not sure is the correct approach -- from the completeP work, it appears as though this is a design decision -- a=1 should be depth invariant scaling. So why are we sweeping the depth exponent? The alpha sweep is a massively compute intensive step (8 runs at three  model sizes, probably 2 weeks on 8-12 nodes). Is this really necessary? What should we be doing instead?
+
+---
+
+OK, let's rewrite `transfer` to correct the errors and incorrect assumptions. If I've already run the first four steps (smoke, coarse, refine, and the first replicate), can I reuse those data for your revised `transfer` phase?
+
+---
+
+OK, let's rewrite `transfer` to correct the errors and incorrect assumptions. Two questions: 
+1) If I've already run the first four steps (smoke, coarse, refine, and the first replicate), can I reuse those data for your revised `transfer` phase? 
+2) while sandwich norm and learned channel gates provide a performance improvement (in ablation experiments run at 50M and 170M scales), are these actually significant issues that may break our learning rate scaling and cause large-scale models to fail or be suboptimally trained? Should we consider removing these from the prod architecture in the name of lr scaling predictability?
+
+---
+
+great, one kote change -- update all runs to distribute across 4 nodes (32 GPUs, data parallel).

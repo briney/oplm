@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "5c76c74598a9",
+  "strategy": "manual-commit",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "docs/LR_SWEEP.md",
+    "docs/MUP.md",
+    "src/oplm/sweep/phases.py",
+    "tests/slurm/test_config.py",
+    "tests/sweep/conftest.py",
+    "tests/sweep/test_jobs.py",
+    "tests/sweep/test_phases.py",
+    "tests/sweep/test_status.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/5c/76c74598a9/0/metadata.json",
+      "transcript": "/5c/76c74598a9/0/full.jsonl",
+      "compact_transcript": "/5c/76c74598a9/0/transcript.jsonl",
+      "content_hash": "/5c/76c74598a9/0/content_hash.txt",
+      "prompt": "/5c/76c74598a9/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 149,
+    "cache_creation_tokens": 397981,
+    "cache_read_tokens": 11787641,
+    "output_tokens": 93871,
+    "api_call_count": 80
+  }
+}
