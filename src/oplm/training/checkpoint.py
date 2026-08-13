@@ -826,7 +826,57 @@ def validate_schedule_compat(
         )
 
 
-def validate_checkpoint_for_resume(checkpoint_dir: Path, cfg: OplmConfig) -> None:
+def _validate_rng_sidecar_count(checkpoint_dir: Path, world_size: int) -> None:
+    """Reject a resume whose live world size exceeds the checkpoint's RNG sidecar count.
+
+    Each rank's RNG state lives in its own ``rng_state_<rank>.pt`` sidecar (see
+    :func:`_write_rng_sidecar`), so a checkpoint saved with N ranks only carries
+    sidecars ``0..N-1``. Resuming it at a *larger* world size leaves the extra ranks
+    with nothing to restore, and :func:`_restore_rng_sidecar` raises there -- on those
+    ranks only, deep inside a collective load. This check runs instead on the main
+    process, before the resume target is broadcast, so the failure is rank-identical
+    (see :func:`validate_checkpoint_for_resume`). The per-rank check stays in place as
+    a backstop for the cases this one cannot see (e.g. an explicit ``resume_from``
+    path, which is deliberately never pre-validated, or a sidecar missing for some
+    reason other than a count mismatch). A checkpoint with *no* sidecars at all is
+    left to that backstop too rather than being rejected here: "zero" means the
+    checkpoint predates the sidecars or was hand-assembled, not that the world size
+    grew.
+
+    Args:
+        checkpoint_dir: Path to a committed ``checkpoint-<step>/`` directory.
+        world_size: The live run's world size (``accelerator.num_processes``).
+
+    Raises:
+        ValueError: The live world size exceeds the sidecar count and
+            ``OPLM_ALLOW_MISSING_RNG=1`` is not set.
+    """
+    sidecar_count = len(list(checkpoint_dir.glob(f"{_RNG_SIDECAR_PREFIX}*.pt")))
+    if sidecar_count == 0 or world_size <= sidecar_count:
+        return
+    if os.environ.get(_ALLOW_MISSING_RNG_ENV) == "1":
+        logger.warning(
+            "Checkpoint %s carries %d RNG sidecar(s) but this run has %d rank(s); "
+            "%s=1 is set, so the extra rank(s) will start with fresh RNG state.",
+            checkpoint_dir,
+            sidecar_count,
+            world_size,
+            _ALLOW_MISSING_RNG_ENV,
+        )
+        return
+    raise ValueError(
+        f"Checkpoint {checkpoint_dir} was saved with {sidecar_count} rank(s) "
+        f"(it carries {sidecar_count} rng_state_<rank>.pt sidecar(s)) but this run has "
+        f"{world_size} rank(s). Each rank restores its own RNG state from its own "
+        f"sidecar, so the {world_size - sidecar_count} extra rank(s) have none. To "
+        f"resume anyway and start those ranks' RNG fresh, set the environment variable "
+        f"{_ALLOW_MISSING_RNG_ENV}=1."
+    )
+
+
+def validate_checkpoint_for_resume(
+    checkpoint_dir: Path, cfg: OplmConfig, *, world_size: int | None = None
+) -> None:
     """Cheaply validate a checkpoint before it is used as a (broadcast) auto-resume target.
 
     ``dcp.load`` is a collective: every rank must call it together, and a corrupt shard
@@ -846,6 +896,10 @@ def validate_checkpoint_for_resume(checkpoint_dir: Path, cfg: OplmConfig) -> Non
       - ``.metadata`` exists and is readable as DCP metadata (catches a truncated file
         left by a kill during ``dcp.save``'s own write, distinct from the tmp-dir commit
         rename ``save_checkpoint`` otherwise protects against).
+      - When ``world_size`` is given: the checkpoint carries at least that many
+        ``rng_state_<rank>.pt`` sidecars (see :func:`_validate_rng_sidecar_count`) --
+        the world-size-increase case, which would otherwise raise on the *new* ranks
+        only, mid-load, instead of identically on every rank here.
       - The checkpoint is schedule-compatible with ``cfg`` (see
         :func:`validate_schedule_compat`).
 
@@ -856,11 +910,16 @@ def validate_checkpoint_for_resume(checkpoint_dir: Path, cfg: OplmConfig) -> Non
     Args:
         checkpoint_dir: Path to a committed ``checkpoint-<step>/`` directory.
         cfg: The live, resolved config being trained/resumed with.
+        world_size: The live run's world size (``accelerator.num_processes``), when the
+            caller knows it. ``None`` skips the RNG-sidecar count check entirely --
+            appropriate only where the world size genuinely isn't available.
 
     Raises:
         FileNotFoundError: ``trainer_state.json`` or ``.metadata`` is missing.
         json.JSONDecodeError: ``trainer_state.json`` exists but is not valid JSON.
-        ValueError: The checkpoint is not schedule-compatible with ``cfg``.
+        ValueError: The checkpoint is not schedule-compatible with ``cfg``, or it has
+            fewer RNG sidecars than ``world_size`` ranks (and ``OPLM_ALLOW_MISSING_RNG``
+            is unset).
         Exception: Any other error ``FileSystemReader.read_metadata`` raises for a
             corrupted/truncated ``.metadata`` file (the exact type is an internal detail
             of DCP's metadata deserialization, not part of this function's contract).
@@ -869,6 +928,9 @@ def validate_checkpoint_for_resume(checkpoint_dir: Path, cfg: OplmConfig) -> Non
     state: dict[str, Any] = json.loads(state_path.read_text())
 
     FileSystemReader(str(checkpoint_dir)).read_metadata()
+
+    if world_size is not None:
+        _validate_rng_sidecar_count(checkpoint_dir, world_size)
 
     validate_schedule_compat(checkpoint_dir, cfg, checkpoint_global_step=state.get("global_step"))
 

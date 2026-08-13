@@ -633,7 +633,7 @@ def test_parallelism_ddp_with_eval_is_accepted() -> None:
     )
 
 
-def test_parallelism_roundtrips_through_load_config(tmp_path: "Path") -> None:
+def test_parallelism_roundtrips_through_load_config(tmp_path: Path) -> None:
     """``train.parallelism`` survives a serialize_config -> load_config round trip."""
     cfg = load_config(["train.parallelism=hsdp"])
     path = tmp_path / "run.yaml"
@@ -641,7 +641,7 @@ def test_parallelism_roundtrips_through_load_config(tmp_path: "Path") -> None:
     assert load_config(["--config", str(path)]).train.parallelism == "hsdp"
 
 
-def test_cadence_retention_knobs_roundtrip_through_load_config(tmp_path: "Path") -> None:
+def test_cadence_retention_knobs_roundtrip_through_load_config(tmp_path: Path) -> None:
     """The new knobs survive a serialize_config -> load_config round trip."""
     cfg = load_config(
         [

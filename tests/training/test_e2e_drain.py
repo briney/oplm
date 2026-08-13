@@ -57,12 +57,18 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     # reaches max_steps normally, which a drain this early never does -- the signal is
     # sent as soon as config.yaml appears, long before even one training step completes,
     # so any max_steps comfortably above the (dynamically discovered) drained_step below
-    # works. Kept small (rather than the very large value used pre-Task-2.2) because the
-    # follow-up resume below must not *decrease* max_steps relative to this run's own
-    # config -- validate_schedule_compat's asymmetric max_steps policy (Task 2.2 fix
-    # round) raises on any decrease -- and a small original value keeps the follow-up
-    # resume.train() call (which runs from drained_step up to original_max_steps + 2) fast.
-    original_max_steps = 6
+    # works.
+    #
+    # Sized at 200 to fix a 10-17% flake (Important review finding): at max_steps=6 the
+    # whole training loop took ~70ms, so the signal-delivery race the docstring above
+    # calls "no race" was in fact one -- the child could reach max_steps and exit 0
+    # before the SIGUSR1 landed. 200 steps of this tiny CPU model is a ~1s window, three
+    # orders of magnitude wider than signal delivery, while still finishing fast.
+    # It must also satisfy the *other* constraint the previous small value was chosen
+    # for: the follow-up resume must not *decrease* max_steps relative to this run's own
+    # config (validate_schedule_compat's asymmetric max_steps policy, Task 2.2 fix
+    # round), which resume_max_steps below handles by taking a value >= this one.
+    original_max_steps = 200
     cfg = tiny_train_cfg(
         run_dir,
         training_parquet,
@@ -160,7 +166,9 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     # asymmetric max_steps policy raises on any decrease (Task 2.2 fix round) -- so this
     # takes whichever of "past the drained step" or "past the original target" is
     # larger, guaranteeing a genuine increase (allowed, logs a warning) rather than a
-    # decrease (rejected).
+    # decrease (rejected). With original_max_steps=200 this resume trains ~200 tiny CPU
+    # steps in-process -- a couple of seconds, and the price of a drain window wide
+    # enough not to race signal delivery.
     resume_max_steps = max(drained_step + 2, original_max_steps + 2)
     resume_cfg = tiny_train_cfg(
         run_dir,
@@ -198,10 +206,12 @@ def test_sigusr1_drain_with_remote_uri_mirrors_before_exiting_85(
     remote_root = tmp_path / "remote"
     remote_uri = f"file://{remote_root}"
 
+    # max_steps=200 for the same anti-flake reason as the test above: a 6-step run
+    # finishes in ~70ms and can beat the SIGUSR1 to the finish line.
     cfg = tiny_train_cfg(
         run_dir,
         training_parquet,
-        max_steps=6,
+        max_steps=200,
         save_every=0,
         log_every=1,
         remote_checkpoint_uri=remote_uri,
@@ -317,9 +327,11 @@ def test_drain_defers_checkpoint_and_skips_eval_until_worker_cycle_alignment(
 
     monkeypatch.setattr(trainer, "_run_eval", _recording_run_eval)
 
-    with caplog.at_level(logging.INFO, logger="oplm.training.trainer"):
-        with pytest.raises(SystemExit) as exc_info:
-            trainer.train()
+    with (
+        caplog.at_level(logging.INFO, logger="oplm.training.trainer"),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        trainer.train()
 
     # (c) exit code 85 still propagates.
     assert exc_info.value.code == DRAIN_EXIT_CODE == 85

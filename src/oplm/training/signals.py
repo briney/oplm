@@ -39,6 +39,38 @@ DRAIN_EXIT_CODE = 85
 _DRAIN_SIGNALS = (signal.SIGUSR1, signal.SIGTERM)
 
 
+def seconds_until_job_end(env: Mapping[str, str] | None = None) -> float | None:
+    """Seconds of wall clock left before ``SLURM_JOB_END_TIME``, or ``None``.
+
+    The single place this codebase reads the scheduler's end-time clock: used by
+    :class:`DrainSignal` to decide when to raise a drain, and by the trainer to size
+    the budgets that must fit *inside* the drain margin (see
+    ``Trainer._drain_remote_uploads``).
+
+    Args:
+        env: Environment mapping to read ``SLURM_JOB_END_TIME`` (unix seconds) from.
+            Defaults to the real process environment.
+
+    Returns:
+        Remaining seconds (negative once the end time has passed), or ``None`` when
+        the variable is unset or unparseable -- i.e. "there is no wall clock here",
+        which every caller must treat as inert rather than as zero time left.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    end_time_raw = source.get("SLURM_JOB_END_TIME")
+    if end_time_raw is None:
+        return None
+    try:
+        end_time = float(end_time_raw)
+    except ValueError:
+        logger.warning(
+            "SLURM_JOB_END_TIME=%r is not a number; ignoring the env drain clock",
+            end_time_raw,
+        )
+        return None
+    return end_time - time.time()
+
+
 class DrainSignal:
     """Set-a-flag drain trigger: SIGUSR1/SIGTERM handlers plus the Slurm end-time clock.
 
@@ -99,15 +131,5 @@ class DrainSignal:
 
     def _env_clock_expired(self) -> bool:
         """Check the Slurm wall-clock margin. Inert (always False) if unset/malformed."""
-        end_time_raw = self._env.get("SLURM_JOB_END_TIME")
-        if end_time_raw is None:
-            return False
-        try:
-            end_time = float(end_time_raw)
-        except ValueError:
-            logger.warning(
-                "SLURM_JOB_END_TIME=%r is not a number; ignoring the env drain clock",
-                end_time_raw,
-            )
-            return False
-        return time.time() >= end_time - self._margin_seconds
+        remaining = seconds_until_job_end(self._env)
+        return remaining is not None and remaining <= self._margin_seconds

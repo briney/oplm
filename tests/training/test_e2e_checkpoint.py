@@ -230,6 +230,46 @@ def test_keep_every_n_hours_marks_crossing_checkpoint_permanent(
     assert state["last_time_keep_index"] == 1
 
 
+def test_keep_every_n_hours_checkpoint_survives_a_later_commits_rotation(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A KEEP-marked checkpoint that is NOT the newest survives the next commit's rotation.
+
+    The test above is not falsifiable on its own: the checkpoint it marks permanent is
+    also the newest one, so ``save_total_limit=1`` would have kept it either way. This
+    one runs one step further so the marked checkpoint is strictly older than the newest
+    when rotation next runs.
+
+    Same fake wall clock (2000s per checkpoint, one ``time.time()`` call each) with
+    ``keep_every_n_hours=1`` (3600s): the anchor is set at checkpoint-1 (t=0), the
+    boundary is crossed at checkpoint-3 (elapsed=4000 -> index 1) which is therefore
+    KEEP-marked, and checkpoint-4 (elapsed=6000 -> still index 1) is an ordinary rolling
+    checkpoint. With ``save_total_limit=1``, checkpoint-4's own rotation pass sees
+    rolling={2, 4} and deletes 2 -- and would delete 3 as well if the KEEP marker were
+    ignored. Surviving set: {3 (permanent), 4 (newest rolling)}.
+    """
+    from oplm.training.trainer import Trainer
+
+    monkeypatch.setattr(
+        "oplm.training.trainer.time", _FakeTimeModule(time_fn=_FakeClock(step=2000.0))
+    )
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=4,
+        batch_size=_BATCH_SIZE,
+        save_every=1,
+        save_total_limit=1,
+        keep_every_n_hours=1.0,
+    )
+    Trainer(cfg, callbacks=[]).train()
+
+    assert _checkpoint_names(tmp_path) == ["checkpoint-3", "checkpoint-4"]
+    assert (tmp_path / "checkpoint-3" / "KEEP").exists()
+    assert not (tmp_path / "checkpoint-4" / "KEEP").exists()
+
+
 def test_first_checkpoint_unix_anchor_survives_resume(
     training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

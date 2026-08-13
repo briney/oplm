@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.nn as nn
 
-from oplm.training.signals import DRAIN_EXIT_CODE, DrainSignal
+from oplm.training.signals import DRAIN_EXIT_CODE, DrainSignal, seconds_until_job_end
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from accelerate import Accelerator
     from torch.distributed import ProcessGroup
@@ -37,12 +37,23 @@ logger = logging.getLogger(__name__)
 # become a config knob later if a use case needs it.
 _DRAIN_MARGIN_SECONDS = 600
 
-# Bound (seconds) on how long Trainer._drain_remote_uploads blocks on a background
+# Bounds (seconds) on how long Trainer._drain_remote_uploads blocks on a background
 # checkpoint upload (Task 4.2) before giving up and proceeding anyway -- the local
 # checkpoint the upload mirrors already exists and is a valid resume target
 # regardless of whether the remote mirror finished. Matches the drain path's own
 # "checkpoint, then exit 85" budget philosophy: bounded, never indefinite.
-_REMOTE_UPLOAD_DRAIN_TIMEOUT_SECONDS = 600.0
+#
+# That wait runs in SERIES inside the _DRAIN_MARGIN_SECONDS budget above (drain flag ->
+# checkpoint -> upload drain -> exit 85 -> requeue), so a flat 600s cap could consume the
+# entire 600s margin on its own and let the scheduler SIGKILL the job mid-shutdown. The
+# effective budget is therefore derived from the remaining wall clock whenever the
+# scheduler exposes one (see _remote_upload_drain_budget): whatever is left before
+# SLURM_JOB_END_TIME, minus a safety buffer for the exit path itself, clamped to
+# [0, _REMOTE_UPLOAD_DRAIN_MAX_SECONDS]. Without that env var (a workstation run, no
+# wall-clock deadline at all) it falls back to a small fraction of the margin.
+_REMOTE_UPLOAD_DRAIN_MAX_SECONDS = 600.0
+_REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS = 180.0
+_REMOTE_UPLOAD_DRAIN_SAFETY_BUFFER_SECONDS = 60.0
 
 # Loss-spike warn-only detector (Task 1.8, spec §6): same 0.98/0.02 EMA smoothing
 # oplm.training.mup's logging helper uses. Warns (never aborts) once the EMA has had
@@ -51,6 +62,35 @@ _REMOTE_UPLOAD_DRAIN_TIMEOUT_SECONDS = 600.0
 _LOSS_EMA_DECAY = 0.98
 _LOSS_SPIKE_MULTIPLIER = 3.0
 _LOSS_SPIKE_WARMUP_LOGS = 50
+
+
+def _remote_upload_drain_budget(env: Mapping[str, str] | None = None) -> float:
+    """Seconds to wait on the background remote upload before giving up.
+
+    Sized from the scheduler's own wall clock rather than being a second, independent
+    10-minute budget nested inside the 10-minute drain margin: whatever is left before
+    ``SLURM_JOB_END_TIME``, minus :data:`_REMOTE_UPLOAD_DRAIN_SAFETY_BUFFER_SECONDS`
+    for the rest of the shutdown path (exit 85 -> wrapper -> ``scontrol requeue``),
+    clamped to ``[0, _REMOTE_UPLOAD_DRAIN_MAX_SECONDS]``. Waiting past the job's end
+    time buys nothing: the scheduler kills the process, and the local checkpoint is a
+    valid resume target regardless of whether the mirror finished.
+
+    Args:
+        env: Environment mapping to read the end-time clock from (see
+            :func:`oplm.training.signals.seconds_until_job_end`); defaults to the real
+            process environment. Tests inject a plain dict.
+
+    Returns:
+        The bound in seconds. Falls back to
+        :data:`_REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS` when the scheduler exposes no
+        end time at all (e.g. a workstation run), where there is no deadline to fit
+        inside and an unbounded-ish wait would only stall an interactive shutdown.
+    """
+    remaining = seconds_until_job_end(env)
+    if remaining is None:
+        return _REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS
+    usable = remaining - _REMOTE_UPLOAD_DRAIN_SAFETY_BUFFER_SECONDS
+    return max(0.0, min(usable, _REMOTE_UPLOAD_DRAIN_MAX_SECONDS))
 
 
 @dataclass(frozen=True)
@@ -1384,8 +1424,8 @@ class Trainer:
         )
         self._remote_upload_manager.submit(job)
 
-    def _drain_remote_uploads(self, timeout: float = _REMOTE_UPLOAD_DRAIN_TIMEOUT_SECONDS) -> None:
-        """Block (bounded by ``timeout``) until the background remote upload has drained.
+    def _drain_remote_uploads(self, timeout: float | None = None) -> None:
+        """Block (bounded) until the background remote upload has drained.
 
         A no-op on any rank without an upload manager (see :meth:`_submit_remote_upload`).
         Called before the drain exit (so the drained checkpoint's remote mirror has a
@@ -1396,10 +1436,17 @@ class Trainer:
         already killing the process for other reasons, and this bound exists to keep
         drain/shutdown responsive, not to guarantee every checkpoint's remote mirror
         always completes.
+
+        Args:
+            timeout: Explicit bound in seconds. ``None`` (the default, and what every
+                production call site uses) derives it from the remaining wall clock --
+                see :func:`_remote_upload_drain_budget` -- so this wait cannot eat the
+                whole drain margin it runs inside.
         """
         if self._remote_upload_manager is None:
             return
-        self._remote_upload_manager.drain(timeout=timeout)
+        budget = _remote_upload_drain_budget() if timeout is None else timeout
+        self._remote_upload_manager.drain(timeout=budget)
 
     def _checkpoint_extra_state(self) -> dict[str, Any]:
         """Build the ``extra_state`` payload merged into ``trainer_state.json``.
@@ -1636,6 +1683,7 @@ def _select_auto_resume_candidate(
     output_dir: Path,
     cfg: OplmConfig,
     status: Callable[[str], None] | None,
+    world_size: int | None = None,
 ) -> Path | None:
     """Pick the newest committed checkpoint that passes cheap pre-load validation.
 
@@ -1655,6 +1703,9 @@ def _select_auto_resume_candidate(
         cfg: The live, resolved config being trained/resumed with (for schedule-compat
             validation).
         status: Optional main-process-only status callback; ``None`` suppresses it.
+        world_size: The live run's world size, threaded into validation so a candidate
+            saved at a smaller world size is rejected here (rank-identically) rather
+            than on the new ranks alone, mid-load.
 
     Returns:
         The selected checkpoint path, or ``None`` if there is no committed checkpoint at
@@ -1677,7 +1728,7 @@ def _select_auto_resume_candidate(
     last_error: Exception | None = None
     for index, candidate in enumerate(attempts):
         try:
-            validate_checkpoint_for_resume(candidate, cfg)
+            validate_checkpoint_for_resume(candidate, cfg, world_size=world_size)
         except Exception as exc:  # noqa: BLE001 -- any validation failure triggers fallback
             remaining = len(attempts) - index - 1
             logger.error(
@@ -1718,6 +1769,7 @@ def _consult_remote_resume_candidate(
     output_dir: Path,
     cfg: OplmConfig,
     status: Callable[[str], None] | None,
+    world_size: int | None = None,
 ) -> Path | None:
     """Extend auto-resume (Task 4.2) to consult the remote mirror, main process only.
 
@@ -1755,6 +1807,8 @@ def _consult_remote_resume_candidate(
         output_dir: The training output directory (download destination).
         cfg: The live, resolved config being trained/resumed with.
         status: Optional main-process-only status callback; ``None`` suppresses it.
+        world_size: The live run's world size, threaded into the downloaded
+            checkpoint's validation exactly like a local candidate's.
 
     Returns:
         ``local_found``, or the freshly downloaded remote checkpoint's local path if
@@ -1795,7 +1849,7 @@ def _consult_remote_resume_candidate(
         remote_uri,
     )
     downloaded = store.download_checkpoint(remote_name, output_dir)
-    validate_checkpoint_for_resume(downloaded, cfg)
+    validate_checkpoint_for_resume(downloaded, cfg, world_size=world_size)
     return downloaded
 
 
@@ -1827,8 +1881,8 @@ def _resolve_resume_target(
     *different* checkpoint after a failed ``dcp.load`` would require ranks to agree, mid
     failure, to retry together -- exactly the desynchronized-exception/hang risk
     rank-sync discipline exists to avoid. Instead, everything cheap to validate without
-    the collective (``trainer_state.json`` readability, ``.metadata`` readability,
-    schedule compatibility -- see
+    the collective (``trainer_state.json`` readability, ``.metadata`` readability, RNG
+    sidecar count vs. this run's world size, schedule compatibility -- see
     :func:`oplm.training.checkpoint.validate_checkpoint_for_resume`) runs here, on the
     main process, *before* the broadcast: a torn or schedule-incompatible candidate is
     rejected identically on every rank, and the next-newest committed checkpoint is
@@ -1868,8 +1922,11 @@ def _resolve_resume_target(
     resolve_error: str | None = None
     if resume_target is None and auto_resume and accelerator.is_main_process:
         try:
-            found = _select_auto_resume_candidate(Path(output_dir), cfg, status)
-            found = _consult_remote_resume_candidate(found, Path(output_dir), cfg, status)
+            world_size = accelerator.num_processes
+            found = _select_auto_resume_candidate(Path(output_dir), cfg, status, world_size)
+            found = _consult_remote_resume_candidate(
+                found, Path(output_dir), cfg, status, world_size
+            )
         except Exception as exc:  # noqa: BLE001 -- packaged into the broadcast, see above
             resolve_error = (
                 f"auto_resume: no usable checkpoint found under {output_dir} after "

@@ -571,9 +571,10 @@ its own node's ranks wrote; the global main process additionally uploads the sha
 process group, never the trainer's own (typically NCCL) default group.
 
 Finalizing the remote manifest is not a bare barrier: every node leader that just finished its
-own upload exchanges its checkpoint identity (which step it just uploaded) with every other node
-leader over that GLOO group. Only if every leader agrees on the step does the main process write
-the manifest and rotate; a bare barrier can't detect two leaders having finished uploading
+own upload exchanges its checkpoint identity (which step it just uploaded) *and* whether that
+upload actually succeeded with every other node leader over that GLOO group. Only if every leader
+reports success on the same step does the main process write the manifest and rotate; a bare
+barrier can't detect two leaders having finished uploading
 *different* checkpoints (a node whose own upload queue fell behind and coalesced onto a different
 step than its peers), which would otherwise let a manifest get committed while silently missing
 that node's files. On a disagreement, an operator will see an ERROR log naming the divergent
@@ -587,9 +588,20 @@ skipped or torn round leaves a manifest-less `checkpoint-<step>/` directory sitt
 store; rotation never touches it (nothing without a manifest is ever counted or deleted), so these
 are safe but do accumulate over time until an operator cleans them up manually.
 
-The drain path (and the natural end of training) blocks on the upload, bounded by a 10-minute
-timeout, before proceeding — the local checkpoint is always the fallback resume target
-regardless of whether the remote mirror finishes (or finalizes) in time.
+An upload that *fails* (a transient fsspec error, or local rotation deleting the source
+`checkpoint-<step>/` while the background thread is still reading it) is caught, logged, and
+reported into that same exchange as a failed round: nothing is finalized, and the leader still
+makes its collective call, so the group never drifts out of lockstep. The next checkpoint's round
+mirrors and commits normally. Local rotation is deliberately *not* coordinated with in-flight
+uploads (no pinning) — a deleted source is simply a failed round, not a lost run.
+
+The drain path (and the natural end of training) blocks on the upload before proceeding — the
+local checkpoint is always the fallback resume target regardless of whether the remote mirror
+finishes (or finalizes) in time. That wait is nested *inside* the 10-minute drain margin the
+whole drain mechanism exists to beat, so its budget is derived from the wall clock rather than
+being a second, independent 10 minutes: when `SLURM_JOB_END_TIME` is set, the upload wait is
+`end_time - now - 60s` clamped to `[0s, 600s]`; without that env var (e.g. a workstation run) it
+falls back to 180s.
 
 `auto_resume` also consults the remote mirror: if no local committed checkpoint validates, or a
 remote one exists at a *higher* step than the best local candidate, the remote checkpoint is

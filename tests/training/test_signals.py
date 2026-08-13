@@ -116,3 +116,44 @@ def test_default_env_reads_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SLURM_JOB_END_TIME", str(int(now + 100)))
     drain = DrainSignal(margin_seconds=600)
     assert drain.requested is True
+
+
+# --- the wall-clock budget the remote-upload drain is sized from (review fix) ---------
+
+
+def test_remote_upload_drain_budget_derives_from_remaining_wall_clock() -> None:
+    """The upload-drain wait fits inside the drain margin instead of nesting a 2nd 600s.
+
+    Important review finding: ``Trainer._drain_remote_uploads``'s 600s bound ran in
+    series *inside* the 600s ``_DRAIN_MARGIN_SECONDS``, so a slow mirror could consume
+    the entire margin and let the scheduler SIGKILL the job mid-shutdown. The budget is
+    now whatever wall clock is left, minus a safety buffer for the exit path, clamped.
+    """
+    from oplm.training.trainer import (
+        _REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS,
+        _REMOTE_UPLOAD_DRAIN_MAX_SECONDS,
+        _remote_upload_drain_budget,
+    )
+
+    now = time.time()
+
+    # Mid-margin: 300s left -> 300 - 60 buffer = 240s.
+    budget = _remote_upload_drain_budget({"SLURM_JOB_END_TIME": str(now + 300)})
+    assert 235.0 <= budget <= 240.0
+
+    # Far from the deadline: clamped to the hard cap, never more.
+    assert (
+        _remote_upload_drain_budget({"SLURM_JOB_END_TIME": str(now + 100_000)})
+        == _REMOTE_UPLOAD_DRAIN_MAX_SECONDS
+    )
+
+    # Past the end time (or inside the safety buffer): never negative, never a wait.
+    assert _remote_upload_drain_budget({"SLURM_JOB_END_TIME": str(now - 10)}) == 0.0
+    assert _remote_upload_drain_budget({"SLURM_JOB_END_TIME": str(now + 30)}) == 0.0
+
+    # No scheduler clock at all (workstation): the small fixed fallback.
+    assert _remote_upload_drain_budget({}) == _REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS
+    assert (
+        _remote_upload_drain_budget({"SLURM_JOB_END_TIME": "not-a-number"})
+        == _REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS
+    )

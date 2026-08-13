@@ -416,10 +416,10 @@ def test_upload_manager_skips_finalize_on_identity_mismatch(
         return 2
 
     def _fake_all_gather_object(out_list: list[Any], obj: Any, group: object) -> None:
-        # This leader's own identity, plus a peer that finished a DIFFERENT (later)
-        # checkpoint -- the exact desync scenario a bare barrier can't detect.
+        # This leader's own report, plus a peer that successfully finished a DIFFERENT
+        # (later) checkpoint -- the exact desync scenario a bare barrier can't detect.
         out_list[0] = obj
-        out_list[1] = "checkpoint-999"
+        out_list[1] = ("checkpoint-999", True)
 
     monkeypatch.setattr(dist, "get_world_size", _fake_get_world_size)
     monkeypatch.setattr(dist, "all_gather_object", _fake_all_gather_object)
@@ -435,6 +435,207 @@ def test_upload_manager_skips_finalize_on_identity_mismatch(
     assert store.finalized == []  # but finalize/rotate never ran on the mismatch
     assert store.rotated == []
     assert any("desync" in record.getMessage() for record in caplog.records)
+
+
+class _FakeLeaderGroup:
+    """Fake ``all_gather_object`` peer for a 2-leader upload group.
+
+    Records every gather call so a test can prove this leader's call count stayed in
+    lockstep with its peers' (the Critical review finding: a leader that skips the
+    gather after a failed upload desynchronizes the group's collective call count
+    permanently). ``peer_report`` is what the *other* leader reports for the same
+    round; by default it mirrors this leader's own checkpoint name and reports
+    success, i.e. a healthy peer.
+    """
+
+    def __init__(self, peer_report: Any = None) -> None:
+        self.calls: list[Any] = []
+        self._peer_report = peer_report
+
+    def get_world_size(self, group: object) -> int:
+        return 2
+
+    def all_gather_object(self, out_list: list[Any], obj: Any, group: object) -> None:
+        self.calls.append(obj)
+        out_list[0] = obj
+        if self._peer_report is not None:
+            out_list[1] = self._peer_report
+            return
+        # A healthy peer: same checkpoint, upload succeeded.
+        name = obj[0] if isinstance(obj, tuple) else obj
+        out_list[1] = (name, True)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import torch.distributed as dist
+
+        monkeypatch.setattr(dist, "get_world_size", self.get_world_size)
+        monkeypatch.setattr(dist, "all_gather_object", self.all_gather_object)
+
+
+class _FailingStore(_SlowFakeStore):
+    """Fake store whose ``upload_checkpoint`` raises for named checkpoints."""
+
+    def __init__(self, fail_names: set[str]) -> None:
+        super().__init__(sleep_seconds=0.0)
+        self.fail_names = fail_names
+
+    def upload_checkpoint(
+        self, local_dir: Path, *, files: list[Path], permanent: bool, write_manifest: bool
+    ) -> None:
+        if local_dir.name in self.fail_names:
+            raise OSError(f"simulated transient upload failure for {local_dir.name}")
+        super().upload_checkpoint(
+            local_dir, files=files, permanent=permanent, write_manifest=write_manifest
+        )
+
+
+def test_upload_failure_still_gathers_and_next_round_finalizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raising upload must NOT skip the identity gather (Critical review fix).
+
+    Before this fix the ``all_gather_object`` identity check sat *after* the
+    ``upload_checkpoint`` calls with nothing catching their exceptions, so a single
+    transient fsspec error (or a local dir deleted by rotation mid-upload, see the
+    test below) made that leader skip the gather while every peer still called it --
+    a permanent, run-long call-count divergence on the upload group, i.e. a dead
+    remote mirror plus repeated multi-minute collective timeouts.
+
+    This drives two rounds through a fake 2-leader group: round 1's upload raises,
+    round 2's succeeds. The gather must run exactly once per processed job (2 calls,
+    aligned with the peers'), round 1 must log an error and skip finalize/rotate,
+    and round 2 must finalize normally.
+    """
+    from oplm.training.remote import UploadManager
+
+    group = _FakeLeaderGroup()
+    group.install(monkeypatch)
+
+    store = _FailingStore(fail_names={"checkpoint-100"})
+    manager = UploadManager(store, _FakeAccelerator(), upload_group=object())
+
+    with caplog.at_level(logging.ERROR, logger="oplm.training.remote"):
+        manager.submit(_job(tmp_path / "checkpoint-100"))
+        manager.drain(timeout=5.0)
+
+        assert store.uploaded == []  # the upload itself raised
+        assert store.finalized == []  # ... so this round never finalizes
+        assert len(group.calls) == 1  # ... but the gather still ran, in lockstep
+        assert any("upload failure" in record.getMessage() for record in caplog.records)
+
+        manager.submit(_job(tmp_path / "checkpoint-200"))
+        manager.drain(timeout=5.0)
+
+    # The next healthy round commits normally -- the failure was not sticky.
+    assert store.uploaded == ["checkpoint-200"]
+    assert store.finalized == ["checkpoint-200"]
+    assert store.rotated == [(3, None)]
+    # Exactly one gather per processed job: this leader's call count matches its peer's.
+    assert len(group.calls) == 2
+
+
+def test_peer_upload_failure_skips_finalize_for_that_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Identities agreeing is not enough: every leader must also report success."""
+    from oplm.training.remote import UploadManager
+
+    group = _FakeLeaderGroup(peer_report=("checkpoint-100", False))
+    group.install(monkeypatch)
+
+    store = _SlowFakeStore(sleep_seconds=0.0)
+    manager = UploadManager(store, _FakeAccelerator(), upload_group=object())
+
+    with caplog.at_level(logging.ERROR, logger="oplm.training.remote"):
+        manager.submit(_job(tmp_path / "checkpoint-100"))
+        manager.drain(timeout=5.0)
+
+    assert store.uploaded == ["checkpoint-100"]  # this leader's own upload was fine
+    assert store.finalized == []  # but a peer's was not, so nothing commits
+    assert store.rotated == []
+    assert any("upload failure" in record.getMessage() for record in caplog.records)
+
+
+def test_rotation_deleting_an_in_flight_upload_source_fails_the_round_gracefully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Local rotation rmtree'ing an in-flight upload's source dir is non-fatal (I5).
+
+    ``UploadManager`` uploads in a background thread while the trainer keeps saving,
+    so ``checkpoint.save_checkpoint``'s own rotation can delete the very
+    ``checkpoint-<step>/`` an upload is still reading from. This test simulates that
+    exact race with a real ``RemoteStore`` over ``file://`` plus a hook that
+    ``shutil.rmtree``s the source directory between the first and second file of the
+    upload. With the Critical fix in place the round simply fails: the gather still
+    runs, nothing is finalized (the remote checkpoint stays uncommitted/invisible),
+    and the *next* healthy round commits normally -- no pinning or rotation
+    coordination needed.
+    """
+    from oplm.training.remote import RemoteStore, UploadManager
+
+    group = _FakeLeaderGroup()
+    group.install(monkeypatch)
+
+    remote_root = tmp_path / "remote"
+    store = RemoteStore(f"file://{remote_root}")
+
+    victim = tmp_path / "local" / "checkpoint-100"
+    files = _write_local_checkpoint(victim, {"a.txt": "aaaa", "b.txt": "bbbb"})
+
+    original_put_file = store._fs.put_file
+    deleted: list[Path] = []
+
+    def _put_file_then_rotate(lpath: str, rpath: str, **kwargs: Any) -> Any:
+        result = original_put_file(lpath, rpath, **kwargs)
+        if not deleted and victim.exists():
+            # Local rotation fires mid-upload and deletes the source directory.
+            shutil.rmtree(victim)
+            deleted.append(victim)
+        return result
+
+    monkeypatch.setattr(store._fs, "put_file", _put_file_then_rotate)
+
+    manager = UploadManager(store, _FakeAccelerator(), upload_group=object())
+
+    from oplm.training.remote import UploadJob
+
+    with caplog.at_level(logging.ERROR, logger="oplm.training.remote"):
+        manager.submit(
+            UploadJob(
+                local_dir=victim,
+                files=files,
+                shared_files=None,
+                permanent=False,
+                save_total_limit=3,
+                keep_every_n_steps=None,
+            )
+        )
+        manager.drain(timeout=10.0)
+
+    assert deleted == [victim]
+    assert len(group.calls) == 1  # the gather still ran despite the failed upload
+    assert store.latest_committed() is None  # nothing was finalized
+    assert any("upload failure" in record.getMessage() for record in caplog.records)
+
+    # The next round -- a healthy checkpoint whose source dir survives -- commits.
+    survivor = tmp_path / "local" / "checkpoint-200"
+    survivor_files = _write_local_checkpoint(survivor, {"a.txt": "aaaa"})
+    manager.submit(
+        UploadJob(
+            local_dir=survivor,
+            files=survivor_files,
+            shared_files=None,
+            permanent=False,
+            save_total_limit=3,
+            keep_every_n_steps=None,
+        )
+    )
+    manager.drain(timeout=10.0)
+
+    assert len(group.calls) == 2
+    result = store.latest_committed()
+    assert result is not None
+    assert result[0] == "checkpoint-200"
 
 
 def test_remote_rotation_via_upload_manager_honors_keep_every_n_steps(tmp_path: Path) -> None:

@@ -25,10 +25,11 @@ integration stays thin (per-checkpoint calls, no threading/collective details):
   ``config.yaml``, ``scaler.pt``, ``KEEP``, ``hf/``).
 - :class:`UploadManager` -- serializes uploads to a single background daemon
   thread (one in flight; a new commit while uploading replaces at most one queued
-  job, dropping the superseded one), cross-checks every node leader's job
-  identity (not a bare barrier -- see :meth:`UploadManager._upload_one`'s
-  docstring) once their local upload lands, and -- on the global leader only,
-  and only if every leader agreed -- finalizes and rotates the remote manifest.
+  job, dropping the superseded one), cross-checks every node leader's job identity
+  *and* upload success (not a bare barrier -- see :meth:`UploadManager._upload_one`'s
+  docstring) once their local upload lands or fails, and -- on the global leader
+  only, and only if every leader succeeded and agreed -- finalizes and rotates the
+  remote manifest.
 """
 
 from __future__ import annotations
@@ -563,23 +564,27 @@ class UploadManager:
     Each call to :meth:`submit` uploads ``job.files`` (this node's own shard files)
     and, when ``job.shared_files`` is not ``None`` (the global leader only), the
     shared artifacts too -- then, if this manager was built with an
-    ``upload_group`` (multi-node), exchanges each node leader's job identity via
-    ``all_gather_object`` over that group so every leader can confirm every other
-    leader just finished uploading the *same* checkpoint before anyone finalizes
-    (see :meth:`_upload_one`'s docstring for why a bare barrier is not enough: it
-    pairs calls by order, not identity, and per-node drop-oldest queuing can
-    desynchronize which checkpoint each node's Nth call is actually about). Only on
-    unanimous agreement does the global leader (``accelerator.is_main_process`` at
-    construction time) call ``store.finalize`` and ``store.rotate``; on any
-    disagreement, finalize/rotate is skipped for that round (logged loudly) rather
-    than ever committing a manifest some node's files never landed for. This is
-    exactly the ordering ``RemoteStore.finalize``'s hard precondition requires:
-    finalize only after every writer's files are confirmed uploaded.
+    ``upload_group`` (multi-node), exchanges each node leader's ``(job identity,
+    upload succeeded)`` report via ``all_gather_object`` over that group so every
+    leader can confirm every other leader just finished uploading the *same*
+    checkpoint, successfully, before anyone finalizes (see :meth:`_upload_one`'s
+    docstring for why a bare barrier is not enough: it pairs calls by order, not
+    identity, and per-node drop-oldest queuing can desynchronize which checkpoint
+    each node's Nth call is actually about). Only when every leader reports success
+    on the same checkpoint does the global leader (``accelerator.is_main_process``
+    at construction time) call ``store.finalize`` and ``store.rotate``; on any
+    disagreement or any leader's upload failure, finalize/rotate is skipped for that
+    round (logged loudly) rather than ever committing a manifest some node's files
+    never landed for. This is exactly the ordering ``RemoteStore.finalize``'s hard
+    precondition requires: finalize only after every writer's files are confirmed
+    uploaded. An upload that *raises* still reaches (and reports into) the gather --
+    see :meth:`_upload_one` -- so a failed round never desynchronizes the group.
 
     Single-process degradation: ``upload_group=None`` and (necessarily, since
     there is only one process) ``is_global_leader=True`` -- upload, skip the
-    identity check entirely (nothing to check against), finalize, rotate; exactly
-    Task 4.1's own direct ``upload_checkpoint(..., write_manifest=True)`` flow.
+    identity check entirely (nothing to check against), finalize (unless the upload
+    itself failed), rotate; exactly Task 4.1's own direct
+    ``upload_checkpoint(..., write_manifest=True)`` flow.
 
     **Self-healing, not just fail-safe:** because the identity-check gather is
     itself a blocking collective, every node leader is forced into lockstep at
@@ -673,7 +678,7 @@ class UploadManager:
             next_thread.start()
 
     def _upload_one(self, job: UploadJob) -> None:
-        """Upload ``job``'s files, cross-check every leader's identity, then finalize + rotate.
+        """Upload ``job``'s files, cross-check every leader's report, then finalize + rotate.
 
         **Why not a bare barrier (fix for a Critical review finding):** a plain
         ``dist.barrier()`` pairs calls by ORDER -- the Nth call any leader makes on
@@ -688,41 +693,83 @@ class UploadManager:
         holding, and the manifest silently omits node A's checkpoint-300 shards (A
         never uploaded them) while still being marked committed.
 
-        Exchanging each leader's own job identity (``job.local_dir.name``) via
-        ``all_gather_object`` over the SAME group turns that same order-paired call
-        into something verifiable: every leader can see what every other leader
-        actually just uploaded. On any disagreement, finalize/rotate is skipped for
-        this round entirely (logged loudly) rather than ever finalizing a set that no
+        Exchanging each leader's own report -- its job identity (``job.local_dir.name``)
+        *and* whether its own upload actually succeeded -- via ``all_gather_object``
+        over the SAME group turns that same order-paired call into something
+        verifiable: every leader can see what every other leader just uploaded, and
+        whether it landed. Finalize/rotate happens only when every leader reports
+        success AND every leader's identity agrees; otherwise it is skipped for this
+        round entirely (logged loudly) rather than ever finalizing a set that no
         leader can vouch for in full -- the checkpoint simply stays uncommitted
-        remotely, and the next round where every leader's identity agrees commits
+        remotely, and the next round where every leader succeeds and agrees commits
         normally (see :meth:`RemoteStore.finalize`'s hard precondition).
 
-        This gather call is unconditional and sits before any branch that could skip
-        it -- a mismatch detected below only skips *this round's* finalize/rotate,
-        never the gather call itself, and never a future round's processing (handled
-        entirely by :meth:`_run`'s independent pending-job chaining). This keeps the
-        group's collective call count, from this leader's own perspective, advancing
-        by exactly one call per processed (non-dropped) job -- the same as a bare
-        barrier would have -- so this change alone does not introduce any new
-        divergence beyond what per-node drop-oldest queuing can already cause (see
-        the class docstring's "known limitation" note); it only makes an existing
-        divergence observable and safe instead of silent and unsafe.
+        **The gather ALWAYS runs, exactly once per processed job (fix for a second
+        Critical review finding).** An exception from ``upload_checkpoint`` -- a
+        transient fsspec/network error, or the local source directory being deleted
+        out from under an in-flight upload by the trainer's own local rotation -- is
+        caught here and turned into a ``False`` success flag in this leader's gathered
+        report, never into a skipped gather. Skipping it would leave this leader one
+        collective call behind every peer *for the rest of the run*: every subsequent
+        round would pair mismatched calls, the mirror would never commit again, and
+        each round would additionally burn the group's (multi-minute) collective
+        timeout. So the group's call count, from this leader's own perspective,
+        advances by exactly one per processed (non-dropped) job -- the same as a bare
+        barrier would have. A failed round is therefore recoverable by construction:
+        the next round processes normally (chaining is handled entirely by
+        :meth:`_run`'s independent pending-job logic).
+
+        **Deliberately not solved here (accepted scope):** the trainer's local
+        rotation is not coordinated with in-flight uploads -- no job pinning, no
+        deletion interlock. A rotation that deletes an uploading checkpoint's source
+        directory simply fails that round gracefully (nothing is committed remotely
+        for that step, an error is logged), and the next checkpoint's round mirrors
+        normally. See ``tests/training/test_remote.py``'s rotation-mid-upload test.
         """
-        self._store.upload_checkpoint(
-            job.local_dir, files=job.files, permanent=job.permanent, write_manifest=False
-        )
-        if job.shared_files is not None:
+        upload_ok = True
+        try:
             self._store.upload_checkpoint(
-                job.local_dir, files=job.shared_files, permanent=job.permanent, write_manifest=False
+                job.local_dir, files=job.files, permanent=job.permanent, write_manifest=False
+            )
+            if job.shared_files is not None:
+                self._store.upload_checkpoint(
+                    job.local_dir,
+                    files=job.shared_files,
+                    permanent=job.permanent,
+                    write_manifest=False,
+                )
+        except Exception:  # noqa: BLE001 -- reported to peers below, never a skipped gather
+            upload_ok = False
+            logger.exception(
+                "Checkpoint upload failure for %s; this round will not be finalized "
+                "(the local checkpoint is unaffected, and the next checkpoint's upload "
+                "round commits normally).",
+                job.local_dir,
             )
 
         if self._upload_group is not None:
             import torch.distributed as dist
 
             group_size = dist.get_world_size(group=self._upload_group)
-            identities: list[str | None] = [None] * group_size
-            dist.all_gather_object(identities, job.local_dir.name, group=self._upload_group)
-            if len(set(identities)) != 1:
+            reports: list[tuple[str, bool] | None] = [None] * group_size
+            dist.all_gather_object(
+                reports, (job.local_dir.name, upload_ok), group=self._upload_group
+            )
+            landed = [report for report in reports if report is not None]
+            failed = sorted(name for name, ok in landed if not ok)
+            identities = {name for name, _ok in landed}
+            if failed:
+                logger.error(
+                    "Checkpoint upload round failed: %d of this run's node leader(s) could "
+                    "not upload their files (checkpoint(s): %s) -- see that node's own "
+                    "upload failure log for the cause. Skipping finalize/rotate for this "
+                    "round rather than committing a manifest some node's files never landed "
+                    "for; the next round where every leader succeeds commits normally.",
+                    len(failed),
+                    failed,
+                )
+                return
+            if len(identities) != 1:
                 logger.error(
                     "Checkpoint upload round desync: this run's node leaders finished "
                     "uploading different checkpoints (%s) -- one or more nodes' upload "
@@ -730,9 +777,13 @@ class UploadManager:
                     "docstring). Skipping finalize/rotate for this round rather than "
                     "committing a manifest some node's files never landed for; a later "
                     "round where every leader agrees will commit normally.",
-                    sorted(name for name in identities if name is not None),
+                    sorted(identities),
                 )
                 return
+        elif not upload_ok:
+            # Single-process: no peers to report to, but the same rule applies -- a
+            # failed upload must never be finalized.
+            return
 
         if self._is_global_leader:
             self._store.finalize(job.local_dir.name, permanent=job.permanent)
