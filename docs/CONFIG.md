@@ -273,7 +273,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.auto_resume` | `bool` | `false` | Resume from the newest committed checkpoint under `output_dir` automatically at trainer start, with no `resume_from` needed. `oplm slurm generate` injects `true` into every rendered job (see [SLURM.md](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard)). |
 | `train.resume_data_position` | `bool` | `true` | **Reserved, wired in a later phase (Phase 3).** Round-trips through config serialization; nothing in the trainer reads it yet — a resume always restarts the dataloader from the beginning of the current epoch regardless of this value. |
 | `train.dist_timeout_minutes` | `int` | `15` | Timeout (minutes) passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. Must be `> 0`. |
-| `train.remote_checkpoint_uri` | `str \| null` | `null` | **Reserved, wired in a later phase (Phase 4).** Round-trips through config serialization; nothing syncs checkpoints anywhere yet regardless of this value. |
+| `train.remote_checkpoint_uri` | `str \| null` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background, and that `auto_resume` also consults. `null` disables it entirely (zero behavior change). See [TRAIN.md's "Remote checkpoint mirror"](TRAIN.md#remote-checkpoint-mirror). |
 | `train.seed` | `int` | `42` | Global seed. |
 | `train.output_dir` | `str` | `outputs` | Base dir for logs and checkpoints. |
 | `train.mixed_precision` | `str` | `bf16` | `bf16`, `fp16`, or `no`. |

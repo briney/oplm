@@ -37,8 +37,10 @@ train:
   # from the newest committed checkpoint under output_dir automatically on every restart, so a
   # requeue after preemption/failure continues training instead of restarting from step 0.
   auto_resume: true
-  # Additionally sync committed checkpoints to remote object storage for durability beyond
-  # /mnt/home. Reserved: not yet implemented (Phase 4).
+  # Additionally mirror every committed checkpoint to remote object storage for durability
+  # beyond /mnt/home (Task 4.2). Uncomment and point at a real bucket/prefix to enable --
+  # requires the `s3` extra for s3:// URIs (`pip install oplm[s3]`) and valid AWS credentials
+  # in the environment (never in this file). Left commented by default: opt in per run.
   # remote_checkpoint_uri: s3://oplm-checkpoints/scaling
   eval_every: {steps: 5000}
   compile: true

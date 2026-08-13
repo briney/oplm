@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from oplm.eval.evaluator import Evaluator
     from oplm.training.callbacks import TrainerCallback
     from oplm.training.checkpoint import PendingSave
+    from oplm.training.remote import UploadManager
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,13 @@ logger = logging.getLogger(__name__)
 # clock starts reporting requested=True. Fixed module constant for now; may
 # become a config knob later if a use case needs it.
 _DRAIN_MARGIN_SECONDS = 600
+
+# Bound (seconds) on how long Trainer._drain_remote_uploads blocks on a background
+# checkpoint upload (Task 4.2) before giving up and proceeding anyway -- the local
+# checkpoint the upload mirrors already exists and is a valid resume target
+# regardless of whether the remote mirror finished. Matches the drain path's own
+# "checkpoint, then exit 85" budget philosophy: bounded, never indefinite.
+_REMOTE_UPLOAD_DRAIN_TIMEOUT_SECONDS = 600.0
 
 # Loss-spike warn-only detector (Task 1.8, spec §6): same 0.98/0.02 EMA smoothing
 # oplm.training.mup's logging helper uses. Warns (never aborts) once the EMA has had
@@ -244,6 +252,28 @@ class Trainer:
         # together, REGARDLESS of its own local outcome, or a locally-failing rank would
         # leave the healthy ranks hanging in it instead of failing fast and attributably.
         run_preflight(self.accelerator)
+
+        # Remote checkpoint mirror (Task 4.2). build_upload_group is a collective --
+        # EVERY rank calls it here, unconditionally within this branch, whenever a
+        # remote URI is configured (never skipped on some ranks and not others, or it
+        # hangs every rank at that collective). Only this run's node leaders
+        # (local_process_index == 0) actually construct an UploadManager; every other
+        # rank's self._remote_upload_manager stays None and every per-checkpoint call
+        # into it (_submit_remote_upload/_drain_remote_uploads) is then a no-op on that
+        # rank. Unset remote_checkpoint_uri (the default): this whole block is skipped
+        # on every rank, so nothing here executes and nothing in oplm.training.remote
+        # is even imported -- the zero-behavior-change contract for existing runs.
+        self._remote_upload_manager: UploadManager | None = None
+        if cfg.train.remote_checkpoint_uri is not None:
+            from oplm.training.remote import RemoteStore, UploadManager, build_upload_group
+
+            upload_group = build_upload_group(self.accelerator)
+            if self.accelerator.local_process_index == 0:
+                self._remote_upload_manager = UploadManager(
+                    RemoteStore(cfg.train.remote_checkpoint_uri),
+                    self.accelerator,
+                    upload_group=upload_group,
+                )
 
         # Status helper for user-facing messages (main process only)
         _console = Console()
@@ -750,6 +780,7 @@ class Trainer:
                         if self._pending_save is not None:
                             self._finalize_pending_save()
                         self._save_checkpoint()
+                        self._drain_remote_uploads()
                         logger.warning(
                             "Drain requested: checkpoint saved at step %d; exiting %d",
                             self.global_step,
@@ -842,6 +873,13 @@ class Trainer:
             # re-write.
             if cfg.save_final and not last_step_did_save:
                 self._save_checkpoint()
+
+            # A still-outstanding remote upload (Task 4.2) must drain before training
+            # ends normally, for the same reason as the local pending-save finalize
+            # just above: otherwise the final checkpoint's background upload thread is
+            # abandoned mid-upload the moment this process exits. Bounded (10 min
+            # default) rather than unconditional -- see _drain_remote_uploads.
+            self._drain_remote_uploads()
 
         finally:
             # Deliberately NOT finalizing self._pending_save here. This finally runs on
@@ -1205,6 +1243,7 @@ class Trainer:
             assert isinstance(result, Path)
             if should_mark_permanent:
                 mark_permanent(checkpoint_dir)
+            self._submit_remote_upload(checkpoint_dir, should_mark_permanent)
             self._emit_checkpoint_saved(checkpoint_dir, self.global_step)
         else:
             assert isinstance(result, PendingSave)
@@ -1236,8 +1275,60 @@ class Trainer:
         final_dir = finalize_pending_save(self.accelerator, pending.handle)
         if pending.should_mark_permanent:
             mark_permanent(final_dir)
+        self._submit_remote_upload(final_dir, pending.should_mark_permanent)
         self._pending_save = None
         self._emit_checkpoint_saved(final_dir, pending.global_step)
+
+    def _submit_remote_upload(self, checkpoint_dir: Path, permanent: bool) -> None:
+        """Hand the just-committed checkpoint to the background remote-upload thread.
+
+        A no-op on any rank without an upload manager -- either
+        ``train.remote_checkpoint_uri`` is unset (every rank), or this rank isn't its
+        node's leader (only leaders hold a manager at all; see ``Trainer.__init__``).
+        Building the :class:`~oplm.training.remote.UploadJob` partitions the
+        checkpoint's files into this node's own shard files plus, on global rank 0,
+        the shared artifacts -- see
+        :func:`~oplm.training.remote.build_upload_job`. ``submit`` itself is
+        non-blocking: see :class:`~oplm.training.remote.UploadManager` for the
+        one-in-flight, drop-oldest-queued serialization.
+
+        Args:
+            checkpoint_dir: The just-committed checkpoint directory (identical on
+                every rank).
+            permanent: Whether this checkpoint is exempt from local rotation
+                (``keep_every_n_steps``/``keep_every_n_hours``) -- mirrored into the
+                remote manifest so ``RemoteStore.rotate`` makes the same exemption.
+        """
+        if self._remote_upload_manager is None:
+            return
+
+        from oplm.training.remote import build_upload_job
+
+        job = build_upload_job(
+            checkpoint_dir,
+            self.accelerator,
+            permanent=permanent,
+            save_total_limit=self.cfg.train.save_total_limit,
+            keep_every_n_steps=self.cfg.train.keep_every_n_steps,
+        )
+        self._remote_upload_manager.submit(job)
+
+    def _drain_remote_uploads(self, timeout: float = _REMOTE_UPLOAD_DRAIN_TIMEOUT_SECONDS) -> None:
+        """Block (bounded by ``timeout``) until the background remote upload has drained.
+
+        A no-op on any rank without an upload manager (see :meth:`_submit_remote_upload`).
+        Called before the drain exit (so the drained checkpoint's remote mirror has a
+        chance to land before the process exits with :data:`DRAIN_EXIT_CODE`) and at
+        the natural end of training (so the final checkpoint isn't left mirroring in a
+        daemon thread that the process exit abandons). Deliberately *not* called on
+        the non-finite-loss guard's raise path or an unrelated crash -- those paths are
+        already killing the process for other reasons, and this bound exists to keep
+        drain/shutdown responsive, not to guarantee every checkpoint's remote mirror
+        always completes.
+        """
+        if self._remote_upload_manager is None:
+            return
+        self._remote_upload_manager.drain(timeout=timeout)
 
     def _checkpoint_extra_state(self) -> dict[str, Any]:
         """Build the ``extra_state`` payload merged into ``trainer_state.json``.
@@ -1545,6 +1636,98 @@ def _select_auto_resume_candidate(
     raise last_error
 
 
+def _checkpoint_step(name: str) -> int | None:
+    """Parse the numeric step out of a ``checkpoint-<step>`` name, or ``None``."""
+    suffix = name.removeprefix("checkpoint-")
+    return int(suffix) if suffix.isdigit() else None
+
+
+def _consult_remote_resume_candidate(
+    local_found: Path | None,
+    output_dir: Path,
+    cfg: OplmConfig,
+    status: Callable[[str], None] | None,
+) -> Path | None:
+    """Extend auto-resume (Task 4.2) to consult the remote mirror, main process only.
+
+    Called from :func:`_resolve_resume_target`'s main-process branch, immediately
+    after :func:`_select_auto_resume_candidate` has picked ``local_found`` (or found
+    nothing local at all) -- still before the broadcast to every other rank, so the
+    download below (when it happens) lands before any rank branches on the result,
+    exactly like the local candidate selection it extends.
+
+    A total no-op, including no import of :mod:`oplm.training.remote` and no fsspec
+    call whatsoever, when ``cfg.train.remote_checkpoint_uri`` is unset -- the
+    zero-behavior-change contract for every run that doesn't opt in. When it *is*
+    set, consults ``RemoteStore.latest_committed()``: if there is no remote
+    checkpoint, or its step does not exceed ``local_found``'s (a tie keeps the local
+    copy -- no point re-downloading what's already there), ``local_found`` is
+    returned unchanged. Otherwise the remote checkpoint is downloaded to
+    ``output_dir`` (``RemoteStore.download_checkpoint``'s own tmp-dir + rename
+    commits it as ``output_dir/checkpoint-<step>``, the same local commit convention
+    ``checkpoint.save_checkpoint`` uses) and cheaply pre-load-validated exactly like a
+    local candidate (:func:`~oplm.training.checkpoint.validate_checkpoint_for_resume`)
+    before being returned as the new resume target.
+
+    **Multi-node assumption:** the download lands at ``output_dir`` on the MAIN
+    process, before the resume-target broadcast to every other rank (see
+    :func:`_resolve_resume_target`) -- exactly like the local auto-resume scan. On a
+    shared/network filesystem ``output_dir`` (the common case for a Slurm cluster,
+    e.g. SUNK), every rank on every node can read the downloaded checkpoint straight
+    away. If ``output_dir`` is instead node-local storage (e.g. node-local NVMe) on a
+    multi-node run, only ranks on the main process's own node can actually see the
+    download -- this function has no way to detect that from here, so a multi-node
+    run with a node-local ``output_dir`` must not rely on this path (see docs/TRAIN.md).
+
+    Args:
+        local_found: The local candidate already selected (possibly ``None``).
+        output_dir: The training output directory (download destination).
+        cfg: The live, resolved config being trained/resumed with.
+        status: Optional main-process-only status callback; ``None`` suppresses it.
+
+    Returns:
+        ``local_found``, or the freshly downloaded remote checkpoint's local path if
+        it exists and its step exceeds ``local_found``'s (or there was no local
+        candidate at all).
+
+    Raises:
+        Exception: Whatever :meth:`~oplm.training.remote.RemoteStore.download_checkpoint`
+            or :func:`~oplm.training.checkpoint.validate_checkpoint_for_resume` raises
+            for a torn/incompatible remote checkpoint -- propagates to
+            :func:`_resolve_resume_target`'s caller, which packages it into the
+            broadcast identically to a local candidate's validation failure.
+    """
+    remote_uri = cfg.train.remote_checkpoint_uri
+    if remote_uri is None:
+        return local_found
+
+    from oplm.training.checkpoint import validate_checkpoint_for_resume
+    from oplm.training.remote import RemoteStore
+
+    store = RemoteStore(remote_uri)
+    remote_result = store.latest_committed()
+    if remote_result is None:
+        return local_found
+
+    remote_name, _remote_manifest = remote_result
+    remote_step = _checkpoint_step(remote_name)
+    local_step = _checkpoint_step(local_found.name) if local_found is not None else None
+    if remote_step is None or (local_step is not None and local_step >= remote_step):
+        return local_found
+
+    if status is not None:
+        status(f"[dim]Auto-resuming from remote checkpoint {remote_name}[/dim]")
+    logger.info(
+        "auto_resume: no usable local checkpoint at or past remote step %d; downloading %s from %s",
+        remote_step,
+        remote_name,
+        remote_uri,
+    )
+    downloaded = store.download_checkpoint(remote_name, output_dir)
+    validate_checkpoint_for_resume(downloaded, cfg)
+    return downloaded
+
+
 def _resolve_resume_target(
     accelerator: Accelerator,
     resume_from: str | None,
@@ -1615,6 +1798,7 @@ def _resolve_resume_target(
     if resume_target is None and auto_resume and accelerator.is_main_process:
         try:
             found = _select_auto_resume_candidate(Path(output_dir), cfg, status)
+            found = _consult_remote_resume_candidate(found, Path(output_dir), cfg, status)
         except Exception as exc:  # noqa: BLE001 -- packaged into the broadcast, see above
             resolve_error = (
                 f"auto_resume: no usable checkpoint found under {output_dir} after "

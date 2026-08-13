@@ -179,6 +179,86 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     assert resumed.global_step == resume_max_steps
 
 
+def test_sigusr1_drain_with_remote_uri_mirrors_before_exiting_85(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """The drain path (Task 4.2) drains its remote upload before exiting 85.
+
+    Same real-subprocess SIGUSR1 drive as the test above, but with
+    ``train.remote_checkpoint_uri`` set to a ``file://`` store: ``Trainer.train()``'s
+    drain branch calls ``_save_checkpoint()`` (the local commit) and then
+    ``_drain_remote_uploads()`` -- bounded but, for this tiny/fast local-file upload,
+    plenty of time to actually finish -- *before* raising ``SystemExit(85)``. This
+    asserts the remote mirror is already committed with the drained step by the time
+    the subprocess has exited, not merely that the local checkpoint exists.
+    """
+    from oplm.training.remote import RemoteStore
+
+    run_dir = tmp_path / "run"
+    remote_root = tmp_path / "remote"
+    remote_uri = f"file://{remote_root}"
+
+    cfg = tiny_train_cfg(
+        run_dir,
+        training_parquet,
+        max_steps=6,
+        save_every=0,
+        log_every=1,
+        remote_checkpoint_uri=remote_uri,
+    )
+    config_path = tmp_path / "launch_config.yaml"
+    config_path.write_text(serialize_config(cfg))
+
+    cmd = [sys.executable, "-m", "oplm.train", "--config", str(config_path)]
+    env = {**os.environ, "ACCELERATE_USE_CPU": "true"}
+
+    stdout_path = tmp_path / "child.stdout.log"
+    stderr_path = tmp_path / "child.stderr.log"
+    with stdout_path.open("w") as out, stderr_path.open("w") as err:
+        child = subprocess.Popen(cmd, stdout=out, stderr=err, env=env)
+
+    try:
+        deadline = time.monotonic() + _CONFIG_WAIT_TIMEOUT_S
+        written_config = run_dir / "config.yaml"
+        while not written_config.exists():
+            if child.poll() is not None:
+                pytest.fail(
+                    f"child exited early (rc={child.returncode}) before writing "
+                    f"config.yaml.\nstdout:\n{stdout_path.read_text()}\n"
+                    f"stderr:\n{stderr_path.read_text()}"
+                )
+            if time.monotonic() > deadline:
+                pytest.fail("timed out waiting for the child to write config.yaml")
+            time.sleep(0.05)
+
+        child.send_signal(signal.SIGUSR1)
+        returncode = child.wait(timeout=_EXIT_WAIT_TIMEOUT_S)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+    assert returncode == DRAIN_EXIT_CODE == 85, (
+        f"stdout:\n{stdout_path.read_text()}\nstderr:\n{stderr_path.read_text()}"
+    )
+
+    committed = [p for p in run_dir.glob("checkpoint-*") if p.is_dir()]
+    assert len(committed) == 1, (
+        f"expected exactly one committed checkpoint, got {sorted(p.name for p in committed)}\n"
+        f"stderr:\n{stderr_path.read_text()}"
+    )
+    drained_step = int(committed[0].name.removeprefix("checkpoint-"))
+
+    result = RemoteStore(remote_uri).latest_committed()
+    assert result is not None, (
+        f"remote store has no committed checkpoint after the drain\n"
+        f"stderr:\n{stderr_path.read_text()}"
+    )
+    name, manifest = result
+    assert name == f"checkpoint-{drained_step}"
+    assert "trainer_state.json" in manifest["files"]
+
+
 # --- worker-cycle drain deferral (Task 3.3 controller addition, review fix round) ------
 
 

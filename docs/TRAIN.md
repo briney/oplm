@@ -549,10 +549,41 @@ no-progress guard), see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget
 | `auto_resume` | `false` | Resume from the newest **committed** checkpoint under `output_dir` automatically at trainer start, with no `resume_from` needed. An explicit `resume_from` always wins over `auto_resume`. `oplm slurm generate` injects `train.auto_resume=true` into every job it renders (see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard)); `configs/scaling.yaml` also sets it explicitly, since that config only ever runs under Slurm. |
 | `resume_data_position` | `true` | **Reserved, wired in a later phase (Phase 3).** The field exists and round-trips through config serialization, but nothing in the trainer reads it yet — a resume always restarts the dataloader from the beginning of the current epoch (see "What a resume restores" below). |
 | `dist_timeout_minutes` | `15` | Timeout passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. A genuine hang raises within this window instead of wedging until the Slurm time limit; a no-op on a single process. |
-| `remote_checkpoint_uri` | `null` | **Reserved, wired in a later phase (Phase 4).** The field exists and round-trips through config serialization, but nothing syncs checkpoints anywhere yet — committed checkpoints stay local/shared-filesystem-only regardless of this value. |
+| `remote_checkpoint_uri` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background (Task 4.2) — durability beyond local/shared storage. `null` (default) disables it entirely: zero behavior change, no import of `oplm.training.remote`, no fsspec call. See "Remote checkpoint mirror" below. |
 
 `save_every`, `save_total_limit`, and `resume_from` are the pre-existing checkpointing knobs —
 see [§9](#9-checkpointing-and-resume) and [CONFIG.md](CONFIG.md#train-fields-train).
+
+### Remote checkpoint mirror
+
+When `remote_checkpoint_uri` is set, each committed checkpoint (blocking or the deferred
+commit of an async periodic save) is additionally uploaded, on a background daemon thread, to
+that fsspec URI, following the same tmp-dir/manifest-last commit discipline as the local
+checkpoint layout (`oplm.training.remote.RemoteStore`) — a `checkpoint-<step>/` directory
+without a `manifest.json` remotely is uncommitted and invisible to discovery, exactly like a
+local `.tmp` dir. Only one upload is ever in flight; a checkpoint that commits while a previous
+one is still uploading is queued (at most one slot — a further commit before its turn drops the
+queued one, since the newer checkpoint always supersedes an older, not-yet-started upload). On
+multi-node runs, each node's `local_process_index == 0` process uploads only the DCP shard files
+its own node's ranks wrote; the global main process additionally uploads the shared artifacts
+(`.metadata`, `trainer_state.json`, `config.yaml`, `hf/`) and only finalizes the remote manifest
+after a dedicated GLOO barrier confirms every node's upload has landed — never the trainer's own
+(typically NCCL) process group, and never before every writer is done (see
+`RemoteStore.finalize`'s docstring for why that ordering is a hard, unenforced invariant). The
+drain path (and the natural end of training) blocks on this upload, bounded by a 10-minute
+timeout, before proceeding — the local checkpoint is always the fallback resume target
+regardless of whether the remote mirror finishes in time.
+
+`auto_resume` also consults the remote mirror: if no local committed checkpoint validates, or a
+remote one exists at a *higher* step than the best local candidate, the remote checkpoint is
+downloaded to `output_dir` (becoming the local committed copy) before resuming — the mechanism a
+requeued job on a fresh node with no local checkpoints (e.g. node-local NVMe lost on
+reallocation) uses to recover purely from the remote mirror. **Multi-node caveat:** this download
+happens once, on the main process, before the resume target is broadcast to every other rank —
+correct as long as `output_dir` is a shared/network filesystem every rank can read (the common
+case on a Slurm cluster, e.g. SUNK). A multi-node run with a **node-local** `output_dir` (e.g.
+node-local NVMe) must not rely on this recovery path: only ranks on the main process's own node
+would actually see the downloaded checkpoint.
 
 ### Drain: checkpoint-before-kill on preemption
 
