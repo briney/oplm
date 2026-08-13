@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from accelerate import Accelerator
+    from torch.distributed import ProcessGroup
     from torch.utils.data import DataLoader
 
     from oplm.config import OplmConfig
@@ -259,6 +260,29 @@ class Trainer:
         # together, REGARDLESS of its own local outcome, or a locally-failing rank would
         # leave the healthy ranks hanging in it instead of failing fast and attributably.
         run_preflight(self.accelerator)
+
+        # Dedicated process group for checkpoint I/O collectives (Task 5.1b, fixing a
+        # latent bug found -- and reproduced live -- during Task 5.1's HSDP pilot).
+        # dcp.async_save's background write thread runs its own DCP planning/metadata
+        # collectives over whatever process group it is given; left unset, that was the
+        # DEFAULT process group -- the exact same group the training loop's own
+        # collectives (the per-step control-bundle reduce, gradient
+        # all-reduce/reduce-scatter) run on from the MAIN thread. Two threads issuing
+        # collectives on one group interleave nondeterministically and can abort with a
+        # gloo "collective mismatch" (see build_checkpoint_process_group's docstring and
+        # task-5.1-report.md's Concern 1). Building ONE dedicated GLOO group here, once,
+        # and threading it into every checkpoint collective (save_checkpoint's
+        # process_group parameter -> dcp.save/dcp.async_save) from here on closes that
+        # hole. Collective -- called unconditionally on EVERY rank, never behind a
+        # feature-flag guard (unlike the remote-upload group below, checkpointing itself
+        # is not optional), or a rank that skips it hangs every other rank here forever.
+        # None on a single process (no process group exists to build a subgroup of).
+        from oplm.training.checkpoint import build_checkpoint_process_group
+
+        self._checkpoint_process_group: ProcessGroup | None = build_checkpoint_process_group(
+            self.accelerator,
+            timeout=timedelta(minutes=cfg.train.dist_timeout_minutes),
+        )
 
         # Remote checkpoint mirror (Task 4.2). build_upload_group is a collective --
         # EVERY rank calls it here, unconditionally within this branch, whenever a
@@ -1282,6 +1306,7 @@ class Trainer:
             extra_state=self._checkpoint_extra_state(),
             cursor=cursor,
             blocking=blocking,
+            process_group=self._checkpoint_process_group,
         )
         self._last_save_at = time.monotonic()
 

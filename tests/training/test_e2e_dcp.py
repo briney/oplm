@@ -1108,3 +1108,165 @@ def test_dcp_checkpoint_saved_at_world_size_2_resumes_at_world_size_1(
 
     resumed.train()
     assert resumed.global_step == resume_max_steps
+
+
+# --- Task 5.1b: dedicated checkpoint process group --------------------------------------
+
+
+class _FakeAcceleratorForGroup:
+    """Stand-in for Accelerate's Accelerator: only ``num_processes`` is read by
+    ``build_checkpoint_process_group``.
+    """
+
+    def __init__(self, num_processes: int) -> None:
+        self.num_processes = num_processes
+
+
+def test_build_checkpoint_process_group_returns_none_for_single_process() -> None:
+    """No process group is built (or even inspected) for a single-process run."""
+    from oplm.training.checkpoint import build_checkpoint_process_group
+
+    assert build_checkpoint_process_group(_FakeAcceleratorForGroup(1)) is None
+
+
+def test_build_checkpoint_process_group_returns_none_without_a_live_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``num_processes > 1`` alone is not enough -- a dead/absent process group is also None.
+
+    Mirrors ``build_upload_group``'s identical defensive check: a caller that reports
+    ``num_processes > 1`` without ``torch.distributed`` actually being initialized (not a
+    real production shape, but defensive) must not attempt ``dist.new_group``.
+    """
+    import torch.distributed as dist
+
+    from oplm.training.checkpoint import build_checkpoint_process_group
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    assert build_checkpoint_process_group(_FakeAcceleratorForGroup(2)) is None
+
+
+def test_build_checkpoint_process_group_calls_new_group_exactly_once_with_gloo_and_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-process: ``dist.new_group`` is called exactly once, with ``backend="gloo"``.
+
+    ``torch.distributed.new_group`` is itself the collective every rank must reach
+    identically (see the function's own docstring); this spies on the real distributed
+    module (rather than faking it out entirely) to pin the exact call shape --
+    ``backend="gloo"`` (never inherited from whatever the default process group's own
+    backend is) and the caller's ``timeout`` passed straight through -- without needing a
+    real multi-rank launch (that proof is the 2-rank e2e pilot in
+    ``test_e2e_checkpoint_pg.py``).
+    """
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from oplm.training.checkpoint import build_checkpoint_process_group
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    calls: list[dict[str, object]] = []
+    sentinel_group = object()
+
+    def _fake_new_group(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return sentinel_group
+
+    monkeypatch.setattr(dist, "new_group", _fake_new_group)
+
+    timeout = timedelta(minutes=15)
+    result = build_checkpoint_process_group(_FakeAcceleratorForGroup(2), timeout=timeout)
+
+    assert result is sentinel_group
+    assert calls == [{"backend": "gloo", "timeout": timeout}]
+
+
+def test_save_checkpoint_blocking_passes_process_group_to_dcp_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``blocking=True`` threads ``process_group`` straight through to ``dcp.save``.
+
+    Captures the real ``dcp.save`` call's kwargs via monkeypatch (rather than faking out
+    the whole save) so this pins the exact plumbing Task 5.1b added to
+    ``save_checkpoint`` without re-deriving DCP's own save behavior.
+    """
+    from oplm.training import checkpoint as checkpoint_module
+
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    _take_optimizer_step(cfg, accelerator, model, optimizer, scheduler)
+
+    captured: dict[str, object] = {}
+    real_dcp_save = checkpoint_module.dcp.save
+
+    def _spy_save(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_dcp_save(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoint_module.dcp, "save", _spy_save)
+
+    sentinel_group = object()
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+        process_group=sentinel_group,  # type: ignore[arg-type]
+    )
+
+    assert captured["process_group"] is sentinel_group
+
+
+def test_save_checkpoint_async_passes_process_group_to_dcp_async_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``blocking=False`` threads ``process_group`` straight through to ``dcp.async_save``.
+
+    Same shape as the blocking test above, but on the async path -- the one Task 5.1b
+    actually exists to fix, since ``dcp.async_save``'s background write thread is what
+    runs collectives that could otherwise interleave with the training loop's own.
+    """
+    from oplm.training import checkpoint as checkpoint_module
+
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    _take_optimizer_step(cfg, accelerator, model, optimizer, scheduler)
+
+    captured: dict[str, object] = {}
+    real_dcp_async_save = checkpoint_module.dcp.async_save
+
+    def _spy_async_save(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_dcp_async_save(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoint_module.dcp, "async_save", _spy_async_save)
+
+    sentinel_group = object()
+    result = save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+        blocking=False,
+        process_group=sentinel_group,  # type: ignore[arg-type]
+    )
+
+    assert captured["process_group"] is sentinel_group
+
+    # Clean up the still-pending write so this test doesn't leak a background thread
+    # holding file handles open past the test's tmp_path teardown.
+    assert isinstance(result, PendingSave)
+    result.future.result()

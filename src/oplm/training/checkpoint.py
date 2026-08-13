@@ -21,8 +21,10 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import timedelta
 
     from accelerate import Accelerator
+    from torch.distributed import ProcessGroup
 
     from oplm.config import OplmConfig
 
@@ -403,6 +405,69 @@ def finalize_pending_save(accelerator: Accelerator, pending: PendingSave) -> Pat
     )
 
 
+def build_checkpoint_process_group(
+    accelerator: Accelerator, *, timeout: timedelta | None = None
+) -> ProcessGroup | None:
+    """Create a dedicated GLOO process group for DCP's own checkpoint collectives.
+
+    **Why this exists (Task 5.1b, a latent bug found -- and reproduced live -- during
+    Task 5.1's HSDP pilot):** ``dcp.async_save`` stages the state dict synchronously,
+    then runs its write-coordination collectives (planning, metadata exchange) on a
+    **background thread**, over whatever process group it is given -- the DEFAULT
+    process group, if none is passed explicitly, which is exactly what
+    :func:`save_checkpoint` used to do. The training loop meanwhile issues its own
+    collectives (the per-step control-bundle reduce, gradient all-reduce/reduce-scatter)
+    on that same default group from the MAIN thread. Two threads issuing collectives on
+    one group interleave nondeterministically; Task 5.1's pilot aborted with a gloo
+    "collective mismatch" from exactly this interleaving. Any multi-rank run with
+    periodic async saves (``save_every``/``save_every_minutes`` -- i.e. every production
+    run) is exposed, not just the pilot's particular trigger.
+
+    The fix is simply to never let DCP's collectives share a group with anything else:
+    this function builds ONE dedicated GLOO group, spanning every rank (unlike
+    :func:`~oplm.training.remote.build_upload_group`'s node-leader subgroup, checkpoint
+    I/O collectives -- ``dcp.save``/``dcp.async_save``, see :func:`save_checkpoint`'s
+    ``process_group`` parameter -- involve every rank, not just node leaders), and every
+    checkpoint collective from here on runs on it instead of the default group. GLOO has
+    no restriction on driving collectives from a thread other than the one that created
+    the group (NCCL does), so this is safe for the background write thread even under a
+    ``cuda:nccl`` default group in production.
+
+    Must be called collectively, exactly once, by **every** rank in the default process
+    group -- ``torch.distributed.new_group`` requires this even for a rank that will
+    never trigger a save itself; a rank that skips this call (e.g. behind a guard that
+    isn't identical on every rank) hangs every other rank at this line forever. The
+    caller (``Trainer.__init__``) is responsible for reaching it identically on every
+    rank, unconditionally -- unlike the remote-upload group, this one is not gated on
+    any opt-in config field, since checkpointing itself is not optional.
+
+    Args:
+        accelerator: The trainer's Accelerator, called right after it is constructed.
+        timeout: Passed to ``torch.distributed.new_group`` so a genuinely stuck
+            checkpoint collective on this group fails attributably within this bound
+            instead of waiting on GLOO's own (unrelated) default timeout. ``None``
+            leaves the torch default. Callers should pass
+            ``timedelta(minutes=cfg.train.dist_timeout_minutes)`` to match the
+            trainer's own default process group timeout (``InitProcessGroupKwargs``)
+            and :func:`~oplm.training.remote.build_upload_group`'s.
+
+    Returns:
+        The new GLOO ``ProcessGroup``, spanning every rank, for a multi-process run.
+        ``None`` for a single-process run (``accelerator.num_processes <= 1``, or no
+        process group initialized at all) -- callers must then pass
+        ``process_group=None`` to ``dcp.save``/``dcp.async_save``, which is exactly
+        DCP's own default (falls back to the default process group internally), so
+        single-process behavior is unchanged byte-for-byte.
+    """
+    import torch.distributed as dist
+
+    if accelerator.num_processes <= 1 or not dist.is_initialized():
+        return None
+
+    kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+    return dist.new_group(backend="gloo", **kwargs)
+
+
 def save_checkpoint(
     accelerator: Accelerator,
     model: torch.nn.Module,
@@ -420,6 +485,7 @@ def save_checkpoint(
     extra_state: dict[str, Any] | None = None,
     cursor: Any | None = None,
     blocking: bool = True,
+    process_group: ProcessGroup | None = None,
 ) -> Path | PendingSave:
     """Save a training checkpoint atomically via a tmp-dir + rename commit.
 
@@ -497,6 +563,15 @@ def save_checkpoint(
             returns a :class:`PendingSave` handle instead of the committed path, and
             the caller must later call :func:`finalize_pending_save` once every rank's
             local write has actually finished.
+        process_group: The process group ``dcp.save``/``dcp.async_save`` run their
+            write-coordination collectives on (see
+            :func:`build_checkpoint_process_group`). ``None`` (the default) lets DCP
+            fall back to its own default-process-group resolution -- correct for a
+            single-process run, but a multi-process caller MUST pass the dedicated
+            group built once at trainer init, or an async save's background-thread
+            collectives can interleave with the training loop's own collectives on the
+            default group (Task 5.1b; see :func:`build_checkpoint_process_group`'s
+            docstring for the full story).
 
     Returns:
         When ``blocking=True`` (default): the path the checkpoint is committed to
@@ -517,9 +592,11 @@ def save_checkpoint(
     #     get_model_state_dict(full_state_dict=True) is collective, so a main-only call
     #     would hang every other rank.
     #   - It must run BEFORE the dcp.save/dcp.async_save below: async_save runs the whole
-    #     save -- including DCP's own collectives -- on a background thread over this same
-    #     process group, so a collective issued here afterward could interleave with it
-    #     and mismatch across ranks.
+    #     save -- including DCP's own collectives -- on a background thread, so a
+    #     collective issued here afterward could interleave with it and mismatch across
+    #     ranks. (This gather itself runs on the default process group, not
+    #     process_group below, but the ordering constraint holds regardless of which
+    #     group either one uses.)
     # Being synchronous, it also stalls training for the length of a full-model all-gather
     # even on the async path (see _gather_hf_state_dict); decoupling the hf/ export cadence
     # from the checkpoint cadence is ledgered follow-up work.
@@ -537,14 +614,25 @@ def save_checkpoint(
     }
     future: Future[Any] | None = None
     if blocking:
-        dcp.save(dcp_state, checkpoint_id=str(tmp_dir))
+        # Runs on the main thread, so it was never racy against the training loop's own
+        # collectives -- process_group is threaded through anyway (Task 5.1b) so every
+        # checkpoint collective, blocking or async, shares one group and call cadence.
+        dcp.save(dcp_state, checkpoint_id=str(tmp_dir), process_group=process_group)
     else:
         # dcp.async_save's synchronous staging step does NOT create tmp_dir itself
         # (verified: only the background write thread does) -- pre-create it so the
         # sidecar writes just below, which must run synchronously regardless of
         # blocking, don't race a FileNotFoundError against the background thread.
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        async_result = dcp.async_save(dcp_state, checkpoint_id=str(tmp_dir))
+        # process_group (Task 5.1b): the background write thread's own DCP planning/
+        # metadata collectives run on this group, never on the default group the
+        # training loop's main-thread collectives (control-bundle reduce, gradient
+        # all-reduce/reduce-scatter) also use -- see build_checkpoint_process_group's
+        # docstring for the interleaving abort this prevents. None on a single-process
+        # run, matching DCP's own default-group fallback exactly.
+        async_result = dcp.async_save(
+            dcp_state, checkpoint_id=str(tmp_dir), process_group=process_group
+        )
         # dcp.async_save's return type is Future | AsyncSaveResponse. Which one comes
         # back depends on whether the STAGING step itself is asynchronous, not on
         # async_checkpointer_type (that only selects the upload executor): DCP takes
@@ -802,6 +890,20 @@ def load_checkpoint(
     missing sidecar is a hard error -- see :func:`_restore_rng_sidecar`), and restores the
     fp16 ``GradScaler``'s state (see :func:`_restore_scaler_sidecar`) when both the
     checkpoint and the current run have one. Reads and returns the trainer state dict.
+
+    **``dcp.load`` deliberately stays on the default process group (Task 5.1b decision):**
+    unlike ``dcp.save``/``dcp.async_save`` (see :func:`build_checkpoint_process_group`),
+    this call is always synchronous on the caller's own (main) thread, and every existing
+    call site (``Trainer._resume_from_checkpoint``) runs it once, at trainer construction,
+    strictly before the training loop starts and therefore before any periodic save --
+    blocking or async -- has ever been triggered. There is no background thread anywhere
+    in the process at that point to interleave with, so the race the dedicated group
+    exists to prevent cannot occur here regardless of which group is used. Moving it onto
+    the dedicated group anyway would cost real coupling (every caller of this function
+    would need to also thread the group through, including the handful of direct-call
+    unit tests in ``test_e2e_dcp.py`` that construct a bare, single-process
+    ``Accelerator`` with no group to give) for zero correctness benefit, so it is left on
+    the default group intentionally rather than "for uniformity."
 
     Args:
         accelerator: The HuggingFace Accelerator instance.
