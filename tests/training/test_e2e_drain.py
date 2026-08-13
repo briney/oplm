@@ -24,6 +24,7 @@ the test discovers the drained step rather than assuming it is step 1.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -176,3 +177,83 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
 
     resumed.train()
     assert resumed.global_step == resume_max_steps
+
+
+# --- worker-cycle drain deferral (Task 3.3 controller addition, review fix round) ------
+
+
+def test_drain_defers_checkpoint_and_skips_eval_until_worker_cycle_alignment(
+    training_parquet: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A misaligned drain defers its save/exit -- and skips eval entirely while deferred.
+
+    Drives the real ``train()`` loop in-process (no subprocess/real signal): a fake
+    drain source reports ``requested=True`` from the very first optimizer step. With
+    ``num_workers=4`` the drain is first observed at ``batches_in_epoch=1`` (misaligned)
+    and must defer for three steps (batches_in_epoch=1,2,3, none a multiple of 4) before
+    landing on ``batches_in_epoch=4`` -- exactly the scenario
+    ``test_periodic_save_deferred_until_worker_cycle_alignment`` covers for periodic
+    saves, but for drain, and with a wide-enough deferral window (3 steps) to also check
+    the log-dedup fix below.
+
+    ``_run_eval`` is patched to record every call (Critical review fix): with
+    ``eval_every={"steps": 1}`` configured, an un-fixed trainer would run eval on every
+    deferred step, burning wall-clock time the drain margin exists to avoid -- this
+    asserts it is never called at all before the drain resolves. The "deferring
+    checkpoint" info log is also asserted to appear exactly once (Minor review fix),
+    not once per deferred step (``DrainSignal.requested`` is sticky, so an un-deduped
+    log would otherwise repeat on steps 1, 2, and 3).
+    """
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=4,
+        save_every=0,
+        save_final=False,
+        num_workers=4,
+        log_every=1,
+        eval={"hd": {"path": str(training_parquet), "type": "sequence", "every": {"steps": 1}}},
+    )
+    trainer = Trainer(cfg, callbacks=[])
+
+    class _AlwaysRequestedDrain:
+        """Stand-in for DrainSignal: reports requested=True from step 1 onward."""
+
+        requested = True
+
+    monkeypatch.setattr(trainer, "_drain_signal", _AlwaysRequestedDrain())
+
+    eval_calls: list[int] = []
+
+    def _recording_run_eval(tokens_delta: int) -> dict[str, float]:
+        eval_calls.append(trainer.global_step)
+        return {}
+
+    monkeypatch.setattr(trainer, "_run_eval", _recording_run_eval)
+
+    with caplog.at_level(logging.INFO, logger="oplm.training.trainer"):
+        with pytest.raises(SystemExit) as exc_info:
+            trainer.train()
+
+    # (c) exit code 85 still propagates.
+    assert exc_info.value.code == DRAIN_EXIT_CODE == 85
+
+    # (a) the drain checkpoint lands on the aligned batch count (4), not the misaligned
+    # trigger step (1) -- and nothing else was committed.
+    committed = sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("checkpoint-"))
+    assert committed == ["checkpoint-4"]
+
+    # (b) no eval ran at all: the drain was pending from step 1 through step 3 and
+    # resolved at step 4, so every step this run reached had a pending drain save.
+    assert eval_calls == []
+
+    # Minor fix: the "deferring checkpoint" log appears exactly once across the
+    # 3-step deferral window (steps 1, 2, 3), not once per deferred step.
+    defer_logs = [r for r in caplog.records if "deferring checkpoint" in r.getMessage()]
+    assert len(defer_logs) == 1

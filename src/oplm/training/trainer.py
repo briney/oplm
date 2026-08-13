@@ -518,6 +518,10 @@ class Trainer:
         # (a fresh Trainer always starts with nothing in flight).
         self._periodic_save_deferral = _SaveDeferral()
         self._drain_save_deferral = _SaveDeferral()
+        # De-dupes the "deferring drain checkpoint" log line to once per deferral
+        # episode instead of once per deferred step (DrainSignal.requested is sticky,
+        # so without this it would otherwise repeat on every step until aligned).
+        self._drain_defer_logged = False
 
         # Loss-spike warn-only detector state (Task 1.8). Not persisted across a
         # requeue/resume: it is a diagnostic-only trend, not training state, and simply
@@ -722,14 +726,19 @@ class Trainer:
                 # Drain takes priority over logging/eval/periodic-save: this step's
                 # bookkeeping (tokens_seen, throughput window) is already complete above,
                 # so the checkpoint below carries tokens_seen consistent with global_step
-                # across a drain+resume -- but we still check before eval so a drain never
-                # starts a long eval. Worker-cycle save-alignment deferral (Task 3.3): the
-                # actual save/exit is deferred up to num_workers - 1 extra steps looking for
-                # batches_in_epoch % num_workers == 0 -- bounded and rank-safe (see
-                # _SaveDeferral). A pending async save is finalized (blocking) FIRST (Task
-                # 2.3) once the deferral actually fires: the drain's own save must always be
-                # blocking, and must never be preceded by a torn/uncommitted async save left
-                # dangling behind it.
+                # across a drain+resume. Worker-cycle save-alignment deferral (Task 3.3):
+                # the actual save/exit is deferred up to num_workers - 1 extra steps looking
+                # for batches_in_epoch % num_workers == 0 -- bounded and rank-safe (see
+                # _SaveDeferral). While that deferral is outstanding (`drain_pending`
+                # below), eval is explicitly skipped for the rest of this step (see the
+                # Evaluation section) -- a multi-minute eval landing in the deferral window
+                # would burn the SLURM drain margin the whole mechanism exists to beat.
+                # Logging/progress still proceed either way (cheap, and useful signal that
+                # the run is alive while draining). A pending async save is finalized
+                # (blocking) FIRST (Task 2.3) once the deferral actually fires: the drain's
+                # own save must always be blocking, and must never be preceded by a
+                # torn/uncommitted async save left dangling behind it.
+                drain_pending = False
                 if flags.drain:
                     drain_ready = self._drain_save_deferral.decide(
                         triggered=True,
@@ -747,26 +756,35 @@ class Trainer:
                             DRAIN_EXIT_CODE,
                         )
                         raise SystemExit(DRAIN_EXIT_CODE)
-                    logger.info(
-                        "Drain requested at step %d: deferring checkpoint for worker-cycle "
-                        "alignment (batches_in_epoch=%d, num_workers=%d)",
-                        self.global_step,
-                        self._batches_in_epoch,
-                        self._effective_num_workers(),
-                    )
+                    drain_pending = True
+                    # DrainSignal.requested is sticky (never clears), so without this
+                    # guard this would otherwise log once per deferred step instead of
+                    # once per deferral episode.
+                    if not self._drain_defer_logged:
+                        logger.info(
+                            "Drain requested at step %d: deferring checkpoint for "
+                            "worker-cycle alignment (batches_in_epoch=%d, num_workers=%d)",
+                            self.global_step,
+                            self._batches_in_epoch,
+                            self._effective_num_workers(),
+                        )
+                        self._drain_defer_logged = True
 
                 # Logging
                 if self.global_step % cfg.log_every == 0:
                     self._log_step(current_loss)
 
-                # Evaluation
-                eval_metrics = self._run_eval(tokens_delta)
-                if eval_metrics:
-                    eval_loss = self._extract_eval_loss(eval_metrics)
-                    if eval_loss is not None:
-                        self._last_eval_loss = eval_loss
-                    self._log_metrics(eval_metrics)
-                    self._emit_eval_end(eval_metrics)
+                # Evaluation -- skipped entirely while a drain checkpoint is deferred
+                # (drain_pending): eval can run for minutes, which would burn the SLURM
+                # drain margin before the deferral ever gets to align and save/exit.
+                if not drain_pending:
+                    eval_metrics = self._run_eval(tokens_delta)
+                    if eval_metrics:
+                        eval_loss = self._extract_eval_loss(eval_metrics)
+                        if eval_loss is not None:
+                            self._last_eval_loss = eval_loss
+                        self._log_metrics(eval_metrics)
+                        self._emit_eval_end(eval_metrics)
 
                 # Checkpointing: step cadence OR the rank-synced save_every_minutes
                 # timer (flags.save_due is identical on every rank after the reduce
