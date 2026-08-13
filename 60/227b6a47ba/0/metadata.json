@@ -1,0 +1,121 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "60227b6a47ba",
+  "session_id": "be5c66b2-dc2d-461c-9e87-d6bcff4e05a9",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-13T05:03:30.789674791Z",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "TODOS.md"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "39638a49e003",
+  "checkpoint_transcript_start": 134,
+  "transcript_lines_at_start": 134,
+  "compact_transcript_start": 33,
+  "token_usage": {
+    "input_tokens": 6764,
+    "cache_creation_tokens": 85479,
+    "cache_read_tokens": 1140464,
+    "output_tokens": 47504,
+    "api_call_count": 10
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_01XeAfqMFvGBaZaJXtN5JdL9",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "superpowers:brainstorming"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "39638a49e003",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 17,
+        "end": 18,
+        "entry_ids": [
+          "1c072b43-373c-43da-8251-74ef05ca12c2"
+        ],
+        "tool_use_id": "toolu_01XeAfqMFvGBaZaJXtN5JdL9"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01XeAfqMFvGBaZaJXtN5JdL9"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: superpowers:brainstorming",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_01SP5R2KVz9QmudFffSm9kjQ",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "superpowers:writing-plans"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "39638a49e003",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 140,
+        "end": 141,
+        "entry_ids": [
+          "ed6a5ca6-863b-452d-9974-cc24f45a59b9"
+        ],
+        "tool_use_id": "toolu_01SP5R2KVz9QmudFffSm9kjQ"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01SP5R2KVz9QmudFffSm9kjQ"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: superpowers:writing-plans",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 9
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-13T05:03:30.745895015Z",
+    "agent_lines": 862,
+    "agent_removed": 2714,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 862,
+    "total_lines_changed": 3576,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 325,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/agents/entire-search.md": 25,
+        ".claude/plans/i-d-like-to-add-dreamy-creek.md": 162,
+        ".claude/settings.json": 84,
+        ".claude/settings.local.json": 14,
+        ".cursor/hooks.json": 40
+      }
+    }
+  ]
+}
