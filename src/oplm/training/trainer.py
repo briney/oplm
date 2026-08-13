@@ -132,13 +132,15 @@ class Trainer:
             ],
         )
 
-        # Preflight (Task 1.8): allocate + matmul + (distributed) collective on every rank,
-        # right after the Accelerator exists and BEFORE anything below touches checkpoints or
-        # data. A sick node must fail here, in seconds and attributably, rather than hanging
-        # mid-training or corrupting a resume by racing the stale-checkpoint cleanup below.
-        # Unconditional on every rank -- like the resume-target broadcast further down,
-        # run_preflight contains a collective (the reduce, when num_processes > 1) that every
-        # rank must reach together or the group hangs.
+        # Preflight (Task 1.8): allocate + matmul on every rank, right after the
+        # Accelerator exists and BEFORE anything below touches checkpoints or data. A
+        # sick node must fail here, in seconds and attributably, rather than hanging
+        # mid-training or corrupting a resume by racing the stale-checkpoint cleanup
+        # below. Unconditional on every rank -- like the resume-target broadcast further
+        # down, run_preflight contains a collective (a gather_object exchange of every
+        # rank's local pass/fail, when num_processes > 1) that every rank must reach
+        # together, REGARDLESS of its own local outcome, or a locally-failing rank would
+        # leave the healthy ranks hanging in it instead of failing fast and attributably.
         run_preflight(self.accelerator)
 
         # Status helper for user-facing messages (main process only)
