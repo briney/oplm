@@ -90,6 +90,14 @@ class Trainer:
         if self.accelerator.is_main_process:
             Path(cfg.train.output_dir).mkdir(parents=True, exist_ok=True)
 
+            # A checkpoint-<step>.tmp/ staging dir surviving to trainer start means the
+            # process that created it was killed mid-save: it was never committed (the
+            # commit rename removes the .tmp suffix atomically) and is therefore torn.
+            # Clean it up before any resume logic below can consider it.
+            from oplm.training.checkpoint import clean_stale_tmp_checkpoints
+
+            clean_stale_tmp_checkpoints(Path(cfg.train.output_dir))
+
         # Init wandb early so login prompt appears before slow setup steps
         if cfg.train.wandb_enabled:
             _status("[dim]Initializing wandb...[/dim]")

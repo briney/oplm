@@ -7,37 +7,11 @@ from typing import Annotated
 
 import typer
 
+from oplm.training.checkpoint import latest_checkpoint
+
 app = typer.Typer(name="mup-run", help=__doc__, add_completion=False)
 
-_CHECKPOINT_PREFIX = "checkpoint-"
-
-
-def latest_checkpoint(output_dir: Path) -> Path | None:
-    """Return the highest-step checkpoint under ``output_dir``, or ``None``.
-
-    Checkpoints are named ``checkpoint-<global_step>`` (see
-    ``oplm.training.trainer.Trainer._save_checkpoint``), so ordering is numeric on the suffix —
-    lexicographic ordering would rank ``checkpoint-9000`` above ``checkpoint-10000``.
-
-    Args:
-        output_dir: The cell's training output directory (may not exist yet).
-
-    Returns:
-        The path to the checkpoint directory with the highest numeric step, or ``None`` if
-        ``output_dir`` does not exist or holds no well-formed checkpoint directory.
-    """
-    if not output_dir.is_dir():
-        return None
-    candidates: list[tuple[int, Path]] = []
-    for path in output_dir.glob(f"{_CHECKPOINT_PREFIX}*"):
-        if not path.is_dir():
-            continue
-        suffix = path.name.removeprefix(_CHECKPOINT_PREFIX)
-        if suffix.isdigit():
-            candidates.append((int(suffix), path))
-    if not candidates:
-        return None
-    return max(candidates)[1]
+__all__ = ["app", "latest_checkpoint", "main"]
 
 
 @app.command()
