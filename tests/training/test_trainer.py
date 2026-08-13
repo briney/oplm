@@ -364,3 +364,160 @@ def test_compile_dynamic_false_no_pad_emits_warning(
         "Expected a warning about unbounded shapes / recompile thrashing; "
         f"got warning messages: {warning_msgs!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Process-group timeout wiring (Task 1.8)
+# ---------------------------------------------------------------------------
+
+
+def test_accelerator_pg_timeout_uses_dist_timeout_minutes(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`train.dist_timeout_minutes` must reach the Accelerator as an InitProcessGroupKwargs."""
+    from datetime import timedelta
+
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1)
+    cfg.train.dist_timeout_minutes = 7
+    trainer = Trainer(cfg)
+
+    assert trainer.accelerator.init_handler is not None
+    assert trainer.accelerator.init_handler.timeout == timedelta(minutes=7)
+
+
+def test_accelerator_pg_timeout_uses_config_default(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default dist_timeout_minutes=15 must reach the Accelerator too."""
+    from datetime import timedelta
+
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1)
+    assert cfg.train.dist_timeout_minutes == 15
+    trainer = Trainer(cfg)
+
+    assert trainer.accelerator.init_handler.timeout == timedelta(minutes=15)
+
+
+# ---------------------------------------------------------------------------
+# Preflight check wiring (Task 1.8)
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_runs_before_output_dir_is_touched(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing preflight aborts Trainer.__init__ before anything touches output_dir.
+
+    Patches `oplm.training.preflight.run_preflight` (the module Trainer.__init__ imports
+    it from) to raise, and asserts the failure surfaces before the stale-checkpoint-cleanup
+    /output_dir.mkdir block that follows Accelerator construction.
+    """
+    from oplm.training import preflight as preflight_module
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    calls: list[object] = []
+
+    def _boom(accelerator: object) -> None:
+        calls.append(accelerator)
+        raise RuntimeError("preflight check failed on host fakehost: boom")
+
+    monkeypatch.setattr(preflight_module, "run_preflight", _boom)
+
+    run_dir = tmp_path / "run"
+    cfg = tiny_train_cfg(run_dir, training_parquet, max_steps=1)
+
+    with pytest.raises(RuntimeError, match="preflight check failed"):
+        Trainer(cfg)
+
+    assert len(calls) == 1
+    assert not run_dir.exists(), "output_dir must not be created before preflight passes"
+
+
+# ---------------------------------------------------------------------------
+# Loss-spike warn-only detector (Task 1.8)
+# ---------------------------------------------------------------------------
+
+
+def test_log_step_suppresses_loss_spike_warning_during_warmup(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No loss-spike warning fires within the first 50 logged steps, however extreme."""
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1, compile=False)
+    trainer = Trainer(cfg)
+    monkeypatch.setattr(trainer, "_log_metrics", lambda m: None)
+
+    with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
+        for _ in range(49):
+            trainer._log_step(1.0)
+        trainer._log_step(100.0)  # a 100x spike, but still within the warmup window
+
+    assert not any("loss spike" in r.getMessage() for r in caplog.records)
+
+
+def test_log_step_warns_on_loss_spike_after_warmup(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A loss > 3x the EMA warns (does not raise) once past the 50-logged-step warmup."""
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1, compile=False)
+    trainer = Trainer(cfg)
+    monkeypatch.setattr(trainer, "_log_metrics", lambda m: None)
+
+    with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
+        for _ in range(50):
+            trainer._log_step(1.0)
+        trainer._log_step(10.0)  # 51st logged step; EMA is ~1.0, so 10 > 3x it
+
+    assert any("loss spike" in r.getMessage() for r in caplog.records)
+
+
+def test_log_step_does_not_warn_below_spike_threshold(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A mild loss increase (below 3x EMA) past warmup does not warn."""
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1, compile=False)
+    trainer = Trainer(cfg)
+    monkeypatch.setattr(trainer, "_log_metrics", lambda m: None)
+
+    with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
+        for _ in range(50):
+            trainer._log_step(1.0)
+        trainer._log_step(2.0)  # well under 3x the ~1.0 EMA
+
+    assert not any("loss spike" in r.getMessage() for r in caplog.records)

@@ -108,6 +108,28 @@ def test_rendezvous_variables(tmp_path: Path) -> None:
     assert "export OMP_NUM_THREADS=1" in text
 
 
+def test_nccl_hardening_env_block(tmp_path: Path) -> None:
+    """The full NCCL-hardening env block replaces the old bare `NCCL_DEBUG=INFO` line."""
+    text = render_job(_array_spec(tmp_path), SLURM)
+    assert f"export NCCL_DEBUG={SLURM.nccl_debug}" in text
+    assert "export TORCH_NCCL_ASYNC_ERROR_HANDLING=1" in text
+    assert "export TORCH_NCCL_TRACE_BUFFER_SIZE=2000" in text
+    assert "export TORCH_NCCL_DUMP_ON_TIMEOUT=1" in text
+    assert (
+        f"export TORCH_FR_DUMP_TEMP_FILE={SLURM.log_dir}/nccl_trace_${{SLURM_JOB_ID}}_rank"
+        in text
+    )
+    assert "export NCCL_DEBUG=INFO" not in text
+
+
+def test_nccl_debug_uses_the_configured_value(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    custom = replace(SLURM, nccl_debug="INFO")
+    text = render_job(_array_spec(tmp_path), custom)
+    assert "export NCCL_DEBUG=INFO" in text
+
+
 def test_slurm_vars_expand_inside_the_container(tmp_path: Path) -> None:
     """The inner command is single-quoted so $SLURM_PROCID expands in the container shell."""
     spec = JobSpec(

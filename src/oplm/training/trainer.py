@@ -7,6 +7,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -32,6 +33,14 @@ logger = logging.getLogger(__name__)
 # clock starts reporting requested=True. Fixed module constant for now; may
 # become a config knob later if a use case needs it.
 _DRAIN_MARGIN_SECONDS = 600
+
+# Loss-spike warn-only detector (Task 1.8, spec §6): same 0.98/0.02 EMA smoothing
+# oplm.training.mup's logging helper uses. Warns (never aborts) once the EMA has had
+# _LOSS_SPIKE_WARMUP_LOGS logged steps to settle, so a cold-start EMA (which starts
+# equal to the very first loss) can't trivially trip the 3x threshold.
+_LOSS_EMA_DECAY = 0.98
+_LOSS_SPIKE_MULTIPLIER = 3.0
+_LOSS_SPIKE_WARMUP_LOGS = 50
 
 
 @dataclass(frozen=True)
@@ -69,13 +78,14 @@ class Trainer:
         callbacks: Sequence[TrainerCallback] | None = None,
     ) -> None:
         from accelerate import Accelerator
-        from accelerate.utils import DataLoaderConfiguration, set_seed
+        from accelerate.utils import DataLoaderConfiguration, InitProcessGroupKwargs, set_seed
         from rich.console import Console
 
         from oplm.data import DeviceDataLoader, build_train_dataloader
         from oplm.model import OplmForMaskedLM
         from oplm.training.flops import estimate_flops_per_token
         from oplm.training.optim import build_optimizers, build_schedulers
+        from oplm.training.preflight import run_preflight
 
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
@@ -104,7 +114,11 @@ class Trainer:
         # Seed everything
         set_seed(cfg.train.seed)
 
-        # Accelerator
+        # Accelerator. kwargs_handlers=[InitProcessGroupKwargs(timeout=...)] (Task 1.8)
+        # bounds every NCCL/gloo collective's wait, converting a genuine hang into a
+        # raised exception (-> nonzero exit -> requeue) within cfg.train.dist_timeout_minutes
+        # instead of wedging until the Slurm time limit; on a single process it is a harmless
+        # no-op (there is no process group to time out).
         log_with = "wandb" if cfg.train.wandb_enabled else None
         self.accelerator = Accelerator(
             mixed_precision=cfg.train.mixed_precision,
@@ -113,7 +127,19 @@ class Trainer:
             project_dir=cfg.train.output_dir,
             dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
             step_scheduler_with_optimizer=False,
+            kwargs_handlers=[
+                InitProcessGroupKwargs(timeout=timedelta(minutes=cfg.train.dist_timeout_minutes))
+            ],
         )
+
+        # Preflight (Task 1.8): allocate + matmul + (distributed) collective on every rank,
+        # right after the Accelerator exists and BEFORE anything below touches checkpoints or
+        # data. A sick node must fail here, in seconds and attributably, rather than hanging
+        # mid-training or corrupting a resume by racing the stale-checkpoint cleanup below.
+        # Unconditional on every rank -- like the resume-target broadcast further down,
+        # run_preflight contains a collective (the reduce, when num_processes > 1) that every
+        # rank must reach together or the group hangs.
+        run_preflight(self.accelerator)
 
         # Status helper for user-facing messages (main process only)
         _console = Console()
@@ -372,6 +398,12 @@ class Trainer:
         self._epoch_at_last_opt_step = 0
         self._step_local_tokens = 0  # local tokens accumulated across the current opt step
 
+        # Loss-spike warn-only detector state (Task 1.8). Not persisted across a
+        # requeue/resume: it is a diagnostic-only trend, not training state, and simply
+        # re-warms from the resumed run's own logged losses.
+        self._loss_ema: float | None = None
+        self._loss_log_count = 0
+
         # Wall-clock/time-based checkpoint cadence state (Task 1.3). _last_save_at
         # uses time.monotonic() and is never persisted (meaningless across process
         # restarts); _first_checkpoint_at/_last_time_keep_index anchor the
@@ -499,10 +531,24 @@ class Trainer:
                 flags = self._reduce_step_flags(
                     local_tokens,
                     drain=self._drain_signal.requested,
+                    nonfinite=not math.isfinite(current_loss),
                     save_due=self._save_timer_due(),
                 )
                 tokens_delta = flags.tokens_delta
                 self.tokens_seen += tokens_delta
+
+                # Non-finite loss guard (Task 1.8, spec §6): a NaN/inf loss on ANY rank trips
+                # this flag on EVERY rank (it is post-reduce), so all ranks raise together
+                # here -- after this step's tokens_seen accounting is complete (consistent
+                # with where the drain branch sits below), but before eval/checkpoint can act
+                # on a poisoned step. The requeue loop then resumes from the last checkpoint,
+                # an automatic rollback; two such restarts with no step advance trips the
+                # no-progress crash-loop guard instead of requeueing forever.
+                if flags.nonfinite:
+                    logger.error(
+                        "non-finite training loss %s at step %d", current_loss, self.global_step
+                    )
+                    raise RuntimeError(f"non-finite training loss at step {self.global_step}")
 
                 # Accumulate throughput window, excluding warmup steps
                 now = time.perf_counter()
@@ -629,8 +675,9 @@ class Trainer:
                 step.
             drain: This rank's local drain signal (SIGUSR1/SIGTERM/SLURM end-time
                 margin), from :attr:`_drain_signal` (Task 1.5).
-            nonfinite: This rank's local non-finite-loss signal. Hardwired False
-                until Task 1.8 wires the real signal.
+            nonfinite: This rank's local non-finite-loss signal, i.e.
+                ``not math.isfinite(current_loss)`` for this rank's just-computed loss
+                (Task 1.8).
             save_due: This rank's local ``save_every_minutes`` timer signal.
 
         Returns:
@@ -735,6 +782,41 @@ class Trainer:
             self._tput_window_steps = 0
 
         self._log_metrics(metrics)
+
+        # Main-process-only: _log_step itself runs on every rank (accelerator.log/
+        # _log_metrics' callback dispatch is what's already gated), and `loss` is this
+        # rank's own local value, not a cross-rank reduction -- gating here keeps the EMA
+        # state and any warning single-sourced instead of one (possibly divergent) copy
+        # per rank.
+        if self.accelerator.is_main_process:
+            self._check_loss_spike(loss)
+
+    def _check_loss_spike(self, loss: float) -> None:
+        """Warn (never abort) when a logged loss deviates sharply from its EMA trend.
+
+        Maintains ``self._loss_ema`` with the same 0.98/0.02 smoothing
+        ``oplm.training.mup``'s logging helper uses, and flags ``loss > 3 * ema`` once
+        at least ``_LOSS_SPIKE_WARMUP_LOGS`` logged steps have built up a trend (a
+        cold-start EMA equals the very first loss, which would otherwise trivially
+        clear the 3x threshold on step one). Spikes self-recover often enough that
+        acting on them (abort/rollback, as the non-finite guard does) would cause more
+        harm than the spike itself, so this only logs.
+
+        Args:
+            loss: This step's logged training loss.
+        """
+        self._loss_log_count += 1
+        if self._loss_ema is None:
+            self._loss_ema = loss
+        else:
+            self._loss_ema = _LOSS_EMA_DECAY * self._loss_ema + (1.0 - _LOSS_EMA_DECAY) * loss
+
+        if self._loss_log_count <= _LOSS_SPIKE_WARMUP_LOGS:
+            return
+        if loss > _LOSS_SPIKE_MULTIPLIER * self._loss_ema:
+            logger.warning(
+                "loss spike: %.4f vs EMA %.4f at step %d", loss, self._loss_ema, self.global_step
+            )
 
     def _save_checkpoint(self) -> None:
         """Save a training checkpoint.

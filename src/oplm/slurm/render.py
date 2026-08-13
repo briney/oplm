@@ -150,7 +150,16 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         "MASTER_ADDR=$(hostname --ip-address)",
         "export MASTER_ADDR",
         "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))",
-        "export NCCL_DEBUG=INFO",
+        # NCCL hardening (Task 1.8): async error handling turns a hung collective into a
+        # raised exception -> nonzero exit -> requeue, instead of wedging the job until the
+        # Slurm time limit; the flight recorder dumps a per-rank trace on a timeout so a
+        # stalled rank is identifiable after the fact. NCCL_DEBUG defaults to WARN in
+        # production; set slurm.nccl_debug=INFO for verbose rendezvous/topology logging.
+        f"export NCCL_DEBUG={slurm.nccl_debug}",
+        "export TORCH_NCCL_ASYNC_ERROR_HANDLING=1",
+        "export TORCH_NCCL_TRACE_BUFFER_SIZE=2000",
+        "export TORCH_NCCL_DUMP_ON_TIMEOUT=1",
+        f"export TORCH_FR_DUMP_TEMP_FILE={slurm.log_dir}/nccl_trace_${{SLURM_JOB_ID}}_rank",
         "export OMP_NUM_THREADS=1",
         "",
         # `set +e` / `set -e` bracket the srun so a nonzero training exit (drain, crash) does
