@@ -12,7 +12,9 @@ happens later, in the collator (``data/sequence/collate.py``). Rows are yielded 
 
 from __future__ import annotations
 
+import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +25,8 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
+
+logger = logging.getLogger(__name__)
 
 # Parquet shard discovery accepts these suffixes (case-insensitive).
 _PARQUET_SUFFIXES = frozenset({".parquet", ".parq", ".pq"})
@@ -94,6 +98,66 @@ def _joint_stripe() -> tuple[int, int]:
     return joint_index, stride
 
 
+def _resolve_sample_skip(
+    batches_in_epoch: int | None, per_rank_batch: int, num_workers: int, stream_length: int
+) -> int:
+    """Resolve an armed batch-count skip into this stream's sample-offset skip.
+
+    Shared round-robin arithmetic behind both :meth:`ShardedProteinDataset._resolved_skip`
+    and :class:`InterleavedDataset`'s ``__iter__``: each worker computes its own share of
+    the globally-armed ``batches_in_epoch``, matching DataLoader's round-robin batch
+    assignment across workers, then converts that batch count to a sample count and
+    reduces it modulo ``stream_length`` (a full wrap is the identity since these streams
+    refill deterministically).
+
+    Args:
+        batches_in_epoch: Globally-armed batch count already consumed this epoch, or
+            ``None`` if unarmed.
+        per_rank_batch: Samples per batch contributed by one (rank, worker) stream.
+        num_workers: DataLoader ``num_workers`` the interrupted run used.
+        stream_length: This stream's total sample count for the epoch.
+
+    Returns:
+        The resolved sample skip, in ``[0, stream_length)``; ``0`` when unarmed or when
+        ``stream_length <= 0``.
+    """
+    if batches_in_epoch is None:
+        return 0
+    _, _, worker_id, _ = _resolve_distributed_context()
+    batch_count = len(range(worker_id, batches_in_epoch, num_workers))
+    skip = batch_count * per_rank_batch
+    return skip % max(stream_length, 1)
+
+
+@dataclass(frozen=True)
+class DataCursor:
+    """Position of the training stream, plus the layout it is only valid under.
+
+    Captured at checkpoint time (one per run, not per rank — ranks step in lockstep
+    so ``batches_in_epoch`` is the same value everywhere) and replayed on resume via
+    :meth:`ShardedProteinDataset.set_resume_skip`. The layout fields
+    (``world_size``, ``num_workers``, ``per_rank_batch``, ``seed``) let the
+    resuming run detect a changed layout before trusting ``batches_in_epoch`` — see
+    Task 3.3's guard.
+
+    Attributes:
+        epoch: Epoch index the cursor was captured in.
+        batches_in_epoch: Count of batches consumed so far this epoch (per rank;
+            identical across ranks since training steps in lockstep).
+        world_size: Number of ranks the interrupted run used.
+        num_workers: DataLoader ``num_workers`` the interrupted run used.
+        per_rank_batch: Samples per batch contributed by one (rank, worker) stream.
+        seed: Base dataset seed the interrupted run used.
+    """
+
+    epoch: int
+    batches_in_epoch: int
+    world_size: int
+    num_workers: int
+    per_rank_batch: int
+    seed: int
+
+
 class ShardedProteinDataset(IterableDataset[dict[str, object]]):
     """Iterable dataset over one or more parquet shards of protein sequences.
 
@@ -139,6 +203,15 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._seed = seed
         self._load_masking_weights = load_masking_weights
         self._epoch = 0
+
+        # Armed resume skip (Task 3.1): plain instance state, so it pickles into
+        # DataLoader worker processes along with the dataset. `None` means
+        # unarmed (`__iter__` behaves exactly as before). Set via
+        # `set_resume_skip`, resolved per-worker at iteration time by
+        # `_resolved_skip`.
+        self._resume_batches_in_epoch: int | None = None
+        self._resume_per_rank_batch = 0
+        self._resume_num_workers = 1
 
         shard_paths = self._discover_shards(self._path)
 
@@ -186,6 +259,99 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         """
         self._epoch = epoch
 
+    def stream_length(self) -> int:
+        """Return the number of rows this (rank, worker) stream serves in one epoch.
+
+        Order-invariant: shard order only redistributes which rows land in which
+        shard, not which global row indices this ``(rank, worker)`` owns, so this
+        equals ``len(range(joint_index, total_rows, stride))`` — independent of
+        shuffling and the epoch. Must be called in-context (inside a DataLoader
+        worker, or single-process): it resolves the current ``(rank, worker)``
+        via :func:`_joint_stripe`.
+        """
+        joint_index, stride = _joint_stripe()
+        return len(range(joint_index, self._total_rows, stride))
+
+    def set_resume_skip(self, batches_in_epoch: int, per_rank_batch: int, num_workers: int) -> None:
+        """Arm a one-epoch skip so the next ``__iter__`` (in every worker) resumes mid-epoch.
+
+        Stored as plain instance attributes, which pickle into DataLoader worker
+        processes along with the dataset — that is how the skip reaches them. Each
+        worker resolves its own share of ``batches_in_epoch`` at iteration time
+        (see :meth:`_resolved_skip`), using its own ``worker_id``. The skip applies
+        to the very next epoch iterated (usually the epoch it was captured in);
+        call :meth:`clear_resume_skip` once it has been consumed so later epochs
+        are unaffected.
+
+        Args:
+            batches_in_epoch: Count of batches this rank's DataLoader has already
+                consumed this epoch (from the interrupted run's cursor).
+            per_rank_batch: Samples per batch contributed by one (rank, worker)
+                stream (the per-device batch size).
+            num_workers: DataLoader ``num_workers`` the interrupted run used. Must
+                match the resuming run's actual ``num_workers`` for the skip
+                arithmetic to be correct; validated by the caller (Task 3.3's
+                layout guard), not here.
+
+        Note:
+            With ``num_workers > 1``, a resumed ``DataLoader`` always restarts its
+            worker round-robin at worker 0 (a fresh iterator/process has no memory
+            of which worker was "next"). Each worker's own substream still resumes
+            with no row lost or duplicated regardless of where the interruption
+            landed, but the *global* interleaving order across workers only
+            reproduces the uninterrupted run's batch order bit-for-bit when
+            ``batches_in_epoch % num_workers == 0`` (the interruption landed on a
+            full worker-cycle boundary). Off that boundary, data content is still
+            exact; only which worker's batch appears at which global position can
+            shift.
+        """
+        self._resume_batches_in_epoch = batches_in_epoch
+        self._resume_per_rank_batch = per_rank_batch
+        self._resume_num_workers = num_workers
+
+    def clear_resume_skip(self) -> None:
+        """Disarm the resume skip; the next ``__iter__`` starts each stream at row 0."""
+        self._resume_batches_in_epoch = None
+
+    def _resolved_skip(self) -> int:
+        """Resolve the armed batch-count skip into this stream's sample-offset skip.
+
+        Must be called in-context (inside a DataLoader worker, or single-process):
+        delegates to :func:`_resolve_sample_skip`, which uses the current worker's
+        own ``worker_id`` (via :func:`_resolve_distributed_context`) so each worker
+        computes its own share of the globally-armed ``batches_in_epoch``, matching
+        DataLoader's round-robin batch assignment across workers. Returns ``0`` when
+        unarmed.
+        """
+        return _resolve_sample_skip(
+            self._resume_batches_in_epoch,
+            self._resume_per_rank_batch,
+            self._resume_num_workers,
+            self.stream_length(),
+        )
+
+    def _arm_sample_skip(self, n: int) -> Iterator[dict[str, object]]:
+        """Return a fresh, one-shot stream over this dataset, skipping ``n`` samples.
+
+        Reduces ``n`` modulo :meth:`stream_length` (this stream refills
+        deterministically on re-iteration, so a full wrap is the identity — see
+        :meth:`_iter_stream`). This is the internal, sample-count-based arming path
+        shared by :meth:`__iter__` (via :meth:`_resolved_skip`, which is itself
+        batch-count-based) and by :class:`InterleavedDataset`, which computes a
+        per-source *sample* count directly from its own ``choices`` draws and arms
+        this source's first pass only — bypassing :meth:`set_resume_skip`, whose
+        batch-based arithmetic assumes this dataset is iterated standalone by a
+        DataLoader, not as one source among several in a mix.
+
+        Args:
+            n: Number of samples to skip.
+
+        Returns:
+            An iterator over this stream, starting ``n`` (mod :meth:`stream_length`)
+            samples in.
+        """
+        return self._iter_stream(n % max(self.stream_length(), 1))
+
     def _shard_order(self, epoch_seed: int) -> list[int]:
         """Return shard indices in this epoch's (optionally shuffled) order."""
         n = len(self._shards)
@@ -204,6 +370,19 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         return torch.randperm(n_rows, generator=generator).tolist()
 
     def __iter__(self) -> Iterator[dict[str, object]]:
+        yield from self._arm_sample_skip(self._resolved_skip())
+
+    def _iter_stream(self, skip: int) -> Iterator[dict[str, object]]:
+        """Yield this (rank, worker) stream, skipping its first ``skip`` selected rows.
+
+        Walks the shard order computing each shard's selected-row COUNT from index
+        arithmetic alone (no ``pq.read_table``): a shard fully consumed by
+        ``skip`` is passed over without ever being read. Reading starts at the
+        shard where the running count first reaches ``skip``, applying the
+        remainder of the skip to that shard's (already-shuffled) selection only;
+        every later shard is read in full, exactly as when unarmed. With
+        ``skip=0`` this is behavior-identical to the pre-refactor ``__iter__``.
+        """
         epoch_seed = _epoch_seed(self._seed, self._epoch)
         joint_index, stride = _joint_stripe()
 
@@ -212,19 +391,33 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         # mod stride. Unioned over joint_index in [0, stride) this covers every
         # row exactly once.
         global_idx = 0
+        remaining_skip = skip
         for shard_idx in self._shard_order(epoch_seed):
             n_rows = self._rows_per_shard[shard_idx]
-            row_order = self._row_order(n_rows, epoch_seed, shard_idx)
-
             base = global_idx
             global_idx += n_rows
+
+            # Smallest offset o in [0, n_rows) with (base + o) % stride == joint_index,
+            # i.e. o ≡ (joint_index - base) (mod stride); the selected-row count for
+            # this shard follows without materializing row_order or reading it.
+            first_hit_offset = (joint_index - base) % stride
+            shard_count = len(range(first_hit_offset, n_rows, stride))
+            if shard_count == 0:
+                continue  # no rows in this shard belong to this (rank, worker)
+
+            if remaining_skip >= shard_count:
+                remaining_skip -= shard_count
+                continue  # fully skipped by arithmetic — no read_table call
+
+            row_order = self._row_order(n_rows, epoch_seed, shard_idx)
             selected = [
                 row_idx
                 for offset, row_idx in enumerate(row_order)
                 if (base + offset) % stride == joint_index
             ]
-            if not selected:
-                continue  # no rows in this shard belong to this (rank, worker)
+            if remaining_skip:
+                selected = selected[remaining_skip:]
+                remaining_skip = 0
 
             yield from self._read_rows(shard_idx, selected)
 
@@ -302,6 +495,14 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         self._epoch = 0
         self._num_samples = self._default_num_samples() if num_samples is None else int(num_samples)
 
+        # Armed resume skip (Task 3.2): mirrors ShardedProteinDataset's plain
+        # instance-attribute state (Task 3.1), so it pickles into DataLoader worker
+        # processes along with the dataset. `None` means unarmed. Resolved per-worker,
+        # per-source at iteration time in `__iter__` — see `_arm_source_skip`.
+        self._resume_batches_in_epoch: int | None = None
+        self._resume_per_rank_batch = 0
+        self._resume_num_workers = 1
+
     def _default_num_samples(self) -> int:
         """Sum of source lengths, or 0 if any source has no defined length."""
         total = 0
@@ -333,6 +534,77 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
             if callable(set_epoch):
                 set_epoch(epoch)
 
+    def set_resume_skip(self, batches_in_epoch: int, per_rank_batch: int, num_workers: int) -> None:
+        """Arm a one-epoch skip so the next ``__iter__`` (in every worker) resumes mid-epoch.
+
+        Same contract as :meth:`ShardedProteinDataset.set_resume_skip`: stored as plain
+        instance attributes (pickled into DataLoader worker processes), resolved
+        per-worker at iteration time. Here, the resolved skip additionally determines
+        *which* of this worker's already-drawn source ``choices`` were already
+        consumed, so each source can be armed with its own sample-count skip — see
+        :meth:`_arm_source_skip`. Call :meth:`clear_resume_skip` once consumed so later
+        epochs are unaffected.
+
+        Data-exact resume (skipping exactly the already-consumed rows, no loss or
+        duplication) holds only for sources that expose the internal sample-skip path
+        — currently :class:`ShardedProteinDataset`. Any other ``IterableDataset``
+        source instead restarts from position 0 on resume (a logged warning, not an
+        error); see :meth:`_arm_source_skip`.
+
+        Args:
+            batches_in_epoch: Count of batches this rank's DataLoader has already
+                consumed this epoch (from the interrupted run's cursor).
+            per_rank_batch: Samples per batch contributed by one (rank, worker) stream.
+            num_workers: DataLoader ``num_workers`` the interrupted run used.
+        """
+        self._resume_batches_in_epoch = batches_in_epoch
+        self._resume_per_rank_batch = per_rank_batch
+        self._resume_num_workers = num_workers
+
+    def clear_resume_skip(self) -> None:
+        """Disarm the resume skip; the next ``__iter__`` starts each stream at step 0.
+
+        Since per-source sample skips are computed fresh inside ``__iter__`` from the
+        (now-unarmed) skip rather than stored on the sub-datasets, this also implicitly
+        clears any per-source arming — there is nothing further to undo.
+        """
+        self._resume_batches_in_epoch = None
+
+    def _arm_source_skip(self, source_idx: int, n_samples: int) -> Iterator[dict[str, object]]:
+        """Return a one-shot iterator over source ``source_idx``, skipping ``n_samples``.
+
+        Arms the skip directly via the source's internal sample-skip path
+        (:meth:`ShardedProteinDataset._arm_sample_skip`), never via the source's own
+        :meth:`~ShardedProteinDataset.set_resume_skip` — that does its own batch-based
+        arithmetic tied to the source being iterated standalone by a DataLoader, which
+        is irrelevant here since ``n_samples`` was already computed as a sample count
+        from this worker's own ``choices`` draws. Applies only to this, the first, pass
+        over the source: :meth:`_next_or_refill` re-iterates an exhausted source via
+        plain ``iter(source)``, which is unskipped, so the one-shot skip is never
+        reapplied on refill. Sources without sample-skip support (anything other than
+        :class:`ShardedProteinDataset`) fall back to a fresh, unskipped iterator — data
+        exactness degrades to a restart-from-0 for that source, logged via
+        :data:`logger`.
+
+        Args:
+            source_idx: Index into ``self._datasets``.
+            n_samples: Number of samples to skip.
+        """
+        source = self._datasets[source_idx]
+        arm = getattr(source, "_arm_sample_skip", None)
+        if callable(arm):
+            return arm(n_samples)
+        if n_samples > 0:
+            logger.warning(
+                "InterleavedDataset resume skip: source %d (%s) has no sample-skip "
+                "support; data-exact resume is unavailable for it, restarting this "
+                "source from position 0 instead of skipping %d already-consumed sample(s).",
+                source_idx,
+                type(source).__name__,
+                n_samples,
+            )
+        return iter(source)
+
     def __iter__(self) -> Iterator[dict[str, object]]:
         joint_index, stride = _joint_stripe()
         if self._num_samples <= 0 or joint_index >= self._num_samples:
@@ -347,7 +619,25 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         weights = torch.tensor(self._fractions, dtype=torch.float64)
         choices = torch.multinomial(weights, n_steps, replacement=True, generator=generator)
 
-        iters = [iter(ds) for ds in self._datasets]
+        skip = _resolve_sample_skip(
+            self._resume_batches_in_epoch,
+            self._resume_per_rank_batch,
+            self._resume_num_workers,
+            n_steps,
+        )
+        if skip:
+            # Per-source draw counts among the choices already consumed before the
+            # interruption; each count is a sample count for that source alone, so
+            # `_arm_source_skip` reduces it modulo that source's own stream length.
+            counts = torch.bincount(choices[:skip], minlength=len(self._datasets))
+            iters = [
+                self._arm_source_skip(idx, int(counts[idx].item()))
+                for idx in range(len(self._datasets))
+            ]
+            choices = choices[skip:]
+        else:
+            iters = [iter(ds) for ds in self._datasets]
+
         for source_idx in choices.tolist():
             item = self._next_or_refill(iters, source_idx)
             if item is _EXHAUSTED:

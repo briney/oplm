@@ -133,6 +133,29 @@ def test_no_masking_weights_key_emitted(tokenizer) -> None:
     assert "masking_weights" not in out
 
 
+def test_keep_sequence_ids_off_by_default(tokenizer) -> None:
+    """Without keep_sequence_ids, the batch dict has no sequence_ids key."""
+    collator = MLMCollator(tokenizer, max_length=_MAX_LENGTH)
+    out = collator(_batch(_SEQUENCES))
+    assert "sequence_ids" not in out
+
+
+def test_keep_sequence_ids_surfaces_ids_in_row_order(tokenizer) -> None:
+    """keep_sequence_ids=True adds a plain list of each row's sequence_id, in order."""
+    collator = MLMCollator(tokenizer, max_length=_MAX_LENGTH, keep_sequence_ids=True)
+    batch = _batch(_SEQUENCES)
+    out = collator(batch)
+    assert out["sequence_ids"] == [row["sequence_id"] for row in batch]
+    assert isinstance(out["sequence_ids"], list)
+
+
+def test_keep_sequence_ids_raises_on_raw_string_batch(tokenizer) -> None:
+    """A raw-str batch item carries no id, so keep_sequence_ids=True raises."""
+    collator = MLMCollator(tokenizer, max_length=_MAX_LENGTH, keep_sequence_ids=True)
+    with pytest.raises(KeyError):
+        collator(_SEQUENCES)
+
+
 # --------------------------------------------------------------------------- #
 # Fixed-k selection
 # --------------------------------------------------------------------------- #

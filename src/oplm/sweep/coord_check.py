@@ -43,7 +43,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, cast
 
 import typer
 from rich.console import Console
@@ -159,7 +159,10 @@ def _build_batch(sequences: list[str], *, max_length: int, seed: int) -> dict[st
     from oplm.data import MLMCollator, get_tokenizer
 
     collator = MLMCollator(get_tokenizer(), max_length=max_length, deterministic=True, seed=seed)
-    return collator(sequences)
+    # keep_sequence_ids defaults to False, so this is always tensor-only in practice;
+    # the collator's return type is a union to support that opt-in flag (see
+    # `MLMCollator.__call__`), which the cast reconciles here.
+    return cast("dict[str, torch.Tensor]", collator(sequences))
 
 
 def _module_type(name: str) -> str:

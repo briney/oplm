@@ -20,6 +20,7 @@ AVAILABLE_PRESETS = ("50M", "170M", "400M", "800M", "1B", "3B", "6B", "12B")
 _VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
 _VALID_OPTIMIZERS = ("adamw", "muon")
 _VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
+_VALID_PARALLELISM = ("ddp", "hsdp")
 _VALID_COMPILE_MODES = ("default", "reduce-overhead", "max-autotune")
 _VALID_MUON_ADJUST_LR_FNS = ("match_rms_adamw", "original")
 
@@ -87,6 +88,42 @@ class TrainConfig:
     # step already triggered a periodic save (avoids a redundant re-write).
     save_final: bool = True
     resume_from: str | None = None
+    # Time-based checkpoint cadence: also save every N wall-clock minutes, in
+    # addition to (not instead of) the step-based save_every cadence. None
+    # disables it (checkpoints only happen on the save_every step cadence).
+    save_every_minutes: int | None = None
+    # Retain (never rotate away) every checkpoint whose step is a multiple of
+    # this value, in addition to the rolling save_total_limit window. None
+    # disables this exemption (all checkpoints are subject to rotation).
+    keep_every_n_steps: int | None = None
+    # Retain (never rotate away) a checkpoint at least this many wall-clock
+    # hours after the previous permanent checkpoint. None disables this
+    # exemption. Enforced by the trainer via checkpoint.mark_permanent.
+    keep_every_n_hours: float | None = None
+    # Automatically resume from the latest committed checkpoint under
+    # output_dir at trainer start, without an explicit --resume_from.
+    auto_resume: bool = False
+    # When resuming, also restore the data-loader position (sampler/shard
+    # offsets) so training resumes from the same data point rather than
+    # restarting the data stream from the beginning of the current epoch.
+    resume_data_position: bool = True
+    # Timeout (minutes) for the process-group / distributed backend, passed to
+    # Accelerator's InitProcessGroupKwargs. Longer timeouts tolerate slow
+    # checkpoint writes or requeue delays without triggering a collective abort.
+    dist_timeout_minutes: int = 15
+    # Optional remote URI (e.g. s3://bucket/prefix) that committed checkpoints
+    # are additionally synced to, for durability beyond local/shared storage.
+    # None disables remote sync.
+    remote_checkpoint_uri: str | None = None
+
+    # Parallelism strategy.
+    #   "ddp"  — one full model replica per rank, gradients all-reduced (default;
+    #            what every run did before Phase 5).
+    #   "hsdp" — FSDP2 (`fully_shard`) over a 2-D device mesh: shard within a node,
+    #            replicate across nodes. Required before ~24B; needs world size > 1.
+    # Checkpoints are parallelism-agnostic (DCP `get_state_dict`), so the same
+    # checkpoint resumes under either setting -- see docs/TRAIN.md.
+    parallelism: str = "ddp"
 
     # Infrastructure
     seed: int = 42
@@ -191,6 +228,51 @@ class TrainConfig:
         if self.stability_probe_every < 0:
             raise ValueError(
                 f"stability_probe_every must be >= 0, got {self.stability_probe_every}"
+            )
+        if self.save_every_minutes is not None and self.save_every_minutes <= 0:
+            raise ValueError(
+                f"save_every_minutes must be > 0 when set, got {self.save_every_minutes}"
+            )
+        if self.keep_every_n_steps is not None and self.keep_every_n_steps <= 0:
+            raise ValueError(
+                f"keep_every_n_steps must be > 0 when set, got {self.keep_every_n_steps}"
+            )
+        if self.keep_every_n_hours is not None and self.keep_every_n_hours <= 0:
+            raise ValueError(
+                f"keep_every_n_hours must be > 0 when set, got {self.keep_every_n_hours}"
+            )
+        if self.dist_timeout_minutes <= 0:
+            raise ValueError(f"dist_timeout_minutes must be > 0, got {self.dist_timeout_minutes}")
+        if self.parallelism not in _VALID_PARALLELISM:
+            raise ValueError(
+                f"parallelism must be one of {_VALID_PARALLELISM}, got {self.parallelism!r}"
+            )
+        if self.parallelism == "hsdp" and self.mixed_precision == "fp16":
+            # Under FSDP2 every gradient is a sharded DTensor, and torch.amp.GradScaler's
+            # unscale_/inf-check runs per rank over local shards without a cross-rank
+            # reduction -- ranks can then disagree about whether to skip a step, which
+            # desynchronizes the run (a hang or silently divergent replicas, not a clean
+            # failure). bf16, the default, needs no scaler; fully_shard's own
+            # MixedPrecisionPolicy handles the param/reduce dtypes.
+            raise ValueError(
+                "parallelism='hsdp' does not support mixed_precision='fp16': the fp16 "
+                "GradScaler's inf-check is not shard-aware and would let ranks diverge. "
+                "Use mixed_precision='bf16' (default) or 'no'."
+            )
+        if self.parallelism == "hsdp" and self.stability_diagnostics and self.stability_probe_every:
+            # StabilityDiagnosticsCallback's probe forward is deliberately main-process
+            # only, on the documented assumption that "the extra forward has no
+            # collectives" -- true under DDP, false under FSDP2, where every forward
+            # all-gathers sharded parameters. Running it on rank 0 alone would hang every
+            # other rank until dist_timeout_minutes, then crash-loop through the requeue.
+            # Refuse up front instead (grad-norm-only diagnostics stay available via
+            # stability_probe_every=0).
+            raise ValueError(
+                "parallelism='hsdp' is incompatible with stability_diagnostics=true and "
+                "stability_probe_every > 0: the diagnostic probe runs a main-process-only "
+                "forward, which under FSDP2 issues an all-gather that would hang every "
+                "other rank. Set train.stability_probe_every=0 to keep the (collective-free) "
+                "grad-norm diagnostic, or run the probe under train.parallelism='ddp'."
             )
 
 
@@ -359,6 +441,44 @@ class OplmConfig:
     model: Any = field(default_factory=dict)
     train: TrainConfig = field(default_factory=TrainConfig)
     data: DataConfig = field(default_factory=DataConfig)
+
+
+def validate_parallelism_compat(cfg: OplmConfig) -> None:
+    """Reject cross-section config combinations that would deadlock under HSDP.
+
+    ``TrainConfig.__post_init__`` validates everything inside ``train.*``; this covers the
+    one incompatibility that spans sections, so it needs both ``cfg.train`` and
+    ``cfg.data``. Called from :func:`load_config` (so a CLI/YAML mistake fails at parse
+    time) and again at the top of ``Trainer.__init__`` (so a directly-constructed config --
+    tests, sweeps, notebooks -- cannot bypass it). Idempotent and pure; no collectives, and
+    its inputs are rank-identical, so every rank raises identically.
+
+    **Eval under HSDP deadlocks.** ``fully_shard`` mutates the module in place, so
+    ``accelerator.unwrap_model`` hands the evaluator the ``FSDPModule`` itself, and every
+    eval forward all-gathers sharded parameters. The eval tasks stripe their work across
+    ranks (``[rank::world_size]``), so ranks run *different numbers* of forwards -- the
+    ranks that finish early never issue the matching all-gathers and the group wedges until
+    ``dist_timeout_minutes``, then crash-loops through the requeue. Making eval
+    HSDP-safe (rank-padded forward counts, or gathering the model once into an unsharded
+    eval copy) is follow-up work; until then this refuses the combination up front rather
+    than letting a multi-node run hang at its first eval.
+
+    Args:
+        cfg: The fully resolved root config.
+
+    Raises:
+        ValueError: ``train.parallelism="hsdp"`` with any eval dataset configured.
+    """
+    if cfg.train.parallelism == "hsdp" and cfg.data.eval is not None:
+        raise ValueError(
+            "train.parallelism='hsdp' is incompatible with configured eval datasets "
+            "(data.eval): eval tasks stripe their forwards across ranks, but under FSDP2 "
+            "every forward all-gathers sharded parameters -- ranks with fewer forwards "
+            "stop issuing all-gathers and the whole group hangs until dist_timeout_minutes. "
+            "Run eval as a separate ddp job against the checkpoint, or set "
+            "train.parallelism='ddp'. See oplm.training.parallel for the limitation and "
+            "the planned fix."
+        )
 
 
 def get_preset_config(preset: str) -> DictConfig:
@@ -572,6 +692,10 @@ def load_config(argv: list[str]) -> OplmConfig:
                 f"{max_pos} % {ptm} = {max_pos % ptm}"
             )
 
+    # Cross-section compatibility (train.parallelism vs data.eval); also re-checked at
+    # Trainer.__init__ for configs built without load_config.
+    validate_parallelism_compat(cfg)
+
     cfg.train.config_path = config_path
 
     # Propagate --name to the W&B run name unless explicitly set in YAML/CLI.
@@ -595,8 +719,23 @@ def serialize_config(cfg: OplmConfig) -> str:
     """
     from dataclasses import asdict
 
+    model_dict = cfg.model.to_dict()
+    # `auto_map` is HF `register_for_auto_class`/`save_pretrained` plumbing for
+    # trust_remote_code loading (see oplm/__init__.py's registration calls), not
+    # something a user ever sets. `PretrainedConfig.register_for_auto_class` stamps
+    # it onto the config instance *in place* the first time any `save_pretrained`
+    # call runs against it -- e.g. this very checkpoint's own `hf/` export just
+    # below in `save_checkpoint`, or an earlier checkpoint's, since `cfg.model` is
+    # one shared, mutable object across every checkpoint in a run. Once stamped, it
+    # sticks for the rest of the process, so every checkpoint after the first one
+    # saved would otherwise carry it into config.yaml -- and fail to round-trip
+    # through `load_config` (`_reject_unknown_model_keys` rejects it: a freshly
+    # constructed default instance's own `to_dict()` never has it either, since it
+    # is only ever added by `save_pretrained`, not by construction).
+    model_dict.pop("auto_map", None)
+
     config_dict = {
-        "model": cfg.model.to_dict(),
+        "model": model_dict,
         "train": asdict(cfg.train),
         "data": asdict(cfg.data),
     }

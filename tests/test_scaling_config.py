@@ -41,3 +41,23 @@ def test_scaling_config_schedule_has_a_real_decay_phase() -> None:
 
     assert schedule_fn(midpoint_of_stable_phase) == 1.0
     assert schedule_fn(near_the_end) < 1.0
+
+
+def test_scaling_config_loads_the_fault_tolerance_knobs() -> None:
+    """``load_config`` must accept the Task 1.9 fault-tolerance keys in scaling.yaml.
+
+    Regression for the production config gaining ``save_every_minutes``,
+    ``keep_every_n_steps``, and an explicit ``auto_resume: true`` (this config only ever
+    runs under Slurm, via ``oplm slurm generate``) -- and for the ``slurm:`` block, which
+    ``load_config`` tolerates as an unrecognized top-level key, still round-tripping
+    alongside them.
+    """
+    cfg = load_config(["--config", str(_SCALING_CONFIG)])
+    train = cfg.train
+
+    assert train.save_every_minutes == 30
+    assert train.keep_every_n_steps == 100_000
+    assert train.auto_resume is True
+    assert train.save_total_limit == 3
+    # Reserved fields stay untouched by this config -- Phase 4 activates remote sync.
+    assert train.remote_checkpoint_uri is None

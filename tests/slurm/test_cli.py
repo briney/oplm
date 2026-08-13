@@ -80,6 +80,46 @@ def test_generate_from_the_committed_scaling_config(tmp_path: Path) -> None:
 # --- generate: relative --config must resolve to an absolute path ----------------------
 
 
+def test_generate_injects_auto_resume_into_the_rendered_command(tmp_path: Path) -> None:
+    """A requeued Slurm job must resume rather than restart -- see Trainer.auto_resume."""
+    result = runner.invoke(
+        app,
+        [
+            "slurm",
+            "generate",
+            "--config",
+            str(REPO_ROOT / "configs" / "scaling.yaml"),
+            "--preset",
+            "400M",
+            "--out",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    text = (tmp_path / "oplm-400M.sbatch").read_text()
+    assert "train.auto_resume=true" in text
+
+
+def test_generate_wires_progress_dir_for_the_requeue_wrapper(tmp_path: Path) -> None:
+    """The rendered script's no-progress guard must key off the run's own output_dir."""
+    result = runner.invoke(
+        app,
+        [
+            "slurm",
+            "generate",
+            "--config",
+            str(REPO_ROOT / "configs" / "scaling.yaml"),
+            "--preset",
+            "400M",
+            "--out",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    text = (tmp_path / "oplm-400M.sbatch").read_text()
+    assert 'STEP_FILE="/mnt/home/briney/projects/oplm/scaling/.last_requeue_step"' in text
+
+
 def test_generate_resolves_a_relative_config_path_to_absolute(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

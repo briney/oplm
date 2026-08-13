@@ -35,6 +35,10 @@ class JobSpec:
     array_index_file: Path | None = None
     gres: bool = True
     base_dir: Path | None = None
+    # Shell-expandable path to this job's training output dir, used by the requeue wrapper's
+    # no-progress guard (a plain path for a single job; "$RUN_DIR/..." for an array task). None
+    # for non-training jobs, which skips the guard entirely (budget-only requeue).
+    progress_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,12 @@ def _header(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
     lines += [
         f"#SBATCH --time={spec.time_limit}",
         "#SBATCH --requeue",
+        # Slurm sends USR1 10 minutes before the time limit so the trainer can drain cleanly
+        # (see the Task 1.5 signal handling) instead of being SIGTERM'd mid-checkpoint.
+        "#SBATCH --signal=USR1@600",
+        # A requeued run reuses the same %j/%A_%a log path; append instead of truncating it so
+        # the pre-requeue tail (including the drain/crash-loop diagnosis) survives.
+        "#SBATCH --open-mode=append",
         "",
         "# --- logs ---",
         f"#SBATCH --output={slurm.log_dir}/%x_{suffix}.out",
@@ -121,6 +131,9 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         "",
         "# Creates JOB_WORK_DIR and exports object-storage / W&B credentials.",
         f"source {slurm.env_file}",
+        # Marks the top of every attempt (fresh submission or requeue) in the append-mode log,
+        # so `restart_count` is visible without cross-referencing `scontrol show job`.
+        'echo "=== $(date -Is) start; restart_count=${SLURM_RESTART_COUNT:-0} ==="',
     ]
     lines += _array_lookup(spec)
     lines += [
@@ -137,9 +150,22 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         "MASTER_ADDR=$(hostname --ip-address)",
         "export MASTER_ADDR",
         "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))",
-        "export NCCL_DEBUG=INFO",
+        # NCCL hardening (Task 1.8): async error handling turns a hung collective into a
+        # raised exception -> nonzero exit -> requeue, instead of wedging the job until the
+        # Slurm time limit; the flight recorder dumps a per-rank trace on a timeout so a
+        # stalled rank is identifiable after the fact. NCCL_DEBUG defaults to WARN in
+        # production; set slurm.nccl_debug=INFO for verbose rendezvous/topology logging.
+        f"export NCCL_DEBUG={slurm.nccl_debug}",
+        "export TORCH_NCCL_ASYNC_ERROR_HANDLING=1",
+        "export TORCH_NCCL_TRACE_BUFFER_SIZE=2000",
+        "export TORCH_NCCL_DUMP_ON_TIMEOUT=1",
+        f"export TORCH_FR_DUMP_TEMP_FILE={slurm.log_dir}/nccl_trace_${{SLURM_JOB_ID}}_rank",
         "export OMP_NUM_THREADS=1",
         "",
+        # `set +e` / `set -e` bracket the srun so a nonzero training exit (drain, crash) does
+        # not immediately kill the script under the top-level `set -euo pipefail` -- the
+        # requeue wrapper below needs to inspect $STATUS first.
+        "set +e",
         "srun --nodes=$SLURM_NNODES --ntasks-per-node=1 \\",
         "  --export=ALL \\",
         f"  --container-image={slurm.container_image} \\",
@@ -148,9 +174,79 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         "  --no-container-mount-home \\",
         f"  bash -c '{slurm.install} && \\",
         f"    {spec.command}'",
-        "",
     ]
+    lines += _requeue_wrapper(spec, slurm)
+    lines.append("")
     return "\n".join(lines)
+
+
+def _requeue_wrapper(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
+    """Budget- and progress-aware requeue logic run after the training `srun` exits.
+
+    Exit 0 is a clean finish. Exit ``DRAIN_EXIT_CODE`` (85, see ``oplm.training.signals``)
+    requeues unconditionally as long as the requeue budget (``slurm.max_requeues``) is not
+    exhausted -- it bypasses the no-progress guard below entirely (it neither reads nor
+    writes the guard's step file), but not the budget cap. Any other nonzero exit requeues
+    only if budget remains *and* checkpoint progress was made since the previous *non-drain*
+    failure; two consecutive non-drain failures with no step advance between them is a crash
+    loop, and the job exits without requeueing.
+
+    When ``spec.progress_dir`` is ``None`` (a non-training job), the no-progress guard and its
+    step-tracking file are omitted entirely -- the wrapper requeues on budget alone.
+    """
+    lines = [
+        "STATUS=$?",
+        "set -e",
+        'if [ "$STATUS" -eq 0 ]; then',
+        '  echo "training complete"',
+        "  exit 0",
+        "fi",
+        "RESTARTS=${SLURM_RESTART_COUNT:-0}",
+        f'if [ "$RESTARTS" -ge {slurm.max_requeues} ]; then',
+        f'  echo "requeue budget ({slurm.max_requeues}) exhausted; exiting $STATUS" >&2',
+        '  exit "$STATUS"',
+        "fi",
+    ]
+    if spec.progress_dir is not None:
+        lines += [
+            f'STEP_FILE="{spec.progress_dir}/.last_requeue_step"',
+            # `|| true` guards the whole pipeline, not just `grep`: under the script's
+            # top-level `set -o pipefail`, `ls` finding no `checkpoint-*` match (the common
+            # case on a job's first restart, before any checkpoint is committed) and `grep`
+            # finding no numeric line (a `.tmp`/`.old`-only dir) both exit nonzero, and
+            # pipefail propagates the rightmost failure into this assignment. Without `||
+            # true`, `set -e` would abort the whole script right here -- silently, with no
+            # STEP_FILE write and no `scontrol requeue` -- instead of falling through to the
+            # `CURRENT_STEP=${CURRENT_STEP:-0}` default below.
+            f'CURRENT_STEP=$(ls -d "{spec.progress_dir}"/checkpoint-* 2>/dev/null \\',
+            "  | sed 's/.*checkpoint-//' | grep -E '^[0-9]+$' | sort -n | tail -1 || true)",
+            "CURRENT_STEP=${CURRENT_STEP:-0}",
+            # The guard reads AND writes STEP_FILE only on non-drain exits. Writing it on
+            # the drain (85) path too would arm the guard against the very next crash:
+            # drain -> requeue -> crash before the next checkpoint commits leaves
+            # CURRENT_STEP == PREV_STEP, so a single non-drain failure after a drain would
+            # end the requeue loop. The guard's contract is two consecutive *non-drain*
+            # failures with no progress between them, so the drain leg is fail-open: it
+            # neither consults nor updates the recorded step.
+            'if [ "$STATUS" -ne 85 ]; then',
+            '  if [ "$RESTARTS" -ge 1 ]; then',
+            '    PREV_STEP=$(cat "$STEP_FILE" 2>/dev/null || echo -1)',
+            '    if [ "$CURRENT_STEP" -le "$PREV_STEP" ]; then',
+            (
+                '      echo "no checkpoint progress since last restart (step $CURRENT_STEP); '
+                'crash loop -- not requeueing" >&2'
+            ),
+            '      exit "$STATUS"',
+            "    fi",
+            "  fi",
+            '  echo "$CURRENT_STEP" > "$STEP_FILE"',
+            "fi",
+            'echo "requeueing (exit=$STATUS, restarts=$RESTARTS, step=$CURRENT_STEP)"',
+        ]
+    else:
+        lines.append('echo "requeueing (exit=$STATUS, restarts=$RESTARTS)"')
+    lines.append('scontrol requeue "$SLURM_JOB_ID"')
+    return lines
 
 
 def accelerate_command(
@@ -160,6 +256,14 @@ def accelerate_command(
 
     ``$SLURM_NNODES`` and ``$SLURM_PROCID`` are left unexpanded on purpose: the caller embeds this
     inside single quotes so the container's shell resolves them.
+
+    ``--multi_gpu`` is emitted for ``train.parallelism=hsdp`` runs too, deliberately. The flag
+    only sets Accelerate's ``distributed_type`` to ``MULTI_GPU``, whose sole model-facing effect
+    is that ``accelerator.prepare`` wraps a *prepared* model in DDP -- and the HSDP path never
+    passes its model through ``prepare`` (see ``oplm.training.parallel``). Everything else the
+    flag governs (process-group setup, device placement, ``reduce``/``broadcast``) is exactly
+    what the sharded path still relies on. Dropping it would buy nothing and would change the
+    launch for every existing DDP run.
     """
     return (
         "accelerate launch \\\n"
