@@ -1,40 +1,59 @@
-# μP Sweep on SUNK/Slurm — Implementation Plan
+# Fault-Tolerant Training — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Run the phased μP learning-rate sweep on CoreWeave SUNK/Slurm instead of one local
-8×B200 node, behind a general-purpose job-generation layer usable by any oplm training run, and
-re-center the learning-rate grid on the region the 170M coarse sweep identified.
+**Goal:** Make week-to-month training runs on ~64 nodes / 512 B200s survive node/GPU failures
+automatically: committed-only checkpoints with atomic writes, data-exact resume, signal-driven
+drain checkpoints, a Slurm requeue loop, durable object-store copies, and a DCP checkpoint format
+that carries through the DDP→HSDP transition — while keeping `oplm train` unchanged for one-off
+bare-metal runs and free of anything CoreWeave-specific.
 
-**Architecture:** Sweep tooling moves out of the unpackaged `scripts/` directory into the wheel and
-splits in two. `oplm.slurm` turns any training config plus a `slurm:` block into sbatch scripts,
-submits them, and reports status — it knows nothing about μP. `oplm.sweep` keeps the phase funnel,
-ranking, and selection, and delegates all rendering and submission to `oplm.slurm`. Each phase
-emits one job array per preset plus a CPU-only analyze job wired with `--dependency=afterany`.
+**Architecture:** The failure-recovery unit is the Slurm job: failures exit nonzero, the generated
+script requeues with a budget, and `oplm.train` auto-resumes from the newest *committed*
+checkpoint. The checkpoint layer moves from `accelerator.save_state` to
+`torch.distributed.checkpoint` (DCP) with a tmp-dir + rename commit protocol, async saves staged
+to node-local NVMe, and a background per-node upload to an S3-compatible object store whose
+manifest-written-last is the remote commit marker. Resume is data-exact: a tiny
+`{epoch, batches_consumed}` cursor is replayed against the already-deterministic `(seed, epoch)`
+shuffle by index arithmetic. All rank-coordination (drain, time-based save, non-finite abort)
+piggybacks on the existing per-step token all-reduce so every rank agrees on the same step.
 
-**Tech Stack:** Python 3.11+, Typer, OmegaConf, pytest, Slurm (SUNK) with Pyxis/enroot containers,
-HuggingFace Accelerate.
+**Tech Stack:** Python 3.11+, PyTorch ≥ 2.10 (`torch.distributed.checkpoint`, `torch.optim.Muon`,
+FSDP2 `fully_shard`), HuggingFace Accelerate, fsspec (+ s3fs as an optional extra), Slurm
+(SUNK/pyxis), pytest.
 
-**Spec:** [docs/superpowers/specs/2026-07-31-mup-sweep-slurm-design.md](docs/superpowers/specs/2026-07-31-mup-sweep-slurm-design.md)
+**Spec:** [docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md](docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md)
 
 ## Global Constraints
 
-- Python 3.11+; `from __future__ import annotations` in every module.
-- Max line length 100. Formatter `ruff format`; linter `ruff check`; type checker `ty` (pinned
-  `0.0.40`).
-- CI gates run on `src/` only: `ruff check src/`, `ruff format --check src/`, `ty check src/`,
-  `pytest -m "not slow" --cov=oplm`. Run all four before declaring any task done.
-- Run tests as `python -m pytest` (a bare `pytest` resolves to a linuxbrew Python without oplm).
-- Type hints on every function signature. Google-style docstrings on public classes/functions.
-- `subprocess.run` with a list of args. Never `shell=True`, never `os.system`.
-- `pathlib.Path` throughout; `str()` only at IO boundaries.
-- `oplm.slurm` MUST NOT import `oplm.sweep`. The reverse is required.
-- Preserve existing μP behavior: parameterization, ranking rules, phase ordering, and the
-  selection protocol are unchanged except where a task says otherwise.
-- Never use `oplm.__version__` (stale at `0.0.1` vs `pyproject` `0.1.6`). Use
-  `importlib.metadata.version("oplm")`.
+- Python 3.11+; `from __future__ import annotations` in every module. Max line length 100.
+- CI gates run before declaring any task done: `ruff check src/`, `ruff format --check src/`,
+  `ty check src/`, `python -m pytest -m "not slow"`. Run tests as `python -m pytest` (bare
+  `pytest` resolves to a linuxbrew Python without oplm).
+- Multi-process tests launch via `sys.executable -m torch.distributed.run` (never bare
+  `torchrun`), CPU + gloo backend, and are marked `@pytest.mark.slow`.
+- Type hints on every signature; Google-style docstrings on public classes/functions.
+- `subprocess.run` with list args; never `shell=True`. `pathlib.Path` throughout.
+- **Nothing CoreWeave/SUNK-specific in `src/`** (spec §2): trainer code is pure
+  PyTorch + POSIX; Slurm specifics live in `oplm.slurm` render output; site specifics live in the
+  user's YAML/`.env`. This tooling ships open source.
+- `train.auto_resume` defaults `false`; only generated Slurm/sweep commands inject `true`
+  (spec §5). Explicit `train.resume_from` always wins.
+- Exit code **85** is reserved: "drained cleanly, resume expected" (spec §5).
+- Checkpoint discovery (resume, rotation, status) must only ever consider **committed**
+  checkpoints — a `checkpoint-<step>/` directory produced by the rename in the commit protocol.
+  `*.tmp` directories are invisible everywhere (spec §3).
+- `save_total_limit` culls rolling checkpoints only; checkpoints matching `keep_every_n_steps` /
+  `keep_every_n_hours` are permanent and exempt (spec §3).
+- Preserve current behavior for configs that set none of the new knobs: same checkpoint cadence,
+  same resume semantics, same generated-script content except the additions specified here.
+- Plan deviation from spec §5 (deliberate, small): in addition to SIGUSR1/SIGTERM handlers, the
+  trainer treats `SLURM_JOB_END_TIME` (already in the environment via `--export=ALL`) minus a
+  margin as a drain trigger. Signal delivery through `srun → container bash → accelerate
+  launcher → ranks` is fragile (the launcher's default SIGUSR1 action is termination); the env
+  clock is deterministic and needs no delivery chain. Both paths set the same drain flag.
 
 ## File Structure
 
@@ -42,2933 +61,1062 @@ HuggingFace Accelerate.
 
 | Path | Responsibility |
 | --- | --- |
-| `src/oplm/slurm/__init__.py` | Public exports for the general layer |
-| `src/oplm/slurm/config.py` | `SlurmConfig` schema, phase/preset table resolution, batch planning |
-| `src/oplm/slurm/render.py` | sbatch/srun script text for array and single jobs |
-| `src/oplm/slurm/submit.py` | `sbatch --parsable`, dependency wiring, `squeue` status |
-| `src/oplm/slurm/cli.py` | `oplm slurm generate\|submit\|status` |
-| `src/oplm/sweep/__init__.py` | Public exports for the sweep layer |
-| `src/oplm/sweep/cli.py` | `oplm sweep <phase>\|analyze\|status\|coord-check` |
-| `configs/scaling.yaml` | Runnable production scaling config with its own `slurm:` block |
-| `docs/SLURM.md` | General-layer operator docs (no μP content) |
-| `tests/slurm/*` | Tests for the general layer, using plain training configs |
+| `src/oplm/training/signals.py` | `DrainSignal` (USR1/TERM flag + `SLURM_JOB_END_TIME` clock), `DRAIN_EXIT_CODE = 85` |
+| `src/oplm/training/preflight.py` | Startup GPU/collective sanity check with rank→host map |
+| `src/oplm/training/remote.py` | `RemoteStore`: fsspec upload/manifest/rotation/latest-committed (Phase 4) |
+| `tests/training/test_signals.py` | Drain flag, env-clock trigger, exit-code constant |
+| `tests/training/test_commit_protocol.py` | tmp+rename atomicity, committed-only discovery, retention rules |
+| `tests/training/test_e2e_drain.py` | SIGUSR1 mid-train → sync checkpoint + exit 85 → resume |
+| `tests/training/test_e2e_dcp.py` | DCP round-trip, world-size 2→1 reshard, async overlap (slow) |
+| `tests/training/test_remote.py` | `RemoteStore` over `file://` (+ optional moto, slow) |
+| `tests/data/test_resume_cursor.py` | Stream skip arithmetic, interleaved skip, layout guard |
+| `tests/training/test_e2e_data_exact.py` | Sample-identity equality vs uninterrupted control |
+| `tests/data/test_double_sharding.py` | Phase-0 verification: per-rank coverage under `accelerator.prepare` (slow) |
 
-**Moved:**
+**Modified:**
 
-| From | To |
+| Path | Change |
 | --- | --- |
-| `scripts/_mup_common.py` | `src/oplm/sweep/common.py` |
-| `scripts/mup_sweep.py` | `src/oplm/sweep/phases.py` |
-| `scripts/mup_run.py` | `src/oplm/sweep/run.py` |
-| `scripts/mup_coord_check.py` | `src/oplm/sweep/coord_check.py` |
-| `tests/scripts/test_mup_common.py` | `tests/sweep/test_common.py` |
-| `tests/scripts/test_mup_sweep.py` | `tests/sweep/test_phases.py` |
-| `tests/scripts/test_mup_run.py` | `tests/sweep/test_run.py` |
-| `tests/scripts/test_mup_coord_check_data.py` | `tests/sweep/test_coord_check.py` |
-
-**Modified:** `src/oplm/cli.py` (wire both sub-apps), `src/oplm/training/mup.py` (record version),
-`docs/LR_SWEEP.md`, `docs/MUP.md`, `docs/TRAIN.md`, `AGENTS.md`.
-
-**Deleted:** `scripts/` entirely.
+| `src/oplm/training/checkpoint.py` | Commit protocol; shared `latest_checkpoint`; retention exemptions; Phase 2: DCP save/load |
+| `src/oplm/training/trainer.py` | Control-bundle reduce; time cadence; auto-resume; drain; preflight; W&B id; cursor wiring |
+| `src/oplm/config.py` | New `TrainConfig` fields (spec §8) + validation |
+| `src/oplm/data/sequence/dataset.py` | `stream_length()`, skip-aware iteration, `DataCursor`, interleaved skip |
+| `src/oplm/data/sequence/loaders.py` | Dataloader kept out of accelerate sharding (if Phase 0 confirms) |
+| `src/oplm/slurm/render.py` | `--signal`/`--open-mode` directives; requeue wrapper; NCCL env |
+| `src/oplm/slurm/config.py` | `max_requeues`, `nccl_debug` fields |
+| `src/oplm/slurm/cli.py` | Inject `train.auto_resume=true`; pass `progress_dir` to render |
+| `src/oplm/sweep/phases.py` | Inject `train.auto_resume=true`; pass per-run progress dir |
+| `src/oplm/sweep/run.py` | Reuse shared committed-only `latest_checkpoint` |
+| `configs/scaling.yaml` | Time cadence, keep rules, requeue budget, remote URI placeholder |
+| `docs/TRAIN.md`, `docs/SLURM.md`, `docs/CONFIG.md` | Resilience + requeue semantics docs |
 
 ---
 
-## Phase 1 — Move the tooling into the package
+## Phase 0 — Verification
 
-No behavior changes in this phase. The goal is that `pip install oplm[train]` provides everything,
-and that the moved code passes the `src/`-scoped CI gates it was never subject to before.
-
-### Task 1: Move sweep modules into `src/oplm/sweep/`
+### Task 0.1: Double-sharding verification test
 
 **Files:**
-- Create: `src/oplm/sweep/__init__.py`
-- Move: `scripts/_mup_common.py` → `src/oplm/sweep/common.py`
-- Move: `scripts/mup_sweep.py` → `src/oplm/sweep/phases.py`
-- Move: `scripts/mup_run.py` → `src/oplm/sweep/run.py`
-- Move: `scripts/mup_coord_check.py` → `src/oplm/sweep/coord_check.py`
-- Move: `tests/scripts/*` → `tests/sweep/*` (see File Structure table)
-- Create: `tests/sweep/__init__.py`
-- Delete: `scripts/`
+- Create: `tests/data/test_double_sharding.py`
+- Create: `tests/data/_double_sharding_worker.py` (subprocess entry)
 
 **Interfaces:**
-- Produces: `oplm.sweep.common` exporting `Params`, `RunSpec`, `PhaseManifest`, `Scaling`,
-  `Optimizer`, `parse_widths`, `parse_floats`, `parse_candidates`, `num_layers_for`,
-  `gradient_accumulation_steps`, `relative_path`, `write_phase`, `load_phase`, `result_metric`,
-  `accelerate_argv`, `HEAD_DIM`, `PRESET_ASPECT_RATIO` — all names unchanged from
-  `scripts/_mup_common.py`.
-- Produces: `oplm.sweep.phases` exporting `app`, `analyze_phase`, `SMOKE_LRS`, `COARSE_LRS`,
-  `OUTPUT_MULTS`.
+- Produces: an empirical verdict (test + committed note) on whether `accelerator.prepare`'s
+  `IterableDatasetShard` stacks on `ShardedProteinDataset`'s own rank striping. Task 0.2 consumes
+  the verdict.
 
-- [ ] **Step 1: Move files with git so history follows**
-
-```bash
-mkdir -p src/oplm/sweep tests/sweep
-git mv scripts/_mup_common.py src/oplm/sweep/common.py
-git mv scripts/mup_sweep.py src/oplm/sweep/phases.py
-git mv scripts/mup_run.py src/oplm/sweep/run.py
-git mv scripts/mup_coord_check.py src/oplm/sweep/coord_check.py
-git mv tests/scripts/test_mup_common.py tests/sweep/test_common.py
-git mv tests/scripts/test_mup_sweep.py tests/sweep/test_phases.py
-git mv tests/scripts/test_mup_run.py tests/sweep/test_run.py
-git mv tests/scripts/test_mup_coord_check_data.py tests/sweep/test_coord_check.py
-rm -rf scripts tests/scripts
-```
-
-- [ ] **Step 2: Create the package init**
-
-`src/oplm/sweep/__init__.py`:
+- [ ] **Step 1: Write the subprocess worker** — a script run under
+  `torch.distributed.run --nproc_per_node=2` (CPU/gloo) that builds the real train dataloader from
+  a tiny config over the existing test parquet fixtures, passes it through `accelerator.prepare`
+  exactly as `Trainer.__init__` does, iterates one full epoch, and writes the consumed
+  `sequence_id`s to `out_dir/rank<i>.json`:
 
 ```python
-"""μP learning-rate sweep tooling: phase generation, ranking, and selection."""
-
+"""Worker for the double-sharding verification test. Run under torch.distributed.run."""
 from __future__ import annotations
 
-from oplm.sweep.common import (
-    Params,
-    PhaseManifest,
-    RunSpec,
-    load_phase,
-    result_metric,
-    write_phase,
-)
-
-__all__ = [
-    "Params",
-    "PhaseManifest",
-    "RunSpec",
-    "load_phase",
-    "result_metric",
-    "write_phase",
-]
-```
-
-Create an empty `tests/sweep/__init__.py` (matching `tests/eval/__init__.py` etc.).
-
-- [ ] **Step 3: Rewrite imports**
-
-In `src/oplm/sweep/phases.py` and `src/oplm/sweep/coord_check.py`, replace
-`from scripts._mup_common import (...)` with `from oplm.sweep.common import (...)`. The imported
-names do not change.
-
-In `src/oplm/sweep/common.py`, change `accelerate_argv` to launch the packaged module:
-
-```python
-    argv.extend(
-        [
-            "--num_processes",
-            str(num_processes),
-            "-m",
-            "oplm.sweep.run",
-            "--config",
-            str(config),
-            "--result",
-            str(result),
-        ]
-    )
-```
-
-In the moved tests, replace `from scripts import mup_sweep` with `from oplm.sweep import phases`
-(and update every `mup_sweep.` reference to `phases.`), and
-`from scripts._mup_common import ...` with `from oplm.sweep.common import ...`. Do the same for
-`scripts.mup_run` → `oplm.sweep.run` and `scripts.mup_coord_check` → `oplm.sweep.coord_check`.
-
-- [ ] **Step 4: Run the moved tests**
-
-Run: `python -m pytest tests/sweep/ -q`
-Expected: PASS, same test count as before the move. Any failure here is an import path that was
-missed, not a behavior change.
-
-- [ ] **Step 5: Verify no `scripts.` references survive**
-
-Run: `grep -rn "scripts\._mup_common\|scripts\.mup_\|from scripts import" --include=*.py --include=*.md . | grep -v "^./.venv\|docs/superpowers"`
-Expected: no output. (`docs/superpowers/` specs and plans are historical records and are excluded
-deliberately; `docs/LR_SWEEP.md` and `docs/MUP.md` are updated in Phase 10.)
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add -A
-git commit -m "refactor: move sweep tooling into the oplm package"
-```
-
-### Task 2: Bring the moved code under the `src/` CI gates
-
-The moved modules were previously outside `ruff check src/` and `ty check src/`. This task fixes
-whatever those now report, and nothing else.
-
-**Files:**
-- Modify: `src/oplm/sweep/*.py` (as needed by the gates)
-
-- [ ] **Step 1: Run the linter and see what the move surfaced**
-
-Run: `ruff check src/`
-Expected: possible new findings in `src/oplm/sweep/*`. Record them.
-
-- [ ] **Step 2: Run the type checker**
-
-Run: `ty check src/`
-Expected: possible new findings in `src/oplm/sweep/*`. Record them.
-
-- [ ] **Step 3: Fix the findings**
-
-Fix each finding in place. Do not change runtime behavior. Two rules:
-- Do not add `# type: ignore` without a specific error code and a comment explaining why.
-- If a fix would change behavior, stop and leave a note in the commit body instead of guessing.
-
-The most likely findings are `TC003`-style typing-only import placement (already suppressed with
-`# noqa: TC003` at `phases.py` and `run.py` for Typer's runtime annotation resolution — keep those
-suppressions, they are load-bearing) and `ty` complaints about `dict[str, object]` indexing in the
-ranking helpers.
-
-- [ ] **Step 4: Verify all four gates**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/ && python -m pytest tests/sweep/ -q
-```
-Expected: all pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add -A src/oplm/sweep
-git commit -m "style: satisfy src CI gates for moved sweep tooling"
-```
-
-### Task 3: Wire `oplm sweep` into the CLI
-
-**Files:**
-- Create: `src/oplm/sweep/cli.py`
-- Modify: `src/oplm/cli.py`
-- Test: `tests/sweep/test_cli.py`
-
-**Interfaces:**
-- Produces: `oplm.sweep.cli.app` — a `typer.Typer` carrying every phase command plus `analyze` and
-  `coord-check`. Mounted at `oplm sweep`.
-
-- [ ] **Step 1: Write the failing test**
-
-`tests/sweep/test_cli.py`:
-
-```python
-from __future__ import annotations
-
-from typer.testing import CliRunner
-
-from oplm.cli import app
-
-runner = CliRunner()
-
-
-def test_sweep_subcommand_is_registered() -> None:
-    result = runner.invoke(app, ["sweep", "--help"])
-    assert result.exit_code == 0
-    for command in ("smoke", "coarse", "refine", "replicate", "transfer", "bridge", "confirm"):
-        assert command in result.stdout
-
-
-def test_sweep_analyze_is_registered() -> None:
-    result = runner.invoke(app, ["sweep", "analyze", "--help"])
-    assert result.exit_code == 0
-
-
-def test_sweep_coord_check_is_registered() -> None:
-    result = runner.invoke(app, ["sweep", "coord-check", "--help"])
-    assert result.exit_code == 0
-```
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `python -m pytest tests/sweep/test_cli.py -q`
-Expected: FAIL — `oplm` has no `sweep` command, exit code 2.
-
-- [ ] **Step 3: Create the sub-app**
-
-`src/oplm/sweep/cli.py`:
-
-```python
-"""`oplm sweep` command surface."""
-
-from __future__ import annotations
-
-from oplm.sweep.coord_check import main as coord_check_main
-from oplm.sweep.phases import app
-
-app.command("coord-check")(coord_check_main)
-
-__all__ = ["app"]
-```
-
-`coord_check.py` currently declares its own `typer.Typer` named `mup-coord-check` with a single
-`main` command; reuse that function rather than duplicating its signature. Delete the now-unused
-`app = typer.Typer(...)` line and the `if __name__ == "__main__"` block from `coord_check.py`, and
-likewise delete the `if __name__ == "__main__"` block from `phases.py`.
-
-- [ ] **Step 4: Mount it in the root CLI**
-
-In `src/oplm/cli.py`, after the `app = typer.Typer(...)` line, add:
-
-```python
-app.add_typer(sweep_app, name="sweep", help="μP learning-rate sweep phases")
-```
-
-with `from oplm.sweep.cli import app as sweep_app` placed with the other `oplm` imports at the top
-of the file, not inline.
-
-- [ ] **Step 5: Run the test to verify it passes**
-
-Run: `python -m pytest tests/sweep/test_cli.py -q`
-Expected: PASS.
-
-- [ ] **Step 6: Verify the module entrypoint still works**
-
-Run: `python -m oplm.sweep.run --help`
-Expected: exit 0, usage text for the cell runner.
-
-- [ ] **Step 7: Run all gates and commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/ && python -m pytest tests/sweep/ -q
-git add -A src/oplm tests/sweep
-git commit -m "feat: expose sweep phases as oplm sweep"
-```
-
----
-
-## Phase 2 — Learning-rate grid and manifest-derived gates
-
-Independent of Slurm. Do it before the Slurm work so the grid change is reviewable on its own.
-
-### Task 4: Shift the grid and derive the smoke gates from the manifest
-
-**Files:**
-- Modify: `src/oplm/sweep/phases.py:30-32` (constants), `:417-428` (`_smoke_gated_lrs`),
-  `:573-576` (smoke branch of `analyze_phase`), and the `--lrs` defaults on the `smoke` and
-  `coarse` commands
-- Test: `tests/sweep/test_phases.py`
-
-**Interfaces:**
-- Produces: `SMOKE_LRS = (0.0004, 0.0016, 0.0063)`,
-  `COARSE_LRS = (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)`.
-- Produces: `_smoke_gated_lrs(source: Path, lrs: list[float]) -> list[float]` — signature
-  unchanged, behavior now derived from the source manifest's own LR set.
-
-- [ ] **Step 1: Write the failing tests**
-
-Add to `tests/sweep/test_phases.py`. These use the existing helpers in that file for building a
-phase directory; if it has a fixture that writes a manifest plus `result.json` files, reuse it
-rather than writing a new one.
-
-```python
-def test_grid_constants_are_recentered() -> None:
-    assert phases.COARSE_LRS == (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)
-    assert phases.SMOKE_LRS == (0.0004, 0.0016, 0.0063)
-    # Smoke probes the coarse grid's endpoints and midpoint.
-    assert phases.SMOKE_LRS[0] == phases.COARSE_LRS[0]
-    assert phases.SMOKE_LRS[-1] == phases.COARSE_LRS[-1]
-    assert phases.SMOKE_LRS[1] == phases.COARSE_LRS[len(phases.COARSE_LRS) // 2]
-
-
-def test_no_phase_logic_hardcodes_a_learning_rate() -> None:
-    """The old gates tested scores.get(0.0025) / scores.get(0.01) literally.
-
-    Scoped to the two gate functions rather than the whole module: `_write_run_config`
-    legitimately mentions 0.01 when validating `train.weight_decay`, which is unrelated.
-    """
-    import inspect
-
-    for func in (phases._smoke_gated_lrs, phases.analyze_phase):
-        body = inspect.getsource(func)
-        for literal in ("0.0025", "0.01", "0.0016", "0.0004"):
-            assert literal not in body, (
-                f"{func.__name__} still references the literal learning rate {literal}"
-            )
-
-
-def test_smoke_gate_follows_a_custom_grid(tmp_path: Path) -> None:
-    """Gates must track --lrs, not a module constant."""
-    source = _write_smoke_phase(
-        tmp_path,
-        # Custom grid, nothing to do with SMOKE_LRS.
-        results={0.002: 3.1, 0.008: 3.0, 0.032: None},
-    )
-    # The highest LR diverged, so it is dropped from the downstream coarse grid.
-    assert phases._smoke_gated_lrs(source, [0.002, 0.008, 0.032]) == [0.002, 0.008]
-
-
-def test_smoke_gate_raises_when_a_low_lr_is_non_finite(tmp_path: Path) -> None:
-    source = _write_smoke_phase(
-        tmp_path,
-        results={0.002: 3.1, 0.008: None, 0.032: 3.5},
-    )
-    with pytest.raises(ValueError, match="0.008"):
-        phases._smoke_gated_lrs(source, [0.002, 0.008, 0.032])
-
-
-def test_analyze_smoke_requires_two_lowest_finite(tmp_path: Path) -> None:
-    source = _write_smoke_phase(tmp_path, results={0.002: 3.1, 0.008: None, 0.032: 3.5})
-    with pytest.raises(ValueError, match="two lowest"):
-        phases.analyze_phase(source)
-```
-
-Add the helper to the same file:
-
-```python
-def _write_smoke_phase(tmp_path: Path, *, results: dict[float, float | None]) -> Path:
-    """Write a minimal smoke phase directory with one cell per learning rate."""
-    out = tmp_path / "smoke"
-    (out / "runs").mkdir(parents=True)
-    runs = []
-    for lr, value in results.items():
-        run_id = f"170M-lr{lr:g}"
-        run_dir = out / "runs" / run_id
-        run_dir.mkdir()
-        if value is not None:
-            (run_dir / "result.json").write_text(json.dumps({"eval": {"eval/heldout/loss": value}}))
-        runs.append(
-            RunSpec(
-                run_id,
-                f"runs/{run_id}/run.yaml",
-                f"runs/{run_id}/result.json",
-                {"preset": "170M", "lr": lr, "output_mult": 1.0, "depth_exponent": 0.0, "seed": 42},
-            )
-        )
-    path = out / "phase.json"
-    write_phase(
-        path,
-        PhaseManifest(
-            version=1,
-            phase="smoke",
-            metric="eval/heldout/loss",
-            source=None,
-            runs=runs,
-            ranking=[],
-            selected=[],
-        ),
-    )
-    return path
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `python -m pytest tests/sweep/test_phases.py -q -k "grid or smoke_gate or hardcode or two_lowest"`
-Expected: FAIL — constants are the old values and the gates reference `SMOKE_LRS` and literal
-learning rates.
-
-- [ ] **Step 3: Update the constants and the CLI defaults**
-
-In `src/oplm/sweep/phases.py`:
-
-```python
-# Grid re-centered after the 170M coarse sweep ranked 0.0025 ~ 0.004 >> 0.0063 > 0.01 > 0.016,
-# putting the winner on the old grid's lower boundary. Same 1.6x spacing, shifted one half-decade
-# down, so both observed winners sit interior with headroom below and 0.0063 remains an upper
-# guard. See docs/LR_SWEEP.md.
-SMOKE_LRS = (0.0004, 0.0016, 0.0063)
-COARSE_LRS = (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)
-OUTPUT_MULTS = (0.5, 1.0, 2.0)
-
-
-def _grid_default(values: tuple[float, ...]) -> str:
-    """Render an LR grid as the comma-separated string a Typer default expects."""
-    return ",".join(f"{value:g}" for value in values)
-```
-
-Change the `--lrs` defaults so they cannot drift from the constants:
-
-```python
-    lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(SMOKE_LRS),
-```
-
-in `smoke`, and
-
-```python
-    lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(COARSE_LRS),
-```
-
-in `coarse`.
-
-- [ ] **Step 4: Rewrite `_smoke_gated_lrs` to read the manifest**
-
-Replace the body of `_smoke_gated_lrs` entirely:
-
-```python
-def _smoke_gated_lrs(source: Path, lrs: list[float]) -> list[float]:
-    """Drop the smoke phase's highest LR from ``lrs`` when it failed to produce a finite metric.
-
-    The gate is derived from the source manifest's own learning rates rather than from a module
-    constant, so changing ``--lrs`` moves the gate with it.
-
-    Args:
-        source: Path to the completed smoke ``phase.json``.
-        lrs: Candidate coarse grid.
-
-    Returns:
-        ``lrs``, minus the smoke phase's highest learning rate if that cell diverged.
-
-    Raises:
-        ValueError: If the smoke phase has fewer than two cells, or either of its two lowest
-            learning rates lacks a finite metric.
-    """
-    phase = load_phase(source)
-    phase_dir = source.resolve().parent
-    runs_by_lr = {float(run.params["lr"]): run for run in phase.runs}
-    phase_lrs = sorted(runs_by_lr)
-    if len(phase_lrs) < 2:
-        raise ValueError(f"smoke phase {source} must have at least two learning rates")
-    for lr in phase_lrs[:2]:
-        if result_metric(phase_dir, runs_by_lr[lr], phase.metric) is None:
-            raise ValueError(f"smoke lr={lr:g} lacks a finite {phase.metric}")
-    highest = phase_lrs[-1]
-    if result_metric(phase_dir, runs_by_lr[highest], phase.metric) is None:
-        return [lr for lr in lrs if lr != highest]
-    return lrs
-```
-
-- [ ] **Step 5: Rewrite the smoke branch of `analyze_phase`**
-
-Replace:
-
-```python
-        if phase.phase == "smoke":
-            scores = {float(entry["params"]["lr"]): entry["score"] for entry in phase.ranking}
-            if scores.get(0.0025) is None or scores.get(0.01) is None:
-                raise ValueError("smoke requires finite validation loss at LR 0.0025 and 0.01")
-```
-
-with:
-
-```python
-        if phase.phase == "smoke":
-            scores = {float(entry["params"]["lr"]): entry["score"] for entry in phase.ranking}
-            ordered = sorted(scores)
-            if len(ordered) < 2:
-                raise ValueError("smoke requires at least two learning rates")
-            missing = [lr for lr in ordered[:2] if scores[lr] is None]
-            if missing:
-                listed = ", ".join(f"{lr:g}" for lr in missing)
-                raise ValueError(
-                    "smoke requires finite validation loss at the two lowest learning rates; "
-                    f"missing: {listed}"
-                )
-```
-
-- [ ] **Step 6: Run the tests to verify they pass**
-
-Run: `python -m pytest tests/sweep/test_phases.py -q`
-Expected: PASS. Existing gate tests written against the old grid will fail — update their LR
-values to the new grid; do not weaken the assertions.
-
-- [ ] **Step 7: Run all gates and commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/ && python -m pytest tests/sweep -q
-git add -A src/oplm/sweep tests/sweep
-git commit -m "feat: recenter LR grid and derive smoke gates from the manifest"
-```
-
----
-
-## Phase 3 — `oplm.slurm` configuration layer
-
-### Task 5: `SlurmConfig` schema and table resolution
-
-**Files:**
-- Create: `src/oplm/slurm/__init__.py`, `src/oplm/slurm/config.py`
-- Create: `tests/slurm/__init__.py`, `tests/slurm/test_config.py`
-
-**Interfaces:**
-- Produces: `SlurmConfig` (frozen dataclass) with fields `partition: str`,
-  `time_limit: PhaseTable[str]`, `nodes: PhaseTable[int]`, `max_batch_size: dict[str, int]`,
-  `gpus_per_node: int`, `cpus_per_task: int`, `mem: str`, `exclusive: bool`, `log_dir: Path`,
-  `env_file: Path`, `container_image: Path`, `container_mounts: tuple[str, ...]`, `install: str`,
-  `max_concurrent: int`, `account: str | None`.
-- Produces: `SlurmConfig.from_mapping(raw: Mapping[str, object]) -> SlurmConfig`.
-- Produces: `load_slurm_config(config_path: Path) -> SlurmConfig`.
-- Produces: `PhaseTable[T].resolve(*, phase: str | None, preset: str | None) -> T`.
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/slurm/test_config.py`:
-
-```python
-from __future__ import annotations
-
-import pytest
-
-from oplm.slurm.config import PhaseTable, SlurmConfig
-
-RAW = {
-    "partition": "hpc-mid",
-    "time_limit": {"default": "168:00:00", "analyze": "01:00:00"},
-    "cpus_per_task": 128,
-    "gpus_per_node": 8,
-    "exclusive": True,
-    "mem": "0",
-    "log_dir": "/mnt/home/briney/logs",
-    "env_file": "/mnt/home/briney/.env",
-    "container_image": "/mnt/data/containers/dl.sqsh",
-    "container_mounts": ["/mnt/data:/mnt/data", "/tmp:/tmp"],
-    "install": "pip install oplm[train]",
-    "max_concurrent": 4,
-    "nodes": {
-        "default": {"170M": 1, "400M": 4, "800M": 8, "1B": 8},
-        "bridge": {"170M": 4},
-        "confirm": {"800M": 8},
-    },
-    "max_batch_size": {"170M": 256, "400M": 256, "800M": 256, "1B": 128},
-}
-
-
-def test_scalar_table_applies_everywhere() -> None:
-    table = PhaseTable.from_value(4, name="nodes")
-    assert table.resolve(phase=None, preset=None) == 4
-    assert table.resolve(phase="bridge", preset="800M") == 4
-
-
-def test_preset_table_without_default_key() -> None:
-    table = PhaseTable.from_value({"170M": 1, "400M": 4}, name="nodes")
-    assert table.resolve(phase=None, preset="400M") == 4
-    with pytest.raises(KeyError, match="800M"):
-        table.resolve(phase=None, preset="800M")
-
-
-def test_phase_override_beats_default() -> None:
-    cfg = SlurmConfig.from_mapping(RAW)
-    assert cfg.nodes.resolve(phase="coarse", preset="170M") == 1
-    assert cfg.nodes.resolve(phase="bridge", preset="170M") == 4
-    assert cfg.nodes.resolve(phase="confirm", preset="800M") == 8
-    # A phase override that omits a preset falls back to default for that preset.
-    assert cfg.nodes.resolve(phase="bridge", preset="400M") == 4
-
-
-def test_time_limit_resolves_per_phase() -> None:
-    """`time_limit` entries are bare values, not preset maps: they apply to every preset."""
-    cfg = SlurmConfig.from_mapping(RAW)
-    assert cfg.time_limit.resolve(phase="coarse", preset="170M") == "168:00:00"
-    assert cfg.time_limit.resolve(phase="analyze", preset=None) == "01:00:00"
-    # A phase with no override falls back to default regardless of preset.
-    assert cfg.time_limit.resolve(phase="transfer", preset="1B") == "168:00:00"
-
-
-def test_exact_preset_beats_wildcard() -> None:
-    table = PhaseTable.from_value({"default": 1, "bridge": {"170M": 4}}, name="nodes")
-    assert table.resolve(phase="bridge", preset="170M") == 4
-    # bridge has no 800M entry and no wildcard, so default's wildcard applies.
-    assert table.resolve(phase="bridge", preset="800M") == 1
-    assert table.resolve(phase="coarse", preset="170M") == 1
-
-
-def test_missing_required_field_raises() -> None:
-    raw = {key: value for key, value in RAW.items() if key != "partition"}
-    with pytest.raises(ValueError, match="partition"):
-        SlurmConfig.from_mapping(raw)
-
-
-@pytest.mark.parametrize("field", ["gpus_per_node", "cpus_per_task", "max_concurrent"])
-def test_non_positive_ints_rejected(field: str) -> None:
-    raw = {**RAW, field: 0}
-    with pytest.raises(ValueError, match=field):
-        SlurmConfig.from_mapping(raw)
-
-
-def test_non_positive_max_batch_size_rejected() -> None:
-    raw = {**RAW, "max_batch_size": {"170M": 0}}
-    with pytest.raises(ValueError, match="max_batch_size"):
-        SlurmConfig.from_mapping(raw)
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/slurm/test_config.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'oplm.slurm'`.
-
-- [ ] **Step 3: Implement `PhaseTable` and `SlurmConfig`**
-
-`src/oplm/slurm/config.py`:
-
-```python
-"""Schema and resolution for the ``slurm:`` block of an oplm training config.
-
-The block is general: it describes how to turn a training config into Slurm job scripts and
-carries no μP or sweep concepts. ``load_config`` tolerates it as an unknown top-level key
-(``OmegaConf.set_struct(base, False)``), and ``serialize_config`` omits it, so a generated
-per-cell ``run.yaml`` never carries cluster settings.
-"""
-
-from __future__ import annotations
-
-from collections.abc import Mapping
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Generic, TypeVar
-
-# PEP 695 (`class PhaseTable[T]:`) is Python 3.12+; this project supports 3.11 and CI runs
-# 3.11/3.12/3.13, so use the TypeVar + Generic form.
-T = TypeVar("T")
-
-_DEFAULT_KEY = "default"
-# Stands in for "any preset" when a phase entry carries a bare value rather than a preset map,
-# e.g. `time_limit: {default: "168:00:00", analyze: "01:00:00"}`.
-_ANY_KEY = "*"
-
-
-@dataclass(frozen=True)
-class PhaseTable(Generic[T]):
-    """A setting that may be a scalar, per-preset, or per-phase-and-preset.
-
-    Four accepted YAML forms::
-
-        nodes: 4                                          # one value for every job
-        nodes: {170M: 1, 400M: 4}                         # per preset
-        nodes: {default: {170M: 1}, bridge: {170M: 4}}    # per phase, then per preset
-        time_limit: {default: "168:00:00", analyze: "1:00:00"}   # per phase, no preset dimension
-
-    The presence of a ``default`` key is what distinguishes the last two forms from the second.
-    A phase entry that is not itself a mapping applies to every preset in that phase.
-    """
-
-    name: str
-    scalar: T | None
-    tables: dict[str, dict[str, T]]
-
-    @classmethod
-    def from_value(cls, value: object, *, name: str) -> PhaseTable[T]:
-        """Build a table from any of the four accepted forms."""
-        if not isinstance(value, Mapping):
-            return cls(name=name, scalar=value, tables={})  # ty: ignore[invalid-argument-type]
-        if _DEFAULT_KEY in value:
-            tables: dict[str, dict[str, T]] = {}
-            for phase, sub in value.items():
-                if isinstance(sub, Mapping):
-                    tables[str(phase)] = {str(preset): entry for preset, entry in sub.items()}
-                else:
-                    tables[str(phase)] = {_ANY_KEY: sub}
-            return cls(name=name, scalar=None, tables=tables)
-        return cls(
-            name=name,
-            scalar=None,
-            tables={_DEFAULT_KEY: {str(preset): entry for preset, entry in value.items()}},
-        )
-
-    def resolve(self, *, phase: str | None, preset: str | None) -> T:
-        """Resolve the value for one (phase, preset) pair.
-
-        Looks in the phase's own table first, then the ``default`` table; within each, an exact
-        preset match wins over the ``*`` wildcard.
-
-        Raises:
-            KeyError: If no entry covers ``preset``.
-        """
-        if self.scalar is not None:
-            return self.scalar
-        for table in (self.tables.get(phase or ""), self.tables.get(_DEFAULT_KEY)):
-            if table is None:
-                continue
-            if preset is not None and preset in table:
-                return table[preset]
-            if _ANY_KEY in table:
-                return table[_ANY_KEY]
-        raise KeyError(f"{self.name} has no entry for phase={phase!r} preset={preset!r}")
-
-
-def _require(raw: Mapping[str, Any], key: str) -> Any:
-    if key not in raw:
-        raise ValueError(f"slurm config is missing required field {key!r}")
-    return raw[key]
-
-
-def _positive_int(raw: Mapping[str, Any], key: str, default: int | None = None) -> int:
-    value = raw.get(key, default)
-    if value is None:
-        raise ValueError(f"slurm config is missing required field {key!r}")
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"slurm config {key} must be a positive int, got {value!r}")
-    return value
-
-
-@dataclass(frozen=True)
-class SlurmConfig:
-    """Validated ``slurm:`` block."""
-
-    partition: str
-    time_limit: PhaseTable[str]
-    nodes: PhaseTable[int]
-    max_batch_size: dict[str, int]
-    log_dir: Path
-    env_file: Path
-    container_image: Path
-    container_mounts: tuple[str, ...]
-    install: str
-    gpus_per_node: int = 8
-    cpus_per_task: int = 128
-    mem: str = "0"
-    exclusive: bool = True
-    max_concurrent: int = 4
-    account: str | None = None
-
-    @classmethod
-    def from_mapping(cls, raw: Mapping[str, Any]) -> SlurmConfig:
-        """Validate and build from the raw YAML mapping.
-
-        Raises:
-            ValueError: On a missing required field or an out-of-range value.
-        """
-        max_batch = {
-            str(preset): int(value) for preset, value in dict(raw.get("max_batch_size", {})).items()
-        }
-        bad = sorted(preset for preset, value in max_batch.items() if value < 1)
-        if bad:
-            raise ValueError(f"slurm config max_batch_size must be >= 1; bad presets: {bad}")
-        return cls(
-            partition=str(_require(raw, "partition")),
-            time_limit=PhaseTable.from_value(_require(raw, "time_limit"), name="time_limit"),
-            nodes=PhaseTable.from_value(_require(raw, "nodes"), name="nodes"),
-            max_batch_size=max_batch,
-            log_dir=Path(str(_require(raw, "log_dir"))),
-            env_file=Path(str(_require(raw, "env_file"))),
-            container_image=Path(str(_require(raw, "container_image"))),
-            container_mounts=tuple(str(mount) for mount in _require(raw, "container_mounts")),
-            install=str(_require(raw, "install")),
-            gpus_per_node=_positive_int(raw, "gpus_per_node", 8),
-            cpus_per_task=_positive_int(raw, "cpus_per_task", 128),
-            mem=str(raw.get("mem", "0")),
-            exclusive=bool(raw.get("exclusive", True)),
-            max_concurrent=_positive_int(raw, "max_concurrent", 4),
-            account=str(raw["account"]) if raw.get("account") is not None else None,
-        )
-
-
-def load_slurm_config(config_path: Path) -> SlurmConfig:
-    """Read the ``slurm:`` block out of an oplm training config.
-
-    Raises:
-        ValueError: If the config has no ``slurm:`` block.
-    """
-    from omegaconf import OmegaConf
-
-    raw = OmegaConf.load(config_path)
-    block = OmegaConf.select(raw, "slurm")
-    if block is None:
-        raise ValueError(f"{config_path} has no `slurm:` block")
-    return SlurmConfig.from_mapping(
-        dict(OmegaConf.to_container(block, resolve=True))  # ty: ignore[invalid-argument-type]
-    )
-```
-
-`src/oplm/slurm/__init__.py`:
-
-```python
-"""Turn an oplm training config into Slurm job scripts. Knows nothing about μP."""
-
-from __future__ import annotations
-
-from oplm.slurm.config import SlurmConfig, load_slurm_config
-
-__all__ = ["SlurmConfig", "load_slurm_config"]
-```
-
-Create an empty `tests/slurm/__init__.py`.
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `python -m pytest tests/slurm/test_config.py -q`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/
-git add -A src/oplm/slurm tests/slurm
-git commit -m "feat: add slurm config schema and phase/preset resolution"
-```
-
-### Task 6: Batch planning
-
-**Files:**
-- Modify: `src/oplm/slurm/config.py`
-- Test: `tests/slurm/test_config.py`
-
-**Interfaces:**
-- Produces: `BatchPlan` frozen dataclass with `per_device_batch: int`,
-  `gradient_accumulation_steps: int`, `world_size: int`.
-- Produces: `resolve_batch_plan(*, global_examples: int, world_size: int,
-  max_batch_size: int) -> BatchPlan`. It takes `world_size` rather than `nodes` so the `--local`
-  path can pass its actual process count and still land on an exact global batch; Slurm callers
-  pass `nodes * gpus_per_node`.
-
-- [ ] **Step 1: Write the failing tests**
-
-Append to `tests/slurm/test_config.py`:
-
-```python
-from oplm.slurm.config import BatchPlan, resolve_batch_plan
-
-
-@pytest.mark.parametrize(
-    ("global_examples", "nodes", "cap", "expected"),
-    [
-        # The spec's node table: every row resolves to accum == 1.
-        (2048, 1, 256, BatchPlan(per_device_batch=256, gradient_accumulation_steps=1, world_size=8)),
-        (2048, 4, 256, BatchPlan(per_device_batch=64, gradient_accumulation_steps=1, world_size=32)),
-        (2048, 8, 256, BatchPlan(per_device_batch=32, gradient_accumulation_steps=1, world_size=64)),
-        (2048, 8, 128, BatchPlan(per_device_batch=32, gradient_accumulation_steps=1, world_size=64)),
-        (8192, 4, 256, BatchPlan(per_device_batch=256, gradient_accumulation_steps=1, world_size=32)),
-        (8192, 8, 256, BatchPlan(per_device_batch=128, gradient_accumulation_steps=1, world_size=64)),
-    ],
-)
-def test_batch_plan_matches_the_spec_table(
-    global_examples: int, nodes: int, cap: int, expected: BatchPlan
-) -> None:
-    assert (
-        resolve_batch_plan(
-            global_examples=global_examples, world_size=nodes * 8, max_batch_size=cap
-        )
-        == expected
-    )
-
-
-def test_cap_forces_accumulation() -> None:
-    # 2048 / 8 = 256 per device at accum 1, over a cap of 128, so accum must rise to 2.
-    plan = resolve_batch_plan(global_examples=2048, world_size=8, max_batch_size=128)
-    assert plan == BatchPlan(per_device_batch=128, gradient_accumulation_steps=2, world_size=8)
-
-
-def test_local_world_size_still_lands_on_the_global_batch() -> None:
-    """--local passes its actual process count, so a 400M cell keeps a 2048 global batch."""
-    plan = resolve_batch_plan(global_examples=2048, world_size=8, max_batch_size=256)
-    assert plan.per_device_batch * plan.gradient_accumulation_steps * plan.world_size == 2048
-
-
-def test_indivisible_global_batch_raises() -> None:
-    with pytest.raises(ValueError, match="not divisible"):
-        resolve_batch_plan(global_examples=2048, world_size=24, max_batch_size=256)
-
-
-def test_global_batch_smaller_than_world_raises() -> None:
-    with pytest.raises(ValueError, match="not divisible"):
-        resolve_batch_plan(global_examples=4, world_size=8, max_batch_size=256)
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/slurm/test_config.py -q -k batch`
-Expected: FAIL — `ImportError: cannot import name 'BatchPlan'`.
-
-- [ ] **Step 3: Implement**
-
-Append to `src/oplm/slurm/config.py`:
-
-```python
-@dataclass(frozen=True)
-class BatchPlan:
-    """Per-device batch and accumulation for one cell."""
-
-    per_device_batch: int
-    gradient_accumulation_steps: int
-    world_size: int
-
-
-def resolve_batch_plan(
-    *, global_examples: int, world_size: int, max_batch_size: int
-) -> BatchPlan:
-    """Derive per-device batch and accumulation from the global batch and world size.
-
-    Picks the smallest accumulation that yields an integer per-device batch no larger than
-    ``max_batch_size``. Node counts are chosen for wall time, so per-device batch is derived
-    rather than configured; an infeasible combination is an error, never a silently adjusted
-    global batch.
-
-    Takes ``world_size`` rather than a node count so both callers land on an exact global batch:
-    Slurm passes ``nodes * gpus_per_node``, while ``--local`` passes its actual process count.
-
-    Args:
-        global_examples: Target global batch in examples per optimizer step.
-        world_size: Total training processes.
-        max_batch_size: Memory cap on per-device batch for this preset.
-
-    Returns:
-        The resolved plan.
-
-    Raises:
-        ValueError: If the global batch is not divisible by the world size, or no accumulation
-            brings the per-device batch within ``max_batch_size``.
-    """
-    if global_examples < 1 or world_size < 1 or max_batch_size < 1:
-        raise ValueError(
-            "global_examples, world_size, and max_batch_size must all be >= 1; got "
-            f"{global_examples=}, {world_size=}, {max_batch_size=}"
-        )
-    if global_examples % world_size != 0:
-        raise ValueError(
-            f"global batch {global_examples} is not divisible by world size {world_size}"
-        )
-    base = global_examples // world_size
-    for accum in range(1, base + 1):
-        if base % accum != 0:
-            continue
-        per_device = base // accum
-        if per_device <= max_batch_size:
-            return BatchPlan(
-                per_device_batch=per_device,
-                gradient_accumulation_steps=accum,
-                world_size=world_size,
-            )
-    raise ValueError(
-        f"no accumulation brings per-device batch within {max_batch_size} for "
-        f"global batch {global_examples} at world size {world_size}"
-    )
-```
-
-Add `BatchPlan` and `resolve_batch_plan` to `src/oplm/slurm/__init__.py`'s imports and `__all__`.
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `python -m pytest tests/slurm/test_config.py -q`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/
-git add -A src/oplm/slurm tests/slurm
-git commit -m "feat: derive per-device batch and accumulation from node count"
-```
-
----
-
-## Phase 4 — `oplm.slurm` rendering
-
-### Task 7: Render single and array job scripts
-
-**Files:**
-- Create: `src/oplm/slurm/render.py`
-- Test: `tests/slurm/test_render.py`
-
-**Interfaces:**
-- Produces: `JobSpec` frozen dataclass: `name: str`, `nodes: int`, `time_limit: str`,
-  `command: str`, `array_size: int | None = None`, `array_index_file: Path | None = None`,
-  `gres: bool = True`, `base_dir: Path | None = None`.
-- Produces: `render_job(spec: JobSpec, slurm: SlurmConfig) -> str`.
-- Produces: `accelerate_command(*, module: str, gpus_per_node: int, args: str,
-  mixed_precision: str = "bf16") -> str`.
-- Produces: `SubmitEntry` frozen dataclass (`var: str`, `script: Path`,
-  `depends_on: tuple[str, ...] = ()`) and `render_submit_script(entries: list[SubmitEntry]) -> str`.
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/slurm/test_render.py`:
-
-```python
-from __future__ import annotations
-
-import shutil
-import subprocess
-from pathlib import Path
-
-import pytest
-
-from oplm.slurm.config import SlurmConfig
-from oplm.slurm.render import JobSpec, SubmitEntry, render_job, render_submit_script
-from tests.slurm.test_config import RAW
-
-SLURM = SlurmConfig.from_mapping(RAW)
-
-
-def _array_spec(tmp_path: Path) -> JobSpec:
-    return JobSpec(
-        name="oplm-coarse-170M",
-        nodes=1,
-        time_limit="168:00:00",
-        command='python -m oplm.sweep.run --config "$RUN_DIR/run.yaml"',
-        array_size=7,
-        array_index_file=tmp_path / "jobs" / "170M.jobs",
-        base_dir=tmp_path,
-    )
-
-
-def test_array_header_includes_throttle(tmp_path: Path) -> None:
-    text = render_job(_array_spec(tmp_path), SLURM)
-    assert "#SBATCH --array=0-6%4" in text
-    assert "#SBATCH --nodes=1" in text
-    assert "#SBATCH --ntasks-per-node=1" in text
-    assert "#SBATCH --gres=gpu:8" in text
-    assert "#SBATCH --time=168:00:00" in text
-    assert "#SBATCH --requeue" in text
-    assert "#SBATCH --exclusive" in text
-
-
-def test_array_logs_use_array_placeholders(tmp_path: Path) -> None:
-    text = render_job(_array_spec(tmp_path), SLURM)
-    assert "%x_%A_%a.out" in text
-    assert "%x_%A_%a.err" in text
-
-
-def test_single_job_logs_use_job_id() -> None:
-    spec = JobSpec(
-        name="oplm-scale-400M",
-        nodes=8,
-        time_limit="168:00:00",
-        command="python -m oplm.train --config cfg.yaml",
-    )
-    text = render_job(spec, SLURM)
-    assert "%x_%j.out" in text
-    assert "--array" not in text
-    assert "SLURM_ARRAY_TASK_ID" not in text
-
-
-def test_pyxis_flags_are_on_srun_not_sbatch(tmp_path: Path) -> None:
-    text = render_job(_array_spec(tmp_path), SLURM)
-    for line in text.splitlines():
-        if line.startswith("#SBATCH"):
-            assert "--container-" not in line
-    assert "--container-image=/mnt/data/containers/dl.sqsh" in text
-    assert (
-        "--container-mounts=/mnt/home/${SLURM_JOB_USER}:/mnt/home/${SLURM_JOB_USER},"
-        "/mnt/data:/mnt/data,/tmp:/tmp" in text
-    )
-    assert "--no-container-mount-home" in text
-
-
-def test_workdir_is_created_on_every_node(tmp_path: Path) -> None:
-    """JOB_WORK_DIR is node-local /tmp and .env only creates it on the batch node."""
-    text = render_job(_array_spec(tmp_path), SLURM)
-    assert 'srun --nodes=$SLURM_NNODES --ntasks-per-node=1 mkdir -p "$JOB_WORK_DIR"' in text
-    # The mkdir fanout must precede the training srun.
-    assert text.index("mkdir -p") < text.index("--container-image=")
-
-
-def test_rendezvous_variables(tmp_path: Path) -> None:
-    text = render_job(_array_spec(tmp_path), SLURM)
-    # Assignment and export are split so a `hostname` failure trips `set -e`; with
-    # `export VAR=$(cmd)` bash reports export's status (always 0) and the job would
-    # proceed with an empty MASTER_ADDR and hang at rendezvous.
-    assert "\nMASTER_ADDR=$(hostname --ip-address)\n" in text
-    assert "\nexport MASTER_ADDR\n" in text
-    assert "export MASTER_ADDR=$(" not in text
-    # SLURM_JOB_ID is unique per array task, so concurrent jobs cannot collide.
-    assert "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))" in text
-    assert "export OMP_NUM_THREADS=1" in text
-
-
-def test_slurm_vars_expand_inside_the_container(tmp_path: Path) -> None:
-    """The inner command is single-quoted so $SLURM_PROCID expands in the container shell."""
-    spec = JobSpec(
-        name="oplm-coarse-170M",
-        nodes=1,
-        time_limit="168:00:00",
-        command=accelerate_command(module="oplm.sweep.run", gpus_per_node=8, args="--config x"),
-        array_size=7,
-        array_index_file=tmp_path / "jobs" / "170M.jobs",
-        base_dir=tmp_path,
-    )
-    text = render_job(spec, SLURM)
-    inner = text.split("bash -c '", 1)[1]
-    assert "--machine_rank $SLURM_PROCID" in inner
-    assert "--num_machines $SLURM_NNODES" in inner
-    # gpus_per_node is a render-time constant, so the arithmetic is already substituted.
-    assert "--num_processes $((SLURM_NNODES * 8))" in inner
-    assert "pip install oplm[train]" in inner
-
-
-def test_array_index_maps_through_the_index_file(tmp_path: Path) -> None:
-    text = render_job(_array_spec(tmp_path), SLURM)
-    assert "170M.jobs" in text
-    assert "SLURM_ARRAY_TASK_ID" in text
-    assert "export RUN_DIR" in text
-
-
-def test_gres_omitted_for_cpu_only_jobs() -> None:
-    spec = JobSpec(
-        name="oplm-coarse-analyze",
-        nodes=1,
-        time_limit="01:00:00",
-        command="oplm sweep analyze phase.json",
-        gres=False,
-    )
-    text = render_job(spec, SLURM)
-    assert "--gres" not in text
-
-
-def test_submit_script_wires_afterany_across_arrays() -> None:
-    text = render_submit_script(
-        [
-            SubmitEntry(var="A_400M", script=Path("jobs/400M.sbatch")),
-            SubmitEntry(var="A_800M", script=Path("jobs/800M.sbatch")),
-            SubmitEntry(var="A_1B", script=Path("jobs/1B.sbatch")),
-            SubmitEntry(
-                var="ANALYZE",
-                script=Path("jobs/analyze.sbatch"),
-                depends_on=("A_400M", "A_800M", "A_1B"),
-            ),
-        ]
-    )
-    assert "A_400M=$(sbatch --parsable jobs/400M.sbatch)" in text
-    assert (
-        "ANALYZE=$(sbatch --parsable --dependency=afterany:$A_400M:$A_800M:$A_1B "
-        "jobs/analyze.sbatch)" in text
-    )
-    # afterok would wedge the downstream job the first time an upstream one fails.
-    assert "afterok" not in text
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
-def test_rendered_scripts_are_valid_bash(tmp_path: Path) -> None:
-    for index, text in enumerate(
-        (
-            render_job(_array_spec(tmp_path), SLURM),
-            render_submit_script([SubmitEntry(var="A", script=Path("jobs/a.sbatch"))]),
-        )
-    ):
-        script = tmp_path / f"candidate{index}.sh"
-        script.write_text(text)
-        subprocess.run(["bash", "-n", str(script)], check=True)
-```
-
-Add `accelerate_command` to the import line at the top of the test file.
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/slurm/test_render.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'oplm.slurm.render'`.
-
-- [ ] **Step 3: Implement the renderer**
-
-`src/oplm/slurm/render.py`:
-
-```python
-"""Render Slurm job scripts from a :class:`~oplm.slurm.config.SlurmConfig`.
-
-One launcher form is used for every job. The multi-node ``srun`` form degrades correctly at
-``SLURM_NNODES=1``, so there is no separate single-node path to maintain or test.
-
-Quoting matters here. The inner training command is wrapped in ``bash -c '...'`` with *single*
-quotes, so ``$SLURM_NNODES`` / ``$SLURM_PROCID`` / ``$MASTER_ADDR`` expand in the container's
-shell (they reach it via ``--export=ALL``), not at render time. Anything that must be substituted
-at render time is interpolated into the template directly.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
-
-from oplm.slurm.config import SlurmConfig
-
-# The user's home mount is user-specific, so it is added at render time rather than configured.
-_HOME_MOUNT = "/mnt/home/${SLURM_JOB_USER}:/mnt/home/${SLURM_JOB_USER}"
-
-
-@dataclass(frozen=True)
-class JobSpec:
-    """One Slurm job: a single run, or an array over homogeneous jobs."""
-
-    name: str
-    nodes: int
-    time_limit: str
-    command: str
-    array_size: int | None = None
-    array_index_file: Path | None = None
-    gres: bool = True
-    base_dir: Path | None = None
-
-
-@dataclass(frozen=True)
-class SubmitEntry:
-    """One ``sbatch`` invocation in a generated ``submit.sh``."""
-
-    var: str
-    script: Path
-    depends_on: tuple[str, ...] = ()
-
-
-def _header(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
-    suffix = "%A_%a" if spec.array_size is not None else "%j"
-    lines = [
-        "#!/bin/bash",
-        "",
-        "# --- job ---",
-        f"#SBATCH --job-name={spec.name}",
-        f"#SBATCH --partition={slurm.partition}",
-    ]
-    if slurm.account is not None:
-        lines.append(f"#SBATCH --account={slurm.account}")
-    lines += [
-        "",
-        "# --- nodes & resources ---",
-        f"#SBATCH --nodes={spec.nodes}",
-        "#SBATCH --ntasks-per-node=1",
-    ]
-    if spec.gres:
-        lines.append(f"#SBATCH --gres=gpu:{slurm.gpus_per_node}")
-    lines.append(f"#SBATCH --cpus-per-task={slurm.cpus_per_task}")
-    lines.append(f"#SBATCH --mem={slurm.mem}")
-    if slurm.exclusive:
-        lines.append("#SBATCH --exclusive")
-    lines += [
-        f"#SBATCH --time={spec.time_limit}",
-        "#SBATCH --requeue",
-        "",
-        "# --- logs ---",
-        f"#SBATCH --output={slurm.log_dir}/%x_{suffix}.out",
-        f"#SBATCH --error={slurm.log_dir}/%x_{suffix}.err",
-    ]
-    if spec.array_size is not None:
-        lines += [
-            "",
-            "# --- array ---",
-            f"#SBATCH --array=0-{spec.array_size - 1}%{slurm.max_concurrent}",
-        ]
-    return lines
-
-
-def _array_lookup(spec: JobSpec) -> list[str]:
-    if spec.array_index_file is None or spec.base_dir is None:
-        return []
-    return [
-        "",
-        "# Map this array index to its run. One run id per line; index = line number - 1.",
-        f'BASE_DIR="{spec.base_dir}"',
-        f'INDEX_FILE="{spec.array_index_file}"',
-        'RUN_ID=$(awk "NR==$((SLURM_ARRAY_TASK_ID + 1))" "$INDEX_FILE")',
-        'if [ -z "$RUN_ID" ]; then',
-        '  echo "no run for array index $SLURM_ARRAY_TASK_ID" >&2',
-        "  exit 1",
-        "fi",
-        'export RUN_DIR="$BASE_DIR/runs/$RUN_ID"',
-    ]
-
-
-def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
-    """Render one sbatch script.
-
-    Args:
-        spec: What to run and at what size.
-        slurm: Cluster settings.
-
-    Returns:
-        Complete script text, ending in a newline.
-    """
-    mounts = ",".join((_HOME_MOUNT, *slurm.container_mounts))
-    lines = _header(spec, slurm)
-    lines += [
-        "",
-        "set -euo pipefail",
-        "",
-        "# Creates JOB_WORK_DIR and exports object-storage / W&B credentials.",
-        f"source {slurm.env_file}",
-    ]
-    lines += _array_lookup(spec)
-    lines += [
-        "",
-        "# JOB_WORK_DIR is node-local /tmp; .env only created it on the batch node.",
-        'srun --nodes=$SLURM_NNODES --ntasks-per-node=1 mkdir -p "$JOB_WORK_DIR"',
-        "",
-        "# Distributed rendezvous. The sbatch body runs on the rank-0 node, and SLURM_JOB_ID is",
-        "# unique per array task, so concurrent jobs cannot collide on a port.",
-        "MASTER_ADDR=$(hostname --ip-address)",
-        "export MASTER_ADDR",
-        "export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))",
-        "export NCCL_DEBUG=INFO",
-        "export OMP_NUM_THREADS=1",
-        "",
-        "srun --nodes=$SLURM_NNODES --ntasks-per-node=1 \\",
-        "  --export=ALL \\",
-        f"  --container-image={slurm.container_image} \\",
-        f"  --container-mounts={mounts} \\",
-        '  --container-workdir="$JOB_WORK_DIR" \\',
-        "  --no-container-mount-home \\",
-        f"  bash -c '{slurm.install} && \\",
-        f"    {spec.command}'",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def accelerate_command(
-    *, module: str, gpus_per_node: int, args: str, mixed_precision: str = "bf16"
-) -> str:
-    """Build the inner ``accelerate launch`` command for a container shell.
-
-    ``$SLURM_NNODES`` and ``$SLURM_PROCID`` are left unexpanded on purpose: the caller embeds this
-    inside single quotes so the container's shell resolves them.
-    """
-    return (
-        "accelerate launch \\\n"
-        "    --multi_gpu \\\n"
-        f"    --mixed_precision {mixed_precision} \\\n"
-        "    --num_machines $SLURM_NNODES \\\n"
-        f"    --num_processes $((SLURM_NNODES * {gpus_per_node})) \\\n"
-        "    --machine_rank $SLURM_PROCID \\\n"
-        '    --main_process_ip "$MASTER_ADDR" \\\n'
-        "    --main_process_port $MASTER_PORT \\\n"
-        f"    -m {module} \\\n"
-        f"    {args}"
-    )
-
-
-def render_submit_script(entries: list[SubmitEntry]) -> str:
-    """Render a ``submit.sh`` that submits every job and wires dependencies.
-
-    Dependencies use ``afterany``, not ``afterok``: an upstream failure is expected data, and the caller
-    already treats a missing or non-finite result as ineligible. Under ``afterok`` the first
-    failed upstream job would leave it in ``DependencyNeverSatisfied`` forever.
-    """
-    lines = [
-        "#!/bin/bash",
-        "set -euo pipefail",
-        "",
-        "# Run from the base directory regardless of the caller's cwd.",
-        'cd "$(dirname "$0")/.."',
-        "",
-    ]
-    for entry in entries:
-        if entry.depends_on:
-            deps = ":".join(f"${var}" for var in entry.depends_on)
-            call = f"sbatch --parsable --dependency=afterany:{deps} {entry.script}"
-        else:
-            call = f"sbatch --parsable {entry.script}"
-        lines.append(f"{entry.var}=$({call})")
-        lines.append(f'echo "submitted {entry.script}: ${entry.var}"')
-    lines.append("")
-    return "\n".join(lines)
-```
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `python -m pytest tests/slurm/test_render.py -q`
-Expected: PASS, including the `bash -n` syntax check.
-
-- [ ] **Step 5: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/
-git add -A src/oplm/slurm tests/slurm
-git commit -m "feat: render single and array slurm job scripts"
-```
-
----
-
-## Phase 5 — `oplm.slurm` submission and status
-
-### Task 8: Submit via `sbatch --parsable` and report status
-
-**Files:**
-- Create: `src/oplm/slurm/submit.py`
-- Test: `tests/slurm/test_submit.py`
-
-**Interfaces:**
-- Produces: `submit_job(script: Path, *, depends_on: Sequence[str] = ()) -> str` returning the job
-  id.
-- Produces: `submit_all(entries: Sequence[SubmitEntry], *, base_dir: Path) -> dict[str, str]`
-  mapping each entry's `var` to its job id.
-- Produces: `running_job_ids(job_ids: Sequence[str]) -> set[str]`.
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/slurm/test_submit.py`:
-
-```python
-from __future__ import annotations
-
+import json
 import os
-import stat
+import sys
 from pathlib import Path
 
-import pytest
-
-from oplm.slurm.render import SubmitEntry
-from oplm.slurm.submit import running_job_ids, submit_all, submit_job
+from accelerate import Accelerator
+from accelerate.utils import DataLoaderConfiguration
 
 
-def _install_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, body: str) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    script = bin_dir / name
-    script.write_text(body)
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-
-
-@pytest.fixture
-def fake_sbatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Put a recording `sbatch` stub on PATH; no cluster required."""
-    log = tmp_path / "sbatch.log"
-    _install_stub(
-        tmp_path,
-        monkeypatch,
-        "sbatch",
-        "#!/bin/bash\n"
-        f'echo "$@" >> "{log}"\n'
-        f'count=$(wc -l < "{log}")\n'
-        "echo $((812344 + count))\n",
+def main(fixture_path: str, out_dir: str) -> None:
+    accelerator = Accelerator(
+        cpu=True, dataloader_config=DataLoaderConfiguration(dispatch_batches=False)
     )
-    return log
-
-
-def test_submit_job_returns_parsed_id(fake_sbatch: Path, tmp_path: Path) -> None:
-    script = tmp_path / "job.sbatch"
-    script.write_text("#!/bin/bash\n")
-    assert submit_job(script) == "812345"
-    assert fake_sbatch.read_text().strip() == f"--parsable {script}"
-
-
-def test_submit_job_builds_afterany_dependency(fake_sbatch: Path, tmp_path: Path) -> None:
-    script = tmp_path / "analyze.sbatch"
-    script.write_text("#!/bin/bash\n")
-    submit_job(script, depends_on=["100", "200", "300"])
-    assert "--dependency=afterany:100:200:300" in fake_sbatch.read_text()
-
-
-def test_submit_all_threads_ids_into_dependencies(fake_sbatch: Path, tmp_path: Path) -> None:
-    for name in ("400M.sbatch", "800M.sbatch", "analyze.sbatch"):
-        (tmp_path / name).write_text("#!/bin/bash\n")
-    ids = submit_all(
-        [
-            SubmitEntry(var="A_400M", script=Path("400M.sbatch")),
-            SubmitEntry(var="A_800M", script=Path("800M.sbatch")),
-            SubmitEntry(
-                var="ANALYZE", script=Path("analyze.sbatch"), depends_on=("A_400M", "A_800M")
-            ),
-        ],
-        base_dir=tmp_path,
-    )
-    assert ids == {"A_400M": "812345", "A_800M": "812346", "ANALYZE": "812347"}
-    assert "--dependency=afterany:812345:812346" in fake_sbatch.read_text()
-
-
-def test_submit_job_raises_on_sbatch_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _install_stub(
-        tmp_path, monkeypatch, "sbatch", '#!/bin/bash\necho "queue full" >&2\nexit 1\n'
-    )
-    job = tmp_path / "job.sbatch"
-    job.write_text("#!/bin/bash\n")
-    with pytest.raises(RuntimeError, match="queue full"):
-        submit_job(job)
-
-
-def test_running_job_ids_parses_squeue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_stub(
-        tmp_path, monkeypatch, "squeue", "#!/bin/bash\nprintf '812345_3\\n812347\\n'\n"
-    )
-    assert running_job_ids(["812345", "812346", "812347"]) == {"812345", "812347"}
-
-
-def test_running_job_ids_empty_when_squeue_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PATH", "")
-    assert running_job_ids(["812345"]) == set()
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/slurm/test_submit.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'oplm.slurm.submit'`.
-
-- [ ] **Step 3: Implement**
-
-`src/oplm/slurm/submit.py`:
-
-```python
-"""Submit generated job scripts and query their state."""
-
-from __future__ import annotations
-
-import logging
-import shutil
-import subprocess
-from collections.abc import Sequence
-from pathlib import Path
-
-from oplm.slurm.render import SubmitEntry
-
-logger = logging.getLogger(__name__)
-
-
-def submit_job(script: Path, *, depends_on: Sequence[str] = ()) -> str:
-    """Submit one script with ``sbatch --parsable`` and return its job id.
-
-    Dependencies use ``afterany`` so a diverged cell cannot wedge a downstream job.
-
-    Args:
-        script: Path to the sbatch script.
-        depends_on: Job ids this submission waits on.
-
-    Returns:
-        The Slurm job id.
-
-    Raises:
-        RuntimeError: If ``sbatch`` exits non-zero.
-    """
-    argv = ["sbatch", "--parsable"]
-    if depends_on:
-        argv.append(f"--dependency=afterany:{':'.join(depends_on)}")
-    argv.append(str(script))
-    result = subprocess.run(argv, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"sbatch failed for {script} (exit {result.returncode}): {result.stderr.strip()}"
-        )
-    # --parsable prints "<jobid>" or "<jobid>;<cluster>".
-    return result.stdout.strip().split(";", 1)[0]
-
-
-def submit_all(entries: Sequence[SubmitEntry], *, base_dir: Path) -> dict[str, str]:
-    """Submit every entry in order, threading earlier job ids into later dependencies.
-
-    Args:
-        entries: Jobs to submit, in dependency order.
-        base_dir: Directory the entries' script paths are relative to.
-
-    Returns:
-        Mapping of each entry's ``var`` to its job id.
-    """
-    ids: dict[str, str] = {}
-    for entry in entries:
-        depends = [ids[var] for var in entry.depends_on]
-        job_id = submit_job(base_dir / entry.script, depends_on=depends)
-        ids[entry.var] = job_id
-        logger.info("submitted %s as %s", entry.script, job_id)
-    return ids
-
-
-def running_job_ids(job_ids: Sequence[str]) -> set[str]:
-    """Return the subset of ``job_ids`` still known to the scheduler.
-
-    Returns an empty set when ``squeue`` is unavailable (e.g. off-cluster), so callers degrade to
-    filesystem-only status rather than failing.
-    """
-    if not job_ids or shutil.which("squeue") is None:
-        return set()
-    result = subprocess.run(
-        ["squeue", "--noheader", "--format=%i", "--jobs", ",".join(job_ids)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return set()
-    # Array elements report as "<arrayjobid>_<index>"; match on the base id.
-    return {line.strip().split("_", 1)[0] for line in result.stdout.splitlines() if line.strip()}
-```
-
-Add `submit_job`, `submit_all`, `running_job_ids`, `JobSpec`, `SubmitEntry`, `render_job`,
-`render_submit_script`, `accelerate_command` to `src/oplm/slurm/__init__.py`.
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `python -m pytest tests/slurm/test_submit.py -q`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/
-git add -A src/oplm/slurm tests/slurm
-git commit -m "feat: submit slurm jobs and query scheduler state"
-```
-
----
-
-## Phase 6 — The general layer stands alone
-
-### Task 9: `oplm slurm` CLI, `configs/scaling.yaml`, and the layering guard
-
-**Files:**
-- Create: `src/oplm/slurm/cli.py`, `configs/scaling.yaml`
-- Modify: `src/oplm/cli.py`
-- Test: `tests/slurm/test_cli.py`, `tests/slurm/test_layering.py`
-
-**Interfaces:**
-- Produces: `oplm slurm generate --config <cfg> [--preset P] [--nodes N] --out <dir>` writing
-  `<dir>/<name>.sbatch`; `oplm slurm submit <dir>`; `oplm slurm status <dir>`.
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/slurm/test_layering.py`:
-
-```python
-from __future__ import annotations
-
-import ast
-from pathlib import Path
-
-import oplm.slurm
-
-
-def test_slurm_layer_does_not_import_sweep() -> None:
-    """oplm.slurm is general-purpose; oplm.sweep depends on it, never the reverse."""
-    package = Path(oplm.slurm.__file__).parent
-    offenders = []
-    for module in sorted(package.glob("*.py")):
-        tree = ast.parse(module.read_text())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                names = [node.module or ""]
-            else:
-                continue
-            if any(name.startswith("oplm.sweep") for name in names):
-                offenders.append(f"{module.name}:{node.lineno}")
-    assert offenders == [], f"oplm.slurm must not import oplm.sweep: {offenders}"
-```
-
-`tests/slurm/test_cli.py`:
-
-```python
-from __future__ import annotations
-
-from pathlib import Path
-
-from typer.testing import CliRunner
-
-from oplm.cli import app
-
-runner = CliRunner()
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-def test_slurm_subcommand_is_registered() -> None:
-    result = runner.invoke(app, ["slurm", "--help"])
-    assert result.exit_code == 0
-    for command in ("generate", "submit", "status"):
-        assert command in result.stdout
-
-
-def test_generate_from_the_committed_scaling_config(tmp_path: Path) -> None:
-    """The general layer works from a plain training config, with no sweep artifacts."""
-    result = runner.invoke(
-        app,
-        [
-            "slurm",
-            "generate",
-            "--config",
-            str(REPO_ROOT / "configs" / "scaling.yaml"),
-            "--preset",
-            "400M",
-            "--out",
-            str(tmp_path),
-        ],
-    )
-    assert result.exit_code == 0, result.stdout
-    script = tmp_path / "oplm-400M.sbatch"
-    assert script.exists()
-    text = script.read_text()
-    assert "#SBATCH --nodes=8" in text
-    assert "--preset 400M" in text
-    assert "sweep" not in text
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/slurm/test_cli.py tests/slurm/test_layering.py -q`
-Expected: FAIL — no `slurm` subcommand and no `configs/scaling.yaml`.
-
-- [ ] **Step 3: Write `configs/scaling.yaml`**
-
-A complete, runnable production config. Dataset paths are the CoreWeave locations from the
-production job scripts. `container_mounts` omits the user's home mount because `render.py` adds
-`/mnt/home/${SLURM_JOB_USER}:/mnt/home/${SLURM_JOB_USER}` automatically.
-
-```yaml
-# Production scaling runs. Usable on its own:
-#   oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
-# `oplm sweep scale` merges the confirmed muP winner into this file before generating.
-
-model:
-  max_position_embeddings: 512
-  gradient_checkpointing: true
-  gradient_checkpointing_mode: full
-  norm_strategy: sandwich
-  canon_enabled: true
-  canon_positions: [A, B, C, D]
-  residual_gate: channel
-  mup_enable: true
-  mup_base_width: 768
-
-train:
-  optimizer: muon
-  muon_adjust_lr_fn: original
-  weight_decay: 0.01
-  mup_depth_reference_layers: 24
-  scheduler: wsd_linear
-  max_steps: 100000
-  stable_steps: 95000
-  warmup_steps: 5000
-  save_every: 10000
-  save_total_limit: 3
-  eval_every: {steps: 5000}
-  compile: true
-  wandb_project: oplm-scaling
-  output_dir: /mnt/home/briney/projects/oplm/scaling
-
-data:
-  train:
-    uniref70:
-      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/train
-      fraction: 0.35
-    omg70:
-      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/train
-      fraction: 0.45
-    deepclust30:
-      path: /mnt/data/datasets/plm-training-data/deepclust30-bigg2/train
-      fraction: 0.20
-  eval:
-    uniref70:
-      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/eval.parquet
-      type: sequence
-    omg70:
-      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/eval.parquet
-      type: sequence
-    deepclust30:
-      path: /mnt/data/datasets/plm-training-data/deepclust30-bigg2/eval.parquet
-      type: sequence
-    casp14:
-      path: /mnt/data/datasets/plm-training-data/casp/casp14
-      type: structure
-    proteingym_clinical:
-      path: /mnt/data/datasets/plm-training-data/ProteinGym/eval/clinical_substitutions
-      type: proteingym_clinical
-      scoring: wt_marginals
-      top_k_fraction: 0.1
-    proteingym_dms:
-      path: /mnt/data/datasets/plm-training-data/ProteinGym/eval/dms_substitutions
-      type: proteingym
-      scoring: wt_marginals
-      top_k_fraction: 0.1
-
-slurm:
-  partition: hpc-mid
-  time_limit:
-    default: "168:00:00"
-  cpus_per_task: 128
-  gpus_per_node: 8
-  exclusive: true
-  mem: "0"
-  log_dir: /mnt/home/briney/logs
-  env_file: /mnt/home/briney/.env
-  container_image: /mnt/data/containers/deeplearning_v2026-05-26.sqsh
-  container_mounts:
-    - /mnt/data:/mnt/data
-    - /tmp:/tmp
-  install: pip install oplm[train]
-  max_concurrent: 4
-  nodes: {170M: 4, 400M: 8, 800M: 16, 1B: 16}
-  max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
-```
-
-- [ ] **Step 4: Implement the CLI**
-
-`src/oplm/slurm/cli.py`:
-
-```python
-"""`oplm slurm` command surface: turn a training config into job scripts."""
-
-from __future__ import annotations
-
-import json
-from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime.
-from typing import Annotated
-
-import typer
-from rich.console import Console
-
-from oplm.slurm.config import load_slurm_config
-from oplm.slurm.render import JobSpec, SubmitEntry, accelerate_command, render_job
-from oplm.slurm.submit import running_job_ids, submit_all
-
-app = typer.Typer(name="slurm", help="Generate and submit Slurm jobs", add_completion=False)
-console = Console()
-
-_MANIFEST = "jobs.json"
-
-
-@app.command()
-def generate(
-    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
-    out: Annotated[Path, typer.Option("--out", file_okay=False)],
-    preset: Annotated[str | None, typer.Option("--preset")] = None,
-    nodes: Annotated[int | None, typer.Option("--nodes")] = None,
-    name: Annotated[str | None, typer.Option("--name")] = None,
-    time_limit: Annotated[str | None, typer.Option("--time-limit")] = None,
-) -> None:
-    """Write one sbatch script for a training config."""
-    slurm = load_slurm_config(config)
-    job_name = name or f"oplm-{preset or 'run'}"
-    resolved_nodes = nodes if nodes is not None else slurm.nodes.resolve(phase=None, preset=preset)
-    resolved_time = time_limit or slurm.time_limit.resolve(phase=None, preset=preset)
-    args = f"--config {config}"
-    if preset is not None:
-        args += f" --preset {preset}"
-    spec = JobSpec(
-        name=job_name,
-        nodes=resolved_nodes,
-        time_limit=resolved_time,
-        command=accelerate_command(
-            module="oplm.train", gpus_per_node=slurm.gpus_per_node, args=args
-        ),
-    )
-    out.mkdir(parents=True, exist_ok=True)
-    script = out / f"{job_name}.sbatch"
-    script.write_text(render_job(spec, slurm))
-    (out / _MANIFEST).write_text(
-        json.dumps({"scripts": [script.name], "job_ids": {}}, indent=2) + "\n"
-    )
-    console.print(f"wrote {script} ({resolved_nodes} nodes, {resolved_time})")
-
-
-@app.command()
-def submit(
-    directory: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
-) -> None:
-    """Submit every script a previous `generate` wrote into DIRECTORY."""
-    manifest_path = directory / _MANIFEST
-    manifest = json.loads(manifest_path.read_text())
-    entries = [
-        SubmitEntry(var=f"JOB_{index}", script=Path(script))
-        for index, script in enumerate(manifest["scripts"])
-    ]
-    ids = submit_all(entries, base_dir=directory)
-    manifest["job_ids"] = ids
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    for var, job_id in ids.items():
-        console.print(f"{var}: {job_id}")
-
-
-@app.command()
-def status(
-    directory: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
-) -> None:
-    """Report which submitted jobs are still known to the scheduler."""
-    manifest = json.loads((directory / _MANIFEST).read_text())
-    ids: dict[str, str] = manifest.get("job_ids", {})
-    if not ids:
-        console.print("no jobs submitted yet")
-        raise typer.Exit()
-    live = running_job_ids(list(ids.values()))
-    for var, job_id in ids.items():
-        state = "active" if job_id in live else "finished or unknown"
-        console.print(f"{var} ({job_id}): {state}")
-```
-
-In `src/oplm/cli.py`, alongside the sweep mount:
-
-```python
-app.add_typer(slurm_app, name="slurm", help="Generate and submit Slurm jobs")
-```
-
-with `from oplm.slurm.cli import app as slurm_app` at the top of the file.
-
-- [ ] **Step 5: Run to verify pass**
-
-Run: `python -m pytest tests/slurm/ -q`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/ && python -m pytest tests/slurm -q
-git add -A src/oplm configs/scaling.yaml tests/slurm
-git commit -m "feat: add oplm slurm CLI and a standalone scaling config"
-```
-
----
-
-## Phase 7 — Sweep phases emit Slurm jobs
-
-### Task 10: Pin per-cell overrides from the batch plan
-
-**Files:**
-- Modify: `src/oplm/sweep/phases.py` (`_write_run_config`, `_generate_phase`)
-- Test: `tests/sweep/test_phases.py`
-
-**Interfaces:**
-- Consumes: `resolve_batch_plan`, `BatchPlan`, `SlurmConfig`, `load_slurm_config` from
-  `oplm.slurm.config`.
-- Produces: `_write_run_config(base_config, run_dir, params, *, plan: BatchPlan,
-  diagnostics: bool = False) -> Path` — the `num_processes` parameter is replaced by `plan`.
-
-- [ ] **Step 1: Write the failing tests**
-
-Add to `tests/sweep/test_phases.py`:
-
-```python
-def test_cells_pin_full_gradient_checkpointing(tmp_path: Path) -> None:
-    run_yaml = _generate_one_cell(tmp_path)
-    cfg = load_config(["--config", str(run_yaml)])
-    assert cfg.model.gradient_checkpointing is True
-    assert cfg.model.gradient_checkpointing_mode == "full"
-
-
-def test_cells_pin_batch_from_the_plan(tmp_path: Path) -> None:
-    """Per-device batch comes from the node plan, not from the base config."""
-    run_yaml = _generate_one_cell(tmp_path)
-    cfg = load_config(["--config", str(run_yaml)])
-    assert cfg.train.batch_size == 256
-    assert cfg.train.gradient_accumulation_steps == 1
-
-
-def test_cells_checkpoint_often_enough_to_resume(tmp_path: Path) -> None:
-    """save_every defaults to 10_000, which would checkpoint a 10k cell only at the end."""
-    run_yaml = _generate_one_cell(tmp_path, max_steps=10_000)
-    cfg = load_config(["--config", str(run_yaml)])
-    assert cfg.train.save_every == 1250
-    assert cfg.train.save_total_limit == 1
-```
-
-Write `_generate_one_cell` as a helper in the same file that builds a minimal base config carrying
-the `slurm:` block from `tests/slurm/test_config.py::RAW`, invokes the `coarse` generator with a
-single LR at `--global-examples 2048`, and returns the resulting `runs/<id>/run.yaml`. Reuse the
-file's existing base-config fixture for the μP requirements (`optimizer: muon`,
-`muon_adjust_lr_fn: original`, `weight_decay: 0.01`, exactly one eval task).
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/sweep/test_phases.py -q -k "pin or checkpoint_often"`
-Expected: FAIL — checkpointing is not pinned and `save_every` is the default.
-
-- [ ] **Step 3: Rewrite `_write_run_config`**
-
-Replace the `grad_accum` computation and the `overrides` list in `_write_run_config`:
-
-```python
-def _write_run_config(
-    base_config: Path,
-    run_dir: Path,
-    params: Params,
-    *,
-    plan: BatchPlan,
-    diagnostics: bool = False,
-) -> Path:
-    max_steps = int(params["max_steps"])
-    warmup_steps = int(params["warmup_steps"])
-    if warmup_steps < 0 or warmup_steps >= max_steps:
-        raise ValueError(
-            "warmup_steps must satisfy 0 <= warmup_steps < max_steps, "
-            f"got {warmup_steps} and {max_steps}"
-        )
-
-    preset = str(params["preset"])
-    preset_model = get_preset_config(preset).model
-    base = load_config(["--config", str(base_config)])
-    if base.train.optimizer != "muon":
-        raise ValueError(f"μP sweep requires train.optimizer=muon, got {base.train.optimizer}")
-    if base.train.muon_adjust_lr_fn != "original":
-        raise ValueError(
-            "μP sweep requires train.muon_adjust_lr_fn=original, "
-            f"got {base.train.muon_adjust_lr_fn}"
-        )
-    if base.train.weight_decay != 0.01:
-        raise ValueError(
-            f"μP sweep requires train.weight_decay=0.01, got {base.train.weight_decay}"
-        )
-    run_name = run_dir.name
-    # Checkpoint eight times per cell so a requeue loses at most ~12% of the run, and keep only
-    # the newest: these checkpoints exist solely to make requeue cheap.
-    save_every = max(1, max_steps // 8)
-    overrides = [
-        f"model.hidden_size={preset_model.hidden_size}",
-        f"model.num_hidden_layers={preset_model.num_hidden_layers}",
-        f"model.num_attention_heads={preset_model.num_attention_heads}",
-        "model.head_dim=64",
-        "model.mup_enable=true",
-        "model.mup_base_width=768",
-        f"model.mup_output_mult={params['output_mult']}",
-        # Full checkpointing is what makes the derived per-device batches fit at 400M+. Both keys
-        # are pinned so a change to packaged defaults cannot alter the memory profile mid-sweep.
-        "model.gradient_checkpointing=true",
-        "model.gradient_checkpointing_mode=full",
-        f"train.lr={params['lr']}",
-        f"train.mup_depth_lr_exponent={params['depth_exponent']}",
-        "train.mup_depth_reference_layers=24",
-        f"train.seed={params['seed']}",
-        f"train.batch_size={plan.per_device_batch}",
-        f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
-        f"train.max_steps={params['max_steps']}",
-        "train.max_epochs=null",
-        f"train.warmup_steps={params['warmup_steps']}",
-        f"train.stable_steps={max_steps - warmup_steps}",
-        "train.scheduler=wsd_linear",
-        f"train.save_every={save_every}",
-        "train.save_total_limit=1",
-        f"train.output_dir={run_dir / 'output'}",
-        f"train.wandb_run_name={run_name}",
-        # Explicitly pin diagnostics so the flag overrides whatever the base config
-        # carries (off by default keeps the sweep robust; see docs/LR_SWEEP.md).
-        f"train.stability_diagnostics={str(diagnostics).lower()}",
-    ]
-    cfg = load_config(["--config", str(base_config), *overrides])
-    run_dir.mkdir(parents=True, exist_ok=True)
-    path = run_dir / "run.yaml"
-    path.write_text(serialize_config(cfg))
-    return path
-```
-
-Add to the imports in `phases.py`:
-
-```python
-from oplm.slurm.config import BatchPlan, SlurmConfig, load_slurm_config, resolve_batch_plan
-```
-
-In `_generate_phase`, load the slurm block once and compute the plan per cell before writing its
-config. The world size comes from the node table for the Slurm path and from `--num-processes` for
-`--local`, so both land on an exact global batch:
-
-```python
-    slurm = load_slurm_config(base_config)
-    ...
-        preset = str(params["preset"])
-        nodes = slurm.nodes.resolve(phase=name, preset=preset)
-        # --local runs on this machine's processes, not the phase's node allocation. Deriving
-        # the plan from the node table there would silently shrink the global batch (a 400M cell
-        # is planned for 4 nodes; on 8 local processes that is 512, not 2048) and break every
-        # cross-cell comparison.
-        world_size = num_processes if local else nodes * slurm.gpus_per_node
-        plan = resolve_batch_plan(
-            global_examples=int(params["global_examples"]),
-            world_size=world_size,
-            max_batch_size=slurm.max_batch_size[preset],
-        )
-```
-
-`_generate_phase` therefore takes a `local: bool` parameter alongside the existing
-`num_processes`. Pass `plan=plan` to `_write_run_config`, and record `nodes`,
-`plan.per_device_batch`, and `plan.gradient_accumulation_steps` into each `RunSpec.params`.
-
-Keep `num_processes`, `accelerate_argv`, and `commands.txt` exactly as they are — they serve the
-`--local` path and remain the human-readable record of what each cell runs.
-
-`gradient_accumulation_steps` in `oplm/sweep/common.py` is now unused by `phases.py`. Leave the
-function in place — `test_common.py` covers it and it documents the divisibility contract — but do
-not call it from the new path.
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `python -m pytest tests/sweep/test_phases.py -q`
-Expected: PASS. Existing tests that asserted on `num_processes`-derived accumulation need updating
-to the plan-derived values.
-
-- [ ] **Step 5: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/ && python -m pytest tests/sweep -q
-git add -A src/oplm/sweep tests/sweep
-git commit -m "feat: pin per-cell batch and checkpointing from the node plan"
-```
-
-### Task 11: Emit `jobs/` per phase
-
-**Files:**
-- Modify: `src/oplm/sweep/phases.py` (`_generate_phase`, every phase command),
-  `src/oplm/sweep/common.py` (`PhaseManifest`)
-- Create: `tests/sweep/conftest.py`, `tests/sweep/test_jobs.py`
-
-**Interfaces:**
-- Produces: `_write_jobs(out: Path, phase: str, runs: list[RunSpec], slurm: SlurmConfig,
-  phase_json: Path) -> list[SubmitEntry]`.
-- Produces: a `--submit/--no-submit` flag on every phase command except `scale`, defaulting to
-  `--no-submit`.
-- Produces: `PhaseManifest` gains `oplm_version: str | None`, `generated_at: str | None`,
-  `job_ids: dict[str, str] | None`, all defaulting to `None`.
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/sweep/test_jobs.py`:
-
-```python
-from __future__ import annotations
-
-import json
-import subprocess
-from pathlib import Path
-
-
-def test_single_preset_phase_emits_one_array(coarse_phase: Path) -> None:
-    jobs = coarse_phase.parent / "jobs"
-    assert (jobs / "170M.sbatch").exists()
-    assert (jobs / "170M.jobs").exists()
-    assert (jobs / "analyze.sbatch").exists()
-    assert (jobs / "submit.sh").exists()
-    cells = (jobs / "170M.jobs").read_text().splitlines()
-    assert len(cells) == 7
-    assert "#SBATCH --array=0-6%4" in (jobs / "170M.sbatch").read_text()
-
-
-def test_transfer_emits_one_array_per_preset(transfer_phase: Path) -> None:
-    """Slurm arrays need homogeneous resources, and node count varies by preset."""
-    jobs = transfer_phase.parent / "jobs"
-    for preset, nodes in (("400M", 4), ("800M", 8), ("1B", 8)):
-        text = (jobs / f"{preset}.sbatch").read_text()
-        assert f"#SBATCH --nodes={nodes}" in text
-    submit = (jobs / "submit.sh").read_text()
-    assert "--dependency=afterany:$A_400M:$A_800M:$A_1B" in submit
-
-
-def test_analyze_job_is_cpu_only(coarse_phase: Path) -> None:
-    text = (coarse_phase.parent / "jobs" / "analyze.sbatch").read_text()
-    assert "--gres" not in text
-    assert "oplm sweep analyze" in text
-    assert "#SBATCH --time=01:00:00" in text
-
-
-def test_cells_file_order_matches_manifest(coarse_phase: Path) -> None:
-    manifest = json.loads(coarse_phase.read_text())
-    cells = (coarse_phase.parent / "jobs" / "170M.jobs").read_text().split()
-    assert cells == [run["id"] for run in manifest["runs"]]
-
-
-def test_manifest_records_provenance(coarse_phase: Path) -> None:
-    from importlib.metadata import version
-
-    manifest = json.loads(coarse_phase.read_text())
-    assert manifest["oplm_version"] == version("oplm")
-    assert manifest["generated_at"]
-
-
-def test_generated_scripts_are_valid_bash(coarse_phase: Path) -> None:
-    for script in sorted((coarse_phase.parent / "jobs").glob("*.sbatch")):
-        subprocess.run(["bash", "-n", str(script)], check=True)
-    subprocess.run(["bash", "-n", str(coarse_phase.parent / "jobs" / "submit.sh")], check=True)
-```
-
-Create `tests/sweep/conftest.py` with `coarse_phase`, `transfer_phase`, and `confirm_phase`
-fixtures. Each writes a temp base config carrying the `slurm:` block from
-`tests/slurm/test_config.py::RAW` plus the μP requirements, invokes the matching phase generator,
-and returns the resulting `phase.json` path. `confirm_phase` additionally writes `selected` with
-one winner dict holding `lr`, `output_mult`, `depth_exponent`, and `batch_mult`.
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/sweep/test_jobs.py -q`
-Expected: FAIL — no `jobs/` directory is written.
-
-- [ ] **Step 3: Extend `PhaseManifest`**
-
-In `src/oplm/sweep/common.py`:
-
-```python
-@dataclass
-class PhaseManifest:
-    version: int
-    phase: str
-    metric: str
-    source: str | None
-    runs: list[RunSpec]
-    ranking: list[dict[str, object]]
-    selected: list[Params]
-    oplm_version: str | None = None
-    generated_at: str | None = None
-    job_ids: dict[str, str] | None = None
-```
-
-Update `load_phase` to read the three new fields with `raw.get(...)` defaults so manifests written
-before this change still load:
-
-```python
-def load_phase(path: Path) -> PhaseManifest:
-    raw = json.loads(path.read_text())
-    return PhaseManifest(
-        version=int(raw["version"]),
-        phase=str(raw["phase"]),
-        metric=str(raw["metric"]),
-        source=raw["source"],
-        runs=[RunSpec(**run) for run in raw["runs"]],
-        ranking=list(raw["ranking"]),
-        selected=list(raw["selected"]),
-        oplm_version=raw.get("oplm_version"),
-        generated_at=raw.get("generated_at"),
-        job_ids=raw.get("job_ids"),
-    )
-```
-
-- [ ] **Step 4: Implement `_write_jobs`**
-
-Add to `src/oplm/sweep/phases.py`:
-
-```python
-def _preset_sort_key(preset: str) -> tuple[float, str]:
-    """Order presets by size so `400M` precedes `1B`."""
-    scale = {"M": 1e6, "B": 1e9}.get(preset[-1].upper(), 1.0)
-    try:
-        return (float(preset[:-1]) * scale, preset)
-    except ValueError:
-        return (float("inf"), preset)
-
-
-def _write_jobs(
-    out: Path,
-    phase: str,
-    runs: list[RunSpec],
-    slurm: SlurmConfig,
-    phase_json: Path,
-) -> list[SubmitEntry]:
-    """Write one array job per preset plus a dependent analyze job.
-
-    Slurm job arrays require homogeneous resources and node count varies by preset, so a phase
-    spanning several presets (``transfer``) emits one array each, with a single analyze job
-    depending on all of them.
-
-    Returns:
-        The submission entries, in dependency order.
-    """
-    jobs = out / "jobs"
-    jobs.mkdir(parents=True, exist_ok=True)
-    presets = sorted({str(run.params["preset"]) for run in runs}, key=_preset_sort_key)
-    entries: list[SubmitEntry] = []
-    for preset in presets:
-        group = [run for run in runs if str(run.params["preset"]) == preset]
-        index_file = jobs / f"{preset}.jobs"
-        index_file.write_text("\n".join(run.id for run in group) + "\n")
-        spec = JobSpec(
-            name=f"oplm-{phase}-{preset}",
-            nodes=slurm.nodes.resolve(phase=phase, preset=preset),
-            time_limit=slurm.time_limit.resolve(phase=phase, preset=preset),
-            command=accelerate_command(
-                module="oplm.sweep.run",
-                gpus_per_node=slurm.gpus_per_node,
-                args='--config "$RUN_DIR/run.yaml" --result "$RUN_DIR/result.json"',
-            ),
-            array_size=len(group),
-            array_index_file=index_file,
-            base_dir=out,
-        )
-        script = jobs / f"{preset}.sbatch"
-        script.write_text(render_job(spec, slurm))
-        entries.append(SubmitEntry(var=f"A_{preset}", script=Path("jobs") / script.name))
-
-    analyze_spec = JobSpec(
-        name=f"oplm-{phase}-analyze",
-        nodes=1,
-        time_limit=slurm.time_limit.resolve(phase="analyze", preset=None),
-        command=f"oplm sweep analyze {phase_json}",
-        gres=False,
-    )
-    analyze_script = jobs / "analyze.sbatch"
-    analyze_script.write_text(render_job(analyze_spec, slurm))
-    entries.append(
-        SubmitEntry(
-            var="ANALYZE",
-            script=Path("jobs") / analyze_script.name,
-            depends_on=tuple(entry.var for entry in entries),
-        )
-    )
-
-    submit_path = jobs / "submit.sh"
-    submit_path.write_text(render_submit_script(entries))
-    submit_path.chmod(0o755)
-    return entries
-```
-
-Add to the imports in `phases.py`:
-
-```python
-from oplm.slurm.render import (
-    JobSpec,
-    SubmitEntry,
-    accelerate_command,
-    render_job,
-    render_submit_script,
-)
-from oplm.slurm.submit import submit_all
-```
-
-- [ ] **Step 5: Wire it into `_generate_phase` and the commands**
-
-In `_generate_phase`, set `oplm_version` and `generated_at` on the manifest before `write_phase`:
-
-```python
-    from datetime import UTC, datetime
-    from importlib.metadata import version
-
-    manifest = PhaseManifest(
-        version=1,
-        phase=name,
-        metric=_resolve_metric(base_config, metric),
-        source=str(relative_path(source, out)) if source is not None else None,
-        runs=runs,
-        ranking=[],
-        selected=[],
-        oplm_version=version("oplm"),
-        generated_at=datetime.now(tz=UTC).isoformat(),
-    )
-```
-
-After `write_phase`, call `_write_jobs(out, name, runs, slurm, phase_path)`. Add a
-`submit: bool = False` parameter to `_generate_phase`; when true, call
-`submit_all(entries, base_dir=out)`, store the returned ids on `manifest.job_ids`, and
-`write_phase` again.
-
-Add to every phase command signature except `scale`:
-
-```python
-    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
-```
-
-Thread it into `_generate_phase`. Keep `--local` working unchanged: when `--local` is passed, run
-the commands sequentially and analyze as today. Passing `--local` and `--submit` together is an
-error:
-
-```python
-        if local and submit:
-            raise ValueError("--local and --submit are mutually exclusive")
-```
-
-- [ ] **Step 6: Run to verify pass**
-
-Run: `python -m pytest tests/sweep -q`
-Expected: PASS.
-
-- [ ] **Step 7: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/ && python -m pytest tests -q -m "not slow"
-git add -A src/oplm tests
-git commit -m "feat: emit per-preset slurm arrays and a dependent analyze job"
-```
-
-### Task 12: `oplm sweep status`
-
-**Files:**
-- Modify: `src/oplm/sweep/phases.py`
-- Test: `tests/sweep/test_status.py`
-
-**Interfaces:**
-- Produces: `oplm sweep status <phase.json>` printing per-cell state and a resubmit line.
-
-- [ ] **Step 1: Write the failing test**
-
-`tests/sweep/test_status.py`:
-
-```python
-from __future__ import annotations
-
-import json
-from pathlib import Path
-
-from typer.testing import CliRunner
-
-from oplm.cli import app
-
-runner = CliRunner()
-
-
-def test_status_reports_cell_states_and_resubmit_line(coarse_phase: Path) -> None:
-    manifest = json.loads(coarse_phase.read_text())
-    runs = manifest["runs"]
-    # One complete, one non-finite, the rest missing.
-    for index, value in ((0, 3.0), (1, float("nan"))):
-        result_path = coarse_phase.parent / runs[index]["result"]
-        result_path.parent.mkdir(parents=True, exist_ok=True)
-        result_path.write_text(json.dumps({"eval": {"eval/heldout/loss": value}}))
-
-    result = runner.invoke(app, ["sweep", "status", str(coarse_phase)])
-    assert result.exit_code == 0
-    assert "complete" in result.stdout
-    assert "non-finite" in result.stdout
-    assert "missing" in result.stdout
-    # Indices 1..6 need rerunning: the non-finite one and the five with no result.
-    assert "--array=1,2,3,4,5,6" in result.stdout
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/sweep/test_status.py -q`
-Expected: FAIL — no `status` command.
-
-- [ ] **Step 3: Implement**
-
-Add to `src/oplm/sweep/phases.py`:
-
-```python
-@app.command()
-def status(
-    phase_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
-) -> None:
-    """Report per-cell state for one phase and print the resubmit line for incomplete cells."""
-    from rich.console import Console
-    from rich.table import Table
-
-    from oplm.slurm.submit import running_job_ids
-
-    console = Console()
-    path = phase_json.resolve()
-    phase = load_phase(path)
-    live = running_job_ids(list((phase.job_ids or {}).values()))
-
-    table = Table(title=f"{phase.phase} ({phase.metric})")
-    table.add_column("idx", justify="right")
-    table.add_column("cell")
-    table.add_column("state")
-    table.add_column(phase.metric, justify="right")
-
-    seen: dict[str, int] = {}
-    incomplete: dict[str, list[int]] = {}
-    for run in phase.runs:
-        preset = str(run.params["preset"])
-        index = seen.get(preset, 0)
-        seen[preset] = index + 1
-        value = result_metric(path.parent, run, phase.metric)
-        if value is not None:
-            state, shown = "complete", f"{value:.4f}"
-        else:
-            if (path.parent / run.result).exists():
-                state = "non-finite"
-            elif live:
-                state = "running"
-            else:
-                state = "missing"
-            shown = "-"
-            incomplete.setdefault(preset, []).append(index)
-        table.add_row(str(index), run.id, state, shown)
-    console.print(table)
-
-    for preset, indices in sorted(incomplete.items()):
-        listed = ",".join(str(index) for index in indices)
-        console.print(f"resubmit {preset}: sbatch --array={listed} jobs/{preset}.sbatch")
-```
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `python -m pytest tests/sweep/test_status.py -q`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/
-git add -A src/oplm/sweep tests/sweep
-git commit -m "feat: add oplm sweep status"
-```
-
----
-
-## Phase 8 — Resilience
-
-### Task 13: Auto-resume and version recording
-
-**Files:**
-- Modify: `src/oplm/sweep/run.py`, `src/oplm/training/mup.py`
-- Test: `tests/sweep/test_run.py`
-
-**Interfaces:**
-- Produces: `latest_checkpoint(output_dir: Path) -> Path | None` in `oplm/sweep/run.py`.
-- Produces: `result.json` gains an `oplm_version` key.
-
-- [ ] **Step 1: Write the failing tests**
-
-Add to `tests/sweep/test_run.py`:
-
-```python
-from oplm.sweep.run import latest_checkpoint
-
-
-def test_latest_checkpoint_none_when_empty(tmp_path: Path) -> None:
-    assert latest_checkpoint(tmp_path) is None
-
-
-def test_latest_checkpoint_missing_dir(tmp_path: Path) -> None:
-    assert latest_checkpoint(tmp_path / "nope") is None
-
-
-def test_latest_checkpoint_picks_numeric_max(tmp_path: Path) -> None:
-    """checkpoint-9000 must lose to checkpoint-10000: numeric, not lexicographic."""
-    for step in (1000, 9000, 10000):
-        (tmp_path / f"checkpoint-{step}").mkdir()
-    assert latest_checkpoint(tmp_path) == tmp_path / "checkpoint-10000"
-
-
-def test_latest_checkpoint_ignores_malformed_names(tmp_path: Path) -> None:
-    (tmp_path / "checkpoint-1000").mkdir()
-    (tmp_path / "checkpoint-final").mkdir()
-    (tmp_path / "checkpoint-").mkdir()
-    assert latest_checkpoint(tmp_path) == tmp_path / "checkpoint-1000"
-```
-
-Add to `tests/sweep/test_common.py` (or wherever `SweepMetricsCallback` is already covered):
-
-```python
-def test_result_json_records_installed_version(tmp_path: Path) -> None:
-    """oplm.__version__ is stale (0.0.1); the installed distribution version is what ran."""
-    import json
-    from importlib.metadata import version
-
-    from oplm.training.mup import SweepMetricsCallback
-
-    callback = SweepMetricsCallback(tmp_path / "result.json")
-    callback.on_train_end(_FakeTrainer())
-    payload = json.loads((tmp_path / "result.json").read_text())
-    assert payload["oplm_version"] == version("oplm")
-```
-
-Write `_FakeTrainer` in the test file as a minimal stand-in exposing exactly the attributes
-`on_train_end` reads at `src/oplm/training/mup.py:278` — at minimum `cfg.train.batch_size`,
-`cfg.train.gradient_accumulation_steps`, `cfg.train.lr`, `cfg.model.hidden_size`,
-`accelerator.num_processes`, and `global_step`. Read that method first and match it exactly.
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `python -m pytest tests/sweep/ -q -k "checkpoint or installed_version"`
-Expected: FAIL — `ImportError: cannot import name 'latest_checkpoint'`.
-
-- [ ] **Step 3: Implement checkpoint discovery and auto-resume**
-
-Rewrite `src/oplm/sweep/run.py`:
-
-```python
-"""Run one fully resolved μP sweep cell under Accelerate."""
-
-from __future__ import annotations
-
-from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime.
-from typing import Annotated
-
-import typer
-
-app = typer.Typer(name="mup-run", help=__doc__, add_completion=False)
-
-_CHECKPOINT_PREFIX = "checkpoint-"
-
-
-def latest_checkpoint(output_dir: Path) -> Path | None:
-    """Return the highest-step checkpoint under ``output_dir``, or ``None``.
-
-    Checkpoints are named ``checkpoint-<global_step>`` (see
-    ``oplm.training.trainer.Trainer._save_checkpoint``), so ordering is numeric on the suffix —
-    lexicographic ordering would rank ``checkpoint-9000`` above ``checkpoint-10000``.
-    """
-    if not output_dir.is_dir():
-        return None
-    candidates: list[tuple[int, Path]] = []
-    for path in output_dir.glob(f"{_CHECKPOINT_PREFIX}*"):
-        if not path.is_dir():
-            continue
-        suffix = path.name.removeprefix(_CHECKPOINT_PREFIX)
-        if suffix.isdigit():
-            candidates.append((int(suffix), path))
-    if not candidates:
-        return None
-    return max(candidates)[1]
-
-
-@app.command()
-def main(
-    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
-    result: Annotated[Path, typer.Option("--result", dir_okay=False)],
-) -> None:
-    """Train one resolved config and write its sweep result.
-
-    Idempotent under Slurm ``--requeue``: if the cell's output directory already holds a
-    checkpoint and the config does not pin ``resume_from``, training resumes from the newest one
-    rather than restarting at step 0.
-    """
-    from oplm.train import _bootstrap_training_environment
-
-    _bootstrap_training_environment()
-
-    from oplm.config import load_config
-    from oplm.training.mup import SweepMetricsCallback
-    from oplm.training.trainer import Trainer
-
-    cfg = load_config(["--config", str(config)])
-    if cfg.train.resume_from is None:
-        checkpoint = latest_checkpoint(Path(cfg.train.output_dir))
-        if checkpoint is not None:
-            cfg.train.resume_from = str(checkpoint)
-    Trainer(cfg, callbacks=[SweepMetricsCallback(result)]).train()
+    from oplm.data.sequence.collate import MLMCollator
+    from oplm.data.sequence.dataset import ShardedProteinDataset
+    from oplm.data.tokenizer import get_tokenizer
+    from torch.utils.data import DataLoader
+
+    dataset = ShardedProteinDataset(fixture_path, seed=0)
+    collator = MLMCollator(get_tokenizer(), max_length=64, keep_sequence_ids=True)
+    dataloader = DataLoader(dataset, batch_size=4, collate_fn=collator, num_workers=2)
+    dataloader = accelerator.prepare(dataloader)
+
+    seen: list[str] = []
+    for batch in dataloader:
+        seen.extend(batch["sequence_ids"])
+    rank = accelerator.process_index
+    Path(out_dir, f"rank{rank}.json").write_text(json.dumps(seen))
 
 
 if __name__ == "__main__":
-    app()
+    main(sys.argv[1], sys.argv[2])
 ```
 
-- [ ] **Step 4: Record the installed version in `result.json`**
+  If `MLMCollator` has no way to surface `sequence_id`s, add a private
+  `keep_sequence_ids: bool = False` flag to it (returns them as a plain list in the batch dict,
+  excluded from tensor collation) — that flag is also needed by Task 3.4.
 
-In `src/oplm/training/mup.py`, inside `SweepMetricsCallback.on_train_end`, before building
-`payload`:
+- [ ] **Step 2: Write the test** — launch the worker, load both rank files, assert the invariant
+  we *want*: `set(rank0) ∪ set(rank1)` equals the full fixture id set and
+  `set(rank0) ∩ set(rank1)` is empty. Mark `@pytest.mark.slow`:
 
 ```python
-        from importlib.metadata import PackageNotFoundError, version
-
-        try:
-            oplm_version: str | None = version("oplm")
-        except PackageNotFoundError:  # pragma: no cover - only from a bare checkout
-            oplm_version = None
-```
-
-and add `"oplm_version": oplm_version` to the `payload` dict. Generated scripts install oplm
-unpinned, so this is what makes version drift across a multi-week sweep detectable after the fact.
-
-- [ ] **Step 5: Run to verify pass**
-
-Run: `python -m pytest tests/sweep -q`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/ && python -m pytest tests -q -m "not slow"
-git add -A src/oplm tests
-git commit -m "feat: resume sweep cells from checkpoint and record oplm version"
-```
-
----
-
-## Phase 9 — `scale` as a thin caller
-
-### Task 14: Rewrite `scale` to delegate to `oplm.slurm`
-
-**Files:**
-- Modify: `src/oplm/sweep/phases.py` (`scale` command; delete `_scale_cells`)
-- Test: `tests/sweep/test_scale.py`
-
-**Interfaces:**
-- Produces: `oplm sweep scale --from <confirm/phase.json> --config configs/scaling.yaml
-  --presets 170M,400M,800M,1B --out <dir>` writing `<dir>/<preset>/run.yaml` and
-  `<dir>/jobs/oplm-<preset>-scale.sbatch`, and submitting nothing.
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/sweep/test_scale.py`:
-
-```python
-from __future__ import annotations
-
 import json
+import subprocess
+import sys
 from pathlib import Path
 
-from typer.testing import CliRunner
-
-from oplm.cli import app
-from oplm.config import load_config
-
-runner = CliRunner()
-SCALING = str(Path(__file__).resolve().parents[2] / "configs" / "scaling.yaml")
+import pytest
 
 
-def _run_scale(confirm_phase: Path, out: Path, presets: str) -> None:
-    result = runner.invoke(
-        app,
+@pytest.mark.slow
+def test_prepared_dataloader_covers_dataset_exactly_once(tmp_path, fixture_parquet_dir):
+    worker = Path(__file__).with_name("_double_sharding_worker.py")
+    subprocess.run(
         [
-            "sweep", "scale",
-            "--from", str(confirm_phase),
-            "--config", SCALING,
-            "--presets", presets,
-            "--out", str(out),
+            sys.executable, "-m", "torch.distributed.run",
+            "--nproc_per_node=2", "--rdzv_backend=c10d", "--rdzv_endpoint=localhost:0",
+            str(worker), str(fixture_parquet_dir), str(tmp_path),
         ],
+        check=True,
+        timeout=300,
     )
-    assert result.exit_code == 0, result.stdout
-
-
-def test_scale_writes_one_script_per_preset(confirm_phase: Path, tmp_path: Path) -> None:
-    out = tmp_path / "scale"
-    _run_scale(confirm_phase, out, "170M,400M")
-    for preset, nodes in (("170M", 4), ("400M", 8)):
-        script = out / "jobs" / f"oplm-{preset}-scale.sbatch"
-        assert script.exists()
-        text = script.read_text()
-        assert f"#SBATCH --nodes={nodes}" in text
-        # Not an array: one long production run per preset.
-        assert "--array" not in text
-
-
-def test_scale_carries_the_confirmed_winner(confirm_phase: Path, tmp_path: Path) -> None:
-    out = tmp_path / "scale"
-    _run_scale(confirm_phase, out, "170M")
-    cfg = load_config(["--config", str(out / "170M" / "run.yaml")])
-    winner = json.loads(confirm_phase.read_text())["selected"][0]
-    assert cfg.train.lr == winner["lr"]
-    assert cfg.train.mup_depth_lr_exponent == winner["depth_exponent"]
-    assert cfg.model.mup_output_mult == winner["output_mult"]
-
-
-def test_scale_keeps_the_full_eval_suite(confirm_phase: Path, tmp_path: Path) -> None:
-    """Sweep cells run one eval; scale runs the production suite."""
-    out = tmp_path / "scale"
-    _run_scale(confirm_phase, out, "170M")
-    cfg = load_config(["--config", str(out / "170M" / "run.yaml")])
-    assert set(cfg.data.eval) >= {"uniref70", "omg70", "deepclust30", "casp14"}
-
-
-def test_scale_has_no_submit_flag(confirm_phase: Path, tmp_path: Path) -> None:
-    result = runner.invoke(
-        app,
-        ["sweep", "scale", "--from", str(confirm_phase), "--config", SCALING,
-         "--presets", "170M", "--out", str(tmp_path / "scale"), "--submit"],
-    )
-    assert result.exit_code != 0
+    rank0 = set(json.loads((tmp_path / "rank0.json").read_text()))
+    rank1 = set(json.loads((tmp_path / "rank1.json").read_text()))
+    all_ids = _fixture_ids(fixture_parquet_dir)
+    assert rank0 | rank1 == all_ids, "rows lost: double-sharding is real"
+    assert not (rank0 & rank1), "rows duplicated across ranks"
 ```
 
-- [ ] **Step 2: Run to verify failure**
+  Reuse the repo's existing parquet fixtures (see `tests/data/` conftest); `_fixture_ids` reads
+  the fixture with pyarrow directly.
 
-Run: `python -m pytest tests/sweep/test_scale.py -q`
-Expected: FAIL — `scale` still generates sweep cells and accepts `--submit`.
+- [ ] **Step 3: Run it** — `python -m pytest tests/data/test_double_sharding.py -v -m slow`.
+  Record the verdict (pass = no bug; fail with missing rows = bug confirmed, expected per audit).
+- [ ] **Step 4: Commit** the test with the verdict in the commit message (`test:` prefix). If the
+  bug is confirmed, the test stays red until Task 0.2 lands — commit it `xfail`-marked with
+  `strict=True` and remove the marker in Task 0.2.
 
-- [ ] **Step 3: Rewrite the `scale` command**
+### Task 0.2: Single-striping fix — keep the dataloader out of accelerate's sharding
 
-Delete `_scale_cells` and replace the `scale` command:
+**Only if Task 0.1 confirms the bug.** If 0.1 passes (accelerate skips re-sharding in this
+configuration), close this task with a comment in `loaders.py` documenting why, and move on.
+
+**Files:**
+- Modify: `src/oplm/training/trainer.py:146` (prepare call), `src/oplm/data/sequence/loaders.py`
+- Test: `tests/data/test_double_sharding.py` (goes green), existing `tests/training/test_e2e_*`
+
+**Interfaces:**
+- Produces: `oplm.data.sequence.loaders.DeviceDataLoader` — thin wrapper with
+  `__iter__` (moves batch tensors to `device`, `non_blocking=True`), `set_epoch(epoch)`
+  (forwards to `.dataset`), `.dataset` property, and `__len__` delegation.
+- Consumes: nothing new. Later tasks treat `trainer.dataloader` as this wrapper.
+
+- [ ] **Step 1:** Add `DeviceDataLoader` to `loaders.py`:
 
 ```python
-@app.command()
-def scale(
-    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
-    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
-    out: Annotated[Path, typer.Option("--out", file_okay=False)],
-    presets: Annotated[str, typer.Option("--presets")] = "170M,400M,800M,1B",
-) -> None:
-    """Write per-preset scaling job scripts carrying the confirmed winner.
+class DeviceDataLoader:
+    """Device-placement wrapper for a self-sharding dataloader.
 
-    Generates only. These runs are 100k steps at production batch — days to weeks each, and
-    multi-node — so the operator reviews and submits them on their own schedule. ``--config`` is
-    an ordinary training config (see ``configs/scaling.yaml``) with no μP sweep concepts in it;
-    this command's only job is to carry four hyperparameters across without hand-transcription.
+    ``ShardedProteinDataset`` stripes rows over the joint (rank, worker) index itself, so the
+    training dataloader must NOT pass through ``accelerator.prepare`` — accelerate would wrap the
+    IterableDataset in ``IterableDatasetShard`` and stripe a second time (each rank would then see
+    1/N of its already-1/N stripe). This wrapper supplies the only two things ``prepare`` was
+    providing: device placement and ``set_epoch`` forwarding.
     """
-    try:
-        selected = load_phase(source).selected
-        if not selected:
-            raise ValueError(f"source phase {source} has no selected winner; analyze it first")
-        winner = selected[0]
-        slurm = load_slurm_config(config)
-        out = out.resolve()
-        jobs = out / "jobs"
-        jobs.mkdir(parents=True, exist_ok=True)
-        for preset in _parse_strings(presets, name="--presets"):
-            run_dir = out / preset
-            run_dir.mkdir(parents=True, exist_ok=True)
-            overrides = [
-                f"model.mup_output_mult={winner['output_mult']}",
-                f"train.lr={winner['lr']}",
-                f"train.mup_depth_lr_exponent={winner['depth_exponent']}",
-                f"train.output_dir={run_dir / 'output'}",
-                f"train.wandb_run_name=oplm-{preset}-scale",
-            ]
-            cfg = load_config(["--config", str(config), "--preset", preset, *overrides])
-            run_yaml = run_dir / "run.yaml"
-            run_yaml.write_text(serialize_config(cfg))
-            name = f"oplm-{preset}-scale"
-            spec = JobSpec(
-                name=name,
-                nodes=slurm.nodes.resolve(phase="scale", preset=preset),
-                time_limit=slurm.time_limit.resolve(phase="scale", preset=preset),
-                command=accelerate_command(
-                    module="oplm.train",
-                    gpus_per_node=slurm.gpus_per_node,
-                    args=f"--config {run_yaml}",
-                ),
-            )
-            (jobs / f"{name}.sbatch").write_text(render_job(spec, slurm))
-        typer.echo(f"wrote {len(list(jobs.glob('*.sbatch')))} scaling scripts to {jobs}")
-        typer.echo("review and submit them yourself; `scale` does not submit")
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+
+    def __init__(self, dataloader: DataLoader, device: torch.device) -> None:
+        self._dataloader = dataloader
+        self._device = device
+
+    @property
+    def dataset(self):  # noqa: ANN201 — mirrors DataLoader.dataset
+        return self._dataloader.dataset
+
+    def __len__(self) -> int:
+        return len(self._dataloader)
+
+    def set_epoch(self, epoch: int) -> None:
+        set_epoch = getattr(self._dataloader.dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+
+    def __iter__(self):
+        for batch in self._dataloader:
+            yield {
+                k: v.to(self._device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [ ] **Step 2:** In `Trainer.__init__`, remove `dataloader` from the `accelerator.prepare(...)`
+  call and wrap instead: `self.dataloader = DeviceDataLoader(dataloader, self.accelerator.device)`
+  (adjust the `prepared` tuple indexing — model, optimizers, schedulers only). Add a comment
+  noting the gradient-accumulation caveat: without a prepared dataloader, accelerate cannot
+  detect end-of-dataloader for a partial final accumulation window; the training stream is
+  effectively infinite (epoch rollover re-iterates), so no partial window ever syncs — same
+  semantics as before for `gradient_accumulation_steps == 1`, and for >1 the tail micro-batches
+  of an epoch simply roll into the next window.
+- [ ] **Step 3:** Un-`xfail` the 0.1 test; run
+  `python -m pytest tests/data/test_double_sharding.py -m slow tests/training/ -v`. The e2e
+  training tests must still pass (single-process behavior is unchanged: accelerate never sharded
+  at world size 1).
+- [ ] **Step 4:** Run all CI gates. Commit (`fix: stop double-striping the train dataloader under
+  accelerate.prepare`).
 
-Run: `python -m pytest tests/sweep/test_scale.py -q`
-Expected: PASS.
+### Task 0.3: Muon-under-FSDP2 spike
 
-- [ ] **Step 5: Commit**
+**Files:**
+- Create: `tests/training/test_fsdp2_muon_spike.py` (slow; doubles as the spike artifact)
+- Modify: `docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md` §7 (record verdict)
 
-```bash
-ruff check src/ && ruff format --check src/ && ty check src/ && python -m pytest tests -q -m "not slow"
-git add -A src/oplm tests
-git commit -m "feat: make scale a generate-only caller over oplm.slurm"
-```
+**Interfaces:**
+- Produces: a recorded decision for Phase 5 — `torch.optim.Muon` works on DTensor params as-is,
+  or Phase 5 must carry a gather→Newton–Schulz→scatter adapter.
+
+- [ ] **Step 1:** Write a 2-process CPU/gloo subprocess test (same launch pattern as Task 0.1):
+  build a 2-layer `nn.Linear` stack, `fully_shard` it over a 1-D mesh, construct
+  `torch.optim.Muon` over the (now DTensor) 2-D params, run 3 forward/backward/step iterations,
+  and assert (a) no exception, (b) params changed, (c) the loss decreased on a fixed toy
+  regression target. Wrap the Muon construction in `try/except NotImplementedError | RuntimeError`
+  and make the test **record** rather than fail: `pytest.skip(f"Muon+DTensor unsupported: {e}")`
+  so the suite stays green either way — the *verdict* is the skip/pass outcome.
+- [ ] **Step 2:** Run it; also try `get_state_dict(model, [muon])` on the sharded model to verify
+  the optimizer state round-trips through the Phase-2 checkpoint path.
+- [ ] **Step 3:** Record the outcome in spec §7 (one paragraph: works as-is / needs adapter /
+  needs torchtitan-style distributed Muon) and in this file next to Task 5.2.
+- [ ] **Step 4:** Commit (`test: record Muon-under-FSDP2 spike verdict`).
 
 ---
 
-## Phase 10 — Documentation and verification
+## Phase 1 — Resilience on the current checkpoint format
 
-### Task 15: Write `docs/SLURM.md` and update the μP docs
+Everything in this phase works with `accelerator.save_state` unchanged. **After Phase 1, a
+512-GPU DDP run survives failures automatically.**
+
+### Task 1.1: Commit protocol + shared committed-only discovery
 
 **Files:**
-- Create: `docs/SLURM.md`
-- Modify: `docs/LR_SWEEP.md`, `docs/MUP.md:221`, `docs/TRAIN.md`, `AGENTS.md`
+- Modify: `src/oplm/training/checkpoint.py`, `src/oplm/sweep/run.py:15-40`
+- Test: `tests/training/test_commit_protocol.py`, existing `tests/training/test_checkpoint.py`,
+  `tests/sweep/test_run.py`
 
-- [ ] **Step 1: Write `docs/SLURM.md`**
+**Interfaces:**
+- Produces:
+  - `oplm.training.checkpoint.latest_checkpoint(output_dir: Path) -> Path | None` — newest
+    committed `checkpoint-<step>` by numeric suffix; ignores `*.tmp` and non-numeric names.
+    (Moved from `oplm.sweep.run`; sweep imports it from here.)
+  - `save_checkpoint(...)` now writes into `checkpoint-<step>.tmp/`, barriers, then rank 0
+    renames to `checkpoint-<step>/` and rewrites `<output_dir>/latest` (one line, the checkpoint
+    dir name) via a temp file + `os.replace`.
+- Consumes: existing `save_checkpoint` signature (unchanged for callers).
 
-Operator documentation for the general layer, containing **no μP content**. Cover, in this order:
-the `slurm:` block schema with every field and its default; the three accepted forms for `nodes`
-and `time_limit`; how per-device batch and accumulation are derived and why an indivisible
-configuration is an error; the single launcher form and why it degrades to one node; job arrays
-and the homogeneous-resource constraint; `afterany` versus `afterok` and why the former is
-correct; `--requeue` plus checkpoint resume; and `oplm slurm generate|submit|status` with worked
-examples against `configs/scaling.yaml`.
+- [ ] **Step 1: Write failing tests:**
 
-- [ ] **Step 2: Rewrite the execution sections of `docs/LR_SWEEP.md`**
-
-Replace "Local eight-GPU run" and "SUNK/Slurm use" with a Slurm workflow that references
-`SLURM.md` rather than restating it. Include:
-
-- the per-phase command sequence, with `--submit` on `smoke`/`coarse`/`refine`/`replicate` and
-  review-then-`submit.sh` on `transfer`/`bridge`/`confirm`;
-- the node and derived-batch table from the spec;
-- `oplm sweep status` and the resubmit line;
-- the new grid, with a sentence on why it moved (the 170M coarse winner sat on the old grid's
-  lower boundary, and `analyze` only selects a refinement region when the winner is interior);
-- a correction to the "keep exactly one named sequence eval task" instruction: that holds for the
-  proxy phases, while `scale` uses the full suite from `configs/scaling.yaml`;
-- the updated phase table, with `scale` marked generate-only;
-- a note that wall-time estimates derive from a single 170M measurement and that cells now pin
-  full gradient checkpointing, so they are order-of-magnitude guidance.
-
-Keep the existing "Parameterization gates", "Depth-LR exponent grid", "Stability diagnostics",
-"Deep stability probe", "Head-count control", "Phase artifacts", "Selection protocol", and
-"Production WSD schedule" sections, updating command names from `python -m scripts.mup_*` to
-`oplm sweep *`.
-
-- [ ] **Step 3: Update the remaining docs**
-
-- `docs/MUP.md:221`: point at `oplm sweep` and `docs/SLURM.md`.
-- `docs/TRAIN.md`: add a link to `SLURM.md` from the distributed-launch section.
-- `AGENTS.md`: record that job generation lives in `src/oplm/slurm/`, sweep tooling in
-  `src/oplm/sweep/`, and that `scripts/` no longer exists.
-
-- [ ] **Step 4: Verify every documented command exists**
-
-```bash
-oplm slurm generate --help && oplm slurm submit --help && oplm slurm status --help
-oplm sweep smoke --help && oplm sweep coarse --help && oplm sweep refine --help
-oplm sweep replicate --help && oplm sweep transfer --help && oplm sweep bridge --help
-oplm sweep confirm --help && oplm sweep scale --help && oplm sweep analyze --help
-oplm sweep status --help && oplm sweep coord-check --help
-```
-Expected: all exit 0.
-
-- [ ] **Step 5: Verify no stale references remain**
-
-Run: `grep -rn "scripts/mup_\|scripts\.mup_\|python -m scripts" docs/*.md AGENTS.md README.md`
-Expected: no output.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add -A docs AGENTS.md
-git commit -m "docs: document the slurm layer and the recentered sweep"
+```python
+def test_save_checkpoint_commits_via_rename(tiny_trainer_cfg, tmp_path):
+    # after save: committed dir exists, no *.tmp remains, latest points at it
+    ...
+def test_torn_tmp_dir_is_invisible(tmp_path):
+    (tmp_path / "checkpoint-500.tmp").mkdir()
+    (tmp_path / "checkpoint-300").mkdir()
+    assert latest_checkpoint(tmp_path) == tmp_path / "checkpoint-300"
+def test_rotation_ignores_tmp_dirs(tmp_path):
+    # a .tmp dir neither counts toward the limit nor gets deleted
+    ...
+def test_sweep_run_uses_committed_only(tmp_path):
+    # sweep.run.latest_checkpoint is the shared function (identity check)
+    ...
 ```
 
-### Task 16: Full-suite verification
+- [ ] **Step 2:** Run to verify failure (`latest_checkpoint` not in `oplm.training.checkpoint`).
+- [ ] **Step 3: Implement.** In `save_checkpoint`: `tmp_dir = Path(output_dir) /
+  f"checkpoint-{global_step}.tmp"`; point `accelerator.save_state`, `trainer_state.json`,
+  `config.yaml`, and the `hf/` export at `tmp_dir`; then:
 
-- [ ] **Step 1: Run every CI gate**
+```python
+    accelerator.wait_for_everyone()  # every rank finished writing into tmp_dir
+    if accelerator.is_main_process:
+        final_dir = tmp_dir.with_name(f"checkpoint-{global_step}")
+        if final_dir.exists():  # re-save at same step after requeue: replace atomically-enough
+            shutil.rmtree(final_dir)
+        tmp_dir.rename(final_dir)
+        _write_latest_pointer(Path(output_dir), final_dir.name)
+        _rotate_checkpoints(Path(output_dir), save_total_limit)
+    accelerator.wait_for_everyone()
+```
+
+  `_rotate_checkpoints` and the moved `latest_checkpoint` both filter with
+  `d.name.startswith("checkpoint-") and not d.name.endswith(".tmp") and suffix.isdigit()`.
+  Also add stale-tmp cleanup at trainer start (main process): delete `checkpoint-*.tmp` dirs in
+  `output_dir` — they are by definition torn.
+- [ ] **Step 4:** Update `sweep/run.py` to `from oplm.training.checkpoint import
+  latest_checkpoint` (delete the local copy; keep `_CHECKPOINT_PREFIX` references working).
+- [ ] **Step 5:** Run `python -m pytest tests/training/test_commit_protocol.py
+  tests/training/test_checkpoint.py tests/sweep/ -v` → PASS. Run CI gates. Commit
+  (`feat: atomic checkpoint commit + committed-only discovery`).
+
+### Task 1.2: Cadence and retention config
+
+**Files:**
+- Modify: `src/oplm/config.py` (TrainConfig, ~line 82-90 block + `__post_init__`),
+  `src/oplm/training/checkpoint.py` (`_rotate_checkpoints`)
+- Test: `tests/training/test_commit_protocol.py`, `tests/test_config.py` (or wherever TrainConfig
+  validation tests live — mirror existing patterns)
+
+**Interfaces:**
+- Produces (spec §8): `TrainConfig.save_every_minutes: int | None = None`,
+  `keep_every_n_steps: int | None = None`, `keep_every_n_hours: float | None = None`,
+  `auto_resume: bool = False`, `resume_data_position: bool = True`,
+  `dist_timeout_minutes: int = 15`, `remote_checkpoint_uri: str | None = None`.
+  Validation: the three cadence/keep values must be `> 0` when set.
+- Produces: `_rotate_checkpoints(output_dir, save_total_limit, *, keep_every_n_steps=None)` —
+  a checkpoint is permanent (never rotated) if `step % keep_every_n_steps == 0` or a `KEEP`
+  marker file exists in the checkpoint dir.
+- Produces: `mark_permanent(checkpoint_dir: Path) -> None` — writes the `KEEP` marker (used by
+  the trainer for the hours rule, Task 1.3).
+
+- [ ] **Step 1: Failing tests:** config round-trip + validation errors for each new field;
+  rotation with `save_total_limit=1, keep_every_n_steps=100` over dirs
+  `checkpoint-100, -150, -200, -250` deletes only `-150` (`-250` is newest, `-100`/`-200`
+  permanent); a `KEEP`-marked dir survives regardless of step.
+- [ ] **Step 2:** Run → FAIL.
+- [ ] **Step 3:** Implement fields + validation + rotation exemptions. Thread
+  `keep_every_n_steps` through `save_checkpoint`'s call to `_rotate_checkpoints`.
+- [ ] **Step 4:** Run → PASS. CI gates. Commit (`feat: time/step retention knobs and
+  permanent-checkpoint exemptions`).
+
+### Task 1.3: Control-bundle reduce + time-based save trigger
+
+**Files:**
+- Modify: `src/oplm/training/trainer.py` (train loop, ~lines 356-407; `_save_checkpoint`)
+- Test: extend `tests/training/test_e2e_checkpoint.py`
+
+**Interfaces:**
+- Produces: `Trainer._reduce_step_flags(local_tokens: int) -> _StepFlags` where
+
+```python
+@dataclass(frozen=True)
+class _StepFlags:
+    tokens_delta: int
+    drain: bool        # any rank saw SIGUSR1/SIGTERM or the SLURM_JOB_END_TIME margin
+    nonfinite: bool    # any rank's step loss was non-finite
+    save_due: bool     # any rank's save_every_minutes timer fired
+```
+
+  Implementation: one `accelerator.reduce` (sum) over a 4-element long tensor
+  `[local_tokens, drain_flag, nonfinite_flag, time_due_flag]`, replacing the existing
+  tokens-only reduce at `trainer.py:359-362`. Sum > 0 ⇒ flag set. This is the single
+  rank-synchronization point the drain (1.5) and guardrail (1.8) tasks plug into; per-rank clock
+  skew is harmless because *any* rank's timer firing triggers everyone.
+- Produces: trainer state `self._last_save_at: float` (monotonic, reset after every checkpoint)
+  and `self._first_checkpoint_at: float | None` persisted into `trainer_state.json` as
+  `first_checkpoint_unix` (wall clock) so the `keep_every_n_hours` anchor survives requeue.
+- Consumes: `mark_permanent` from Task 1.2.
+
+- [ ] **Step 1: Failing test:** pilot config with `save_every=0, save_every_minutes=1`, patch
+  `time.monotonic` (autouse-style monotonic fake advancing 30 s per step) → checkpoint appears at
+  the step where 60 s elapses; second test: `keep_every_n_hours=1` with a fake clock crossing the
+  1 h boundary → that checkpoint dir contains `KEEP`.
+- [ ] **Step 2:** Run → FAIL.
+- [ ] **Step 3:** Implement `_StepFlags` + `_reduce_step_flags`; checkpoint trigger becomes:
+
+```python
+                step_saved = cfg.save_every > 0 and self.global_step % cfg.save_every == 0
+                if step_saved or flags.save_due:
+                    self._save_checkpoint()
+```
+
+  In `_save_checkpoint`, after saving: update `self._last_save_at`; set
+  `self._first_checkpoint_at` if unset (loading it back on resume from `trainer_state.json`);
+  apply the hours rule — if `keep_every_n_hours` is set and
+  `(now_wall - first_checkpoint_unix)` has crossed a new multiple of `keep_every_n_hours * 3600`
+  since the last permanent-by-time mark (track `last_time_keep_index` in `trainer_state.json`),
+  call `mark_permanent(checkpoint_dir)`.
+- [ ] **Step 4:** Run new + existing e2e checkpoint tests → PASS. CI gates. Commit
+  (`feat: wall-clock checkpoint cadence on a rank-synchronized control bundle`).
+
+### Task 1.4: Auto-resume in `oplm.train`
+
+**Files:**
+- Modify: `src/oplm/training/trainer.py:263-266`, `src/oplm/slurm/cli.py:77-79`,
+  `src/oplm/sweep/phases.py` (train-args builders), `src/oplm/sweep/run.py`
+- Test: extend `tests/training/test_e2e_checkpoint.py`, `tests/slurm/test_cli.py`,
+  `tests/sweep/test_run.py`
+
+**Interfaces:**
+- Consumes: `latest_checkpoint` (Task 1.1).
+- Produces: `Trainer.__init__` resume block becomes:
+
+```python
+        resume_target = cfg.train.resume_from
+        if resume_target is None and cfg.train.auto_resume:
+            found = latest_checkpoint(Path(cfg.train.output_dir))
+            if found is not None:
+                resume_target = str(found)
+                _status(f"[dim]Auto-resuming from {found.name}[/dim]")
+        if resume_target is not None:
+            self._resume_from_checkpoint(resume_target)
+```
+
+  (Remote resolution is appended here in Task 4.2.)
+
+- [ ] **Step 1: Failing tests:** (a) e2e: train 4 steps with `auto_resume=true`, new
+  `Trainer(cfg)` with `resume_from=None` picks up at step 4; (b) fresh `output_dir` +
+  `auto_resume=true` starts at step 0 (no scan surprise); (c) `oplm slurm generate` output
+  contains `train.auto_resume=true` in the rendered command; (d) sweep-generated commands ditto.
+- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement; in `sweep/run.py`, replace the local
+  scan-and-set block with `cfg.train.auto_resume = True` before `Trainer(cfg)` (single code
+  path). **Step 4:** PASS + CI gates. Commit (`feat: opt-in auto-resume from newest committed
+  checkpoint`).
+
+### Task 1.5: Drain — signals, env clock, sync checkpoint, exit 85
+
+**Files:**
+- Create: `src/oplm/training/signals.py`
+- Modify: `src/oplm/training/trainer.py` (init + train loop + `finally`)
+- Test: `tests/training/test_signals.py`, `tests/training/test_e2e_drain.py`
+
+**Interfaces:**
+- Produces:
+
+```python
+DRAIN_EXIT_CODE = 85
+
+class DrainSignal:
+    """Set-a-flag drain trigger: SIGUSR1/SIGTERM handlers plus the Slurm end-time clock.
+
+    ``install()`` registers handlers (idempotent; chains any previous non-default handler).
+    ``requested`` is True once a signal arrived OR ``SLURM_JOB_END_TIME`` (unix seconds, exported
+    by Slurm and forwarded by ``--export=ALL``) minus ``margin_seconds`` has passed. Handlers only
+    set a bool — the only async-signal-safe action.
+    """
+
+    def __init__(self, *, margin_seconds: int = 600, env: Mapping[str, str] | None = None): ...
+    def install(self) -> None: ...
+    @property
+    def requested(self) -> bool: ...
+```
+
+- Consumes: `_StepFlags.drain` (Task 1.3) — trainer feeds `drain_signal.requested` into the
+  control bundle each step.
+- Produces: on `flags.drain`, the trainer saves synchronously and raises
+  `SystemExit(DRAIN_EXIT_CODE)`; the existing `finally:` (progress stop, `_emit_train_end`,
+  `accelerator.end_training`) runs on the way out, so W&B closes cleanly.
+
+- [ ] **Step 1: Failing unit tests** (`test_signals.py`): flag flips on
+  `os.kill(os.getpid(), signal.SIGUSR1)`; env clock with `SLURM_JOB_END_TIME = now + 300`,
+  `margin_seconds=600` → `requested` immediately True; no env, no signal → False;
+  `DRAIN_EXIT_CODE == 85`.
+- [ ] **Step 2: Failing e2e test** (`test_e2e_drain.py`): start a pilot `Trainer.train()` in a
+  thread is not signal-safe — instead run it in a **subprocess** (plain `sys.executable -m
+  oplm.train --config ...` on a tiny config with `max_steps=200, save_every=0`), wait for
+  `output_dir/config.yaml` + a first logged step (poll a `log_every=1` side-effect or just sleep
+  2 s), send SIGUSR1, assert: exit code 85, exactly one committed checkpoint exists, and a second
+  run with `auto_resume=true` resumes past that step (reuse Task 1.4's assertion helpers). Mark
+  slow.
+- [ ] **Step 3:** Implement `signals.py`; in trainer: instantiate + `install()` in `__init__`
+  (margin from a module constant 600 s for now); in the loop, right after
+  `flags = self._reduce_step_flags(...)`:
+
+```python
+                if flags.drain:
+                    self._save_checkpoint()
+                    logger.warning("Drain requested: checkpoint saved at step %d; exiting %d",
+                                   self.global_step, DRAIN_EXIT_CODE)
+                    raise SystemExit(DRAIN_EXIT_CODE)
+```
+
+  (Placed before the eval/periodic-save blocks so a drain never starts a long eval.)
+- [ ] **Step 4:** PASS + CI gates. Commit (`feat: drain-to-checkpoint on signal or walltime
+  margin, exit 85`).
+
+### Task 1.6: Requeue wrapper + Slurm directives
+
+**Files:**
+- Modify: `src/oplm/slurm/render.py` (`_header`, `render_job`, `JobSpec`),
+  `src/oplm/slurm/config.py` (`max_requeues: int = 20`, `nccl_debug: str = "WARN"`),
+  `src/oplm/slurm/cli.py`, `src/oplm/sweep/phases.py` (pass `progress_dir`)
+- Test: `tests/slurm/test_render.py`, `tests/slurm/test_requeue_wrapper.py` (bash-level)
+
+**Interfaces:**
+- Produces: `JobSpec.progress_dir: str | None = None` — shell-expandable string naming the
+  training output dir (plain path for single jobs; `"$RUN_DIR/..."` for sweep arrays), used by
+  the no-progress guard. `oplm slurm generate` fills it from `cfg.train.output_dir`;
+  `phases.py` from its per-run dir expression.
+- Produces: header gains `#SBATCH --signal=USR1@600` and `#SBATCH --open-mode=append`; body
+  gains a restart banner, `set +e` around the `srun`, and this wrapper after it:
 
 ```bash
-ruff check src/
-ruff format --check src/
-ty check src/
-python -m pytest -m "not slow" --cov=oplm
+STATUS=$?
+set -e
+if [ "$STATUS" -eq 0 ]; then
+  echo "training complete"
+  exit 0
+fi
+RESTARTS=${SLURM_RESTART_COUNT:-0}
+if [ "$RESTARTS" -ge <max_requeues> ]; then
+  echo "requeue budget (<max_requeues>) exhausted; exiting $STATUS" >&2
+  exit "$STATUS"
+fi
+STEP_FILE="<progress_dir>/.last_requeue_step"
+CURRENT_STEP=$(ls -d "<progress_dir>"/checkpoint-* 2>/dev/null \
+  | sed 's/.*checkpoint-//' | grep -E '^[0-9]+$' | sort -n | tail -1)
+CURRENT_STEP=${CURRENT_STEP:-0}
+if [ "$STATUS" -ne 85 ] && [ "$RESTARTS" -ge 1 ]; then
+  PREV_STEP=$(cat "$STEP_FILE" 2>/dev/null || echo -1)
+  if [ "$CURRENT_STEP" -le "$PREV_STEP" ]; then
+    echo "no checkpoint progress since last restart (step $CURRENT_STEP); crash loop — not requeueing" >&2
+    exit "$STATUS"
+  fi
+fi
+echo "$CURRENT_STEP" > "$STEP_FILE"
+echo "requeueing (exit=$STATUS, restarts=$RESTARTS, step=$CURRENT_STEP)"
+scontrol requeue "$SLURM_JOB_ID"
 ```
-Expected: all four pass. Do not claim completion on a partial run.
 
-- [ ] **Step 2: Confirm the acceptance criteria from the spec**
+  Restart banner right after `source <env_file>`:
+  `echo "=== $(date -Is) start; restart_count=${SLURM_RESTART_COUNT:-0} ==="`.
+  When `progress_dir` is `None`, omit the no-progress guard (requeue on budget only) — keeps the
+  layer usable for non-training jobs.
+- Note: the checkpoint-name `ls` scan here intentionally cannot see `.tmp` dirs as committed —
+  the glob matches them, so the `sed`/`grep -E '^[0-9]+$'` pipeline must run on the *basename
+  suffix*; `checkpoint-500.tmp` yields `500.tmp` which fails the numeric grep. Keep that property
+  (it is the shell-side mirror of committed-only discovery) and assert it in the bash test.
 
-Walk the nine acceptance criteria in
-`docs/superpowers/specs/2026-07-31-mup-sweep-slurm-design.md` and verify each against the built
-code. Any that cannot be demonstrated is unfinished work, not a documentation gap.
+- [ ] **Step 1: Failing render tests** (mirror existing `tests/slurm` text-assertion style):
+  header contains both new directives; body contains `scontrol requeue`; `max_requeues` value
+  interpolated; array jobs get `"$RUN_DIR"`-based `STEP_FILE`; no guard block when
+  `progress_dir=None`.
+- [ ] **Step 2: Failing bash test** (`test_requeue_wrapper.py`): extract the wrapper into a
+  rendered script against a `tmp_path` progress dir; execute with `bash` and fake `scontrol` /
+  `SLURM_*` env (write a stub `scontrol` recording its argv to a file, prepend to `PATH`).
+  Cases: exit 0 → no requeue; exit 85 → requeue even at high restart count below budget; exit 1
+  twice at same step → second invocation does NOT requeue; exit 1 with advanced step → requeues;
+  budget exhausted → no requeue; `checkpoint-500.tmp` present alone → `CURRENT_STEP=0`.
+- [ ] **Step 3:** Implement in `render.py` + config field + plumbing. **Step 4:** PASS + CI
+  gates. Commit (`feat: requeue wrapper with budget and no-progress guard`).
 
-- [ ] **Step 3: Commit any remaining fixes**
+### Task 1.7: W&B run continuity
+
+**Files:**
+- Modify: `src/oplm/training/trainer.py:94-106`, `src/oplm/training/checkpoint.py`
+  (`trainer_state.json` gains `wandb_run_id`)
+- Test: extend `tests/training/test_e2e_wandb.py`
+
+**Interfaces:**
+- Produces: main process persists the run id to `<output_dir>/wandb_run_id` right after
+  `init_trackers` (`wandb.run.id`, import guarded by `wandb_enabled`), and `save_checkpoint`
+  copies it into `trainer_state.json`. Before `init_trackers`, if resuming (either
+  `resume_from` set or `auto_resume` found a checkpoint) read the id — checkpoint's
+  `trainer_state.json` first, `wandb_run_id` file second — and extend
+  `wandb_kwargs |= {"id": run_id, "resume": "allow"}`.
+- Ordering note: wandb currently initializes *before* the resume block. Move the resume-target
+  *resolution* (Task 1.4's block, minus the actual `_resume_from_checkpoint` call) ahead of
+  `init_trackers`; keep the heavy `_resume_from_checkpoint` where it is.
+
+- [ ] **Step 1: Failing test:** with `WANDB_MODE=offline` on a pilot config, train + checkpoint;
+  second trainer with `auto_resume=true` → assert both runs' `wandb_run_id` files are identical
+  and the second `wandb.init` received `id=<first id>, resume="allow"` (patch
+  `accelerate.tracking.WandBTracker` init kwargs or read the offline run dir metadata —
+  follow whatever `test_e2e_wandb.py` already inspects).
+- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates. Commit
+  (`feat: persist wandb run id; resume continues the same run`).
+
+### Task 1.8: NCCL hardening, process-group timeout, preflight, non-finite guard
+
+**Files:**
+- Create: `src/oplm/training/preflight.py`
+- Modify: `src/oplm/training/trainer.py` (Accelerator kwargs, preflight call, nonfinite flag),
+  `src/oplm/slurm/render.py` (env block)
+- Test: `tests/slurm/test_render.py`, `tests/training/test_preflight.py`, e2e nonfinite test
+
+**Interfaces:**
+- Produces (render.py env block, replacing the bare `NCCL_DEBUG=INFO` line):
 
 ```bash
-git add -A
-git commit -m "test: verify slurm sweep acceptance criteria"
+export NCCL_DEBUG=<slurm.nccl_debug>            # default WARN
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_FR_DUMP_TEMP_FILE=<slurm.log_dir>/nccl_trace_${SLURM_JOB_ID}_rank
 ```
+
+- Produces: `Accelerator(..., kwargs_handlers=[InitProcessGroupKwargs(
+  timeout=timedelta(minutes=cfg.train.dist_timeout_minutes))])` (import from `accelerate.utils`;
+  only when launched distributed — harmless single-process).
+- Produces: `oplm.training.preflight.run_preflight(accelerator) -> None` — logs
+  `rank=<i> host=<socket.gethostname()> device=<accelerator.device>`, allocates a 64 MB tensor,
+  runs one 1024² matmul, and (when `num_processes > 1`) one small `accelerator.reduce`; raises
+  `RuntimeError` with the host name in the message on any failure. Called in `Trainer.__init__`
+  right after the Accelerator is constructed.
+- Consumes: `_StepFlags.nonfinite` (Task 1.3) — the trainer feeds
+  `not math.isfinite(current_loss)` into the control bundle; on `flags.nonfinite`:
+  `raise RuntimeError(f"non-finite training loss at step {self.global_step}")` (all ranks raise
+  together; the requeue loop resumes from the last checkpoint = automatic rollback; the
+  no-progress guard catches a deterministic NaN).
+- Produces (spec §6, warn-only): in `_log_step`, maintain an EMA of `train/loss` (same
+  `ema = 0.98 * ema + 0.02 * loss` smoothing `oplm.training.mup` uses for its logging helper);
+  when `loss > 3.0 * ema` after the first 50 logged steps, `logger.warning("loss spike: %.4f vs
+  EMA %.4f at step %d", ...)`. No abort, no rollback — spikes self-recover often enough that
+  acting on them causes more harm than good.
+
+- [ ] **Step 1: Failing tests:** render test for the env block + timeout wiring (assert the
+  kwargs handler is passed — construct a Trainer on a pilot config and inspect
+  `accelerator.init_handler` or patch `Accelerator` to capture kwargs); preflight unit test
+  (runs clean single-process; error message contains hostname when the matmul is patched to
+  raise); e2e: patch the model to return a NaN loss at step 3 → `RuntimeError` mentioning step 3,
+  and the step-2 checkpoint is intact.
+- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates. Commit
+  (`feat: NCCL fault env, pg timeout, preflight check, non-finite loss abort`).
+
+### Task 1.9: Production config + docs
+
+**Files:**
+- Modify: `configs/scaling.yaml`, `docs/TRAIN.md`, `docs/SLURM.md`, `docs/CONFIG.md`
+- Test: `tests/test_docs_links.py` (existing link check), config-load test over `scaling.yaml`
+
+- [ ] **Step 1:** `configs/scaling.yaml` train block gains: `save_every_minutes: 30`,
+  `keep_every_n_steps: 100000`, `auto_resume: true` (explicit here — this config only runs under
+  Slurm), `save_total_limit: 3`; slurm block: `max_requeues: 20`. Add a commented
+  `# remote_checkpoint_uri: s3://...` placeholder (activated in Phase 4).
+- [ ] **Step 2:** Docs: `docs/SLURM.md` §"Requeue semantics" rewritten (auto-resume is now real;
+  document exit 85, the budget, the no-progress guard, `--signal`); `docs/TRAIN.md` gains a
+  "Fault tolerance" section (knob table from spec §8, drain behavior, what a resume restores);
+  `docs/CONFIG.md` documents each new field.
+- [ ] **Step 3:** `python -m pytest tests/test_docs_links.py -v` + a test asserting
+  `load_config` accepts `configs/scaling.yaml` with the new keys. CI gates. Commit
+  (`docs: fault-tolerance operations guide + scaling config update`).
+
+---
+
+## Phase 2 — DCP checkpoint layer
+
+### Task 2.1: DCP save path
+
+**Files:**
+- Modify: `src/oplm/training/checkpoint.py` (rewrite `save_checkpoint` internals),
+  `src/oplm/training/trainer.py` (`_save_checkpoint` passes optimizers/schedulers/extra state)
+- Test: `tests/training/test_e2e_dcp.py`, existing checkpoint tests updated
+
+**Interfaces:**
+- Produces: `save_checkpoint` signature change (trainer is the only caller):
+
+```python
+def save_checkpoint(
+    accelerator, model, optimizers, schedulers, cfg, output_dir,
+    *, global_step, epoch, samples_seen, tokens_seen,
+    cursor: DataCursor | None = None,  # dataclass lands in Task 3.1; TYPE_CHECKING import,
+    wandb_run_id: str | None = None,   # callers pass None until Phase 3
+    save_total_limit: int = 3, keep_every_n_steps: int | None = None,
+) -> Path:  # returns the committed checkpoint dir
+```
+
+  Internals: build the state dict via DCP `Stateful` components and write with
+  `dcp.save(state_dict, checkpoint_id=str(tmp_dir))`:
+
+```python
+class _ModelOptState(Stateful):
+    """Model + optimizer state through torch.distributed.checkpoint.state_dict.
+
+    get_state_dict/set_state_dict unwrap DDP ('module.' prefixes) and handle FSDP2/DTensor
+    uniformly — this is what makes the checkpoint parallelism- and world-size-agnostic.
+    """
+    def __init__(self, model, optimizers):
+        self._model, self._optimizers = model, [_unwrap_accelerated(o) for o in optimizers]
+    def state_dict(self):
+        msd, osd = get_state_dict(self._model, self._optimizers)
+        return {"model": msd, "optimizers": osd}
+    def load_state_dict(self, sd):
+        set_state_dict(self._model, self._optimizers,
+                       model_state_dict=sd["model"], optim_state_dict=sd["optimizers"])
+
+state_dict = {
+    "app": _ModelOptState(model, optimizers),
+    "schedulers": [s.state_dict() for s in schedulers],
+    "trainer": {"global_step": ..., "epoch": ..., "samples_seen": ..., "tokens_seen": ...,
+                "cursor": asdict(cursor) if cursor else None, "wandb_run_id": wandb_run_id},
+}
+```
+
+  Per-rank RNG is a sidecar: each rank writes `rng_state_<rank>.pt`
+  (`{"python": random.getstate(), "numpy": np.random.get_state(),
+  "torch_cpu": torch.get_rng_state(), "torch_cuda": torch.cuda.get_rng_state_all()}`) into
+  `tmp_dir` with `torch.save` (DCP dedupes identical keys across ranks, so per-rank blobs don't
+  fit its model; tiny files, no collective needed). Keep `trainer_state.json` (now also carrying
+  `wandb_run_id`, `first_checkpoint_unix`, `last_time_keep_index`, and the serialized cursor for
+  human inspection), `config.yaml`, and the `hf/` export exactly as today. Commit protocol,
+  rotation, and pointer from Task 1.1 unchanged.
+- Consumes: `_unwrap_accelerated(o)` = `getattr(o, "optimizer", o)` (AcceleratedOptimizer wrap).
+
+- [ ] **Step 1: Failing test:** single-process pilot save → committed dir contains `.metadata` +
+  `__0_0.distcp`-style shard files + `rng_state_0.pt` + `trainer_state.json` + `config.yaml` +
+  `hf/`; `accelerator.save_state` artifacts (`model.safetensors`, `optimizer.bin`) are ABSENT.
+- [ ] **Step 2:** FAIL. **Step 3:** Implement (single-process DCP works without an initialized
+  process group). **Step 4:** PASS; existing checkpoint tests updated to the new layout. CI
+  gates. Commit (`feat: DCP checkpoint format`).
+
+### Task 2.2: DCP load, validation, fallback
+
+**Files:**
+- Modify: `src/oplm/training/checkpoint.py` (`load_checkpoint`),
+  `src/oplm/training/trainer.py` (`_resume_from_checkpoint`)
+- Test: `tests/training/test_e2e_dcp.py`, `tests/training/test_commit_protocol.py`
+
+**Interfaces:**
+- Produces: `load_checkpoint(accelerator, model, optimizers, schedulers, checkpoint_dir, cfg)
+  -> dict[str, Any]` — `dcp.load` into the same `Stateful` layout, restore schedulers, restore
+  this rank's `rng_state_<rank>.pt` (**missing file = hard error**, closing the
+  swallowed-RNG-failure hole; error message explains the world-size-change case and points at
+  starting fresh RNG with an explicit `train.resume_from` + documented
+  `OPLM_ALLOW_MISSING_RNG=1` escape), and return the `trainer` dict.
+- Produces: schedule-compatibility validation before `dcp.load`: parse the checkpoint's
+  `config.yaml` and compare `{warmup_steps, stable_steps, max_steps, scheduler, lr, min_lr}`
+  against the live config; mismatch → `ValueError` naming each differing field (closes the
+  silent `LambdaLR` reshape hazard).
+- Produces: fallback in the trainer's auto-resume path (Task 1.4 block): wrap
+  `_resume_from_checkpoint` in `try/except (RuntimeError, OSError, ValueError)`; on failure with
+  `auto_resume` (never with explicit `resume_from`), log loudly and retry with the next-newest
+  committed checkpoint, at most 2 fallback attempts, then re-raise.
+
+- [ ] **Step 1: Failing tests:** save→load round-trip restores step/epoch/tokens + optimizer
+  momentum (compare a Muon `momentum_buffer` tensor before/after); schedule mismatch
+  (`warmup_steps` changed) raises naming the field; corrupted newest (truncate a `.distcp` file)
+  + `auto_resume` → resumes from previous checkpoint with a warning in caplog; corrupted newest
+  + explicit `resume_from` → raises.
+- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates. Commit
+  (`feat: DCP load with schedule validation and committed-fallback`).
+
+### Task 2.3: Async save
+
+**Files:**
+- Modify: `src/oplm/training/checkpoint.py`, `src/oplm/training/trainer.py`
+- Test: `tests/training/test_e2e_dcp.py`
+
+**Interfaces:**
+- Produces: `save_checkpoint(..., blocking: bool = True)`; when `blocking=False` it calls
+  `dcp.async_save(...)` (stages to CPU, returns a `Future`) and returns a `PendingSave` handle
+  `(future, tmp_dir, final_name, permanent)`.
+- Produces: trainer-side finalization on the control-bundle boundary: keep at most one
+  `self._pending_save`; each step, fold `pending_done = pending is not None and
+  future.done()` into the control bundle (5th element, sum); when the sum equals
+  `num_processes`, all ranks' writes are complete → rank 0 performs the rename + pointer +
+  rotation (the deferred tail of the commit protocol), `_emit_checkpoint_saved` fires, pending
+  clears. A new save trigger or drain or train-end while a save is pending first blocks on
+  `future.result()` + finalize. Drain and final saves stay `blocking=True`.
+
+- [ ] **Step 1: Failing test:** pilot run with async on (make it the default for periodic saves)
+  and `save_every=2, max_steps=8` → 4 committed checkpoints, `on_checkpoint_saved` fired 4×, and
+  a probe asserting at least one training step executed between `async_save` returning and the
+  commit rename (instrument with a step-counter captured in a patched rename).
+- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates; also rerun the drain
+  e2e (drain during a pending async save must finalize the pending one, then take its own
+  blocking save). Commit (`feat: async periodic checkpoints with deferred commit`).
+
+### Task 2.4: Reshard e2e (world-size 2 → 1)
+
+**Files:**
+- Test: `tests/training/test_e2e_dcp.py` (+ a subprocess worker like Task 0.1's)
+
+- [ ] **Step 1:** Subprocess test (slow): 2-rank CPU/gloo pilot trains 3 steps, saves; a
+  1-process run loads the same checkpoint (`auto_resume`) and trains 2 more steps without error;
+  assert restored `global_step` and that a designated weight tensor matches rank 0's saved value.
+  This is the resilience property that lets a 64-node run be inspected or resumed at a different
+  world size. (Data-exactness across world-size change is *not* asserted — the cursor guard from
+  Phase 3 will refuse; pass `train.resume_data_position=false` in this test once Phase 3 lands.)
+- [ ] **Step 2:** Run → PASS (no new src code expected; fix what surfaces). CI gates. Commit
+  (`test: cross-world-size DCP resume`).
+
+---
+
+## Phase 3 — Data-exact resume
+
+Requires Task 0.2's single-striping verdict/fix. Cursor rides in Task 2.1's `trainer` state.
+
+### Task 3.1: Skip-aware `ShardedProteinDataset`
+
+**Files:**
+- Modify: `src/oplm/data/sequence/dataset.py`
+- Test: `tests/data/test_resume_cursor.py`
+
+**Interfaces:**
+- Produces:
+
+```python
+@dataclass(frozen=True)
+class DataCursor:
+    """Position of the training stream, plus the layout it is only valid under."""
+    epoch: int
+    batches_in_epoch: int
+    world_size: int
+    num_workers: int
+    per_rank_batch: int
+    seed: int
+
+class ShardedProteinDataset:
+    def stream_length(self) -> int:
+        """Rows this (rank, worker) stream serves in one epoch. Must be called in-context
+        (inside a worker, or single-process) — uses _joint_stripe()."""
+    def set_resume_skip(self, batches_in_epoch: int, per_rank_batch: int,
+                        num_workers: int) -> None:
+        """Arm a one-epoch skip; applied by the next __iter__, in each worker."""
+    def clear_resume_skip(self) -> None: ...
+```
+
+  `__iter__` becomes a thin call to `self._iter_stream(self._resolved_skip())` where
+  `_resolved_skip()` converts the armed batch count to this stream's sample offset:
+  worker `w` of the local rank contributed `len(range(w, batches_in_epoch, num_workers))`
+  batches (DataLoader round-robin), each of `per_rank_batch` consecutive samples from this
+  stream → `skip = that_count * per_rank_batch`, then `skip %= max(self.stream_length(), 1)`
+  (full wraps re-yield the identical stream, so modulo is exact). `_iter_stream(skip)` walks the
+  shard order computing each shard's `selected` count from index arithmetic
+  (`len(range(first_selected_offset, n_rows, ...))` — no `read_table`) and only starts reading
+  at the shard where the running count crosses `skip`, slicing `selected[skip - consumed:]`.
+- The armed skip is plain instance state — it pickles into DataLoader workers with the dataset,
+  which is exactly how it reaches them.
+
+- [ ] **Step 1: Failing tests** (single-process, real fixtures): (a) baseline = materialize
+  epoch-0 stream as a list; for `skip in {0, 1, shard0_len, shard0_len + 3, stream_len + 2}`:
+  armed skip yields `baseline[skip % len(baseline):]` exactly; (b) `pq.read_table` call count
+  (patched counter) for a skip landing in shard 2 of 3 is exactly 2 (shards 2 and 3 read,
+  shard 1 skipped by arithmetic); (c) `stream_length()` equals `len(baseline)`;
+  (d) `num_workers=2` DataLoader: resumed loader's concatenated output equals the uninterrupted
+  loader's output from batch k onward (order-exact at the batch level).
+- [ ] **Step 2:** FAIL. **Step 3:** Implement (refactor `__iter__`; keep the yielded-dict
+  contract byte-identical for skip=0). **Step 4:** PASS + CI gates (whole `tests/data/`).
+  Commit (`feat: index-arithmetic resume skip for ShardedProteinDataset`).
+
+### Task 3.2: Skip-aware `InterleavedDataset`
+
+**Files:**
+- Modify: `src/oplm/data/sequence/dataset.py`
+- Test: `tests/data/test_resume_cursor.py`
+
+**Interfaces:**
+- Produces: same `set_resume_skip`/`clear_resume_skip` on `InterleavedDataset`. In `__iter__`,
+  after computing `choices`: per-stream skip `k` (same round-robin arithmetic) → count
+  per-source draws in `choices[:k]` (`torch.bincount`), arm each source's skip with its count
+  **in samples** via a new internal `_arm_source_skip(source, n)` that reduces `n` modulo the
+  source's `stream_length()` (sources refill deterministically, so wraps are identity), then
+  iterate `choices[k:]`.
+- Consumes: `ShardedProteinDataset.stream_length`, `_iter_stream` (Task 3.1).
+
+- [ ] **Step 1: Failing test:** two-source interleaved fixture; baseline epoch-0 stream vs
+  armed-skip stream — suffix equality for skips crossing several refills of the smaller source.
+- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates. Commit
+  (`feat: resume skip for InterleavedDataset`).
+
+### Task 3.3: Trainer cursor wiring + layout guard
+
+**Files:**
+- Modify: `src/oplm/training/trainer.py`, `src/oplm/training/checkpoint.py` (cursor already in
+  the schema from Task 2.1)
+- Test: `tests/training/test_e2e_checkpoint.py`, `tests/data/test_resume_cursor.py`
+
+**Interfaces:**
+- Produces: trainer tracks `self._batches_in_epoch` (increment where samples are counted,
+  `trainer.py:344`; reset to 0 in the `StopIteration` epoch-rollover branch, which also calls
+  `dataset.clear_resume_skip()`). `_save_checkpoint` builds
+  `DataCursor(epoch=self.epoch, batches_in_epoch=self._batches_in_epoch,
+  world_size=accelerator.num_processes, num_workers=cfg.data.num_workers,
+  per_rank_batch=cfg.train.batch_size, seed=cfg.train.seed)`.
+- Produces: `_resume_from_checkpoint` — with a cursor present and
+  `cfg.train.resume_data_position` true: validate `(world_size, num_workers, per_rank_batch,
+  seed)` against the live run; mismatch → `ValueError` listing each differing field and naming
+  the `train.resume_data_position=false` escape hatch; match → `self._batches_in_epoch = cursor
+  .batches_in_epoch` and arm `dataset.set_resume_skip(...)` (walk `self.dataloader.dataset`;
+  arm the top-level dataset — interleaved propagates internally). With the flag false or no
+  cursor: today's behavior (epoch restart) plus a WARNING that data will be re-seen.
+- Async-save note: the cursor snapshot must be taken at trigger time (it is — the dict is built
+  before `async_save` stages), not at commit time.
+
+- [ ] **Step 1: Failing tests:** guard raises on changed `num_workers` naming the field;
+  `resume_data_position=false` logs the re-seen warning and starts the epoch at row 0;
+  post-resume `_batches_in_epoch` continues from the cursor.
+- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates. Commit
+  (`feat: data cursor in checkpoints with layout guard`).
+
+### Task 3.4: Data-exactness acceptance test
+
+**Files:**
+- Test: `tests/training/test_e2e_data_exact.py`
+- Modify (if not done in 0.1): `src/oplm/data/sequence/collate.py` (`keep_sequence_ids` flag)
+
+- [ ] **Step 1:** Control run: pilot config (real fixtures, `num_workers=2`,
+  `per_rank_batch=4`, `max_steps=12`), a callback recording every batch's `sequence_ids` in
+  order. Interrupted run: same config, `max_steps=12`, checkpoint at step 5 (`save_every=5`),
+  stop at step 6 (small `max_steps` first run = 6), fresh `Trainer` with `auto_resume` running
+  to 12. Assert: concatenated sequence-id stream of (run-to-6 ++ resumed-7-to-12) equals the
+  control's stream **exactly**, and final `tokens_seen` matches the control exactly (retire the
+  old test's continuity-band assertion in favor of equality; keep the file's docstring updated —
+  it currently documents the epoch-restart limitation, which this phase removes).
+- [ ] **Step 2:** Run → PASS (this is the acceptance gate for the whole phase; debug until
+  exact). Also assert a mid-epoch-boundary variant: checkpoint lands within epoch 1 (fixture
+  small enough that step 5 crosses an epoch), proving `epoch + batches_in_epoch` compose.
+- [ ] **Step 3:** CI gates. Commit (`test: bitwise data-stream equality across resume`).
+
+---
+
+## Phase 4 — Object-store sync
+
+### Task 4.1: `RemoteStore`
+
+**Files:**
+- Create: `src/oplm/training/remote.py`
+- Modify: `pyproject.toml` (add `fsspec` to core deps if not already transitive; `s3fs` under a
+  new `[project.optional-dependencies] s3` extra)
+- Test: `tests/training/test_remote.py`
+
+**Interfaces:**
+- Produces:
+
+```python
+class RemoteStore:
+    """Checkpoint mirror on an fsspec filesystem (s3://, gs://, file://...).
+
+    Layout mirrors output_dir: <uri>/checkpoint-<step>/<files> + manifest.json written LAST —
+    a checkpoint-<step>/ without manifest.json is uncommitted and invisible.
+    """
+    def __init__(self, uri: str) -> None: ...           # fsspec.core.url_to_fs
+    def upload_checkpoint(self, local_dir: Path, *, files: list[Path], permanent: bool,
+                          write_manifest: bool) -> None:
+        """Upload `files` (relative to local_dir) into <uri>/<local_dir.name>/."""
+    def finalize(self, name: str, *, permanent: bool) -> None:
+        """Write manifest.json: {"files": {relpath: size}, "permanent": bool}."""
+    def latest_committed(self) -> tuple[str, dict] | None:  # (name, manifest)
+    def download_checkpoint(self, name: str, dest: Path) -> Path: ...
+    def rotate(self, save_total_limit: int, keep_every_n_steps: int | None) -> None:
+        """Delete non-permanent committed checkpoints beyond the limit (manifest-aware)."""
+```
+
+- [ ] **Step 1: Failing tests** over `file://{tmp_path}`: upload+finalize round-trip; a dir
+  without manifest is not `latest_committed`; manifest size mismatch on download →
+  `RuntimeError`; rotate keeps permanent + newest K. Optional `@pytest.mark.slow` moto-based
+  `s3://` smoke test guarded by `pytest.importorskip("moto")`.
+- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates. Commit
+  (`feat: fsspec RemoteStore with manifest-committed checkpoints`).
+
+### Task 4.2: Trainer integration — background upload + remote resume
+
+**Files:**
+- Modify: `src/oplm/training/trainer.py`, `src/oplm/training/checkpoint.py`,
+  `configs/scaling.yaml` (uncomment the URI placeholder into a documented example)
+- Test: `tests/training/test_remote.py` (e2e over `file://`), drain e2e extended
+
+**Interfaces:**
+- Consumes: `RemoteStore` (4.1); `train.remote_checkpoint_uri` (1.2).
+- Produces, save side: after a checkpoint commits (sync or async finalization), each node's
+  local-rank-0 process (`accelerator.local_process_index == 0`) starts a daemon-thread upload of
+  the shard files *this node's ranks wrote* (DCP writer file names carry the writing rank; each
+  rank records its own written files via a save-plan hook or simply `rng_state_<rank>.pt` +
+  `glob` filtered by rank — implementer picks, test pins behavior: union of all nodes' uploads
+  == full dir, no file uploaded twice); global rank 0 additionally uploads `.metadata`,
+  `trainer_state.json`, `config.yaml`, `hf/`, then `finalize()`s the manifest **after** a small
+  gloo-group barrier confirms all nodes' uploads finished (use a dedicated
+  `torch.distributed.new_group(backend="gloo")` created at trainer init when a remote URI is
+  set — never the NCCL default group from a background thread). One in-flight upload at a time;
+  a new commit while uploading queues (drop-oldest beyond 1 queued: the newer checkpoint
+  supersedes). Rank 0 calls `store.rotate(...)` after finalize. Drain path blocks on the upload
+  (bounded by a 10-min timeout, then logs and exits 85 anyway — the local checkpoint still
+  exists for a same-allocation requeue).
+- Produces, resume side (extends Task 1.4's resolution): when `auto_resume` finds no local
+  committed checkpoint and a remote URI is set, `latest_committed()` → download to
+  `output_dir` (becoming the local committed copy — download to `.tmp` + rename, reusing the
+  local commit convention) → resume from it. If both exist, the higher step wins.
+- Single-process degradation: no process group → the one process is both uploader and
+  finalizer; no barrier needed.
+
+- [ ] **Step 1: Failing e2e test** (single-process, `file://` URI): pilot run with
+  `remote_checkpoint_uri` set → remote mirror committed with manifest; wipe `output_dir`
+  (simulates NVMe loss on requeue); fresh trainer with `auto_resume` → downloads and resumes at
+  the right step; remote rotation honors `keep_every_n_steps`.
+- [ ] **Step 2:** FAIL. **Step 3:** Implement (upload manager as a small class inside
+  `remote.py`, e.g. `UploadManager(store, accelerator)`, so trainer wiring stays thin).
+- [ ] **Step 4:** PASS + CI gates; rerun drain e2e with a remote URI. Commit
+  (`feat: background checkpoint upload and remote auto-resume`).
+
+---
+
+## Phase 5 — HSDP
+
+Shaped by Task 0.3's verdict. If the spike showed `torch.optim.Muon` handles DTensor params,
+skip Task 5.2.
+
+### Task 5.1: `train.parallelism` knob + FSDP2 wiring
+
+**Files:**
+- Modify: `src/oplm/config.py` (`parallelism: str = "ddp"`, validate in
+  `{"ddp", "hsdp"}`), `src/oplm/training/trainer.py`, `src/oplm/slurm/render.py`
+  (`accelerate_command` drops `--multi_gpu` in favor of plain multi-process launch when hsdp —
+  decide per the recorded accelerate-vs-native verdict), `docs/TRAIN.md`
+- Test: `tests/training/test_e2e_hsdp.py` (subprocess, slow), config validation test
+
+**Interfaces:**
+- Produces: when `parallelism == "hsdp"`, the trainer builds
+  `init_device_mesh(device_type, (num_nodes, gpus_per_node), mesh_dim_names=("replicate",
+  "shard"))` (dims from `WORLD_SIZE` / `LOCAL_WORLD_SIZE` env; a single-node run degrades to
+  `(1, world)` = plain FSDP; world size 1 → refuse with a clear error, use ddp), applies
+  `fully_shard(block, mesh=mesh)` per `OplmBlock` + `fully_shard(model, mesh=mesh)` on the
+  root, and **does not** pass the model through DDP preparation (record here the exact
+  accelerate interplay chosen — spike + implementation decide between
+  `accelerator.prepare(model)` with fsdp_version 2 vs preparing only optimizers; the checkpoint
+  path is agnostic either way because Phase 2 uses `get_state_dict`).
+- Constraint: `torch.compile` ordering (compile after sharding) and gradient-checkpointing
+  compatibility must be preserved; the pilot e2e is the gate.
+
+- [ ] **Step 1: Failing test:** 2-process CPU/gloo subprocess pilot with
+  `parallelism=hsdp` (mesh (1,2)): trains 3 steps, saves, auto-resumes 2 more, and the saved
+  checkpoint loads into a 1-process `ddp` run (Phase 2 reshard test pattern) — proving the
+  DDP↔HSDP checkpoint interop claim.
+- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates. Commit
+  (`feat: hsdp parallelism via FSDP2 device mesh`).
+
+### Task 5.2: Distributed Muon adapter (only if the 0.3 spike requires it)
+
+**Files:**
+- Create: `src/oplm/training/muon_dtensor.py`
+- Modify: `src/oplm/training/optim.py` (select adapter when params are DTensor)
+- Test: `tests/training/test_fsdp2_muon_spike.py` (un-skip → becomes the regression test)
+
+**Interfaces:**
+- Produces: `DTensorMuon(torch.optim.Optimizer)` — per 2-D param: all-gather the sharded
+  gradient over the mesh's shard dim (`grad.full_tensor()` on the DTensor), run the same
+  momentum + Newton–Schulz update `torch.optim.Muon` applies (reuse
+  `torch.optim._muon` helpers where importable; otherwise vendor the ~30-line NS iteration with
+  a comment pinning it to the torch implementation), then write back this rank's shard
+  (`torch.distributed.tensor.distribute_tensor` slice). Momentum buffers stay sharded
+  (allocated like the param) so optimizer-state memory doesn't regress; only the transient
+  gathered grad is full-size — per-param, freed each step.
+- Consumes: mesh from Task 5.1; `build_optimizers` routing.
+
+- [ ] **Step 1:** Convert the 0.3 spike skip-path into failing assertions (2-proc CPU/gloo:
+  loss decreases; single-device `torch.optim.Muon` on the same toy problem and seeds produces
+  the same params after 3 steps within `atol=1e-6` — the oracle test).
+- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS + CI gates. Commit
+  (`feat: DTensor-aware Muon for hsdp`).
+
+### Task 5.3: Scale config + docs closeout
+
+**Files:**
+- Modify: `configs/scaling.yaml` (document `parallelism` with the 24-30B guidance from spec §2),
+  `docs/TRAIN.md`, `docs/OVERVIEW.md` (resilience architecture paragraph), spec (mark §7
+  sub-decision resolved)
+- Test: `tests/test_docs_links.py`
+
+- [ ] **Step 1:** Write the docs; include the memory table (6B/12B/30B vs DDP/HSDP) and the
+  failure-recovery walkthrough (failure → nonzero exit → requeue → auto-resume → same W&B run).
+- [ ] **Step 2:** Link check + CI gates. Commit (`docs: fault-tolerance closeout`).
+
+---
+
+## Task Dependencies
+
+```
+0.1 → 0.2 → 3.1 → 3.2 → 3.3 → 3.4
+0.3 → 5.1 → 5.2 → 5.3
+1.1 → 1.2 → 1.3 → 1.4 → 1.5 → 1.6
+            1.4 → 1.7        1.3 → 1.8 → 1.9
+1.* → 2.1 → 2.2 → 2.3 → 2.4 → (3.3 cursor schema, 4.2 finalization hook)
+2.* → 4.1 → 4.2
+```
+
+Phase 1 is sequential (each task builds on the previous trainer/render state). Phases 0 and 1
+can run in parallel with each other. Phase 3 needs 0.2 and 2.1; Phase 4 needs 2.3; Phase 5
+needs 0.3 and 2.2.
