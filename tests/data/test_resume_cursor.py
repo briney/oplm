@@ -8,16 +8,16 @@ DataLoader batch-level resume check.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 import pytest
-import torch
 from torch.utils.data import DataLoader
 
 import oplm.data.sequence.dataset as dataset_mod
 from oplm.data.sequence.collate import MLMCollator
-from oplm.data.sequence.dataset import ShardedProteinDataset
+from oplm.data.sequence.dataset import DataCursor, ShardedProteinDataset
 from oplm.data.tokenizer import get_tokenizer
 
 if TYPE_CHECKING:
@@ -223,3 +223,61 @@ def test_unarmed_skip_is_byte_identical_to_baseline(sequence_shards: Path) -> No
     rows2 = list(ds2)
 
     assert rows1 == rows2
+
+
+# --------------------------------------------------------------------------- #
+# Property test: per-shard hit-count arithmetic vs. brute-force enumeration
+# --------------------------------------------------------------------------- #
+
+
+def test_hit_count_formula_matches_brute_force_enumeration() -> None:
+    """The arithmetic hit-count formula matches brute-force enumeration over a grid.
+
+    Directly CI-guards the identity ``_iter_stream`` relies on to skip
+    fully-consumed shards without ever calling ``pq.read_table``:
+    ``len(range((j - b) % s, n, s)) == sum(1 for o in range(n) if (b + o) % s == j)``.
+    Sweeps stride ``s`` in ``[1, 12]``, every valid ``joint_index`` ``j`` in
+    ``[0, s)``, shard size ``n`` (including ``n=0``), and base ``b`` (including
+    small bases and bases far exceeding ``s``, which cover
+    ``first_hit_offset >= n`` cases where the shard contributes no hits at all).
+    """
+    bases = [0, 1, 2, 3, 5, 8, 997, 4999, 12_345]
+    shard_sizes = [0, 1, 2, 3, 5, 10, 25, 50]
+
+    checked = 0
+    for stride in range(1, 13):
+        for joint_index in range(stride):
+            for base in bases:
+                for n_rows in shard_sizes:
+                    first_hit_offset = (joint_index - base) % stride
+                    formula = len(range(first_hit_offset, n_rows, stride))
+                    brute_force = sum(
+                        1 for offset in range(n_rows) if (base + offset) % stride == joint_index
+                    )
+                    assert formula == brute_force, (
+                        f"{stride=} {joint_index=} {base=} {n_rows=} "
+                        f"{first_hit_offset=} {formula=} {brute_force=}"
+                    )
+                    checked += 1
+
+    assert checked == sum(range(1, 13)) * len(bases) * len(shard_sizes)
+
+
+# --------------------------------------------------------------------------- #
+# DataCursor
+# --------------------------------------------------------------------------- #
+
+
+def test_data_cursor_holds_fields_and_is_frozen() -> None:
+    """``DataCursor`` carries exactly the brief's fields and rejects mutation."""
+    cursor = DataCursor(
+        epoch=2, batches_in_epoch=17, world_size=4, num_workers=2, per_rank_batch=8, seed=0
+    )
+    assert cursor.epoch == 2
+    assert cursor.batches_in_epoch == 17
+    assert cursor.world_size == 4
+    assert cursor.num_workers == 2
+    assert cursor.per_rank_batch == 8
+    assert cursor.seed == 0
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cursor.epoch = 3  # type: ignore[misc]

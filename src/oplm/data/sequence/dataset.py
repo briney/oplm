@@ -258,6 +258,18 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                 match the resuming run's actual ``num_workers`` for the skip
                 arithmetic to be correct; validated by the caller (Task 3.3's
                 layout guard), not here.
+
+        Note:
+            With ``num_workers > 1``, a resumed ``DataLoader`` always restarts its
+            worker round-robin at worker 0 (a fresh iterator/process has no memory
+            of which worker was "next"). Each worker's own substream still resumes
+            with no row lost or duplicated regardless of where the interruption
+            landed, but the *global* interleaving order across workers only
+            reproduces the uninterrupted run's batch order bit-for-bit when
+            ``batches_in_epoch % num_workers == 0`` (the interruption landed on a
+            full worker-cycle boundary). Off that boundary, data content is still
+            exact; only which worker's batch appears at which global position can
+            shift.
         """
         self._resume_batches_in_epoch = batches_in_epoch
         self._resume_per_rank_batch = per_rank_batch
