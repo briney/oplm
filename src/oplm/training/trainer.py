@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.nn as nn
 
+from oplm.training.signals import DRAIN_EXIT_CODE, DrainSignal
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -23,6 +25,11 @@ if TYPE_CHECKING:
     from oplm.training.callbacks import TrainerCallback
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock margin (seconds) before SLURM_JOB_END_TIME at which the env drain
+# clock starts reporting requested=True. Fixed module constant for now; may
+# become a config knob later if a use case needs it.
+_DRAIN_MARGIN_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,12 @@ class Trainer:
 
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
+
+        # Drain trigger (Task 1.5): SIGUSR1/SIGTERM handlers plus the Slurm
+        # SLURM_JOB_END_TIME wall-clock margin. Installed immediately so a signal
+        # arriving during the (potentially slow) rest of __init__ is still caught.
+        self._drain_signal = DrainSignal(margin_seconds=_DRAIN_MARGIN_SECONDS)
+        self._drain_signal.install()
 
         # Latest pre-clip gradient norm, captured in the training loop when
         # clipping is active; read by StabilityDiagnosticsCallback. Stays None
@@ -431,7 +444,23 @@ class Trainer:
                 # diverge on ragged batches.
                 local_tokens = self._step_local_tokens
                 self._step_local_tokens = 0
-                flags = self._reduce_step_flags(local_tokens, save_due=self._save_timer_due())
+                flags = self._reduce_step_flags(
+                    local_tokens,
+                    drain=self._drain_signal.requested,
+                    save_due=self._save_timer_due(),
+                )
+
+                # Drain takes priority over everything else this step: check it before
+                # eval or periodic-save decisions so a drain never starts a long eval.
+                if flags.drain:
+                    self._save_checkpoint()
+                    logger.warning(
+                        "Drain requested: checkpoint saved at step %d; exiting %d",
+                        self.global_step,
+                        DRAIN_EXIT_CODE,
+                    )
+                    raise SystemExit(DRAIN_EXIT_CODE)
+
                 tokens_delta = flags.tokens_delta
                 self.tokens_seen += tokens_delta
 
