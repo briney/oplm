@@ -246,6 +246,14 @@ def accelerate_command(
 
     ``$SLURM_NNODES`` and ``$SLURM_PROCID`` are left unexpanded on purpose: the caller embeds this
     inside single quotes so the container's shell resolves them.
+
+    ``--multi_gpu`` is emitted for ``train.parallelism=hsdp`` runs too, deliberately. The flag
+    only sets Accelerate's ``distributed_type`` to ``MULTI_GPU``, whose sole model-facing effect
+    is that ``accelerator.prepare`` wraps a *prepared* model in DDP -- and the HSDP path never
+    passes its model through ``prepare`` (see ``oplm.training.parallel``). Everything else the
+    flag governs (process-group setup, device placement, ``reduce``/``broadcast``) is exactly
+    what the sharded path still relies on. Dropping it would buy nothing and would change the
+    launch for every existing DDP run.
     """
     return (
         "accelerate launch \\\n"

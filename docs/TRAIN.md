@@ -550,6 +550,7 @@ no-progress guard), see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget
 | `resume_data_position` | `true` | **Reserved, wired in a later phase (Phase 3).** The field exists and round-trips through config serialization, but nothing in the trainer reads it yet — a resume always restarts the dataloader from the beginning of the current epoch (see "What a resume restores" below). |
 | `dist_timeout_minutes` | `15` | Timeout passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. A genuine hang raises within this window instead of wedging until the Slurm time limit; a no-op on a single process. |
 | `remote_checkpoint_uri` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background (Task 4.2) — durability beyond local/shared storage. `null` (default) disables it entirely: zero behavior change, no import of `oplm.training.remote`, no fsspec call. See "Remote checkpoint mirror" below. |
+| `parallelism` | `ddp` | `ddp` (one full replica per rank, gradients all-reduced) or `hsdp` (FSDP2 `fully_shard` over a 2-D mesh: shard within a node, replicate across nodes). `hsdp` requires world size > 1 and is incompatible with `mixed_precision=fp16`. Checkpoints are parallelism-agnostic, so the same checkpoint resumes under either setting at any world size. |
 
 `save_every`, `save_total_limit`, and `resume_from` are the pre-existing checkpointing knobs —
 see [§9](#9-checkpointing-and-resume) and [CONFIG.md](CONFIG.md#train-fields-train).

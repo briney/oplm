@@ -100,6 +100,44 @@ class _ModelOptState(Stateful):
         )
 
 
+def _gather_hf_state_dict(model: torch.nn.Module, cfg: OplmConfig) -> dict[str, Any] | None:
+    """Gather a full, unsharded state dict for the ``hf/`` export, or ``None`` under DDP.
+
+    The ``hf/`` export exists so a checkpoint can be reloaded with
+    ``OplmForMaskedLM.from_pretrained``; it is written by ``save_pretrained``, which
+    serializes with ``safetensors`` and therefore needs plain tensors. Under
+    ``train.parallelism="hsdp"`` the live module's parameters are sharded ``DTensor``s, so
+    the state dict has to be all-gathered first.
+
+    **Collective:** ``get_model_state_dict(full_state_dict=True)`` communicates across
+    ranks, so every rank must call this -- callers must keep it outside any
+    ``is_main_process`` branch. ``cpu_offload=True`` keeps the gathered copy off the
+    accelerator, so the transient cost is host memory for one full replica, not device
+    memory (the same amount ``save_pretrained`` already materializes on the DDP path).
+
+    The gate is ``cfg.train.parallelism``, not an inspection of the model: config is
+    rank-identical by construction, so every rank makes the same call/skip decision
+    without needing to agree about the model's structure.
+
+    Args:
+        model: The (possibly compiled/wrapped) model being checkpointed.
+        cfg: The live config, read only for ``train.parallelism``.
+
+    Returns:
+        The gathered full state dict when the model is FSDP2-sharded, else ``None``,
+        meaning "let ``save_pretrained`` use the module's own state dict" -- the exact
+        pre-Task-5.1 behavior for every DDP run.
+    """
+    if cfg.train.parallelism != "hsdp":
+        return None
+
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+    return get_model_state_dict(
+        model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+    )
+
+
 def _write_rng_sidecar(tmp_dir: Path, rank: int) -> None:
     """Write this rank's python/numpy/torch RNG state to a per-rank sidecar file.
 
@@ -463,6 +501,19 @@ def save_checkpoint(
     tmp_dir = Path(output_dir) / f"{_CHECKPOINT_PREFIX}{global_step}{_TMP_SUFFIX}"
     final_dir = tmp_dir.with_name(f"{_CHECKPOINT_PREFIX}{global_step}")
 
+    # HF-export state dict for the sharded (FSDP2/HSDP) path, gathered on EVERY rank.
+    # Two placement constraints, both load-bearing:
+    #   - It must not sit inside the main-process-only block below:
+    #     get_model_state_dict(full_state_dict=True) is collective, so a main-only call
+    #     would hang every other rank.
+    #   - It must run BEFORE the dcp.save/dcp.async_save below: async_save runs the whole
+    #     save -- including DCP's own collectives -- on a background thread over this same
+    #     process group, so a collective issued here afterward could interleave with it
+    #     and mismatch across ranks.
+    # None on the DDP path, where save_pretrained's own state_dict() is already plain and
+    # complete (byte-identical behavior to before Task 5.1).
+    hf_state_dict = _gather_hf_state_dict(model, cfg)
+
     # Model + optimizer state through DCP (all ranks participate; dcp.save/dcp.async_save
     # are internally collective and create tmp_dir as part of that collective, so it
     # exists on every rank by the time this call returns -- verified single-process,
@@ -536,7 +587,13 @@ def save_checkpoint(
         # the underlying PreTrainedModel for save_pretrained.
         if hasattr(unwrapped, "_orig_mod"):
             unwrapped = unwrapped._orig_mod
-        unwrapped.save_pretrained(hf_dir)  # config.json + model.safetensors
+        # config.json + model.safetensors. hf_state_dict is None unless the model is
+        # FSDP2-sharded, in which case it carries the gathered full tensors (the module's
+        # own state_dict would hand safetensors DTensors, which it cannot serialize).
+        if hf_state_dict is None:
+            unwrapped.save_pretrained(hf_dir)
+        else:
+            unwrapped.save_pretrained(hf_dir, state_dict=hf_state_dict)
         get_tokenizer().save_pretrained(hf_dir)  # tokenizer files for round-trip
 
     if blocking:

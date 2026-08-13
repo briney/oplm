@@ -404,6 +404,18 @@ class Trainer:
         if gradient_checkpointing:
             model.gradient_checkpointing_enable()  # propagates to every OplmBlock
 
+        # FSDP2/HSDP sharding (Task 5.1), when train.parallelism == "hsdp". Applied HERE,
+        # before build_optimizers, because fully_shard swaps the module's parameters for
+        # DTensor ones -- an optimizer built beforehand would keep references to tensors
+        # the model no longer uses. See oplm.training.parallel's module docstring for why
+        # the sharded model deliberately bypasses accelerator.prepare (and what accelerate
+        # still provides on this path). A no-op on the default "ddp" path: nothing in
+        # oplm.training.parallel is even imported.
+        if cfg.train.parallelism == "hsdp":
+            from oplm.training.parallel import apply_hsdp
+
+            model = apply_hsdp(model, self.accelerator, mixed_precision=cfg.train.mixed_precision)
+
         # Optimizer and dataloader
         optimizers = build_optimizers(model, cfg.train)
         _status("[dim]Loading training data...[/dim]")
@@ -430,8 +442,27 @@ class Trainer:
         # identical semantics to before for gradient_accumulation_steps == 1, and
         # for >1 the tail micro-batches of an epoch simply roll into the next
         # window instead of forcing an early sync.
+        #
+        # Under train.parallelism="hsdp" the MODEL is excluded from prepare as well: it
+        # is already sharded (and device-placed) by apply_hsdp above, and passing it
+        # through prepare would wrap the FSDP2 module in DDP -- double data parallelism,
+        # with an all-reduce over already-reduce-scattered gradients. Everything prepare
+        # was providing for the model on the DDP path is covered on the sharded path by
+        # fully_shard itself (device placement, and the MixedPrecisionPolicy in place of
+        # accelerate's autocast wrapper). Optimizers and schedulers still go through
+        # prepare on both paths, so their handling -- and every downstream index into
+        # `prepared` -- is identical.
         _status("[dim]Preparing for training...[/dim]")
-        prepared = self.accelerator.prepare(model, *optimizers, *schedulers)
+        prepared: tuple[Any, ...]
+        if cfg.train.parallelism == "hsdp":
+            # cast: a tuple literal would narrow the element types (Module | Tensor),
+            # which the untyped optimizer/scheduler slices below are not written against
+            # -- prepare's own return is effectively Any on the ddp branch.
+            prepared = cast(
+                "tuple[Any, ...]", (model, *self.accelerator.prepare(*optimizers, *schedulers))
+            )
+        else:
+            prepared = self.accelerator.prepare(model, *optimizers, *schedulers)
         num_optimizers = len(optimizers)
         self.model = prepared[0]
 
@@ -442,6 +473,11 @@ class Trainer:
         # causes some accelerate versions to strip the compile wrapper during prepare,
         # leaving self.model = DDP(model) with no _orig_mod — and unwrap_model then
         # fails with KeyError: '_orig_mod' at the first eval call.
+        #
+        # Under parallelism="hsdp" this same position also gives the ordering FSDP2
+        # wants: fully_shard first (above), then compile the sharded module, so Dynamo
+        # traces the FSDP-hooked forward rather than having its own wrapper sharded
+        # underneath it.
         if cfg.train.compile:
             # Selective activation checkpointing (SAC) is incompatible with the
             # default DDPOptimizer: it splits the compiled graph at gradient-bucket

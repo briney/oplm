@@ -548,6 +548,61 @@ def test_cadence_retention_knobs_accept_positive_values() -> None:
     assert cfg.remote_checkpoint_uri == "s3://bucket/prefix"
 
 
+# --- Phase-5 train.parallelism validation ----------------------------------------
+
+
+def test_parallelism_defaults_to_ddp() -> None:
+    """``train.parallelism`` defaults to ``ddp`` so existing runs are unchanged."""
+    assert TrainConfig().parallelism == "ddp"
+
+
+@pytest.mark.parametrize("value", ["ddp", "hsdp"])
+def test_parallelism_accepts_supported_values(value: str) -> None:
+    """Both supported parallelism strategies are accepted."""
+    assert TrainConfig(parallelism=value).parallelism == value
+
+
+def test_parallelism_rejects_unknown_value() -> None:
+    """An unrecognized parallelism strategy raises ValueError naming the field."""
+    with pytest.raises(ValueError, match="parallelism"):
+        TrainConfig(parallelism="fsdp")
+
+
+def test_parallelism_hsdp_rejects_fp16() -> None:
+    """``hsdp`` + ``fp16`` raises: the fp16 GradScaler is not shard-aware.
+
+    Under FSDP2 every gradient is a sharded ``DTensor``, and ``torch.amp.GradScaler``'s
+    ``unscale_``/inf-check runs per rank over local shards -- so ranks can disagree on
+    whether to skip a step, desynchronizing the run. bf16 (the default) needs no scaler.
+    """
+    with pytest.raises(ValueError, match="fp16"):
+        TrainConfig(parallelism="hsdp", mixed_precision="fp16")
+
+
+def test_parallelism_hsdp_rejects_the_stability_probe() -> None:
+    """``hsdp`` + the μP stability probe raises: the probe forward is main-process only.
+
+    Under FSDP2 that forward all-gathers sharded parameters, so running it on rank 0
+    alone would hang every other rank -- a deadlock, not a wrong number.
+    """
+    with pytest.raises(ValueError, match="stability_probe_every"):
+        TrainConfig(parallelism="hsdp", stability_diagnostics=True)
+
+
+def test_parallelism_hsdp_allows_grad_norm_only_diagnostics() -> None:
+    """``stability_probe_every=0`` keeps the collective-free grad-norm diagnostic usable."""
+    cfg = TrainConfig(parallelism="hsdp", stability_diagnostics=True, stability_probe_every=0)
+    assert cfg.stability_diagnostics is True
+
+
+def test_parallelism_roundtrips_through_load_config(tmp_path: "Path") -> None:
+    """``train.parallelism`` survives a serialize_config -> load_config round trip."""
+    cfg = load_config(["train.parallelism=hsdp"])
+    path = tmp_path / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    assert load_config(["--config", str(path)]).train.parallelism == "hsdp"
+
+
 def test_cadence_retention_knobs_roundtrip_through_load_config(tmp_path: "Path") -> None:
     """The new knobs survive a serialize_config -> load_config round trip."""
     cfg = load_config(

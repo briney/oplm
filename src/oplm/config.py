@@ -20,6 +20,7 @@ AVAILABLE_PRESETS = ("50M", "170M", "400M", "800M", "1B", "3B", "6B", "12B")
 _VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
 _VALID_OPTIMIZERS = ("adamw", "muon")
 _VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
+_VALID_PARALLELISM = ("ddp", "hsdp")
 _VALID_COMPILE_MODES = ("default", "reduce-overhead", "max-autotune")
 _VALID_MUON_ADJUST_LR_FNS = ("match_rms_adamw", "original")
 
@@ -114,6 +115,15 @@ class TrainConfig:
     # are additionally synced to, for durability beyond local/shared storage.
     # None disables remote sync.
     remote_checkpoint_uri: str | None = None
+
+    # Parallelism strategy.
+    #   "ddp"  — one full model replica per rank, gradients all-reduced (default;
+    #            what every run did before Phase 5).
+    #   "hsdp" — FSDP2 (`fully_shard`) over a 2-D device mesh: shard within a node,
+    #            replicate across nodes. Required before ~24B; needs world size > 1.
+    # Checkpoints are parallelism-agnostic (DCP `get_state_dict`), so the same
+    # checkpoint resumes under either setting -- see docs/TRAIN.md.
+    parallelism: str = "ddp"
 
     # Infrastructure
     seed: int = 42
@@ -233,6 +243,37 @@ class TrainConfig:
             )
         if self.dist_timeout_minutes <= 0:
             raise ValueError(f"dist_timeout_minutes must be > 0, got {self.dist_timeout_minutes}")
+        if self.parallelism not in _VALID_PARALLELISM:
+            raise ValueError(
+                f"parallelism must be one of {_VALID_PARALLELISM}, got {self.parallelism!r}"
+            )
+        if self.parallelism == "hsdp" and self.mixed_precision == "fp16":
+            # Under FSDP2 every gradient is a sharded DTensor, and torch.amp.GradScaler's
+            # unscale_/inf-check runs per rank over local shards without a cross-rank
+            # reduction -- ranks can then disagree about whether to skip a step, which
+            # desynchronizes the run (a hang or silently divergent replicas, not a clean
+            # failure). bf16, the default, needs no scaler; fully_shard's own
+            # MixedPrecisionPolicy handles the param/reduce dtypes.
+            raise ValueError(
+                "parallelism='hsdp' does not support mixed_precision='fp16': the fp16 "
+                "GradScaler's inf-check is not shard-aware and would let ranks diverge. "
+                "Use mixed_precision='bf16' (default) or 'no'."
+            )
+        if self.parallelism == "hsdp" and self.stability_diagnostics and self.stability_probe_every:
+            # StabilityDiagnosticsCallback's probe forward is deliberately main-process
+            # only, on the documented assumption that "the extra forward has no
+            # collectives" -- true under DDP, false under FSDP2, where every forward
+            # all-gathers sharded parameters. Running it on rank 0 alone would hang every
+            # other rank until dist_timeout_minutes, then crash-loop through the requeue.
+            # Refuse up front instead (grad-norm-only diagnostics stay available via
+            # stability_probe_every=0).
+            raise ValueError(
+                "parallelism='hsdp' is incompatible with stability_diagnostics=true and "
+                "stability_probe_every > 0: the diagnostic probe runs a main-process-only "
+                "forward, which under FSDP2 issues an all-gather that would hang every "
+                "other rank. Set train.stability_probe_every=0 to keep the (collective-free) "
+                "grad-norm diagnostic, or run the probe under train.parallelism='ddp'."
+            )
 
 
 @dataclass
