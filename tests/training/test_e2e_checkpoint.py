@@ -407,3 +407,274 @@ def test_auto_resume_with_a_fresh_output_dir_starts_at_step_zero(
 
     trainer.train()
     assert trainer.global_step == 2
+
+
+# --- data cursor + layout guard (Task 3.3) ----------------------------------------------
+
+
+def test_checkpoint_records_a_data_cursor(training_parquet: Path, tmp_path: Path) -> None:
+    """A saved checkpoint's ``trainer_state.json`` carries a ``cursor`` matching the run layout."""
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path, training_parquet, max_steps=3, batch_size=_BATCH_SIZE, save_every=3
+    )
+    Trainer(cfg, callbacks=[]).train()
+
+    state = json.loads((tmp_path / "checkpoint-3" / "trainer_state.json").read_text())
+    cursor = state["cursor"]
+    assert cursor["epoch"] == 0
+    assert cursor["batches_in_epoch"] == 3
+    assert cursor["world_size"] == 1
+    # cfg.data.num_workers defaults to 0 (no DataLoader worker processes); the cursor
+    # records the dataset-striping-*effective* count (1), matching what
+    # oplm.data.sequence.dataset's own arithmetic treats "no worker processes" as.
+    assert cursor["num_workers"] == 1
+    assert cursor["per_rank_batch"] == _BATCH_SIZE
+    assert cursor["seed"] == cfg.train.seed
+
+
+def test_resume_restores_batches_in_epoch_from_cursor(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """A layout-compatible resume restores ``_batches_in_epoch`` from the checkpoint's cursor."""
+    from oplm.training.trainer import Trainer
+
+    cfg1 = tiny_train_cfg(
+        tmp_path, training_parquet, max_steps=3, batch_size=_BATCH_SIZE, save_every=3
+    )
+    Trainer(cfg1, callbacks=[]).train()
+
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=_BATCH_SIZE,
+        save_every=6,
+        resume_from=str(tmp_path / "checkpoint-3"),
+    )
+    resumed = Trainer(cfg2, callbacks=[])
+    assert resumed._batches_in_epoch == 3
+
+    # The skip must actually reach the top-level dataset (not just the trainer's own
+    # counter): ShardedProteinDataset.set_resume_skip stores it as a plain instance
+    # attribute (see its docstring), so this is directly inspectable.
+    dataset = resumed.dataloader.dataset
+    assert dataset._resume_batches_in_epoch == 3
+    assert dataset._resume_per_rank_batch == _BATCH_SIZE
+    assert dataset._resume_num_workers == 1  # effective count for num_workers=0
+
+
+def test_resume_skip_is_cleared_on_the_next_epoch_rollover(
+    tiny_training_parquet: Path, tmp_path: Path
+) -> None:
+    """The armed resume skip is disarmed once the resumed epoch actually rolls over.
+
+    The 16-row fixture at batch_size=4 makes one epoch exactly 4 steps. Resuming with
+    2 of those 4 batches already consumed and then training past the epoch boundary
+    must clear the skip so the *second* epoch is not incorrectly skipped too (Task
+    3.3: the StopIteration branch calls ``clear_resume_skip`` on the top-level dataset).
+    """
+    from oplm.training.trainer import Trainer
+
+    cfg1 = tiny_train_cfg(
+        tmp_path, tiny_training_parquet, max_steps=2, batch_size=_BATCH_SIZE, save_every=2
+    )
+    Trainer(cfg1, callbacks=[]).train()
+
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        tiny_training_parquet,
+        max_steps=6,  # 2 more steps to finish epoch 0, then 2 steps into epoch 1
+        batch_size=_BATCH_SIZE,
+        save_every=6,
+        resume_from=str(tmp_path / "checkpoint-2"),
+    )
+    resumed = Trainer(cfg2, callbacks=[])
+    dataset = resumed.dataloader.dataset
+    assert dataset._resume_batches_in_epoch == 2  # armed at construction
+
+    resumed.train()
+    assert resumed.global_step == 6
+    assert resumed.epoch == 1  # rolled over once (steps 3-4 finish epoch 0)
+    assert dataset._resume_batches_in_epoch is None  # disarmed at the rollover
+
+
+def test_resume_guard_raises_on_num_workers_mismatch(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """A ``num_workers`` change across a resume raises, naming the mismatched field."""
+    from oplm.training.trainer import Trainer
+
+    cfg1 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=3,
+        batch_size=_BATCH_SIZE,
+        save_every=3,
+        num_workers=0,
+    )
+    Trainer(cfg1, callbacks=[]).train()
+
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=_BATCH_SIZE,
+        save_every=6,
+        num_workers=2,
+        resume_from=str(tmp_path / "checkpoint-3"),
+    )
+    with pytest.raises(ValueError, match="num_workers"):
+        Trainer(cfg2, callbacks=[])
+
+
+def test_resume_guard_mismatch_names_the_escape_hatch(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """The mismatch error names ``train.resume_data_position=false`` as the escape hatch."""
+    from oplm.training.trainer import Trainer
+
+    cfg1 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=3,
+        batch_size=_BATCH_SIZE,
+        save_every=3,
+        num_workers=0,
+    )
+    Trainer(cfg1, callbacks=[]).train()
+
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=_BATCH_SIZE,
+        save_every=6,
+        num_workers=2,
+        resume_from=str(tmp_path / "checkpoint-3"),
+    )
+    with pytest.raises(ValueError, match="resume_data_position=false"):
+        Trainer(cfg2, callbacks=[])
+
+
+def test_resume_guard_bypassed_by_resume_data_position_false(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """``resume_data_position=false`` bypasses the guard even with a mismatched layout."""
+    from oplm.training.trainer import Trainer
+
+    cfg1 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=3,
+        batch_size=_BATCH_SIZE,
+        save_every=3,
+        num_workers=0,
+    )
+    Trainer(cfg1, callbacks=[]).train()
+
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=_BATCH_SIZE,
+        save_every=6,
+        num_workers=2,
+        resume_from=str(tmp_path / "checkpoint-3"),
+        resume_data_position=False,
+    )
+    resumed = Trainer(cfg2, callbacks=[])
+    # The escape hatch restarts the epoch's data position at row 0 -- no skip armed.
+    assert resumed._batches_in_epoch == 0
+    resumed.train()
+    assert resumed.global_step == 6
+
+
+def test_resume_data_position_false_logs_reseen_warning(
+    training_parquet: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``resume_data_position=false`` (matching layout) still logs that data will be re-seen."""
+    from oplm.training.trainer import Trainer
+
+    cfg1 = tiny_train_cfg(
+        tmp_path, training_parquet, max_steps=3, batch_size=_BATCH_SIZE, save_every=3
+    )
+    Trainer(cfg1, callbacks=[]).train()
+
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=_BATCH_SIZE,
+        save_every=6,
+        resume_from=str(tmp_path / "checkpoint-3"),
+        resume_data_position=False,
+    )
+    with caplog.at_level(logging.WARNING):
+        resumed = Trainer(cfg2, callbacks=[])
+
+    assert resumed._batches_in_epoch == 0
+    assert "re-seen" in caplog.text
+
+
+def test_resume_with_no_cursor_logs_reseen_warning_and_restarts_at_zero(
+    training_parquet: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A checkpoint with no cursor (e.g. pre-Task-3.3) restarts the epoch, with a warning."""
+    from oplm.training.trainer import Trainer
+
+    cfg1 = tiny_train_cfg(
+        tmp_path, training_parquet, max_steps=3, batch_size=_BATCH_SIZE, save_every=3
+    )
+    Trainer(cfg1, callbacks=[]).train()
+
+    # Simulate a pre-cursor checkpoint by stripping the "cursor" key back out.
+    state_path = tmp_path / "checkpoint-3" / "trainer_state.json"
+    state = json.loads(state_path.read_text())
+    del state["cursor"]
+    state_path.write_text(json.dumps(state))
+
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        batch_size=_BATCH_SIZE,
+        save_every=6,
+        resume_from=str(tmp_path / "checkpoint-3"),
+    )
+    with caplog.at_level(logging.WARNING):
+        resumed = Trainer(cfg2, callbacks=[])
+
+    assert resumed._batches_in_epoch == 0
+    assert "re-seen" in caplog.text
+
+
+# --- worker-cycle save alignment deferral (Task 3.3 controller addition) ---------------
+
+
+def test_periodic_save_deferred_until_worker_cycle_alignment(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """With ``num_workers=2``, a save due on an odd ``batches_in_epoch`` lands on the next even one.
+
+    ``save_every=1`` fires the trigger every step; with ``gradient_accumulation_steps=1``,
+    ``batches_in_epoch`` tracks ``global_step`` exactly. Steps 1 and 3 land on an odd
+    (misaligned) batch count and must be deferred one step; steps 2 and 4 are already
+    aligned, so the actually-committed checkpoints land at [2, 4], not [1, 2, 3, 4].
+    """
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=4,
+        batch_size=_BATCH_SIZE,
+        save_every=1,
+        save_total_limit=10,
+        num_workers=2,
+    )
+    callback = FullRecordingCallback()
+    Trainer(cfg, callbacks=[callback]).train()
+
+    assert callback.checkpoint_steps == [2, 4]

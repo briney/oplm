@@ -99,6 +99,73 @@ class _PendingAsyncSave:
     global_step: int
 
 
+class _SaveDeferral:
+    """Worker-cycle save-alignment deferral (Task 3.3 controller addition).
+
+    Task 3.1 established that global batch order on resume is exact only when
+    ``batches_in_epoch % num_workers == 0`` -- a resumed ``DataLoader`` always restarts
+    its worker round-robin at worker 0, so the interruption must have landed on a full
+    worker-cycle boundary for the *global* interleaving order to reproduce exactly (each
+    worker's own content is exact regardless). This class defers a checkpoint trigger
+    (periodic step-cadence, ``save_every_minutes``, or drain) across at most
+    ``num_workers - 1`` extra optimizer steps, looking for the first step where
+    ``batches_in_epoch`` lands back on that boundary, before saving anyway. Rank-safe by
+    construction: every input (``batches_in_epoch``, ``num_workers``, ``global_step``) is
+    rank-identical, so every rank reaches the same decision without a new collective.
+
+    A deferral budget exists because some ``(gradient_accumulation_steps, num_workers)``
+    combinations never realign: ``batches_in_epoch`` advances by
+    ``gradient_accumulation_steps`` each optimizer step, so if
+    ``gcd(gradient_accumulation_steps, num_workers)`` does not divide the current
+    ``batches_in_epoch % num_workers`` offset, ``0`` is mathematically unreachable and
+    waiting longer would never help. In that pathological case the budget expires and
+    the save happens anyway, misaligned -- correctness (having a checkpoint) beats
+    alignment, and the resume side (:meth:`Trainer._resume_from_checkpoint`) logs a
+    warning when it detects the recorded cursor is misaligned.
+
+    One instance tracks one cadence's in-flight deferral (the trainer keeps a separate
+    instance for periodic saves and for drain, since drain must never share state with,
+    or be starved by, the periodic-save cadence).
+    """
+
+    def __init__(self) -> None:
+        self._since_step: int | None = None
+
+    def decide(
+        self, *, triggered: bool, batches_in_epoch: int, num_workers: int, global_step: int
+    ) -> bool:
+        """Return ``True`` if a save should happen now for this cadence.
+
+        Args:
+            triggered: This step's own local trigger condition (e.g. ``step_saved or
+                flags.save_due``, or the drain flag). Ignored once a deferral is already
+                in flight -- the pending save is owed regardless of whether the original
+                per-step trigger condition still holds.
+            batches_in_epoch: The trainer's current ``self._batches_in_epoch``
+                (rank-identical).
+            num_workers: ``cfg.data.num_workers`` (rank-identical, from config).
+            global_step: The trainer's current ``self.global_step``, used to bound the
+                deferral window to ``num_workers - 1`` extra steps.
+
+        Returns:
+            ``True`` exactly on the step the caller should actually call
+            ``_save_checkpoint`` for this cadence; ``False`` while deferring.
+        """
+        if self._since_step is None:
+            if not triggered:
+                return False
+            self._since_step = global_step
+
+        aligned = num_workers <= 1 or batches_in_epoch % num_workers == 0
+        extra_steps = global_step - self._since_step
+        budget_expired = extra_steps >= max(num_workers - 1, 0)
+
+        if aligned or budget_expired:
+            self._since_step = None
+            return True
+        return False
+
+
 class Trainer:
     """Training loop for OPLM with accelerate, wandb, and rich progress.
 
@@ -436,6 +503,22 @@ class Trainer:
         self._epoch_at_last_opt_step = 0
         self._step_local_tokens = 0  # local tokens accumulated across the current opt step
 
+        # Data-cursor state (Task 3.3): count of micro-batches (DataLoader batch pulls,
+        # not optimizer steps) consumed so far this epoch, rank-identical since every
+        # rank pulls exactly one batch per micro-step. Reset to 0 -- and the top-level
+        # dataset's armed resume skip cleared -- on every epoch rollover (the
+        # StopIteration branch in `train`). Snapshotted into a DataCursor at every
+        # checkpoint trigger (`_save_checkpoint`) and, on a layout-compatible resume,
+        # restored from the checkpoint's cursor (`_resume_from_checkpoint`).
+        self._batches_in_epoch = 0
+
+        # Worker-cycle save-alignment deferral (Task 3.3 controller addition): one
+        # `_SaveDeferral` per cadence so periodic saves and drain never share or starve
+        # each other's deferral budget. Transient, in-run-only state -- never persisted
+        # (a fresh Trainer always starts with nothing in flight).
+        self._periodic_save_deferral = _SaveDeferral()
+        self._drain_save_deferral = _SaveDeferral()
+
         # Loss-spike warn-only detector state (Task 1.8). Not persisted across a
         # requeue/resume: it is a diagnostic-only trend, not training state, and simply
         # re-warms from the resumed run's own logged losses.
@@ -522,6 +605,13 @@ class Trainer:
                 except StopIteration:
                     self.epoch += 1
                     self._set_dataset_epoch(self.epoch)
+                    # Data-cursor state (Task 3.3): a new epoch starts a fresh count of
+                    # batches, and any resume skip armed for the epoch that just ended
+                    # must not linger and get (incorrectly) reapplied to this new one --
+                    # see ShardedProteinDataset.set_resume_skip's docstring on why the
+                    # skip is one-epoch-scoped and must be explicitly cleared.
+                    self._batches_in_epoch = 0
+                    self._clear_dataset_resume_skip()
                     data_iter = iter(self.dataloader)
                     batch = next(data_iter)
 
@@ -552,9 +642,12 @@ class Trainer:
                 step_loss_sum += loss.detach().item()
 
                 # Track tokens (local; reduced across ranks on the opt-step boundary
-                # below) and samples
+                # below), samples, and the data cursor's micro-batch count (Task 3.3 --
+                # every rank pulls exactly one DataLoader batch per micro-step, so this
+                # stays rank-identical without a reduce).
                 self._step_local_tokens += int(batch["attention_mask"].sum().item())
                 self._samples_seen += len(batch["input_ids"]) * self.accelerator.num_processes
+                self._batches_in_epoch += 1
 
                 # Only act on optimizer steps (accumulation boundary)
                 if not self.accelerator.sync_gradients:
@@ -630,19 +723,37 @@ class Trainer:
                 # bookkeeping (tokens_seen, throughput window) is already complete above,
                 # so the checkpoint below carries tokens_seen consistent with global_step
                 # across a drain+resume -- but we still check before eval so a drain never
-                # starts a long eval. A pending async save is finalized (blocking) FIRST
-                # (Task 2.3): the drain's own save must always be blocking, and must never
-                # be preceded by a torn/uncommitted async save left dangling behind it.
+                # starts a long eval. Worker-cycle save-alignment deferral (Task 3.3): the
+                # actual save/exit is deferred up to num_workers - 1 extra steps looking for
+                # batches_in_epoch % num_workers == 0 -- bounded and rank-safe (see
+                # _SaveDeferral). A pending async save is finalized (blocking) FIRST (Task
+                # 2.3) once the deferral actually fires: the drain's own save must always be
+                # blocking, and must never be preceded by a torn/uncommitted async save left
+                # dangling behind it.
                 if flags.drain:
-                    if self._pending_save is not None:
-                        self._finalize_pending_save()
-                    self._save_checkpoint()
-                    logger.warning(
-                        "Drain requested: checkpoint saved at step %d; exiting %d",
-                        self.global_step,
-                        DRAIN_EXIT_CODE,
+                    drain_ready = self._drain_save_deferral.decide(
+                        triggered=True,
+                        batches_in_epoch=self._batches_in_epoch,
+                        num_workers=self._effective_num_workers(),
+                        global_step=self.global_step,
                     )
-                    raise SystemExit(DRAIN_EXIT_CODE)
+                    if drain_ready:
+                        if self._pending_save is not None:
+                            self._finalize_pending_save()
+                        self._save_checkpoint()
+                        logger.warning(
+                            "Drain requested: checkpoint saved at step %d; exiting %d",
+                            self.global_step,
+                            DRAIN_EXIT_CODE,
+                        )
+                        raise SystemExit(DRAIN_EXIT_CODE)
+                    logger.info(
+                        "Drain requested at step %d: deferring checkpoint for worker-cycle "
+                        "alignment (batches_in_epoch=%d, num_workers=%d)",
+                        self.global_step,
+                        self._batches_in_epoch,
+                        self._effective_num_workers(),
+                    )
 
                 # Logging
                 if self.global_step % cfg.log_every == 0:
@@ -659,13 +770,23 @@ class Trainer:
 
                 # Checkpointing: step cadence OR the rank-synced save_every_minutes
                 # timer (flags.save_due is identical on every rank after the reduce
-                # above, so this decision is too). Periodic saves default to async
+                # above, so this decision is too). Worker-cycle save-alignment deferral
+                # (Task 3.3): the trigger may not fire the actual save this step --
+                # _SaveDeferral defers up to num_workers - 1 extra steps looking for
+                # batches_in_epoch % num_workers == 0 before saving anyway (see its
+                # docstring); with num_workers <= 1 this is unconditionally the trigger
+                # itself, identical to pre-3.3 behavior. Periodic saves default to async
                 # (Task 2.3): a prior pending save that hasn't been finalized yet (the
                 # opportunistic gate above didn't catch it this step) is force-finalized
                 # first -- at most one outstanding async save at a time -- then this
                 # save is triggered without blocking on its own write.
                 step_saved = cfg.save_every > 0 and self.global_step % cfg.save_every == 0
-                last_step_did_save = step_saved or flags.save_due
+                last_step_did_save = self._periodic_save_deferral.decide(
+                    triggered=step_saved or flags.save_due,
+                    batches_in_epoch=self._batches_in_epoch,
+                    num_workers=self._effective_num_workers(),
+                    global_step=self.global_step,
+                )
                 if last_step_did_save:
                     if self._pending_save is not None:
                         self._finalize_pending_save()
@@ -863,6 +984,44 @@ class Trainer:
         if hasattr(dataset, "set_epoch"):
             dataset.set_epoch(epoch)
 
+    def _effective_num_workers(self) -> int:
+        """Return the dataset-striping worker count implied by ``cfg.data.num_workers``.
+
+        ``cfg.data.num_workers == 0`` tells ``DataLoader`` not to spawn worker
+        processes -- the main process fetches batches itself. Dataset-internal
+        striping arithmetic (``oplm.data.sequence.dataset._resolve_distributed_context``)
+        reflects this as a *single* worker (``get_worker_info()`` returns ``None`` ->
+        ``(worker_id=0, num_workers=1)``), not zero -- so every consumer of "num_workers"
+        for cursor/resume-skip/alignment purposes here must use this normalized count,
+        never the raw config value (passing ``0`` straight into the dataset's
+        ``range(..., step=num_workers)`` arithmetic raises ``ValueError``).
+        """
+        return max(self.cfg.data.num_workers, 1)
+
+    def _top_level_dataset(self) -> object:
+        """Return the top-level training dataset (Task 3.3's cursor arm/clear target).
+
+        ``self.dataloader`` is :class:`~oplm.data.DeviceDataLoader`, whose ``dataset``
+        property forwards to the wrapped ``torch.utils.data.DataLoader``'s own
+        ``dataset`` -- i.e. exactly the object :func:`~oplm.data.build_train_dataloader`
+        constructed: a bare ``ShardedProteinDataset``, or an ``InterleavedDataset`` that
+        propagates ``set_resume_skip``/``clear_resume_skip`` to its sources internally.
+        Either way, only this one, top-level object needs to be armed/cleared.
+        """
+        return self.dataloader.dataset
+
+    def _clear_dataset_resume_skip(self) -> None:
+        """Disarm the top-level dataset's resume skip, if it supports one.
+
+        Called on every epoch rollover (Task 3.3): the skip armed by
+        :meth:`_resume_from_checkpoint` (if any) is scoped to one epoch only, and must
+        not silently reapply to the next one. A no-op for a dataset type that never
+        supports it.
+        """
+        clear = getattr(self._top_level_dataset(), "clear_resume_skip", None)
+        if callable(clear):
+            clear()
+
     def _log_step(self, loss: float) -> None:
         """Log training metrics to wandb."""
         fractional_epoch = self._fractional_epoch()
@@ -950,6 +1109,16 @@ class Trainer:
         (:func:`~oplm.training.checkpoint.mark_permanent`) is deferred for an async
         save (see :class:`_PendingAsyncSave`).
 
+        Also snapshots the data cursor (Task 3.3) at TRIGGER time -- ``self
+        ._batches_in_epoch`` and the run's current layout (``world_size``,
+        ``num_workers``, ``per_rank_batch``, ``seed``) -- into a
+        :class:`~oplm.data.DataCursor`, passed through to
+        ``save_checkpoint(cursor=...)``. This is safe for an async save too: the cursor
+        dict is built and handed to ``save_checkpoint`` before ``dcp.async_save`` stages
+        anything, and ``trainer_state.json`` (which the cursor lands in, under the
+        ``"cursor"`` key) is one of the synchronous sidecars written before this call
+        returns -- never deferred to :meth:`_finalize_pending_save`.
+
         Args:
             blocking: When ``True`` (default), calls ``save_checkpoint(...,
                 blocking=True)`` and the checkpoint is fully committed --
@@ -963,6 +1132,7 @@ class Trainer:
                 any existing pending save before triggering a new one (see
                 :meth:`train`'s "new trigger while pending" handling).
         """
+        from oplm.data import DataCursor
         from oplm.training.checkpoint import PendingSave, mark_permanent, save_checkpoint
 
         assert blocking or self._pending_save is None, (
@@ -970,6 +1140,15 @@ class Trainer:
         )
 
         checkpoint_dir = Path(self.cfg.train.output_dir) / f"checkpoint-{self.global_step}"
+
+        cursor = DataCursor(
+            epoch=self.epoch,
+            batches_in_epoch=self._batches_in_epoch,
+            world_size=self.accelerator.num_processes,
+            num_workers=self._effective_num_workers(),
+            per_rank_batch=self.cfg.train.batch_size,
+            seed=self.cfg.train.seed,
+        )
 
         should_mark_permanent = False
         if self.accelerator.is_main_process:
@@ -999,6 +1178,7 @@ class Trainer:
             save_total_limit=self.cfg.train.save_total_limit,
             keep_every_n_steps=self.cfg.train.keep_every_n_steps,
             extra_state=self._checkpoint_extra_state(),
+            cursor=cursor,
             blocking=blocking,
         )
         self._last_save_at = time.monotonic()
@@ -1058,7 +1238,11 @@ class Trainer:
         return extra_state
 
     def _resume_from_checkpoint(self, checkpoint_dir: str) -> None:
-        """Resume training state from a checkpoint."""
+        """Resume training state from a checkpoint.
+
+        Also resumes the data cursor (Task 3.3), when the checkpoint has one and
+        ``cfg.train.resume_data_position`` is true -- see :meth:`_resume_data_cursor`.
+        """
         from oplm.training.checkpoint import load_checkpoint
 
         state = load_checkpoint(
@@ -1080,6 +1264,7 @@ class Trainer:
         self._first_checkpoint_at = state.get("first_checkpoint_unix")
         self._last_time_keep_index = int(state.get("last_time_keep_index", 0))
         self._set_dataset_epoch(self.epoch)
+        self._resume_data_cursor(state, checkpoint_dir)
 
         # Reset per-opt-step snapshot markers so the first post-resume step computes
         # correct deltas. tokens_seen is already restored from trainer_state.json; the
@@ -1095,6 +1280,103 @@ class Trainer:
             self._samples_seen,
             self.tokens_seen,
         )
+
+    def _resume_data_cursor(self, state: dict[str, Any], checkpoint_dir: str) -> None:
+        """Restore ``self._batches_in_epoch`` and arm the dataset's resume skip, or bypass.
+
+        Three cases (Task 3.3):
+
+        - No cursor in ``state`` (a pre-Task-3.3 checkpoint, or one saved with
+          ``resume_data_position=false``): today's behavior -- the epoch's data stream
+          restarts from row 0 (``self._batches_in_epoch`` stays ``0``, no skip armed) --
+          plus a WARNING that some training rows will be re-seen.
+        - A cursor is present but ``cfg.train.resume_data_position`` is false: same
+          restart-from-row-0 behavior and warning, as an explicit operator opt-out.
+        - A cursor is present and ``resume_data_position`` is true: the cursor's layout
+          (``world_size``, ``num_workers``, ``per_rank_batch``, ``seed``) is validated
+          against the live run. A mismatch raises ``ValueError`` naming every differing
+          field and the ``resume_data_position=false`` escape hatch (resuming into a
+          different layout would silently reproduce the wrong data order/coverage --
+          see ``DataCursor``'s docstring). On a match, ``self._batches_in_epoch`` is
+          restored and the top-level dataset's resume skip is armed via
+          :meth:`_top_level_dataset`'s ``set_resume_skip`` (``InterleavedDataset``
+          propagates to its sources internally). If the recorded ``batches_in_epoch``
+          is not itself a multiple of ``num_workers`` (the interruption did not land on
+          a full worker-cycle boundary -- see the worker-cycle save-alignment deferral
+          in :meth:`train`), a WARNING notes that global batch interleaving may be
+          window-shifted, though each worker's own data content stays exact.
+
+        Args:
+            state: The trainer state dict returned by
+                :func:`~oplm.training.checkpoint.load_checkpoint` (holds the optional
+                ``"cursor"`` key).
+            checkpoint_dir: The checkpoint directory being resumed from (for the error
+                message only).
+
+        Raises:
+            ValueError: The cursor's layout disagrees with the live run and
+                ``resume_data_position`` is true.
+        """
+        from oplm.data import DataCursor
+
+        cursor_dict = state.get("cursor")
+        if cursor_dict is None:
+            logger.warning(
+                "Checkpoint %s has no data cursor (saved before Task 3.3, or with "
+                "resume_data_position=false); restarting epoch %d's data stream from "
+                "row 0 -- some training rows will be re-seen.",
+                checkpoint_dir,
+                self.epoch,
+            )
+            return
+
+        if not self.cfg.train.resume_data_position:
+            logger.warning(
+                "train.resume_data_position=false: restarting epoch %d's data stream "
+                "from row 0 instead of resuming from the checkpoint's data cursor -- "
+                "some training rows will be re-seen.",
+                self.epoch,
+            )
+            return
+
+        cursor = DataCursor(**cursor_dict)
+        live_layout = {
+            "world_size": self.accelerator.num_processes,
+            "num_workers": self._effective_num_workers(),
+            "per_rank_batch": self.cfg.train.batch_size,
+            "seed": self.cfg.train.seed,
+        }
+        mismatches = [
+            f"{attr} (checkpoint={getattr(cursor, attr)!r}, live={live_value!r})"
+            for attr, live_value in live_layout.items()
+            if getattr(cursor, attr) != live_value
+        ]
+        if mismatches:
+            raise ValueError(
+                f"Checkpoint {checkpoint_dir}'s data cursor layout does not match the "
+                f"current run -- resuming would silently reproduce the wrong data order "
+                f"or coverage. Mismatched field(s): {'; '.join(mismatches)}. To resume "
+                "anyway (restarting the epoch's data position from row 0 instead of "
+                "resuming it), set train.resume_data_position=false."
+            )
+
+        self._batches_in_epoch = cursor.batches_in_epoch
+        set_resume_skip = getattr(self._top_level_dataset(), "set_resume_skip", None)
+        if callable(set_resume_skip):
+            set_resume_skip(
+                cursor.batches_in_epoch,
+                per_rank_batch=cursor.per_rank_batch,
+                num_workers=cursor.num_workers,
+            )
+
+        if cursor.num_workers > 1 and cursor.batches_in_epoch % cursor.num_workers != 0:
+            logger.warning(
+                "Resuming with batches_in_epoch=%d not a multiple of num_workers=%d: "
+                "global batch interleaving across workers may be window-shifted on "
+                "resume, while each worker's own data content remains exact.",
+                cursor.batches_in_epoch,
+                cursor.num_workers,
+            )
 
     def _global_effective_batch_size(self) -> int:
         """Return the batch size represented by one optimizer step."""

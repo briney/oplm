@@ -34,6 +34,13 @@ def main(output_dir: str, train_data: str, out_dir: str, max_steps: int) -> None
         save_every=max_steps,
         auto_resume=True,
         log_every=1,
+        # Phase 1 (the parent test process) trains at world_size=1; this worker resumes
+        # at world_size=2 -- a genuine world-size change across the resume, which Task
+        # 3.3's data-cursor layout guard makes a hard error by default (world_size is
+        # part of the validated layout). This test's purpose is rank-agreement on the
+        # *resume target*, not data-cursor exactness across a world-size change, so it
+        # opts into the documented escape hatch (mirrors test_e2e_dcp.py's reshard test).
+        resume_data_position=False,
     )
     trainer = Trainer(cfg, callbacks=[])
     rank = trainer.accelerator.process_index
