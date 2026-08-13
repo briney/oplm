@@ -17,6 +17,7 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
+import torch
 
 from oplm.config import DataConfig, OplmConfig, TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
@@ -49,25 +50,31 @@ def _cfg() -> OplmConfig:
     )
 
 
-def _prepared_model(cfg: OplmConfig) -> tuple[Accelerator, OplmForMaskedLM]:
-    """Build and prepare a tiny model on CPU so ``save_state`` has something to save."""
+def _prepared_model(
+    cfg: OplmConfig,
+) -> tuple[Accelerator, OplmForMaskedLM, torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
+    """Build and prepare a tiny model + optimizer + scheduler on CPU for DCP save/load."""
     from accelerate import Accelerator
 
     accelerator = Accelerator(cpu=True, mixed_precision="no")
     model = OplmForMaskedLM(cfg.model)
-    model = accelerator.prepare(model)
-    return accelerator, model
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    model, optimizer = accelerator.prepare(model, optimizer)
+    return accelerator, model, optimizer, scheduler
 
 
 @pytest.mark.slow
 def test_save_checkpoint_commits_via_rename(tmp_path: Path) -> None:
     """After a save: the committed dir exists, no ``.tmp`` dir remains, ``latest`` points at it."""
     cfg = _cfg()
-    accelerator, model = _prepared_model(cfg)
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
 
     save_checkpoint(
         accelerator=accelerator,
         model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
         cfg=cfg,
         output_dir=str(tmp_path),
         global_step=10,
@@ -92,12 +99,14 @@ def test_save_checkpoint_commits_via_rename(tmp_path: Path) -> None:
 def test_save_checkpoint_replaces_tmp_at_same_step_on_resave(tmp_path: Path) -> None:
     """Re-saving at the same step (e.g. after a requeue) replaces the committed dir cleanly."""
     cfg = _cfg()
-    accelerator, model = _prepared_model(cfg)
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
 
     for tokens in (400, 999):
         save_checkpoint(
             accelerator=accelerator,
             model=model,
+            optimizers=[optimizer],
+            schedulers=[scheduler],
             cfg=cfg,
             output_dir=str(tmp_path),
             global_step=10,

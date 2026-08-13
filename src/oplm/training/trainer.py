@@ -855,6 +855,8 @@ class Trainer:
         save_checkpoint(
             accelerator=self.accelerator,
             model=self.model,
+            optimizers=self.optimizers,
+            schedulers=self.schedulers,
             cfg=self.cfg,
             output_dir=self.cfg.train.output_dir,
             global_step=self.global_step,
@@ -892,7 +894,9 @@ class Trainer:
         """Resume training state from a checkpoint."""
         from oplm.training.checkpoint import load_checkpoint
 
-        state = load_checkpoint(self.accelerator, checkpoint_dir)
+        state = load_checkpoint(
+            self.accelerator, self.model, self.optimizers, self.schedulers, checkpoint_dir
+        )
         self.global_step = state["global_step"]
         self.epoch = state["epoch"]
         self.tokens_seen = state["tokens_seen"]

@@ -5,12 +5,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import shutil
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+import torch
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.stateful import Stateful
+
 if TYPE_CHECKING:
-    import torch
+    from collections.abc import Sequence
+
     from accelerate import Accelerator
 
     from oplm.config import OplmConfig
@@ -22,11 +31,105 @@ _TMP_SUFFIX = ".tmp"
 _OLD_SUFFIX = ".old"
 _LATEST_POINTER_NAME = "latest"
 _KEEP_MARKER_NAME = "KEEP"
+_RNG_SIDECAR_PREFIX = "rng_state_"
+
+
+def _unwrap_optimizer(optimizer: Any) -> Any:
+    """Unwrap Accelerate's ``AcceleratedOptimizer`` to the underlying torch optimizer.
+
+    ``AcceleratedOptimizer`` (what ``accelerator.prepare`` returns) exposes the wrapped
+    ``torch.optim.Optimizer`` as ``.optimizer``. A bare optimizer that was never passed
+    through ``accelerator.prepare`` (e.g. in single-process unit tests) has no such
+    attribute and passes through unchanged.
+    """
+    return getattr(optimizer, "optimizer", optimizer)
+
+
+def _unwrap_scheduler(scheduler: Any) -> Any:
+    """Unwrap Accelerate's ``AcceleratedScheduler`` to the underlying LR scheduler.
+
+    Mirrors :func:`_unwrap_optimizer`: ``AcceleratedScheduler`` exposes the wrapped
+    scheduler as ``.scheduler``; a bare scheduler passes through unchanged.
+    """
+    return getattr(scheduler, "scheduler", scheduler)
+
+
+class _ModelOptState(Stateful):
+    """Model + optimizer state via ``torch.distributed.checkpoint.state_dict``.
+
+    ``get_state_dict``/``set_state_dict`` strip DDP's ``module.`` prefix and resolve
+    ``torch.compile``'s ``OptimizedModule`` wrapping automatically (verified: a compiled
+    module's state dict keys come back exactly as if it had never been compiled), and
+    handle FSDP2/DTensor sharded parameters uniformly. This is what makes the checkpoint
+    produced by :func:`save_checkpoint` valid regardless of world size or parallelism
+    strategy -- DDP today, HSDP from Phase 5 on -- without a checkpoint format change.
+    """
+
+    def __init__(self, model: torch.nn.Module, optimizers: Sequence[Any]) -> None:
+        self._model = model
+        self._optimizers = [_unwrap_optimizer(o) for o in optimizers]
+
+    def state_dict(self) -> dict[str, Any]:
+        model_state, optim_state = get_state_dict(self._model, self._optimizers)
+        return {"model": model_state, "optimizers": optim_state}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        set_state_dict(
+            self._model,
+            self._optimizers,
+            model_state_dict=state_dict["model"],
+            optim_state_dict=state_dict["optimizers"],
+        )
+
+
+def _write_rng_sidecar(tmp_dir: Path, rank: int) -> None:
+    """Write this rank's python/numpy/torch RNG state to a per-rank sidecar file.
+
+    DCP dedupes identical-valued entries written under the same key across ranks, but
+    each rank's RNG state is *not* identical -- every rank advances its own generators
+    independently -- so routing it through the DCP state dict would produce
+    ``world_size`` non-deduplicated copies under one key instead of the intended
+    per-rank values. A tiny per-rank ``torch.save`` sidecar avoids that: no collective
+    is needed, and each rank only ever reads its own file back on load.
+    """
+    rng_state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        rng_state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    torch.save(rng_state, tmp_dir / f"{_RNG_SIDECAR_PREFIX}{rank}.pt")
+
+
+def _restore_rng_sidecar(checkpoint_dir: Path, rank: int) -> None:
+    """Restore this rank's RNG state from the sidecar written by :func:`_write_rng_sidecar`.
+
+    A missing sidecar (e.g. a checkpoint saved at a different world size than the one
+    loading it) is logged and skipped rather than raised: reshard-on-load RNG semantics
+    are Task 2.4's concern. This minimal load-side conversion only needs same-world-size
+    resume to work for Task 2.1/2.2.
+    """
+    sidecar_path = checkpoint_dir / f"{_RNG_SIDECAR_PREFIX}{rank}.pt"
+    if not sidecar_path.is_file():
+        logger.warning(
+            "RNG sidecar not found for rank %d at %s; RNG state not restored", rank, sidecar_path
+        )
+        return
+
+    rng_state: dict[str, Any] = torch.load(sidecar_path, weights_only=False)
+    random.setstate(rng_state["python"])
+    np.random.set_state(rng_state["numpy"])
+    torch.set_rng_state(rng_state["torch_cpu"])
+    if torch.cuda.is_available() and "torch_cuda" in rng_state:
+        torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
 
 
 def save_checkpoint(
     accelerator: Accelerator,
     model: torch.nn.Module,
+    optimizers: Sequence[Any],
+    schedulers: Sequence[Any],
     cfg: OplmConfig,
     output_dir: str,
     global_step: int,
@@ -36,18 +139,27 @@ def save_checkpoint(
     save_total_limit: int = 3,
     keep_every_n_steps: int | None = None,
     extra_state: dict[str, Any] | None = None,
-) -> None:
+    cursor: Any | None = None,
+) -> Path:
     """Save a training checkpoint atomically via a tmp-dir + rename commit.
 
-    Every rank writes into a staging directory named ``checkpoint-<step>.tmp/`` (via
-    ``accelerator.save_state()`` for the resumable model, optimizer, scheduler, and RNG
-    states; the main process additionally writes ``trainer_state.json`` metadata, a
+    Every rank writes into a staging directory named ``checkpoint-<step>.tmp/``. Model
+    and optimizer state go through ``torch.distributed.checkpoint`` (DCP) via
+    :class:`_ModelOptState`, which uses ``torch.distributed.checkpoint.state_dict`` to
+    produce a parallelism- and world-size-agnostic checkpoint -- DDP's ``module.``
+    prefix and ``torch.compile``'s ``OptimizedModule`` wrapping are resolved
+    automatically, and FSDP2/DTensor sharded parameters are handled uniformly, which is
+    what unlocks HSDP (Phase 5) and reshard-on-load (Task 2.4) without a further format
+    change. Each rank also writes its own RNG state (python/numpy/torch-CPU/torch-CUDA)
+    to a small ``rng_state_<rank>.pt`` sidecar via plain ``torch.save`` -- see
+    :func:`_write_rng_sidecar` for why RNG state cannot go through the DCP state dict
+    itself. The main process additionally writes ``trainer_state.json`` metadata, a
     re-loadable ``config.yaml``, and a HuggingFace export under ``hf/`` suitable for
-    ``OplmForMaskedLM.from_pretrained``). Only after every rank has finished writing does the
-    main process rename the staging directory to the final ``checkpoint-<step>/`` name,
-    rewrite the ``latest`` pointer file, and rotate old checkpoints. This guarantees a process
-    killed mid-save leaves behind only an invisible ``.tmp`` directory — never a resume
-    candidate.
+    ``OplmForMaskedLM.from_pretrained``. Only after every rank has finished writing does
+    the main process rename the staging directory to the final ``checkpoint-<step>/``
+    name, rewrite the ``latest`` pointer file, and rotate old checkpoints. This
+    guarantees a process killed mid-save leaves behind only an invisible ``.tmp``
+    directory -- never a resume candidate.
 
     Re-saving at the same step (e.g. a requeue that saves before reaching a later step)
     never deletes the previously committed dir before the new one exists: the old
@@ -59,7 +171,11 @@ def save_checkpoint(
 
     Args:
         accelerator: The HuggingFace Accelerator instance.
-        model: The (possibly wrapped) model to export under ``hf/``.
+        model: The (possibly wrapped) model to export under ``hf/`` and checkpoint via DCP.
+        optimizers: All optimizers to checkpoint, in a fixed order that ``load_checkpoint``
+            must be called with too (may be Accelerate-wrapped or bare torch optimizers).
+        schedulers: All LR schedulers to checkpoint, in the same order as ``optimizers``
+            (may be Accelerate-wrapped or bare).
         cfg: Full OPLM configuration (serialized for reproducibility).
         output_dir: Base output directory (checkpoints saved under subdirs).
         global_step: Current global training step.
@@ -77,22 +193,48 @@ def save_checkpoint(
             and ``last_time_keep_index``, or the ``wandb_run_id`` persisted so a resumed
             run continues the same W&B run instead of starting a new one). Merged on top
             of the base keys below, so callers must not collide with ``global_step``,
-            ``epoch``, ``samples_seen``, or ``tokens_seen``.
+            ``epoch``, ``samples_seen``, ``tokens_seen``, or ``cursor``.
+        cursor: Reserved for the data-loading cursor dataclass landing in Task 3.1
+            (``oplm.training.cursor.DataCursor``); typed loosely (``Any | None``) since
+            that type does not exist yet, and ``None`` for every caller until then. When
+            set, its ``dataclasses.asdict`` form is recorded in ``trainer_state.json``
+            under ``cursor`` for human inspection (the authoritative resumable copy will
+            live wherever Task 3.1 places it).
+
+    Returns:
+        The path the checkpoint is committed to (``<output_dir>/checkpoint-<global_step>``),
+        identical on every rank regardless of which rank actually performs the rename.
     """
     from oplm.config import serialize_config
     from oplm.data import get_tokenizer
 
     tmp_dir = Path(output_dir) / f"{_CHECKPOINT_PREFIX}{global_step}{_TMP_SUFFIX}"
-    accelerator.save_state(str(tmp_dir))
+    final_dir = tmp_dir.with_name(f"{_CHECKPOINT_PREFIX}{global_step}")
+
+    # Model + optimizer state through DCP (all ranks participate; dcp.save is
+    # internally collective and creates tmp_dir as part of that collective, so it
+    # exists on every rank by the time this call returns -- verified single-process,
+    # with torch.compile, and 2-rank DDP without requiring a pre-created directory).
+    dcp_state: dict[str, Any] = {
+        "app": _ModelOptState(model, optimizers),
+        "schedulers": [_unwrap_scheduler(s).state_dict() for s in schedulers],
+    }
+    dcp.save(dcp_state, checkpoint_id=str(tmp_dir))
+
+    # Per-rank RNG sidecar (Task 2.1 spec): not part of the DCP state dict (see
+    # _write_rng_sidecar), written before the commit barrier below.
+    _write_rng_sidecar(tmp_dir, accelerator.process_index)
 
     if accelerator.is_main_process:
         # Save trainer state
-        state = {
+        state: dict[str, Any] = {
             "global_step": global_step,
             "epoch": epoch,
             "samples_seen": samples_seen,
             "tokens_seen": tokens_seen,
         }
+        if cursor is not None:
+            state["cursor"] = asdict(cursor) if is_dataclass(cursor) else cursor
         if extra_state:
             state.update(extra_state)
         state_path = tmp_dir / "trainer_state.json"
@@ -116,7 +258,6 @@ def save_checkpoint(
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        final_dir = tmp_dir.with_name(f"{_CHECKPOINT_PREFIX}{global_step}")
         aside_dir = final_dir.with_name(f"{final_dir.name}{_OLD_SUFFIX}")
         if final_dir.exists():
             # Re-saving at the same step after a requeue: move the previous commit
@@ -136,18 +277,36 @@ def save_checkpoint(
     # rename, latest-pointer update, and rotation on the main process are done.
     accelerator.wait_for_everyone()
 
+    return final_dir
+
 
 def load_checkpoint(
     accelerator: Accelerator,
+    model: torch.nn.Module,
+    optimizers: Sequence[Any],
+    schedulers: Sequence[Any],
     checkpoint_dir: str,
 ) -> dict[str, Any]:
     """Load a training checkpoint and return trainer state metadata.
 
-    Calls ``accelerator.load_state()`` to restore model, optimizer, scheduler,
-    and RNG states. Reads and returns the trainer state dict.
+    Restores model and optimizer state via ``torch.distributed.checkpoint`` (DCP; see
+    :class:`_ModelOptState`), restores each scheduler's state, and restores this rank's
+    RNG state from its sidecar (see :func:`_restore_rng_sidecar`). Reads and returns the
+    trainer state dict.
+
+    This is a **minimal** conversion of the load path to the DCP format that
+    :func:`save_checkpoint` (Task 2.1) now writes -- just enough to keep resume working
+    end to end. Task 2.2 owns the full load rework (schema validation, world-size
+    mismatch fallback, etc.); this function does not attempt any of that.
 
     Args:
         accelerator: The HuggingFace Accelerator instance.
+        model: The (possibly wrapped) model to restore state into.
+        optimizers: All optimizers to restore, in the exact order passed to the
+            :func:`save_checkpoint` call that produced ``checkpoint_dir`` (may be
+            Accelerate-wrapped or bare).
+        schedulers: All LR schedulers to restore, in the same order as ``optimizers``
+            (may be Accelerate-wrapped or bare).
         checkpoint_dir: Path to the checkpoint directory.
 
     Returns:
@@ -161,7 +320,18 @@ def load_checkpoint(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
-    accelerator.load_state(str(ckpt_path))
+    unwrapped_schedulers = [_unwrap_scheduler(s) for s in schedulers]
+    dcp_state: dict[str, Any] = {
+        "app": _ModelOptState(model, optimizers),
+        "schedulers": [s.state_dict() for s in unwrapped_schedulers],
+    }
+    dcp.load(dcp_state, checkpoint_id=str(ckpt_path))
+    for scheduler, scheduler_state in zip(
+        unwrapped_schedulers, dcp_state["schedulers"], strict=True
+    ):
+        scheduler.load_state_dict(scheduler_state)
+
+    _restore_rng_sidecar(ckpt_path, accelerator.process_index)
 
     state_path = ckpt_path / "trainer_state.json"
     if not state_path.exists():

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import math
-import time as time_module
+import time as _real_time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -28,6 +28,7 @@ from oplm.training.optim import get_schedule_fn
 from tests.training.conftest import FullRecordingCallback, tiny_train_cfg
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 pytestmark = pytest.mark.slow
@@ -36,13 +37,7 @@ _BATCH_SIZE = 4
 
 
 class _FakeClock:
-    """A fake monotonic/wall clock that advances by a fixed step on every call.
-
-    Installed via ``monkeypatch.setattr(time_module, "monotonic", ...)`` (or
-    ``"time"``) so it stands in for the exact stdlib attribute the trainer calls —
-    patching the module attribute (not a local ``from time import monotonic``
-    binding) is what makes the fake take effect inside ``trainer.py``.
-    """
+    """A fake monotonic/wall clock that advances by a fixed step on every call."""
 
     def __init__(self, step: float = 30.0, start: float = 0.0) -> None:
         self._value = start
@@ -52,6 +47,34 @@ class _FakeClock:
         value = self._value
         self._value += self._step
         return value
+
+
+class _FakeTimeModule:
+    """Stand-in for the ``time`` module-level name bound inside ``trainer.py``.
+
+    Installed via ``monkeypatch.setattr("oplm.training.trainer.time", ...)``, which
+    replaces trainer.py's own ``time`` *name binding* rather than mutating an attribute
+    on the real, shared ``time`` module. That distinction matters: since Task 2.1,
+    ``save_checkpoint`` calls ``torch.distributed.checkpoint`` (DCP), which instruments
+    its own save/load durations with real ``time.time()`` calls internally. Patching the
+    global ``time.time`` slot (as this file used to do) would let those unrelated calls
+    silently consume "ticks" from a fake clock shared process-wide, desynchronizing it
+    from what the elapsed-time math below expects. Scoping the patch to trainer.py's own
+    ``time`` reference means only trainer.py's ``time.time()``/``time.monotonic()``
+    calls ever see the fake clock; DCP's own ``import time`` elsewhere is untouched.
+    """
+
+    def __init__(
+        self,
+        *,
+        time_fn: Callable[[], float] | None = None,
+        monotonic_fn: Callable[[], float] | None = None,
+    ) -> None:
+        self.time = time_fn if time_fn is not None else _real_time.time
+        self.monotonic = monotonic_fn if monotonic_fn is not None else _real_time.monotonic
+        # trainer.py also calls time.perf_counter() for throughput timing; no test in
+        # this file fakes it, so it always passes through to the real clock.
+        self.perf_counter = _real_time.perf_counter
 
 
 def _checkpoint_names(output_dir: Path) -> list[str]:
@@ -144,7 +167,9 @@ def test_save_every_minutes_triggers_time_based_checkpoint(
     """
     from oplm.training.trainer import Trainer
 
-    monkeypatch.setattr(time_module, "monotonic", _FakeClock(step=30.0))
+    monkeypatch.setattr(
+        "oplm.training.trainer.time", _FakeTimeModule(monotonic_fn=_FakeClock(step=30.0))
+    )
 
     cfg = tiny_train_cfg(
         tmp_path,
@@ -174,7 +199,9 @@ def test_keep_every_n_hours_marks_crossing_checkpoint_permanent(
     """
     from oplm.training.trainer import Trainer
 
-    monkeypatch.setattr(time_module, "time", _FakeClock(step=2000.0))
+    monkeypatch.setattr(
+        "oplm.training.trainer.time", _FakeTimeModule(time_fn=_FakeClock(step=2000.0))
+    )
 
     cfg = tiny_train_cfg(
         tmp_path,
@@ -209,7 +236,9 @@ def test_first_checkpoint_unix_anchor_survives_resume(
     """
     from oplm.training.trainer import Trainer
 
-    monkeypatch.setattr(time_module, "time", _FakeClock(step=100.0))
+    monkeypatch.setattr(
+        "oplm.training.trainer.time", _FakeTimeModule(time_fn=_FakeClock(step=100.0))
+    )
 
     cfg1 = tiny_train_cfg(
         tmp_path,
