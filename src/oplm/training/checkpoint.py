@@ -74,9 +74,10 @@ def save_checkpoint(
             ``save_total_limit``.
         extra_state: Additional key/value pairs merged into ``trainer_state.json``
             (e.g. the ``keep_every_n_hours`` bookkeeping keys ``first_checkpoint_unix``
-            and ``last_time_keep_index``). Merged on top of the base keys below, so
-            callers must not collide with ``global_step``, ``epoch``, ``samples_seen``,
-            or ``tokens_seen``.
+            and ``last_time_keep_index``, or the ``wandb_run_id`` persisted so a resumed
+            run continues the same W&B run instead of starting a new one). Merged on top
+            of the base keys below, so callers must not collide with ``global_step``,
+            ``epoch``, ``samples_seen``, or ``tokens_seen``.
     """
     from oplm.config import serialize_config
     from oplm.data import get_tokenizer

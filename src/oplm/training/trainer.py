@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -135,6 +136,29 @@ class Trainer:
 
             clean_stale_checkpoint_dirs(Path(cfg.train.output_dir))
 
+        # Resolve the resume target *before* wandb init (Task 1.7) so a resumed run's id
+        # can be threaded into wandb_kwargs below. An explicit resume_from always wins;
+        # auto_resume only fills in the gap when no explicit path was given, scanning for
+        # the newest *committed* checkpoint under output_dir (see
+        # oplm.training.checkpoint.latest_checkpoint) so a requeued job (Task 1.5) picks up
+        # where it left off instead of restarting at step 0. A fresh output_dir with no
+        # committed checkpoint yet is a no-op: training starts at step 0, exactly as if
+        # auto_resume were unset. The heavy state restore (_resume_from_checkpoint) happens
+        # later, once the model/optimizer/dataloader exist.
+        resume_target = cfg.train.resume_from
+        if resume_target is None and cfg.train.auto_resume:
+            from oplm.training.checkpoint import latest_checkpoint
+
+            found = latest_checkpoint(Path(cfg.train.output_dir))
+            if found is not None:
+                resume_target = str(found)
+                _status(f"[dim]Auto-resuming from {found.name}[/dim]")
+
+        # Run id persisted right after init_trackers below; reused as the wandb_run_id
+        # extra_state key on every checkpoint save. Stays None when wandb is disabled or
+        # (main-process-only) on non-main ranks, so save_checkpoint's extra_state omits it.
+        self._wandb_run_id: str | None = None
+
         # Init wandb early so login prompt appears before slow setup steps
         if cfg.train.wandb_enabled:
             _status("[dim]Initializing wandb...[/dim]")
@@ -144,11 +168,37 @@ class Trainer:
             wandb_kwargs: dict[str, Any] = {"dir": cfg.train.output_dir}
             if cfg.train.wandb_run_name is not None:
                 wandb_kwargs["name"] = cfg.train.wandb_run_name
+            if resume_target is not None:
+                # Task 1.7: continue the same W&B run across a requeue instead of
+                # starting a new one. Checkpoint's trainer_state.json is the first
+                # choice (authoritative for that checkpoint); the output_dir marker
+                # file is the fallback (e.g. a checkpoint saved before this field
+                # existed, or a save that landed between the id write and the next
+                # checkpoint).
+                run_id = _read_resume_wandb_run_id(resume_target, cfg.train.output_dir)
+                if run_id is not None:
+                    wandb_kwargs |= {"id": run_id, "resume": "allow"}
             self.accelerator.init_trackers(
                 project_name=cfg.train.wandb_project,
                 config=_config_to_flat_dict(cfg),
                 init_kwargs={"wandb": wandb_kwargs},
             )
+
+            # Persist the run id immediately so a mid-run kill still leaves a
+            # resumable marker. Lazy/guarded import: wandb is an optional dependency,
+            # only needed when wandb_enabled. `wandb.run` is set by init_trackers just
+            # above (WandBTracker.start() calls wandb.init()); it is main-process-only
+            # (WandBTracker methods are @on_main_process) and can stay None in some
+            # offline edge cases, which is skipped gracefully.
+            if self.accelerator.is_main_process:
+                import wandb
+
+                active_run = wandb.run
+                if active_run is not None:
+                    self._wandb_run_id = active_run.id
+                    (Path(cfg.train.output_dir) / "wandb_run_id").write_text(
+                        f"{self._wandb_run_id}\n"
+                    )
 
         # Drop a top-level copy of the fully resolved config alongside the run.
         if self.accelerator.is_main_process:
@@ -329,21 +379,9 @@ class Trainer:
         # Dataset size for fractional epoch computation
         self._dataset_size = raw_dataset_size
 
-        # Resume from checkpoint. An explicit resume_from always wins; auto_resume only
-        # fills in the gap when no explicit path was given, scanning for the newest
-        # *committed* checkpoint under output_dir (see
-        # oplm.training.checkpoint.latest_checkpoint) so a requeued job (Task 1.5) picks up
-        # where it left off instead of restarting at step 0. A fresh output_dir with no
-        # committed checkpoint yet is a no-op: training starts at step 0, exactly as if
-        # auto_resume were unset.
-        resume_target = cfg.train.resume_from
-        if resume_target is None and cfg.train.auto_resume:
-            from oplm.training.checkpoint import latest_checkpoint
-
-            found = latest_checkpoint(Path(cfg.train.output_dir))
-            if found is not None:
-                resume_target = str(found)
-                _status(f"[dim]Auto-resuming from {found.name}[/dim]")
+        # Resume from checkpoint. resume_target was already resolved above (ahead of wandb
+        # init, so a resumed run can reuse its wandb id); only the heavy state restore
+        # happens here, now that the model/optimizer/dataloader exist.
         if resume_target is not None:
             self._resume_from_checkpoint(resume_target)
 
@@ -727,10 +765,7 @@ class Trainer:
             tokens_seen=self.tokens_seen,
             save_total_limit=self.cfg.train.save_total_limit,
             keep_every_n_steps=self.cfg.train.keep_every_n_steps,
-            extra_state={
-                "first_checkpoint_unix": self._first_checkpoint_at,
-                "last_time_keep_index": self._last_time_keep_index,
-            },
+            extra_state=self._checkpoint_extra_state(),
         )
         self._last_save_at = time.monotonic()
 
@@ -738,6 +773,22 @@ class Trainer:
             mark_permanent(checkpoint_dir)
 
         self._emit_checkpoint_saved(checkpoint_dir)
+
+    def _checkpoint_extra_state(self) -> dict[str, Any]:
+        """Build the ``extra_state`` payload merged into ``trainer_state.json``.
+
+        Includes the ``keep_every_n_hours`` bookkeeping keys and, when a wandb run is
+        active (``self._wandb_run_id`` set on the main process), the run id (Task 1.7)
+        so a resumed run can be threaded back into ``wandb.init(id=..., resume="allow")``
+        without depending on the ``wandb_run_id`` marker file surviving.
+        """
+        extra_state: dict[str, Any] = {
+            "first_checkpoint_unix": self._first_checkpoint_at,
+            "last_time_keep_index": self._last_time_keep_index,
+        }
+        if self._wandb_run_id is not None:
+            extra_state["wandb_run_id"] = self._wandb_run_id
+        return extra_state
 
     def _resume_from_checkpoint(self, checkpoint_dir: str) -> None:
         """Resume training state from a checkpoint."""
@@ -830,6 +881,39 @@ class Trainer:
 
         for callback in self.callbacks:
             callback.on_train_end(self)
+
+
+def _read_resume_wandb_run_id(resume_target: str, output_dir: str) -> str | None:
+    """Read the wandb run id to resume, for threading into ``wandb.init(id=..., ...)``.
+
+    Prefers the id recorded in the resume target checkpoint's own ``trainer_state.json``
+    (authoritative for that exact checkpoint); falls back to the
+    ``<output_dir>/wandb_run_id`` marker file (e.g. a checkpoint saved before this field
+    existed, or a checkpoint dir moved/copied without its marker).
+
+    Args:
+        resume_target: Path to the checkpoint directory being resumed from.
+        output_dir: The training output directory.
+
+    Returns:
+        The wandb run id string, or ``None`` if neither source has one.
+    """
+    state_path = Path(resume_target) / "trainer_state.json"
+    if state_path.is_file():
+        try:
+            state = json.loads(state_path.read_text())
+        except json.JSONDecodeError:
+            state = {}
+        run_id = state.get("wandb_run_id")
+        if run_id:
+            return str(run_id)
+
+    id_path = Path(output_dir) / "wandb_run_id"
+    if id_path.is_file():
+        text = id_path.read_text().strip()
+        if text:
+            return text
+    return None
 
 
 def _config_to_flat_dict(cfg: OplmConfig) -> dict[str, Any]:
