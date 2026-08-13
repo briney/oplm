@@ -565,6 +565,19 @@ any other nonzero exit (a crash). On a plain workstation `SLURM_JOB_END_TIME` is
 signals matter; on Slurm, `--signal=USR1@600` (rendered by `oplm slurm generate`) delivers exactly
 this signal 600 s before the job's time limit, so the two paths normally agree.
 
+### Async checkpointing
+
+Periodic checkpoints (the `save_every` step cadence and the `save_every_minutes` timer) save via
+`torch.distributed.checkpoint`'s asynchronous API by default: the write proceeds on a background
+thread while training continues, and the commit itself — the atomic rename onto the checkpoint's
+final name, the `latest` pointer update, and rotation — is deferred until every rank's write has
+actually finished. This means saves only ever commit when **all** ranks finish writing; a crash
+mid-write (this rank's or a peer's) never produces a torn *committed* checkpoint, only an invisible
+`checkpoint-<step>.tmp/` staging directory that discovery and rotation ignore and that gets cleaned
+up unconditionally the next time a `Trainer` starts against that `output_dir`. Drain and the final
+end-of-training save always finish any still-pending async write first, so a preemption is never
+blocked behind — or preceded by — a torn, uncommitted periodic save.
+
 ### What a resume restores
 
 A resume (`resume_from` or `auto_resume`) restores, via Accelerate's `save_state`/`load_state`:

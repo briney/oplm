@@ -7,9 +7,10 @@ import logging
 import os
 import random
 import shutil
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -20,7 +21,6 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from concurrent.futures import Future
 
     from accelerate import Accelerator
 
@@ -230,6 +230,21 @@ class PendingSave:
     :func:`finalize_pending_save`, which must be called once every rank's local
     background write has actually finished (not merely started).
 
+    **Known limitation, multi-rank:** ``dcp.async_save``'s background write is itself
+    collective when ``use_collectives=True`` (the default this codebase relies on) --
+    surviving ranks' writer threads can exchange Gloo/NCCL messages with a rank that
+    dies mid-write. If one rank is killed while its background write is in flight, the
+    other ranks' writer threads are not guaranteed to unblock promptly; they are bounded
+    only by process teardown (the dist backend's own timeout, or the whole job being
+    torn down by the scheduler), not by anything this module does. This is considered
+    acceptable rather than fixed here: the job-level requeue loop (Slurm/k8s restarting
+    the whole job) is the actual recovery mechanism for a rank death, not graceful
+    in-process cleanup of the other ranks' threads -- and either way, the on-disk
+    invariant holds: no rank ever renames its ``tmp_dir`` onto a committed name without
+    every rank's write having finished, so a crash here still leaves nothing but
+    invisible, stale ``.tmp`` dirs for :func:`clean_stale_checkpoint_dirs` to remove at
+    the next trainer start.
+
     Attributes:
         future: The ``Future`` returned by ``dcp.async_save``; resolves (or raises) once
             this rank's model/optimizer state has been fully written to ``tmp_dir``.
@@ -316,7 +331,10 @@ def finalize_pending_save(accelerator: Accelerator, pending: PendingSave) -> Pat
     finalize before a new trigger/drain/final save" path (where it actually blocks) --
     both need the identical barrier + rename + rotate tail, just reached with or
     without a genuine wait. A write that failed in the background re-raises here,
-    from ``.result()``, rather than being silently swallowed.
+    from ``.result()``, rather than being silently swallowed. If this rank's own write
+    failed or hangs because a *peer* rank died mid-write, see :class:`PendingSave`'s
+    docstring for the known multi-rank limitation (bounded only by process teardown,
+    recovered at the job level by a requeue, not by anything in this function).
 
     Args:
         accelerator: The HuggingFace Accelerator instance (the same one passed to the
@@ -462,11 +480,27 @@ def save_checkpoint(
         # sidecar writes just below, which must run synchronously regardless of
         # blocking, don't race a FileNotFoundError against the background thread.
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        # dcp.async_save's return type is Future | AsyncSaveResponse; it is only ever
-        # an AsyncSaveResponse when async_checkpointer_type=PROCESS, which this codebase
-        # never passes (the default THREAD type is used throughout), so the result is
-        # always a Future in practice.
-        future = cast("Future[Any]", dcp.async_save(dcp_state, checkpoint_id=str(tmp_dir)))
+        async_result = dcp.async_save(dcp_state, checkpoint_id=str(tmp_dir))
+        # dcp.async_save's return type is Future | AsyncSaveResponse. Which one comes
+        # back depends on whether the STAGING step itself is asynchronous, not on
+        # async_checkpointer_type (that only selects the upload executor): DCP takes
+        # the AsyncSaveResponse branch only when the stager returns a Future from its
+        # own .stage() call (a custom async_stager/storage_writer with
+        # StagingOptions(use_async_staging=True)). This codebase never passes a
+        # storage_writer or async_stager, so DCP falls back to its own
+        # DefaultStager(StagingOptions(use_async_staging=False, ...)) -- synchronous
+        # staging, which always takes the Future-returning branch. Checked
+        # defensively (rather than a blind cast) since a future torch upgrade could
+        # change that default.
+        if not isinstance(async_result, Future):
+            raise TypeError(
+                f"dcp.async_save returned {type(async_result).__name__}, not a "
+                "concurrent.futures.Future -- PendingSave/finalize_pending_save "
+                "assume a plain Future (see the comment above for why that is "
+                "expected given this codebase's async_save call shape); a torch "
+                "upgrade may have changed DCP's default staging behavior."
+            )
+        future = async_result
 
     # Per-rank RNG sidecar (Task 2.1 spec): not part of the DCP state dict (see
     # _write_rng_sidecar), written before the commit barrier below.

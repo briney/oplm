@@ -705,6 +705,26 @@ class Trainer:
                 self._save_checkpoint()
 
         finally:
+            # Deliberately NOT finalizing self._pending_save here. This finally runs on
+            # every exit from the try above, including an unrelated crash (an exception
+            # this method didn't raise itself -- e.g. an OOM, a NCCL/dist error, a
+            # keyboard interrupt) with a pending async save still outstanding. Forcing a
+            # finalize (which blocks on the future, then renames tmp_dir onto the final
+            # name) on that path would be wrong: it would let a checkpoint commit AFTER
+            # the crash that was supposed to kill the run, on a filesystem state that may
+            # not reflect what every rank actually finished writing (a crash on one rank
+            # doesn't guarantee every other rank's write, or its own barrier, resolves
+            # cleanly). Every DELIBERATE stop (drain, the non-finite guard, a new
+            # save trigger, or a normal end-of-training) already force-finalizes at its
+            # own call site, above, before reaching here -- so by the time control
+            # reaches this finally through one of those paths, self._pending_save is
+            # already None. An unrelated crash instead leaves self._pending_save's
+            # tmp_dir exactly where clean_stale_checkpoint_dirs expects a torn,
+            # never-committed staging dir: invisible to discovery/rotation, and deleted
+            # unconditionally the next time a Trainer starts against this output_dir.
+            # This is the commit protocol's core invariant working as designed, not a
+            # gap: "a kill mid-async leaves only a .tmp" is supposed to include kills
+            # that happen to land while an async save is pending.
             if progress is not None:
                 progress.stop()
             self._emit_train_end()
