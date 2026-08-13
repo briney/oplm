@@ -23,6 +23,7 @@ the test discovers the drained step rather than assuming it is step 1.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -110,9 +111,42 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     # A drain warning was logged (docs/DRAIN.md-style observability contract).
     assert "Drain requested" in stderr_path.read_text()
 
-    # Follow-up: a requeued run with auto_resume=true picks up past the drained step.
+    # The key regression this test guards against (fix commit 69e70f3): the drain
+    # branch must sit AFTER this step's tokens_seen/throughput bookkeeping, so the
+    # checkpoint it writes carries a tokens_seen that actually covers the drained
+    # step, not one step behind. Cross-check the checkpoint's tokens_seen against an
+    # independent control run: the data pipeline's shuffling is a pure, seeded
+    # function of (cfg.train.seed, epoch) (see oplm.data.sequence.dataset._epoch_seed
+    # -- an explicit torch.Generator, not global RNG state), and tokens_seen depends
+    # only on batch composition (attention_mask sums), not on masking or model
+    # randomness. So a fresh, uninterrupted Trainer sharing the same seed/data/batch
+    # config reproduces the exact same first `drained_step` batches -- in-process,
+    # in a different subprocess, doesn't matter -- and its tokens_seen after exactly
+    # `drained_step` steps is the ground truth for what the drained checkpoint should
+    # have recorded. If the drain branch ever moves back above the tokens_seen/
+    # throughput accounting, the checkpoint's tokens_seen will fall short of this
+    # value by exactly one step's tokens, and this assertion catches it.
+    checkpoint_state = json.loads(
+        (run_dir / f"checkpoint-{drained_step}" / "trainer_state.json").read_text()
+    )
+    checkpoint_tokens_seen = checkpoint_state["tokens_seen"]
+
     from oplm.training.trainer import Trainer
 
+    control_cfg = tiny_train_cfg(
+        tmp_path / "control",
+        training_parquet,
+        max_steps=drained_step,
+        save_every=0,
+        save_final=False,
+        log_every=1,
+    )
+    control = Trainer(control_cfg, callbacks=[])
+    control.train()
+    assert control.global_step == drained_step
+    assert checkpoint_tokens_seen == control.tokens_seen > 0
+
+    # Follow-up: a requeued run with auto_resume=true picks up past the drained step.
     resume_cfg = tiny_train_cfg(
         run_dir,
         training_parquet,
@@ -124,6 +158,7 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     assert resume_cfg.train.resume_from is None
     resumed = Trainer(resume_cfg, callbacks=[])
     assert resumed.global_step == drained_step
+    assert resumed.tokens_seen == checkpoint_tokens_seen
 
     resumed.train()
     assert resumed.global_step == drained_step + 2

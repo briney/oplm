@@ -576,7 +576,7 @@ class Trainer:
             local_tokens: This rank's token count for the just-completed optimizer
                 step.
             drain: This rank's local drain signal (SIGUSR1/SIGTERM/SLURM end-time
-                margin). Hardwired False until Task 1.5 wires the real signal.
+                margin), from :attr:`_drain_signal` (Task 1.5).
             nonfinite: This rank's local non-finite-loss signal. Hardwired False
                 until Task 1.8 wires the real signal.
             save_due: This rank's local ``save_every_minutes`` timer signal.
