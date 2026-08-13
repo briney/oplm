@@ -581,15 +581,27 @@ class UploadManager:
     identity check entirely (nothing to check against), finalize, rotate; exactly
     Task 4.1's own direct ``upload_checkpoint(..., write_manifest=True)`` flow.
 
-    **Known limitation (flagged, not solved by the identity check above):**
-    drop-oldest queuing is independent per node. If commit cadence outpaces upload
-    speed asymmetrically across nodes for long enough, node leaders' *executed*
-    job counts can diverge permanently, at which point every future round's
-    identity check fails and nothing ever finalizes again until the queues
-    happen to realign. The identity check turns that failure mode from "silent,
-    incomplete manifest" into "loud, visible, no manifest" -- a strict
-    improvement -- but does not prevent the underlying desync. A future
-    hardening could coordinate drop decisions globally instead of per-node.
+    **Self-healing, not just fail-safe:** because the identity-check gather is
+    itself a blocking collective, every node leader is forced into lockstep at
+    each round boundary -- no leader can start uploading its *next* job until every
+    leader has returned from the *current* round's gather. So a single slow upload,
+    or one node lagging behind by one job, resolves itself at the very next round:
+    that node's leader simply reports the older step it's still working on, gets a
+    logged mismatch (this round's finalize skipped), and by the time it starts its
+    next round every other leader is waiting at the same gather for it. Drop-oldest
+    queuing is still independent per node (see :meth:`submit`), so a node CAN drop
+    its way onto a different step than its peers -- but the lockstep round
+    boundary means that only shows up as an occasional, self-correcting skipped
+    round, not a growing backlog. **Known limitation (flagged, not solved by the
+    identity check above):** the one scenario this does not self-heal is a
+    *persistent* per-node backlog spanning many round boundaries in a row (e.g. one
+    node's storage backend is durably slower than the rest for the whole run) --
+    every round it participates in still disagrees with its peers, so nothing ever
+    finalizes for that node's checkpoints until its backlog clears. The identity
+    check turns that failure mode from "silent, incomplete manifest" into "loud,
+    visible, no manifest" (a strict improvement) but does not eliminate the
+    possibility. A future hardening could coordinate drop decisions globally
+    instead of per-node.
     """
 
     def __init__(

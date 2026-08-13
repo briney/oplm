@@ -566,13 +566,29 @@ one is still uploading is queued (at most one slot — a further commit before i
 queued one, since the newer checkpoint always supersedes an older, not-yet-started upload). On
 multi-node runs, each node's `local_process_index == 0` process uploads only the DCP shard files
 its own node's ranks wrote; the global main process additionally uploads the shared artifacts
-(`.metadata`, `trainer_state.json`, `config.yaml`, `hf/`) and only finalizes the remote manifest
-after a dedicated GLOO barrier confirms every node's upload has landed — never the trainer's own
-(typically NCCL) process group, and never before every writer is done (see
-`RemoteStore.finalize`'s docstring for why that ordering is a hard, unenforced invariant). The
-drain path (and the natural end of training) blocks on this upload, bounded by a 10-minute
+(`.metadata`, `trainer_state.json`, `config.yaml`, `hf/`) — all of this over a dedicated GLOO
+process group, never the trainer's own (typically NCCL) default group.
+
+Finalizing the remote manifest is not a bare barrier: every node leader that just finished its
+own upload exchanges its checkpoint identity (which step it just uploaded) with every other node
+leader over that GLOO group. Only if every leader agrees on the step does the main process write
+the manifest and rotate; a bare barrier can't detect two leaders having finished uploading
+*different* checkpoints (a node whose own upload queue fell behind and coalesced onto a different
+step than its peers), which would otherwise let a manifest get committed while silently missing
+that node's files. On a disagreement, an operator will see an ERROR log naming the divergent
+steps, and that checkpoint simply stays uncommitted remotely (no manifest.json — invisible to
+`latest_committed`/rotation, exactly like a torn upload) rather than ever being finalized
+incomplete. This self-heals: because the identity exchange is itself a blocking collective, every
+node leader moves to the next round in lockstep, so the next round where every leader's upload
+lands on the same step commits normally — genuine, *permanent* divergence needs a persistent
+per-node backlog across round boundaries, not just one slow upload. **Storage hygiene note:** a
+skipped or torn round leaves a manifest-less `checkpoint-<step>/` directory sitting on the remote
+store; rotation never touches it (nothing without a manifest is ever counted or deleted), so these
+are safe but do accumulate over time until an operator cleans them up manually.
+
+The drain path (and the natural end of training) blocks on the upload, bounded by a 10-minute
 timeout, before proceeding — the local checkpoint is always the fallback resume target
-regardless of whether the remote mirror finishes in time.
+regardless of whether the remote mirror finishes (or finalizes) in time.
 
 `auto_resume` also consults the remote mirror: if no local committed checkpoint validates, or a
 remote one exists at a *higher* step than the best local candidate, the remote checkpoint is
