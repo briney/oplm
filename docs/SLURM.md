@@ -56,6 +56,8 @@ Every field, its type, and its default (`SlurmConfig` in `src/oplm/slurm/config.
 | `exclusive` | bool | `true` | Whether to pass `--exclusive`. |
 | `max_concurrent` | positive int | `4` | Array-job throttle: rendered as `--array=0-N%max_concurrent` (§6). |
 | `account` | string or null | `null` | Optional `--account` for billing/allocation; omitted from the header when unset. |
+| `max_requeues` | positive int | `20` | Requeue budget consulted by the rendered requeue wrapper — §8. |
+| `nccl_debug` | string | `"WARN"` | Value exported as `NCCL_DEBUG`. Set `INFO` for verbose rendezvous/topology logging; noisy for routine production runs. |
 
 A minimal, real block — `configs/scaling.yaml`'s own `slurm:` section:
 
@@ -76,6 +78,7 @@ slurm:
     - /tmp:/tmp
   install: pip install oplm[train]
   max_concurrent: 4
+  max_requeues: 20
   nodes: {170M: 4, 400M: 8, 800M: 16, 1B: 16}
   max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
 ```
@@ -280,23 +283,81 @@ in `DependencyNeverSatisfied` forever, with no job ever running to report why.
 
 ---
 
-## 8. `--requeue` and checkpoint resume
+## 8. Requeue semantics: drain, budget, and the no-progress guard
 
 Every generated job carries `#SBATCH --requeue` unconditionally. This tells Slurm it may
 automatically resubmit the job (same job ID) if it is preempted or the node otherwise fails —
-without an operator noticing or intervening.
+without an operator noticing or intervening. Two more header lines cooperate with the training
+process itself:
 
-`--requeue` only controls *scheduling*. Whether a requeued job actually **continues** training
-rather than restarting at step 0 is a property of the training command itself:
-`oplm.train`'s `Trainer` only resumes when `train.resume_from` names a checkpoint directory
-explicitly (see [TRAIN.md §9](TRAIN.md#9-checkpointing-and-resume)) — it does not scan
-`train.output_dir` for the newest checkpoint on its own. So for a plain training job rendered by
-`oplm slurm generate`, pair `--requeue` with a `train.resume_from` you intend to keep updated (or
-regenerate the job once you know which checkpoint to resume from) if you want a requeue to pick up
-where the previous attempt left off. (Tooling that runs many short cells back-to-back, like the μP
-sweep's runner, can implement its own "resume from the newest checkpoint under this cell's output
-dir" logic on top of this layer — see `oplm.sweep.run` — but that is specific to that runner, not
-a behavior of `oplm.train` or of this general layer.)
+```bash
+#SBATCH --signal=USR1@600
+#SBATCH --open-mode=append
+```
+
+`--signal=USR1@600` asks Slurm to deliver `SIGUSR1` 600 seconds before the job's time limit, so
+the trainer can drain (checkpoint and exit) instead of being `SIGTERM`'d mid-step by the scheduler.
+`--open-mode=append` means a requeued job reuses the same `%j`/`%A_%a` log path and appends to it
+rather than truncating it, so the pre-requeue tail — including whatever diagnosis led to the
+requeue — survives across restarts.
+
+### The trainer side: drain and exit 85
+
+`oplm.train`'s `Trainer` installs a drain trigger (`oplm.training.signals.DrainSignal`) that goes
+true on `SIGUSR1`, `SIGTERM`, **or** a wall-clock margin computed from Slurm's
+`SLURM_JOB_END_TIME` (600 s before the time limit — the same margin the `--signal` header uses, so
+either path can catch the job). Once true, the trainer finishes the in-flight optimizer step,
+saves a checkpoint, logs a warning, and exits with `DRAIN_EXIT_CODE` (`85`) — a code reserved
+exclusively for "drained cleanly, resume expected," distinct from `0` (reached `max_steps`) and
+any other nonzero exit (a crash). See [TRAIN.md §16](TRAIN.md#16-fault-tolerance) for the full
+knob table and what a resume restores.
+
+### The wrapper side: budget-capped, progress-aware requeue
+
+After the training `srun` exits, every generated job script runs a requeue wrapper
+(`oplm.slurm.render._requeue_wrapper`) that decides what happens next from the exit status:
+
+| Exit status | Wrapper behavior |
+| --- | --- |
+| `0` | Clean finish (`max_steps` reached, or `save_final`'s final save completed). Logs `training complete` and exits `0` — never requeued. |
+| `85` (drain) | Requeues **unconditionally**, as long as the requeue budget below is not exhausted. The no-progress guard is bypassed — a drain is not a crash, so there is nothing to diagnose. |
+| any other nonzero | Requeues only if the budget is not exhausted **and** checkpoint progress was made since the previous restart (the no-progress guard below). |
+
+**Requeue budget** (`slurm.max_requeues`, default `20`): the wrapper reads
+`SLURM_RESTART_COUNT` (Slurm's own per-job restart counter) and refuses to requeue once it reaches
+`max_requeues`, exiting with the training process's own status instead — an unbounded requeue loop
+against a persistently broken node or config is not silently infinite.
+
+**No-progress guard** (crash-loop detection, non-drain exits only): the wrapper reads the highest
+committed `checkpoint-<step>` under the job's output directory and compares it to the step
+recorded at the *previous* restart (`.last_requeue_step`, written into the same directory). If the
+step has not advanced since the last restart — i.e. this is already the second consecutive
+non-drain failure with zero checkpoint progress between them — the wrapper treats it as a crash
+loop and exits without requeueing, rather than repeatedly resubmitting a job that immediately dies
+again. A first restart (`SLURM_RESTART_COUNT == 0`) always requeues on budget alone, since there is
+no previous step to compare against yet. Jobs with no `progress_dir` (non-training jobs, e.g. a
+post-processing step) skip the guard entirely and requeue on budget alone.
+
+### Auto-resume: how a requeued job actually continues
+
+`--requeue` (and the wrapper's `scontrol requeue`) only get the job re-scheduled — whether the
+*training process* picks up where it left off is a property of `train.auto_resume`.
+`oplm slurm generate` injects `train.auto_resume=true` into the rendered command automatically, so
+every job it produces resumes from the newest committed checkpoint under `train.output_dir` on
+every restart, without an explicit `train.resume_from`. (`configs/scaling.yaml` also sets
+`train.auto_resume: true` explicitly in the YAML itself — this config only ever runs under Slurm,
+so there is no ambiguity about whether it should auto-resume.) An explicit `train.resume_from`
+always wins if both are set. See [TRAIN.md §16](TRAIN.md#16-fault-tolerance) for the resolution
+mechanics (main-rank scan + broadcast) and exactly what state a resume restores.
+
+**The end-to-end failure-recovery walkthrough:** a node fails or is preempted → the training
+process exits nonzero (drain: `85`; crash: whatever it raised) → Slurm requeues the job (subject to
+`--requeue` and the wrapper's budget/no-progress checks above) → the new attempt's `Trainer` scans
+`train.output_dir` for the newest committed checkpoint and resumes from it (model, optimizers,
+schedulers, RNG, step counters) → the same W&B run continues (the persisted run id) rather than
+starting a new one. (Tooling that runs many short cells back-to-back, like the μP sweep's runner,
+implements its own analogous resume logic on top of this layer — see `oplm.sweep.run` — but that
+is specific to that runner, not this general layer.)
 
 ---
 

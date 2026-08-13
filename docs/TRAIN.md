@@ -530,6 +530,101 @@ train:
 
 ---
 
+## 16. Fault tolerance
+
+Production runs are long enough that node failures, preemptions, and Slurm time limits are
+routine, not exceptional. The trainer, the checkpoint layer, and (on Slurm) the requeue wrapper
+cooperate so a failed or preempted run resumes automatically rather than losing progress. This
+section is the reference for the knobs involved, what actually gets restored on resume, and the
+end-to-end walkthrough. For the Slurm-side half (the requeue wrapper, `--signal`, the budget and
+no-progress guard), see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard).
+
+### Knobs (`train.*`)
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `save_every_minutes` | `null` | Also checkpoint every N wall-clock minutes, **in addition to** (not instead of) the `save_every` step cadence. `null` disables the timer. |
+| `keep_every_n_steps` | `null` | Checkpoints on a step multiple of this value are permanent: excluded from `save_total_limit` rotation entirely. `null` disables the exemption. |
+| `keep_every_n_hours` | `null` | Marks a checkpoint permanent at least this many wall-clock hours after the previous permanent one (independent of `keep_every_n_steps`). `null` disables the exemption. |
+| `auto_resume` | `false` | Resume from the newest **committed** checkpoint under `output_dir` automatically at trainer start, with no `resume_from` needed. An explicit `resume_from` always wins over `auto_resume`. `oplm slurm generate` injects `train.auto_resume=true` into every job it renders (see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard)); `configs/scaling.yaml` also sets it explicitly, since that config only ever runs under Slurm. |
+| `resume_data_position` | `true` | **Reserved, wired in a later phase (Phase 3).** The field exists and round-trips through config serialization, but nothing in the trainer reads it yet — a resume always restarts the dataloader from the beginning of the current epoch (see "What a resume restores" below). |
+| `dist_timeout_minutes` | `15` | Timeout passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. A genuine hang raises within this window instead of wedging until the Slurm time limit; a no-op on a single process. |
+| `remote_checkpoint_uri` | `null` | **Reserved, wired in a later phase (Phase 4).** The field exists and round-trips through config serialization, but nothing syncs checkpoints anywhere yet — committed checkpoints stay local/shared-filesystem-only regardless of this value. |
+
+`save_every`, `save_total_limit`, and `resume_from` are the pre-existing checkpointing knobs —
+see [§9](#9-checkpointing-and-resume) and [CONFIG.md](CONFIG.md#train-fields-train).
+
+### Drain: checkpoint-before-kill on preemption
+
+The trainer installs a drain trigger (`oplm.training.signals.DrainSignal`) that goes true on
+`SIGUSR1`, `SIGTERM`, or a wall-clock margin (600 s) computed from Slurm's `SLURM_JOB_END_TIME` —
+whichever arrives first. Once true, the trainer finishes the in-flight optimizer step, saves a
+checkpoint (with `tokens_seen`/`global_step` bookkeeping already consistent for that step), logs a
+warning, and exits with a reserved exit code (`85`) distinct from `0` (finished `max_steps`) and
+any other nonzero exit (a crash). On a plain workstation `SLURM_JOB_END_TIME` is unset, so only the
+signals matter; on Slurm, `--signal=USR1@600` (rendered by `oplm slurm generate`) delivers exactly
+this signal 600 s before the job's time limit, so the two paths normally agree.
+
+### What a resume restores
+
+A resume (`resume_from` or `auto_resume`) restores, via Accelerate's `save_state`/`load_state`:
+
+- model weights,
+- **all** optimizer state — including Muon's, not just AdamW's,
+- LR scheduler state,
+- RNG state (Python, NumPy, CPU and CUDA generators), and
+- the trainer's own step counters (`global_step`, `epoch`, `samples_seen`, `tokens_seen`, plus the
+  `keep_every_n_hours` bookkeeping and the persisted W&B run id — see below).
+
+**What it does not yet restore: dataloader position.** `resume_data_position` is reserved for a
+later phase (Phase 3, data-exact resume); today a resume always restarts the data stream from the
+beginning of the current epoch rather than the exact row it was on when interrupted. For a
+shuffled, many-epoch pretraining run this is a minor efficiency cost (some rows get seen twice
+sooner than they otherwise would), not a correctness issue — but it is real, and worth knowing
+before assuming a resume is bit-exact.
+
+### W&B continuity
+
+The trainer persists its W&B run id (into `trainer_state.json`'s `wandb_run_id` key on every
+checkpoint, and into an `output_dir/wandb_run_id` marker file as a fallback) the first time it
+initializes tracking. On resume, it reads that id back and passes `id=<run_id>,
+resume="allow"` to `wandb.init`, so a requeued/resumed run continues logging into the **same** W&B
+run instead of starting a new one — one continuous loss curve across any number of
+preemptions.
+
+### Distributed hardening (NCCL / preflight / abort)
+
+- **NCCL/dist env** (Slurm-rendered jobs): `NCCL_DEBUG` (default `WARN`, `slurm.nccl_debug`),
+  `TORCH_NCCL_ASYNC_ERROR_HANDLING=1` (turns a hung collective into a raised exception instead of
+  wedging the job), a trace-buffer + dump-on-timeout pair, and `TORCH_FR_DUMP_TEMP_FILE` pointed
+  at `slurm.log_dir` (so a stalled rank's flight-recorder trace is identifiable after the fact).
+- **Preflight**: at trainer start, every rank allocates a small buffer and runs a matmul on its
+  device, then all ranks participate in one health exchange (regardless of their own local
+  pass/fail) so a sick node fails fast and attributably — naming the failing rank(s) — rather than
+  hanging the healthy ranks in a later collective.
+- **Non-finite-loss abort**: a NaN/inf loss on any rank raises on every rank, exiting nonzero
+  (not the drain code). Combined with `auto_resume` and the Slurm requeue wrapper's no-progress
+  guard, this acts as an automatic rollback — the next attempt resumes from the last checkpoint
+  committed before the poisoned step.
+- **Loss-spike warning**: the trainer tracks an EMA of the training loss and logs (never aborts)
+  a warning when a step's loss exceeds 3× the EMA, once enough steps have logged for the EMA to
+  have settled. This is diagnostic only — it does not affect training or trigger a requeue.
+
+### The failure-recovery walkthrough
+
+1. A node fails, is preempted, or the job hits its time limit → the training process exits
+   nonzero (`85` on a clean drain; some other nonzero code on a crash).
+2. Slurm requeues the job, subject to `slurm.max_requeues` and the requeue wrapper's no-progress
+   (crash-loop) guard — see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard).
+3. The new attempt's `Trainer` scans `output_dir` for the newest **committed** checkpoint
+   (`auto_resume`, or an explicit `resume_from`) and resumes from it.
+4. The same W&B run continues — no new run, no gap in the loss curve.
+
+**Guarantee:** after this phase of work, a requeued production job resumes from the newest
+committed checkpoint automatically, with no operator intervention.
+
+---
+
 ## See also
 
 - [CONFIG.md](CONFIG.md) — full configuration reference.

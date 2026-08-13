@@ -28,6 +28,18 @@ train:
   warmup_steps: 5000
   save_every: 10000
   save_total_limit: 3
+  # Also checkpoint every 30 wall-clock minutes (in addition to the save_every step
+  # cadence) so a preemption never loses more than ~30 minutes of progress on a long run.
+  save_every_minutes: 30
+  # Retain a permanent checkpoint every 100k steps, exempt from save_total_limit rotation.
+  keep_every_n_steps: 100000
+  # Explicit here (this config only ever runs under Slurm, via `oplm slurm generate`): resume
+  # from the newest committed checkpoint under output_dir automatically on every restart, so a
+  # requeue after preemption/failure continues training instead of restarting from step 0.
+  auto_resume: true
+  # Additionally sync committed checkpoints to remote object storage for durability beyond
+  # /mnt/home. Reserved: not yet implemented (Phase 4).
+  # remote_checkpoint_uri: s3://oplm-checkpoints/scaling
   eval_every: {steps: 5000}
   compile: true
   wandb_project: oplm-scaling
@@ -84,5 +96,7 @@ slurm:
     - /tmp:/tmp
   install: pip install oplm[train]
   max_concurrent: 4
+  # Requeue budget for the rendered sbatch requeue wrapper -- see docs/SLURM.md §8.
+  max_requeues: 20
   nodes: {170M: 4, 400M: 8, 800M: 16, 1B: 16}
   max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
