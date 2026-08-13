@@ -21,6 +21,7 @@ from oplm.config import DataConfig, OplmConfig, TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM
 from oplm.training.checkpoint import load_checkpoint, save_checkpoint
+from oplm.training.optim import build_optimizers, build_schedulers
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -212,3 +213,182 @@ def test_dcp_save_load_round_trip_with_compile(tmp_path: Path, reset_dynamo: Non
     fresh_scheduler = torch.optim.lr_scheduler.LambdaLR(fresh_optimizer, lambda _step: 1.0)
     load_checkpoint(accelerator, fresh_model, [fresh_optimizer], [fresh_scheduler], str(committed))
     assert torch.allclose(fresh_model.lm_head.decoder.bias.detach(), original_weight)
+
+
+def test_scaler_sidecar_round_trips_fp16_gradscaler_state(tmp_path: Path) -> None:
+    """The fp16 GradScaler's state round-trips through the ``scaler.pt`` sidecar.
+
+    ``accelerator.save_state`` used to serialize GradScaler state as part of Accelerate's
+    own checkpoint format; the DCP rewrite needs an explicit replacement (see
+    ``_write_scaler_sidecar``/``_restore_scaler_sidecar``). A full fp16 end-to-end pilot
+    run is not exercisable in this environment: ``Accelerate(cpu=True,
+    mixed_precision="fp16")`` leaves ``accelerator.scaler`` as ``None`` (Accelerate's
+    ``get_grad_scaler`` does not construct a CPU-backed fp16 scaler), so there is no CPU
+    path that ever produces a non-``None`` ``accelerator.scaler`` to exercise. Instead we
+    attach a real ``torch.amp.GradScaler`` directly onto a CPU accelerator's ``.scaler``
+    attribute (exactly the attribute ``save_checkpoint``/``load_checkpoint`` read), give
+    it non-default state via ``load_state_dict`` (real fp16 training would reach this
+    state through ``scaler.scale(loss).backward()`` + ``scaler.update()`` on a GPU), and
+    drive the save/load helpers exactly as the trainer does.
+    """
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+
+    non_default_scaler_state = {
+        "scale": 4096.0,
+        "growth_factor": 2.0,
+        "backoff_factor": 0.5,
+        "growth_interval": 2000,
+        "_growth_tracker": 7,
+    }
+    scaler = torch.amp.GradScaler()
+    scaler.load_state_dict(non_default_scaler_state)
+    accelerator.scaler = scaler
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    committed = tmp_path / "checkpoint-10"
+    assert (committed / "scaler.pt").exists()
+
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(cfg)
+    fresh_accelerator.scaler = torch.amp.GradScaler()  # starts from defaults
+
+    load_checkpoint(
+        fresh_accelerator,
+        fresh_model,
+        [fresh_optimizer],
+        [fresh_scheduler],
+        str(committed),
+    )
+
+    assert fresh_accelerator.scaler.state_dict() == non_default_scaler_state
+
+
+def test_scaler_sidecar_absent_when_no_scaler(tmp_path: Path) -> None:
+    """No ``scaler.pt`` is written when ``accelerator.scaler`` is ``None`` (the default)."""
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    assert accelerator.scaler is None
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    assert not (tmp_path / "checkpoint-10" / "scaler.pt").exists()
+
+
+def _muon_cfg() -> OplmConfig:
+    """Tiny root config using the Muon+auxiliary-AdamW dual-optimizer path."""
+    return OplmConfig(
+        model=OplmModelConfig(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            max_position_embeddings=64,
+        ),
+        train=TrainConfig(wandb_enabled=False, mixed_precision="no", optimizer="muon"),
+        data=DataConfig(num_workers=0, pin_memory=False),
+    )
+
+
+def test_dcp_round_trip_preserves_muon_and_aux_adamw_ordering(tmp_path: Path) -> None:
+    """The [Muon, aux AdamW] optimizer pair round-trips through DCP in the right order.
+
+    ``build_optimizers(cfg.train.optimizer="muon")`` returns a *list* of two distinct
+    optimizer instances (Muon for eligible 2D hidden weights, AdamW for everything else),
+    each with its own scheduler. ``_ModelOptState`` passes this list straight through to
+    ``get_state_dict``/``set_state_dict``, which key state by parameter identity, not by
+    optimizer index -- but a mismatched save/load order (or a bug that only ever
+    exercised the single-optimizer AdamW path) could still silently mix up which
+    optimizer's state lands where. Saving into freshly-built, never-stepped optimizers
+    and asserting both Muon's ``momentum_buffer`` and the aux AdamW's ``exp_avg`` pins
+    this exactly.
+    """
+    from accelerate import Accelerator
+
+    cfg = _muon_cfg()
+    accelerator = Accelerator(cpu=True, mixed_precision="no")
+    model = OplmForMaskedLM(cfg.model)
+    optimizers = build_optimizers(model, cfg.train)
+    schedulers = build_schedulers(optimizers, cfg.train, total_steps=100)
+    assert len(optimizers) == 2, "expected [Muon, aux AdamW]"
+    assert type(optimizers[0]).__name__ == "Muon"
+
+    prepared = accelerator.prepare(model, *optimizers)
+    model = prepared[0]
+    optimizers = list(prepared[1:])
+
+    for _ in range(3):
+        inputs = torch.randint(0, cfg.model.vocab_size, (2, 8))
+        loss = model(input_ids=inputs, labels=inputs).loss
+        accelerator.backward(loss)
+        for optimizer in optimizers:
+            optimizer.step()
+        for sched in schedulers:
+            sched.step()
+        for optimizer in optimizers:
+            optimizer.zero_grad()
+
+    muon_optimizer = getattr(optimizers[0], "optimizer", optimizers[0])
+    aux_adamw_optimizer = getattr(optimizers[1], "optimizer", optimizers[1])
+    muon_param = muon_optimizer.param_groups[0]["params"][0]
+    adamw_param = aux_adamw_optimizer.param_groups[0]["params"][0]
+    original_muon_momentum = muon_optimizer.state[muon_param]["momentum_buffer"].clone()
+    original_adamw_exp_avg = aux_adamw_optimizer.state[adamw_param]["exp_avg"].clone()
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=optimizers,
+        schedulers=schedulers,
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    # Fresh, never-stepped optimizers -- their .state dicts start empty, so any restored
+    # state can only have come from the checkpoint.
+    fresh_model = OplmForMaskedLM(cfg.model)
+    fresh_optimizers = build_optimizers(fresh_model, cfg.train)
+    fresh_schedulers = build_schedulers(fresh_optimizers, cfg.train, total_steps=100)
+    load_checkpoint(
+        accelerator,
+        fresh_model,
+        fresh_optimizers,
+        fresh_schedulers,
+        str(tmp_path / "checkpoint-10"),
+    )
+
+    fresh_muon_optimizer = getattr(fresh_optimizers[0], "optimizer", fresh_optimizers[0])
+    fresh_adamw_optimizer = getattr(fresh_optimizers[1], "optimizer", fresh_optimizers[1])
+    fresh_muon_param = fresh_muon_optimizer.param_groups[0]["params"][0]
+    fresh_adamw_param = fresh_adamw_optimizer.param_groups[0]["params"][0]
+
+    restored_muon_momentum = fresh_muon_optimizer.state[fresh_muon_param]["momentum_buffer"]
+    restored_adamw_exp_avg = fresh_adamw_optimizer.state[fresh_adamw_param]["exp_avg"]
+
+    assert torch.allclose(restored_muon_momentum, original_muon_momentum)
+    assert torch.allclose(restored_adamw_exp_avg, original_adamw_exp_avg)

@@ -32,6 +32,7 @@ _OLD_SUFFIX = ".old"
 _LATEST_POINTER_NAME = "latest"
 _KEEP_MARKER_NAME = "KEEP"
 _RNG_SIDECAR_PREFIX = "rng_state_"
+_SCALER_SIDECAR_NAME = "scaler.pt"
 
 
 def _unwrap_optimizer(optimizer: Any) -> Any:
@@ -125,6 +126,56 @@ def _restore_rng_sidecar(checkpoint_dir: Path, rank: int) -> None:
         torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
 
 
+def _write_scaler_sidecar(tmp_dir: Path, accelerator: Accelerator) -> None:
+    """Save the fp16 ``GradScaler``'s state to a ``scaler.pt`` sidecar, main process only.
+
+    ``accelerator.save_state`` used to serialize this (Phase 1); the DCP rewrite dropped
+    it with no replacement, silently losing scale/growth-tracker state on every fp16
+    resume. Mirrors Accelerate's own approach (``accelerate.checkpointing.
+    save_accelerator_state``): a single shared file, not a per-rank sidecar, because
+    Accelerate keeps every rank's scaler in sync -- there is exactly one scale value to
+    persist, so only the main process needs to write it.
+
+    A no-op when ``accelerator.scaler`` is ``None`` (bf16/no mixed precision, the common
+    case for this codebase -- see docs/MUP.md on why fp16 is not the default).
+    """
+    if accelerator.scaler is None:
+        return
+    torch.save(accelerator.scaler.state_dict(), tmp_dir / _SCALER_SIDECAR_NAME)
+
+
+def _restore_scaler_sidecar(checkpoint_dir: Path, accelerator: Accelerator) -> None:
+    """Restore the fp16 ``GradScaler``'s state from the ``scaler.pt`` sidecar, every rank.
+
+    Mirrors :func:`_write_scaler_sidecar`. Restored on every rank (not main-only) because
+    every rank has its own ``accelerator.scaler`` instance driving its own ``backward()``
+    calls, exactly as Accelerate's own ``load_accelerator_state`` does.
+
+    A checkpoint/run mismatch (one has a scaler, the other doesn't) is logged and
+    skipped rather than raised -- e.g. resuming a bf16 run from a checkpoint saved under
+    fp16, or vice versa, is a config change the operator made deliberately.
+    """
+    sidecar_path = checkpoint_dir / _SCALER_SIDECAR_NAME
+    has_sidecar = sidecar_path.is_file()
+    has_scaler = accelerator.scaler is not None
+
+    if has_sidecar and has_scaler:
+        scaler_state: dict[str, Any] = torch.load(sidecar_path, weights_only=False)
+        accelerator.scaler.load_state_dict(scaler_state)
+    elif has_sidecar and not has_scaler:
+        logger.warning(
+            "Checkpoint %s has fp16 GradScaler state but the current run has no scaler "
+            "(mixed_precision is not fp16); scaler state not restored.",
+            sidecar_path,
+        )
+    elif has_scaler and not has_sidecar:
+        logger.warning(
+            "Current run has an fp16 GradScaler but checkpoint %s has no scaler.pt "
+            "sidecar; scaler starting from its default state.",
+            checkpoint_dir,
+        )
+
+
 def save_checkpoint(
     accelerator: Accelerator,
     model: torch.nn.Module,
@@ -132,6 +183,7 @@ def save_checkpoint(
     schedulers: Sequence[Any],
     cfg: OplmConfig,
     output_dir: str,
+    *,
     global_step: int,
     epoch: int,
     samples_seen: int,
@@ -153,8 +205,11 @@ def save_checkpoint(
     change. Each rank also writes its own RNG state (python/numpy/torch-CPU/torch-CUDA)
     to a small ``rng_state_<rank>.pt`` sidecar via plain ``torch.save`` -- see
     :func:`_write_rng_sidecar` for why RNG state cannot go through the DCP state dict
-    itself. The main process additionally writes ``trainer_state.json`` metadata, a
-    re-loadable ``config.yaml``, and a HuggingFace export under ``hf/`` suitable for
+    itself. The main process additionally writes the fp16 ``GradScaler``'s state (when
+    ``accelerator.scaler is not None``) to a ``scaler.pt`` sidecar (see
+    :func:`_write_scaler_sidecar` -- this replaces what ``accelerator.save_state`` used
+    to serialize for that state), ``trainer_state.json`` metadata, a re-loadable
+    ``config.yaml``, and a HuggingFace export under ``hf/`` suitable for
     ``OplmForMaskedLM.from_pretrained``. Only after every rank has finished writing does
     the main process rename the staging directory to the final ``checkpoint-<step>/``
     name, rewrite the ``latest`` pointer file, and rotate old checkpoints. This
@@ -226,6 +281,10 @@ def save_checkpoint(
     _write_rng_sidecar(tmp_dir, accelerator.process_index)
 
     if accelerator.is_main_process:
+        # fp16 GradScaler state (no-op when accelerator.scaler is None, e.g. bf16/no
+        # mixed precision). See _write_scaler_sidecar docstring.
+        _write_scaler_sidecar(tmp_dir, accelerator)
+
         # Save trainer state
         state: dict[str, Any] = {
             "global_step": global_step,
@@ -290,9 +349,10 @@ def load_checkpoint(
     """Load a training checkpoint and return trainer state metadata.
 
     Restores model and optimizer state via ``torch.distributed.checkpoint`` (DCP; see
-    :class:`_ModelOptState`), restores each scheduler's state, and restores this rank's
-    RNG state from its sidecar (see :func:`_restore_rng_sidecar`). Reads and returns the
-    trainer state dict.
+    :class:`_ModelOptState`), restores each scheduler's state, restores this rank's RNG
+    state from its sidecar (see :func:`_restore_rng_sidecar`), and restores the fp16
+    ``GradScaler``'s state (see :func:`_restore_scaler_sidecar`) when both the checkpoint
+    and the current run have one. Reads and returns the trainer state dict.
 
     This is a **minimal** conversion of the load path to the DCP format that
     :func:`save_checkpoint` (Task 2.1) now writes -- just enough to keep resume working
@@ -332,6 +392,7 @@ def load_checkpoint(
         scheduler.load_state_dict(scheduler_state)
 
     _restore_rng_sidecar(ckpt_path, accelerator.process_index)
+    _restore_scaler_sidecar(ckpt_path, accelerator)
 
     state_path = ckpt_path / "trainer_state.json"
     if not state_path.exists():
