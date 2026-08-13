@@ -1,4 +1,4 @@
-"""Double-sharding verification test (Task 0.1).
+"""Double-sharding verification test (Task 0.1 / fixed by Task 0.2).
 
 ``accelerator.prepare(dataloader)`` may wrap an ``IterableDataset`` in
 ``accelerate``'s own ``IterableDatasetShard`` (per-rank striping) *on top of*
@@ -7,13 +7,15 @@
 layers are active at once, each rank's already-striped stream gets re-striped,
 and rows are silently dropped.
 
-This test launches the real ``Trainer``-style dataloader construction
-(``Accelerator(dataloader_config=DataLoaderConfiguration(dispatch_batches=False))``
-then ``accelerator.prepare(dataloader)``) under two CPU/gloo processes via
-``torch.distributed.run``, has each rank consume one full epoch, and checks
-whether the union of what both ranks saw reproduces the full fixture with no
-duplicates. See ``tests/data/_double_sharding_worker.py`` for the subprocess
-entry point.
+This test launches the real ``Trainer``-style dataloader construction — post
+Task 0.2, that means ``Accelerator(dataloader_config=DataLoaderConfiguration(
+dispatch_batches=False))`` with the dataloader kept OUT of
+``accelerator.prepare`` and wrapped in
+:class:`oplm.data.sequence.loaders.DeviceDataLoader` instead — under two
+CPU/gloo processes via ``torch.distributed.run``, has each rank consume one
+full epoch, and checks whether the union of what both ranks saw reproduces the
+full fixture with no duplicates. See ``tests/data/_double_sharding_worker.py``
+for the subprocess entry point.
 
 The fixture is deliberately larger than the repo's tiny 14-row ``sequence_shards``
 fixture: with ``batch_size=4``/``world_size=2``, ``IterableDatasetShard`` only
@@ -24,9 +26,10 @@ loses none, 40 rows loses 16). 40 real rows across 2 shards reliably exceeds
 that threshold, so the test is a faithful, non-coincidental check.
 
 VERDICT (see ``.superpowers/sdd/TODOS/task-0.1-report.md`` for full numbers):
-double-sharding is confirmed — rows are lost (16/40 in the empirical run,
-0 duplicated across ranks). The test below is marked ``xfail(strict=True)``
-until Task 0.2 removes the extra striping layer.
+double-sharding was confirmed under ``accelerator.prepare(dataloader)`` — rows
+were lost (16/40 in the empirical run, 0 duplicated across ranks). Task 0.2
+removed the extra striping layer (``DeviceDataLoader`` replaces ``prepare`` for
+the dataloader), and this test now passes un-``xfail``ed.
 """
 
 from __future__ import annotations
@@ -69,25 +72,17 @@ def _fixture_ids(shard_dir: Path) -> set[str]:
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "Task 0.1 audit: accelerate's IterableDatasetShard re-stripes "
-        "ShardedProteinDataset's already rank/worker-striped stream, dropping rows. "
-        "Fixed by Task 0.2 (removes the double striping)."
-    ),
-)
 def test_prepared_dataloader_covers_dataset_exactly_once(
     tmp_path: Path, double_sharding_fixture_dir: Path
 ) -> None:
-    """Union of what both ranks consume from the prepared dataloader covers the fixture exactly.
+    """Union of what both ranks consume from the wrapped dataloader covers the fixture exactly.
 
     Launches ``tests/data/_double_sharding_worker.py`` under
     ``torch.distributed.run --nproc_per_node=2`` (CPU/gloo), which builds the
-    dataloader exactly as ``Trainer.__init__`` does and dumps each rank's consumed
-    ``sequence_id``s. Asserts the invariant we *want*: no rows lost, none
-    duplicated across ranks.
+    dataloader exactly as ``Trainer.__init__`` does (post Task 0.2: wrapped in
+    ``DeviceDataLoader`` rather than passed through ``accelerator.prepare``) and
+    dumps each rank's consumed ``sequence_id``s. Asserts the invariant we *want*:
+    no rows lost, none duplicated across ranks.
     """
     worker = Path(__file__).with_name("_double_sharding_worker.py")
     subprocess.run(

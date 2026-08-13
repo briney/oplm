@@ -1,10 +1,13 @@
 """Worker for the double-sharding verification test. Run under torch.distributed.run.
 
 Builds the real train dataloader over a real parquet fixture exactly as
-``Trainer.__init__`` does (``Accelerator(dataloader_config=DataLoaderConfiguration(
-dispatch_batches=False))`` then ``accelerator.prepare(dataloader)``), iterates one
-full epoch, and writes each rank's consumed ``sequence_id``s to
-``out_dir/rank<i>.json`` so the parent test process can check coverage.
+``Trainer.__init__`` does post-Task-0.2: ``Accelerator(dataloader_config=
+DataLoaderConfiguration(dispatch_batches=False))``, but the dataloader is kept OUT
+of ``accelerator.prepare`` and wrapped in
+:class:`oplm.data.sequence.loaders.DeviceDataLoader` instead (see
+``src/oplm/training/trainer.py``). Iterates one full epoch and writes each rank's
+consumed ``sequence_id``s to ``out_dir/rank<i>.json`` so the parent test process
+can check coverage.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from accelerate.utils import DataLoaderConfiguration
 
 
 def main(fixture_path: str, out_dir: str) -> None:
-    """Run one epoch of the prepared dataloader and dump this rank's sequence ids.
+    """Run one epoch of the DeviceDataLoader-wrapped dataloader, dump sequence ids.
 
     Args:
         fixture_path: Parquet file or directory of shards to stream from.
@@ -31,12 +34,13 @@ def main(fixture_path: str, out_dir: str) -> None:
 
     from oplm.data.sequence.collate import MLMCollator
     from oplm.data.sequence.dataset import ShardedProteinDataset
+    from oplm.data.sequence.loaders import DeviceDataLoader
     from oplm.data.tokenizer import get_tokenizer
 
     dataset = ShardedProteinDataset(fixture_path, seed=0)
     collator = MLMCollator(get_tokenizer(), max_length=64, keep_sequence_ids=True)
     dataloader = DataLoader(dataset, batch_size=4, collate_fn=collator, num_workers=2)
-    dataloader = accelerator.prepare(dataloader)
+    dataloader = DeviceDataLoader(dataloader, accelerator.device)
 
     seen: list[str] = []
     for batch in dataloader:

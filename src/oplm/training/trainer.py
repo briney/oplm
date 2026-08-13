@@ -41,7 +41,7 @@ class Trainer:
         from accelerate.utils import DataLoaderConfiguration, set_seed
         from rich.console import Console
 
-        from oplm.data import build_train_dataloader
+        from oplm.data import DeviceDataLoader, build_train_dataloader
         from oplm.model import OplmForMaskedLM
         from oplm.training.flops import estimate_flops_per_token
         from oplm.training.optim import build_optimizers, build_schedulers
@@ -141,9 +141,24 @@ class Trainer:
         self.total_steps = self._compute_total_steps(cfg, dataloader)
         schedulers = build_schedulers(optimizers, cfg.train, self.total_steps)
 
-        # Prepare with accelerate
+        # Prepare with accelerate. The dataloader is deliberately excluded: it is
+        # built from ShardedProteinDataset, which already stripes rows over the
+        # joint (rank, worker) index. Passing it through accelerator.prepare would
+        # wrap it in accelerate's own IterableDatasetShard, striping a second time
+        # and silently dropping rows (confirmed in
+        # .superpowers/sdd/TODOS/task-0.1-report.md). DeviceDataLoader below
+        # supplies the only two things prepare was providing for the dataloader:
+        # device placement and set_epoch forwarding.
+        #
+        # Gradient-accumulation caveat: without a prepared dataloader, accelerate
+        # cannot detect end-of-dataloader for a partial final accumulation window.
+        # The training stream is effectively infinite (epoch rollover re-iterates
+        # via _set_dataset_epoch below), so no partial window ever needs to sync —
+        # identical semantics to before for gradient_accumulation_steps == 1, and
+        # for >1 the tail micro-batches of an epoch simply roll into the next
+        # window instead of forcing an early sync.
         _status("[dim]Preparing for training...[/dim]")
-        prepared = self.accelerator.prepare(model, *optimizers, dataloader, *schedulers)
+        prepared = self.accelerator.prepare(model, *optimizers, *schedulers)
         num_optimizers = len(optimizers)
         self.model = prepared[0]
 
@@ -235,8 +250,8 @@ class Trainer:
             )
         self.optimizers = list(prepared[1 : 1 + num_optimizers])
         self.optimizer = self.optimizers[0]
-        self.dataloader = prepared[1 + num_optimizers]
-        self.schedulers = list(prepared[2 + num_optimizers :])
+        self.dataloader = DeviceDataLoader(dataloader, self.accelerator.device)
+        self.schedulers = list(prepared[1 + num_optimizers :])
         self.scheduler = self.schedulers[0]
 
         # Training state

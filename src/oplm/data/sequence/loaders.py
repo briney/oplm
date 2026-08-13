@@ -11,12 +11,18 @@ a :class:`~torch.utils.data.DataLoader`. They differ only in *policy*
 parameters: training shuffles and draws fresh masks each epoch, while sequence
 evaluation freezes shuffling and masking for reproducibility (docs/DATA_TOOLING.md
 §9). There is deliberately no separate "eval dataset"/"eval collator" class.
+
+:class:`DeviceDataLoader` wraps the training dataloader in place of
+``accelerator.prepare`` (see its docstring): the dataset self-shards over
+``(rank, worker)``, so it must never pass through accelerate's own
+``IterableDatasetShard``-adding ``prepare`` call.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
 from torch.utils.data import DataLoader
 
 from oplm.data.config import parse_train_configs
@@ -30,13 +36,48 @@ if TYPE_CHECKING:
 
     from oplm.config import OplmConfig
 
-__all__ = ["build_sequence_eval_dataloader", "build_train_dataloader"]
+__all__ = ["DeviceDataLoader", "build_sequence_eval_dataloader", "build_train_dataloader"]
 
 # Fixed seed for sequence evaluation. Shuffling is off and masks are frozen, so
 # the seed only needs to be stable run-to-run; decoupling it from
 # ``train.seed`` keeps eval batches identical even when the training seed
 # changes (docs/DATA_TOOLING.md §9.2).
 _EVAL_SEED = 42
+
+
+class DeviceDataLoader:
+    """Device-placement wrapper for a self-sharding dataloader.
+
+    ``ShardedProteinDataset`` stripes rows over the joint (rank, worker) index itself, so the
+    training dataloader must NOT pass through ``accelerator.prepare`` — accelerate would wrap the
+    IterableDataset in ``IterableDatasetShard`` and stripe a second time (each rank would then see
+    1/N of its already-1/N stripe). This wrapper supplies the only two things ``prepare`` was
+    providing: device placement and ``set_epoch`` forwarding.
+    """
+
+    def __init__(self, dataloader: DataLoader, device: torch.device) -> None:
+        self._dataloader = dataloader
+        self._device = device
+
+    @property
+    def dataset(self):  # noqa: ANN201 — mirrors DataLoader.dataset
+        return self._dataloader.dataset
+
+    def __len__(self) -> int:
+        return len(self._dataloader)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Forward epoch to the underlying dataset for deterministic shuffling."""
+        set_epoch = getattr(self._dataloader.dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+
+    def __iter__(self):
+        for batch in self._dataloader:
+            yield {
+                k: v.to(self._device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 
 
 def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
