@@ -78,6 +78,26 @@ def test_phase_wildcard_beats_default_exact_preset() -> None:
     assert table.resolve(phase="coarse", preset="170M") == 8
 
 
+def test_max_requeues_defaults_to_twenty() -> None:
+    cfg = SlurmConfig.from_mapping(RAW)
+    assert cfg.max_requeues == 20
+
+
+def test_max_requeues_is_configurable() -> None:
+    cfg = SlurmConfig.from_mapping({**RAW, "max_requeues": 5})
+    assert cfg.max_requeues == 5
+
+
+def test_nccl_debug_defaults_to_warn() -> None:
+    cfg = SlurmConfig.from_mapping(RAW)
+    assert cfg.nccl_debug == "WARN"
+
+
+def test_nccl_debug_is_configurable() -> None:
+    cfg = SlurmConfig.from_mapping({**RAW, "nccl_debug": "INFO"})
+    assert cfg.nccl_debug == "INFO"
+
+
 def test_missing_required_field_raises() -> None:
     raw = {key: value for key, value in RAW.items() if key != "partition"}
     with pytest.raises(ValueError, match="partition"):

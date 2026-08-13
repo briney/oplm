@@ -381,6 +381,9 @@ def _write_jobs(
             array_size=len(group),
             array_index_file=index_file,
             base_dir=out,
+            # `$RUN_DIR` is exported by the array-lookup block before this line renders, and
+            # matches the `output` subdir `_write_run_config` gives each cell's `train.output_dir`.
+            progress_dir="$RUN_DIR/output",
         )
         script = jobs / f"{preset}.sbatch"
         script.write_text(render_job(spec, slurm))
@@ -1499,6 +1502,9 @@ def scale(
                     gpus_per_node=slurm.gpus_per_node,
                     args=f"--config {run_yaml}",
                 ),
+                # These are the days-to-weeks production runs the requeue wrapper matters most
+                # for; its output_dir is known at render time (unlike an array job's $RUN_DIR).
+                progress_dir=str(run_dir / "output"),
             )
             (jobs / f"{name}.sbatch").write_text(render_job(spec, slurm))
         typer.echo(f"wrote {len(list(jobs.glob('*.sbatch')))} scaling scripts to {jobs}")

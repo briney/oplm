@@ -42,6 +42,20 @@ def test_array_header_includes_throttle(tmp_path: Path) -> None:
     assert "#SBATCH --exclusive" in text
 
 
+def test_header_gains_requeue_signal_and_append_mode(tmp_path: Path) -> None:
+    """A requeued job must get an in-job warning signal and append (not truncate) its logs."""
+    text = render_job(_array_spec(tmp_path), SLURM)
+    assert "#SBATCH --signal=USR1@600" in text
+    assert "#SBATCH --open-mode=append" in text
+
+
+def test_restart_banner_follows_env_source(tmp_path: Path) -> None:
+    text = render_job(_array_spec(tmp_path), SLURM)
+    banner = 'echo "=== $(date -Is) start; restart_count=${SLURM_RESTART_COUNT:-0} ==="'
+    assert banner in text
+    assert text.index(f"source {SLURM.env_file}") < text.index(banner)
+
+
 def test_array_logs_use_array_placeholders(tmp_path: Path) -> None:
     text = render_job(_array_spec(tmp_path), SLURM)
     assert "%x_%A_%a.out" in text
@@ -155,11 +169,87 @@ def test_submit_script_wires_afterany_across_arrays() -> None:
     assert "afterok" not in text
 
 
+def test_wrapper_replaces_the_bare_srun_tail(tmp_path: Path) -> None:
+    """The srun must run under `set +e` so a nonzero training exit does not kill the script."""
+    text = render_job(_array_spec(tmp_path), SLURM)
+    assert "set +e\nsrun" in text
+    assert "\nSTATUS=$?\nset -e\n" in text
+
+
+def test_wrapper_handles_clean_completion(tmp_path: Path) -> None:
+    text = render_job(_array_spec(tmp_path), SLURM)
+    assert 'if [ "$STATUS" -eq 0 ]; then' in text
+    assert 'echo "training complete"' in text
+    assert "  exit 0\nfi" in text
+
+
+def test_wrapper_interpolates_the_configured_requeue_budget(tmp_path: Path) -> None:
+    text = render_job(_array_spec(tmp_path), SLURM)
+    assert "RESTARTS=${SLURM_RESTART_COUNT:-0}" in text
+    assert f'if [ "$RESTARTS" -ge {SLURM.max_requeues} ]; then' in text
+    assert f"requeue budget ({SLURM.max_requeues}) exhausted" in text
+    assert 'scontrol requeue "$SLURM_JOB_ID"' in text
+
+
+def test_wrapper_uses_a_custom_requeue_budget(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    custom = replace(SLURM, max_requeues=3)
+    text = render_job(_array_spec(tmp_path), custom)
+    assert 'if [ "$RESTARTS" -ge 3 ]; then' in text
+    assert "requeue budget (3) exhausted" in text
+
+
+def test_array_job_progress_dir_uses_run_dir_expansion(tmp_path: Path) -> None:
+    """Array jobs pass a `$RUN_DIR`-based progress dir; it must reach the shell unexpanded."""
+    spec = JobSpec(
+        name="oplm-coarse-170M",
+        nodes=1,
+        time_limit="168:00:00",
+        command='python -m oplm.sweep.run --config "$RUN_DIR/run.yaml"',
+        array_size=7,
+        array_index_file=tmp_path / "jobs" / "170M.jobs",
+        base_dir=tmp_path,
+        progress_dir="$RUN_DIR/output",
+    )
+    text = render_job(spec, SLURM)
+    assert 'STEP_FILE="$RUN_DIR/output/.last_requeue_step"' in text
+    assert 'ls -d "$RUN_DIR/output"/checkpoint-*' in text
+    # The no-progress guard is only meaningful once at least one restart has happened.
+    assert 'if [ "$STATUS" -ne 85 ] && [ "$RESTARTS" -ge 1 ]; then' in text
+
+
+def test_no_progress_guard_omitted_when_progress_dir_is_none() -> None:
+    """Non-training jobs (progress_dir=None) still requeue, just without checkpoint tracking."""
+    spec = JobSpec(
+        name="oplm-scale-400M",
+        nodes=8,
+        time_limit="168:00:00",
+        command="python -m oplm.train --config cfg.yaml",
+    )
+    text = render_job(spec, SLURM)
+    assert "STEP_FILE" not in text
+    assert "PREV_STEP" not in text
+    assert "no checkpoint progress" not in text
+    assert 'scontrol requeue "$SLURM_JOB_ID"' in text
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
 def test_rendered_scripts_are_valid_bash(tmp_path: Path) -> None:
+    progress_spec = JobSpec(
+        name="oplm-coarse-170M",
+        nodes=1,
+        time_limit="168:00:00",
+        command='python -m oplm.sweep.run --config "$RUN_DIR/run.yaml"',
+        array_size=7,
+        array_index_file=tmp_path / "jobs" / "170M.jobs",
+        base_dir=tmp_path,
+        progress_dir="$RUN_DIR/output",
+    )
     for index, text in enumerate(
         (
             render_job(_array_spec(tmp_path), SLURM),
+            render_job(progress_spec, SLURM),
             render_submit_script([SubmitEntry(var="A", script=Path("jobs/a.sbatch"))]),
         )
     ):
