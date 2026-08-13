@@ -154,3 +154,46 @@ def test_resume_continues_the_same_wandb_run(
     assert len(captured_init_kwargs) == 2
     assert captured_init_kwargs[1]["id"] == first_run_id
     assert captured_init_kwargs[1]["resume"] == "allow"
+
+
+def test_wandb_run_none_after_init_trackers_is_skipped_gracefully(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If ``wandb.run`` stays ``None`` after ``init_trackers`` (an offline-mode edge case),
+    persisting the run id is skipped gracefully instead of raising.
+
+    Forces the edge case by letting the real (offline) ``WandBTracker.start`` -> ``wandb.init``
+    run normally (so ``accelerate``'s subsequent ``store_init_configuration`` -> ``wandb.config.
+    update`` still has a live run to write into), then immediately clearing the module-global
+    ``wandb.run`` pointer -- simulating the trainer observing ``wandb.run is None`` right after
+    ``init_trackers`` returns, without tearing down the actual (offline) run underneath it.
+    """
+    pytest.importorskip("wandb")
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_SILENT", "true")
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+
+    import wandb
+    from accelerate.tracking import WandBTracker
+
+    from oplm.training.trainer import Trainer
+
+    original_start = WandBTracker.start
+
+    def _start_then_clear_run(self: WandBTracker) -> None:
+        original_start(self)
+        wandb.run = None
+
+    monkeypatch.setattr(WandBTracker, "start", _start_then_clear_run)
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=2,
+        wandb_enabled=True,
+        wandb_run_name="e2e-no-active-run",
+    )
+    trainer = Trainer(cfg, callbacks=[])
+
+    assert trainer._wandb_run_id is None
+    assert not (tmp_path / "wandb_run_id").exists()

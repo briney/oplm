@@ -16,8 +16,9 @@ import torch.nn as nn
 from oplm.training.signals import DRAIN_EXIT_CODE, DrainSignal
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
+    from accelerate import Accelerator
     from torch.utils.data import DataLoader
 
     from oplm.config import OplmConfig
@@ -136,23 +137,36 @@ class Trainer:
 
             clean_stale_checkpoint_dirs(Path(cfg.train.output_dir))
 
-        # Resolve the resume target *before* wandb init (Task 1.7) so a resumed run's id
-        # can be threaded into wandb_kwargs below. An explicit resume_from always wins;
-        # auto_resume only fills in the gap when no explicit path was given, scanning for
-        # the newest *committed* checkpoint under output_dir (see
-        # oplm.training.checkpoint.latest_checkpoint) so a requeued job (Task 1.5) picks up
-        # where it left off instead of restarting at step 0. A fresh output_dir with no
-        # committed checkpoint yet is a no-op: training starts at step 0, exactly as if
-        # auto_resume were unset. The heavy state restore (_resume_from_checkpoint) happens
-        # later, once the model/optimizer/dataloader exist.
-        resume_target = cfg.train.resume_from
-        if resume_target is None and cfg.train.auto_resume:
-            from oplm.training.checkpoint import latest_checkpoint
+        # Barrier: no rank proceeds to the resume-target resolution below until the main
+        # process's clean_stale_checkpoint_dirs recovery renames (checkpoint-<N>.old ->
+        # checkpoint-<N>) have landed. Without it, a rank that reaches the auto_resume scan
+        # before the main process finishes an interrupted same-step recovery could see a
+        # directory listing the main process itself never would have. A no-op on a single
+        # process.
+        self.accelerator.wait_for_everyone()
 
-            found = latest_checkpoint(Path(cfg.train.output_dir))
-            if found is not None:
-                resume_target = str(found)
-                _status(f"[dim]Auto-resuming from {found.name}[/dim]")
+        # Resolve the resume target *before* wandb init (Task 1.7) so a resumed run's id can
+        # be threaded into wandb_kwargs below. _resolve_resume_target scans for the newest
+        # *committed* checkpoint (oplm.training.checkpoint.latest_checkpoint) ON THE MAIN
+        # PROCESS ONLY and broadcasts the result to every other rank, rather than letting
+        # every rank scan the directory itself: the barrier above only orders the main
+        # process's recovery renames ahead of the scan, it does not guarantee every rank's
+        # own directory listing agrees with the main process's -- multi-node shared
+        # filesystems (NFS/Lustre) commonly serve a stale/cached listing to a non-writer
+        # rank for a window after a writer's rename lands. Scanning once and broadcasting
+        # makes the resume target rank-identical BY CONSTRUCTION, independent of filesystem
+        # visibility semantics -- the actual property this branch exists to provide. A fresh
+        # output_dir with no committed checkpoint yet is a no-op: training starts at step 0,
+        # exactly as if auto_resume were unset. The heavy state restore
+        # (_resume_from_checkpoint) happens later, once the model/optimizer/dataloader exist.
+        resume_target = _resolve_resume_target(
+            self.accelerator,
+            cfg.train.resume_from,
+            cfg.train.auto_resume,
+            cfg.train.output_dir,
+            status=_status,
+        )
+        self._resolved_resume_target = resume_target  # exposed for tests/observability
 
         # Run id persisted right after init_trackers below; reused as the wandb_run_id
         # extra_state key on every checkpoint save. Stays None when wandb is disabled or
@@ -881,6 +895,58 @@ class Trainer:
 
         for callback in self.callbacks:
             callback.on_train_end(self)
+
+
+def _resolve_resume_target(
+    accelerator: Accelerator,
+    resume_from: str | None,
+    auto_resume: bool,
+    output_dir: str,
+    status: Callable[[str], None] | None = None,
+) -> str | None:
+    """Resolve the checkpoint path to resume from, rank-identical by construction.
+
+    An explicit ``resume_from`` is already rank-identical (it's config), so no scan is
+    needed for it. When ``auto_resume`` applies instead (no explicit path given), ONLY the
+    main process scans the filesystem for the newest committed checkpoint
+    (:func:`oplm.training.checkpoint.latest_checkpoint`). A non-main rank never performs
+    this scan itself: the recovery renames in
+    :func:`oplm.training.checkpoint.clean_stale_checkpoint_dirs` (also main-only) plus
+    shared-filesystem directory-listing caches on a multi-node cluster mean a rank's own
+    scan is not guaranteed to see what the main rank sees, even after a barrier -- so the
+    only way to guarantee a rank-identical result is to compute it once and hand it to
+    everyone. The resolved value (main-only path, or ``None``) is broadcast to every other
+    rank via :func:`accelerate.utils.broadcast_object_list`, which is a no-op on a single
+    process. ``resume_from`` is threaded through the same broadcast for one code path
+    instead of two -- harmless since it is already identical everywhere.
+
+    Args:
+        accelerator: The trainer's Accelerator, called after the ``wait_for_everyone``
+            barrier that follows ``clean_stale_checkpoint_dirs``.
+        resume_from: ``cfg.train.resume_from`` -- an explicit operator-pinned path, or
+            ``None``.
+        auto_resume: ``cfg.train.auto_resume``.
+        output_dir: The training output directory to scan when ``auto_resume`` applies.
+        status: Optional main-process-only status callback (mirrors the trainer's
+            ``_status`` helper); ``None`` suppresses it.
+
+    Returns:
+        The resolved checkpoint directory path, identical on every rank, or ``None`` if
+        there is nothing to resume.
+    """
+    from accelerate.utils import broadcast_object_list
+
+    resume_target: str | None = resume_from
+    if resume_target is None and auto_resume and accelerator.is_main_process:
+        from oplm.training.checkpoint import latest_checkpoint
+
+        found = latest_checkpoint(Path(output_dir))
+        if found is not None:
+            resume_target = str(found)
+            if status is not None:
+                status(f"[dim]Auto-resuming from {found.name}[/dim]")
+
+    return broadcast_object_list([resume_target])[0]
 
 
 def _read_resume_wandb_run_id(resume_target: str, output_dir: str) -> str | None:
