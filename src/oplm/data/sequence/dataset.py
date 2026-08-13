@@ -13,6 +13,7 @@ happens later, in the collator (``data/sequence/collate.py``). Rows are yielded 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -94,6 +95,35 @@ def _joint_stripe() -> tuple[int, int]:
     return joint_index, stride
 
 
+@dataclass(frozen=True)
+class DataCursor:
+    """Position of the training stream, plus the layout it is only valid under.
+
+    Captured at checkpoint time (one per run, not per rank — ranks step in lockstep
+    so ``batches_in_epoch`` is the same value everywhere) and replayed on resume via
+    :meth:`ShardedProteinDataset.set_resume_skip`. The layout fields
+    (``world_size``, ``num_workers``, ``per_rank_batch``, ``seed``) let the
+    resuming run detect a changed layout before trusting ``batches_in_epoch`` — see
+    Task 3.3's guard.
+
+    Attributes:
+        epoch: Epoch index the cursor was captured in.
+        batches_in_epoch: Count of batches consumed so far this epoch (per rank;
+            identical across ranks since training steps in lockstep).
+        world_size: Number of ranks the interrupted run used.
+        num_workers: DataLoader ``num_workers`` the interrupted run used.
+        per_rank_batch: Samples per batch contributed by one (rank, worker) stream.
+        seed: Base dataset seed the interrupted run used.
+    """
+
+    epoch: int
+    batches_in_epoch: int
+    world_size: int
+    num_workers: int
+    per_rank_batch: int
+    seed: int
+
+
 class ShardedProteinDataset(IterableDataset[dict[str, object]]):
     """Iterable dataset over one or more parquet shards of protein sequences.
 
@@ -139,6 +169,15 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._seed = seed
         self._load_masking_weights = load_masking_weights
         self._epoch = 0
+
+        # Armed resume skip (Task 3.1): plain instance state, so it pickles into
+        # DataLoader worker processes along with the dataset. `None` means
+        # unarmed (`__iter__` behaves exactly as before). Set via
+        # `set_resume_skip`, resolved per-worker at iteration time by
+        # `_resolved_skip`.
+        self._resume_batches_in_epoch: int | None = None
+        self._resume_per_rank_batch = 0
+        self._resume_num_workers = 1
 
         shard_paths = self._discover_shards(self._path)
 
@@ -186,6 +225,64 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         """
         self._epoch = epoch
 
+    def stream_length(self) -> int:
+        """Return the number of rows this (rank, worker) stream serves in one epoch.
+
+        Order-invariant: shard order only redistributes which rows land in which
+        shard, not which global row indices this ``(rank, worker)`` owns, so this
+        equals ``len(range(joint_index, total_rows, stride))`` — independent of
+        shuffling and the epoch. Must be called in-context (inside a DataLoader
+        worker, or single-process): it resolves the current ``(rank, worker)``
+        via :func:`_joint_stripe`.
+        """
+        joint_index, stride = _joint_stripe()
+        return len(range(joint_index, self._total_rows, stride))
+
+    def set_resume_skip(self, batches_in_epoch: int, per_rank_batch: int, num_workers: int) -> None:
+        """Arm a one-epoch skip so the next ``__iter__`` (in every worker) resumes mid-epoch.
+
+        Stored as plain instance attributes, which pickle into DataLoader worker
+        processes along with the dataset — that is how the skip reaches them. Each
+        worker resolves its own share of ``batches_in_epoch`` at iteration time
+        (see :meth:`_resolved_skip`), using its own ``worker_id``. The skip applies
+        to the very next epoch iterated (usually the epoch it was captured in);
+        call :meth:`clear_resume_skip` once it has been consumed so later epochs
+        are unaffected.
+
+        Args:
+            batches_in_epoch: Count of batches this rank's DataLoader has already
+                consumed this epoch (from the interrupted run's cursor).
+            per_rank_batch: Samples per batch contributed by one (rank, worker)
+                stream (the per-device batch size).
+            num_workers: DataLoader ``num_workers`` the interrupted run used. Must
+                match the resuming run's actual ``num_workers`` for the skip
+                arithmetic to be correct; validated by the caller (Task 3.3's
+                layout guard), not here.
+        """
+        self._resume_batches_in_epoch = batches_in_epoch
+        self._resume_per_rank_batch = per_rank_batch
+        self._resume_num_workers = num_workers
+
+    def clear_resume_skip(self) -> None:
+        """Disarm the resume skip; the next ``__iter__`` starts each stream at row 0."""
+        self._resume_batches_in_epoch = None
+
+    def _resolved_skip(self) -> int:
+        """Resolve the armed batch-count skip into this stream's sample-offset skip.
+
+        Must be called in-context (inside a DataLoader worker, or single-process):
+        it uses the current worker's own ``worker_id`` — via
+        :func:`_resolve_distributed_context` — so each worker computes its own
+        share of the globally-armed ``batches_in_epoch``, matching DataLoader's
+        round-robin batch assignment across workers. Returns ``0`` when unarmed.
+        """
+        if self._resume_batches_in_epoch is None:
+            return 0
+        _, _, worker_id, _ = _resolve_distributed_context()
+        batch_count = len(range(worker_id, self._resume_batches_in_epoch, self._resume_num_workers))
+        skip = batch_count * self._resume_per_rank_batch
+        return skip % max(self.stream_length(), 1)
+
     def _shard_order(self, epoch_seed: int) -> list[int]:
         """Return shard indices in this epoch's (optionally shuffled) order."""
         n = len(self._shards)
@@ -204,6 +301,19 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         return torch.randperm(n_rows, generator=generator).tolist()
 
     def __iter__(self) -> Iterator[dict[str, object]]:
+        yield from self._iter_stream(self._resolved_skip())
+
+    def _iter_stream(self, skip: int) -> Iterator[dict[str, object]]:
+        """Yield this (rank, worker) stream, skipping its first ``skip`` selected rows.
+
+        Walks the shard order computing each shard's selected-row COUNT from index
+        arithmetic alone (no ``pq.read_table``): a shard fully consumed by
+        ``skip`` is passed over without ever being read. Reading starts at the
+        shard where the running count first reaches ``skip``, applying the
+        remainder of the skip to that shard's (already-shuffled) selection only;
+        every later shard is read in full, exactly as when unarmed. With
+        ``skip=0`` this is behavior-identical to the pre-refactor ``__iter__``.
+        """
         epoch_seed = _epoch_seed(self._seed, self._epoch)
         joint_index, stride = _joint_stripe()
 
@@ -212,19 +322,33 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         # mod stride. Unioned over joint_index in [0, stride) this covers every
         # row exactly once.
         global_idx = 0
+        remaining_skip = skip
         for shard_idx in self._shard_order(epoch_seed):
             n_rows = self._rows_per_shard[shard_idx]
-            row_order = self._row_order(n_rows, epoch_seed, shard_idx)
-
             base = global_idx
             global_idx += n_rows
+
+            # Smallest offset o in [0, n_rows) with (base + o) % stride == joint_index,
+            # i.e. o ≡ (joint_index - base) (mod stride); the selected-row count for
+            # this shard follows without materializing row_order or reading it.
+            first_hit_offset = (joint_index - base) % stride
+            shard_count = len(range(first_hit_offset, n_rows, stride))
+            if shard_count == 0:
+                continue  # no rows in this shard belong to this (rank, worker)
+
+            if remaining_skip >= shard_count:
+                remaining_skip -= shard_count
+                continue  # fully skipped by arithmetic — no read_table call
+
+            row_order = self._row_order(n_rows, epoch_seed, shard_idx)
             selected = [
                 row_idx
                 for offset, row_idx in enumerate(row_order)
                 if (base + offset) % stride == joint_index
             ]
-            if not selected:
-                continue  # no rows in this shard belong to this (rank, worker)
+            if remaining_skip:
+                selected = selected[remaining_skip:]
+                remaining_skip = 0
 
             yield from self._read_rows(shard_idx, selected)
 
