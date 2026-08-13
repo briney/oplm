@@ -25,6 +25,7 @@ from oplm.training.checkpoint import (
     _rotate_checkpoints,
     clean_stale_checkpoint_dirs,
     latest_checkpoint,
+    mark_permanent,
     save_checkpoint,
 )
 
@@ -196,6 +197,65 @@ def test_old_dir_invisible_to_rotation(tmp_path: Path) -> None:
     assert not (tmp_path / "checkpoint-100").exists()
     assert (tmp_path / "checkpoint-200").exists()
     assert (tmp_path / "checkpoint-100.old").exists()
+
+
+# --- Permanent-checkpoint retention exemptions (Task 1.2) ----------------------
+
+
+def test_rotation_exempts_keep_every_n_steps_checkpoints(tmp_path: Path) -> None:
+    """With keep_every_n_steps=100, checkpoints on that boundary are never rotated.
+
+    limit=1 over {100, 150, 200, 250}: 100 and 200 are permanent (step % 100 == 0);
+    250 is the newest rolling checkpoint, so only 150 is deleted.
+    """
+    for step in (100, 150, 200, 250):
+        (tmp_path / f"checkpoint-{step}").mkdir()
+
+    _rotate_checkpoints(tmp_path, save_total_limit=1, keep_every_n_steps=100)
+
+    assert (tmp_path / "checkpoint-100").exists()
+    assert not (tmp_path / "checkpoint-150").exists()
+    assert (tmp_path / "checkpoint-200").exists()
+    assert (tmp_path / "checkpoint-250").exists()
+
+
+def test_rotation_exempts_keep_marker_dirs_regardless_of_step(tmp_path: Path) -> None:
+    """A dir with a ``KEEP`` marker survives rotation even off the step boundary."""
+    for step in (100, 150, 200, 250):
+        (tmp_path / f"checkpoint-{step}").mkdir()
+    mark_permanent(tmp_path / "checkpoint-150")
+
+    _rotate_checkpoints(tmp_path, save_total_limit=1)
+
+    # 150 is KEEP-marked and survives despite not being the newest; 100 and 200 are
+    # ordinary rolling checkpoints culled down to the newest (250).
+    assert not (tmp_path / "checkpoint-100").exists()
+    assert (tmp_path / "checkpoint-150").exists()
+    assert not (tmp_path / "checkpoint-200").exists()
+    assert (tmp_path / "checkpoint-250").exists()
+
+
+def test_mark_permanent_writes_keep_marker(tmp_path: Path) -> None:
+    """mark_permanent writes a ``KEEP`` marker file inside the checkpoint dir."""
+    checkpoint_dir = tmp_path / "checkpoint-100"
+    checkpoint_dir.mkdir()
+
+    mark_permanent(checkpoint_dir)
+
+    assert (checkpoint_dir / "KEEP").exists()
+
+
+def test_rotation_without_keep_every_n_steps_behaves_as_before(tmp_path: Path) -> None:
+    """Omitting keep_every_n_steps preserves the original unconditional rotation behavior."""
+    for step in (100, 150, 200, 250):
+        (tmp_path / f"checkpoint-{step}").mkdir()
+
+    _rotate_checkpoints(tmp_path, save_total_limit=1)
+
+    assert not (tmp_path / "checkpoint-100").exists()
+    assert not (tmp_path / "checkpoint-150").exists()
+    assert not (tmp_path / "checkpoint-200").exists()
+    assert (tmp_path / "checkpoint-250").exists()
 
 
 def test_sweep_run_uses_committed_only() -> None:

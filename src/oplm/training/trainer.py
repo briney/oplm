@@ -561,6 +561,7 @@ class Trainer:
             samples_seen=self._samples_seen,
             tokens_seen=self.tokens_seen,
             save_total_limit=self.cfg.train.save_total_limit,
+            keep_every_n_steps=self.cfg.train.keep_every_n_steps,
         )
         self._emit_checkpoint_saved(checkpoint_dir)
 

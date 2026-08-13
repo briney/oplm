@@ -87,6 +87,33 @@ class TrainConfig:
     # step already triggered a periodic save (avoids a redundant re-write).
     save_final: bool = True
     resume_from: str | None = None
+    # Time-based checkpoint cadence: also save every N wall-clock minutes, in
+    # addition to (not instead of) the step-based save_every cadence. None
+    # disables it (checkpoints only happen on the save_every step cadence).
+    save_every_minutes: int | None = None
+    # Retain (never rotate away) every checkpoint whose step is a multiple of
+    # this value, in addition to the rolling save_total_limit window. None
+    # disables this exemption (all checkpoints are subject to rotation).
+    keep_every_n_steps: int | None = None
+    # Retain (never rotate away) a checkpoint at least this many wall-clock
+    # hours after the previous permanent checkpoint. None disables this
+    # exemption. Enforced by the trainer via checkpoint.mark_permanent.
+    keep_every_n_hours: float | None = None
+    # Automatically resume from the latest committed checkpoint under
+    # output_dir at trainer start, without an explicit --resume_from.
+    auto_resume: bool = False
+    # When resuming, also restore the data-loader position (sampler/shard
+    # offsets) so training resumes from the same data point rather than
+    # restarting the data stream from the beginning of the current epoch.
+    resume_data_position: bool = True
+    # Timeout (minutes) for the process-group / distributed backend, passed to
+    # Accelerator's InitProcessGroupKwargs. Longer timeouts tolerate slow
+    # checkpoint writes or requeue delays without triggering a collective abort.
+    dist_timeout_minutes: int = 15
+    # Optional remote URI (e.g. s3://bucket/prefix) that committed checkpoints
+    # are additionally synced to, for durability beyond local/shared storage.
+    # None disables remote sync.
+    remote_checkpoint_uri: str | None = None
 
     # Infrastructure
     seed: int = 42
@@ -192,6 +219,20 @@ class TrainConfig:
             raise ValueError(
                 f"stability_probe_every must be >= 0, got {self.stability_probe_every}"
             )
+        if self.save_every_minutes is not None and self.save_every_minutes <= 0:
+            raise ValueError(
+                f"save_every_minutes must be > 0 when set, got {self.save_every_minutes}"
+            )
+        if self.keep_every_n_steps is not None and self.keep_every_n_steps <= 0:
+            raise ValueError(
+                f"keep_every_n_steps must be > 0 when set, got {self.keep_every_n_steps}"
+            )
+        if self.keep_every_n_hours is not None and self.keep_every_n_hours <= 0:
+            raise ValueError(
+                f"keep_every_n_hours must be > 0 when set, got {self.keep_every_n_hours}"
+            )
+        if self.dist_timeout_minutes <= 0:
+            raise ValueError(f"dist_timeout_minutes must be > 0, got {self.dist_timeout_minutes}")
 
 
 @dataclass

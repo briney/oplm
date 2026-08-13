@@ -21,6 +21,7 @@ _CHECKPOINT_PREFIX = "checkpoint-"
 _TMP_SUFFIX = ".tmp"
 _OLD_SUFFIX = ".old"
 _LATEST_POINTER_NAME = "latest"
+_KEEP_MARKER_NAME = "KEEP"
 
 
 def save_checkpoint(
@@ -33,6 +34,7 @@ def save_checkpoint(
     samples_seen: int,
     tokens_seen: int,
     save_total_limit: int = 3,
+    keep_every_n_steps: int | None = None,
 ) -> None:
     """Save a training checkpoint atomically via a tmp-dir + rename commit.
 
@@ -63,7 +65,12 @@ def save_checkpoint(
         epoch: Current epoch number.
         samples_seen: Cumulative training samples processed globally.
         tokens_seen: Cumulative training tokens processed.
-        save_total_limit: Maximum number of checkpoints to keep.
+        save_total_limit: Maximum number of rolling checkpoints to keep. Permanent
+            checkpoints (see ``keep_every_n_steps`` and :func:`mark_permanent`) are
+            excluded from both the count and deletion.
+        keep_every_n_steps: When set, checkpoints whose step is a multiple of this
+            value are permanent and never rotated away, regardless of
+            ``save_total_limit``.
     """
     from oplm.config import serialize_config
     from oplm.data import get_tokenizer
@@ -112,7 +119,9 @@ def save_checkpoint(
         if aside_dir.exists():
             shutil.rmtree(aside_dir)
         _write_latest_pointer(Path(output_dir), final_dir.name)
-        _rotate_checkpoints(Path(output_dir), save_total_limit)
+        _rotate_checkpoints(
+            Path(output_dir), save_total_limit, keep_every_n_steps=keep_every_n_steps
+        )
 
     # Second barrier: no rank proceeds (e.g. to a subsequent resume) until the
     # rename, latest-pointer update, and rotation on the main process are done.
@@ -248,30 +257,81 @@ def _write_latest_pointer(output_dir: Path, checkpoint_name: str) -> None:
     os.replace(tmp_path, pointer_path)
 
 
-def _rotate_checkpoints(output_dir: Path, save_total_limit: int) -> None:
-    """Delete oldest committed checkpoints to keep at most ``save_total_limit``.
+def mark_permanent(checkpoint_dir: Path) -> None:
+    """Mark a committed checkpoint directory as permanent (exempt from rotation).
+
+    Writes a ``KEEP`` marker file inside ``checkpoint_dir``. :func:`_rotate_checkpoints`
+    treats any checkpoint dir containing this marker as permanent regardless of its step,
+    in addition to the ``keep_every_n_steps`` step-boundary exemption. Used by the trainer
+    to implement the ``keep_every_n_hours`` retention rule (Task 1.3).
+
+    Args:
+        checkpoint_dir: Path to a committed ``checkpoint-<step>/`` directory.
+    """
+    (checkpoint_dir / _KEEP_MARKER_NAME).write_text("")
+
+
+def _is_committed_checkpoint(d: Path) -> bool:
+    """Return True if ``d`` is a committed ``checkpoint-<step>/`` directory."""
+    if not d.is_dir() or d.name.endswith(_TMP_SUFFIX):
+        return False
+    return (
+        d.name.startswith(_CHECKPOINT_PREFIX) and d.name.removeprefix(_CHECKPOINT_PREFIX).isdigit()
+    )
+
+
+def _is_permanent_checkpoint(d: Path, step: int, keep_every_n_steps: int | None) -> bool:
+    """Return True if a committed checkpoint dir is exempt from rotation.
+
+    A checkpoint is permanent if its step falls on the ``keep_every_n_steps`` boundary,
+    or if a ``KEEP`` marker file has been written into its directory (see
+    :func:`mark_permanent`).
+    """
+    if keep_every_n_steps is not None and step % keep_every_n_steps == 0:
+        return True
+    return (d / _KEEP_MARKER_NAME).exists()
+
+
+def _rotate_checkpoints(
+    output_dir: Path,
+    save_total_limit: int,
+    *,
+    keep_every_n_steps: int | None = None,
+) -> None:
+    """Delete oldest rolling checkpoints to keep at most ``save_total_limit``.
 
     ``.tmp`` staging directories and ``.old`` replace-in-progress directories are ignored
     entirely: they neither count toward the limit nor are they ever deleted here (they are
     resolved separately by :func:`clean_stale_checkpoint_dirs`).
+
+    Permanent checkpoints — those on a ``keep_every_n_steps`` step boundary, or with a
+    ``KEEP`` marker written via :func:`mark_permanent` — are excluded from both the
+    rolling count and deletion; only non-permanent ("rolling") checkpoints are counted
+    against ``save_total_limit`` and eligible for removal.
+
+    Args:
+        output_dir: The training output directory.
+        save_total_limit: Maximum number of rolling checkpoints to keep.
+        keep_every_n_steps: When set, checkpoints whose step is a multiple of this
+            value are permanent and excluded from rotation.
     """
     if save_total_limit <= 0:
         return
 
-    def _is_committed_checkpoint(d: Path) -> bool:
-        if not d.is_dir() or d.name.endswith(_TMP_SUFFIX):
-            return False
-        return (
-            d.name.startswith(_CHECKPOINT_PREFIX)
-            and d.name.removeprefix(_CHECKPOINT_PREFIX).isdigit()
-        )
-
-    checkpoint_dirs = sorted(
+    committed = sorted(
         (d for d in output_dir.iterdir() if _is_committed_checkpoint(d)),
         key=lambda d: int(d.name.removeprefix(_CHECKPOINT_PREFIX)),
     )
 
-    while len(checkpoint_dirs) > save_total_limit:
-        oldest = checkpoint_dirs.pop(0)
+    rolling_dirs = [
+        d
+        for d in committed
+        if not _is_permanent_checkpoint(
+            d, int(d.name.removeprefix(_CHECKPOINT_PREFIX)), keep_every_n_steps
+        )
+    ]
+
+    while len(rolling_dirs) > save_total_limit:
+        oldest = rolling_dirs.pop(0)
         logger.info("Removing old checkpoint: %s", oldest)
         shutil.rmtree(oldest)

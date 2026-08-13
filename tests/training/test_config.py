@@ -483,3 +483,91 @@ def test_pad_divisibility_passes_on_divisible(tmp_path: "Path") -> None:
     cfg = load_config(["--config", config_path, "model.max_position_embeddings=1024"])
     assert cfg.data.pad_to_multiple_of == 128
     assert cfg.model.max_position_embeddings == 1024
+
+
+# --- Phase-1/2 cadence + retention knobs (Task 1.2) -----------------------------
+
+
+def test_cadence_retention_knob_defaults() -> None:
+    """Bare TrainConfig() exposes the new cadence/retention knobs, all off/None by default."""
+    cfg = TrainConfig()
+    assert cfg.save_every_minutes is None
+    assert cfg.keep_every_n_steps is None
+    assert cfg.keep_every_n_hours is None
+    assert cfg.auto_resume is False
+    assert cfg.resume_data_position is True
+    assert cfg.dist_timeout_minutes == 15
+    assert cfg.remote_checkpoint_uri is None
+
+
+@pytest.mark.parametrize("bad_val", [0, -1])
+def test_save_every_minutes_rejects_non_positive(bad_val: int) -> None:
+    """save_every_minutes must be > 0 when set."""
+    with pytest.raises(ValueError, match="save_every_minutes"):
+        TrainConfig(save_every_minutes=bad_val)
+
+
+@pytest.mark.parametrize("bad_val", [0, -1])
+def test_keep_every_n_steps_rejects_non_positive(bad_val: int) -> None:
+    """keep_every_n_steps must be > 0 when set."""
+    with pytest.raises(ValueError, match="keep_every_n_steps"):
+        TrainConfig(keep_every_n_steps=bad_val)
+
+
+@pytest.mark.parametrize("bad_val", [0, -1.0])
+def test_keep_every_n_hours_rejects_non_positive(bad_val: float) -> None:
+    """keep_every_n_hours must be > 0 when set."""
+    with pytest.raises(ValueError, match="keep_every_n_hours"):
+        TrainConfig(keep_every_n_hours=bad_val)
+
+
+@pytest.mark.parametrize("bad_val", [0, -1])
+def test_dist_timeout_minutes_rejects_non_positive(bad_val: int) -> None:
+    """dist_timeout_minutes must be > 0."""
+    with pytest.raises(ValueError, match="dist_timeout_minutes"):
+        TrainConfig(dist_timeout_minutes=bad_val)
+
+
+def test_cadence_retention_knobs_accept_positive_values() -> None:
+    """Setting each knob to a valid positive value is accepted and round-trips."""
+    cfg = TrainConfig(
+        save_every_minutes=30,
+        keep_every_n_steps=1000,
+        keep_every_n_hours=6.0,
+        auto_resume=True,
+        resume_data_position=False,
+        dist_timeout_minutes=45,
+        remote_checkpoint_uri="s3://bucket/prefix",
+    )
+    assert cfg.save_every_minutes == 30
+    assert cfg.keep_every_n_steps == 1000
+    assert cfg.keep_every_n_hours == 6.0
+    assert cfg.auto_resume is True
+    assert cfg.resume_data_position is False
+    assert cfg.dist_timeout_minutes == 45
+    assert cfg.remote_checkpoint_uri == "s3://bucket/prefix"
+
+
+def test_cadence_retention_knobs_roundtrip_through_load_config(tmp_path: "Path") -> None:
+    """The new knobs survive a serialize_config -> load_config round trip."""
+    cfg = load_config(
+        [
+            "train.save_every_minutes=30",
+            "train.keep_every_n_steps=1000",
+            "train.keep_every_n_hours=6.0",
+            "train.auto_resume=true",
+            "train.resume_data_position=false",
+            "train.dist_timeout_minutes=45",
+            "train.remote_checkpoint_uri=s3://bucket/prefix",
+        ]
+    )
+    path = tmp_path / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    restored = load_config(["--config", str(path)])
+    assert restored.train.save_every_minutes == 30
+    assert restored.train.keep_every_n_steps == 1000
+    assert restored.train.keep_every_n_hours == 6.0
+    assert restored.train.auto_resume is True
+    assert restored.train.resume_data_position is False
+    assert restored.train.dist_timeout_minutes == 45
+    assert restored.train.remote_checkpoint_uri == "s3://bucket/prefix"
