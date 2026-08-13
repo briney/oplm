@@ -1070,6 +1070,12 @@ skip Task 5.2.
 
 ### Task 5.2: Distributed Muon adapter (only if the 0.3 spike requires it)
 
+> **Task 0.3 verdict:** `torch.optim.Muon` works as-is on FSDP2 DTensor params
+> (2-process CPU/gloo: no exception, loss decreased, params changed,
+> `get_state_dict` round-tripped sharded momentum buffers) — no adapter
+> needed; **skip this task**. See spec §7 and
+> `.superpowers/sdd/TODOS/task-0.3-report.md`.
+
 **Files:**
 - Create: `src/oplm/training/muon_dtensor.py`
 - Modify: `src/oplm/training/optim.py` (select adapter when params are DTensor)

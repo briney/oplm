@@ -257,10 +257,20 @@ log with `step=global_step`, so a resumed run continues one W&B run.
   optional headroom for 12B.
 - Checkpoints are parallelism-agnostic (§3), so the same checkpoint loads
   under DDP or HSDP at any world size.
-- **Muon spike (Phase 0):** verify whether `torch.optim.Muon` accepts
-  DTensor-sharded params; if not, adopt a torchtitan-style distributed Muon
-  (gather → Newton–Schulz → scatter per matrix). Half-day prototype on 2 GPUs;
-  gates only Phase 5.
+- **Muon spike (Phase 0, Task 0.3 — DONE):** empirically verified on 2-process
+  CPU/gloo (`tests/training/test_fsdp2_muon_spike.py`): `torch.optim.Muon`
+  constructs and steps directly on the 2-D DTensor params `fully_shard`
+  produces — no exception, loss decreased monotonically over 3 steps, the
+  sharded parameter changed, and `get_state_dict(model, [muon])` round-tripped
+  the optimizer state with momentum buffers staying sharded (`Shard(dim=0)`
+  DTensors, not gathered — no memory regression). PyTorch's DTensor dispatch
+  transparently redistributes/reduces inside the Newton–Schulz matmuls and
+  norm, so no manual gather step is needed for the code to *run*; the spike
+  did not check numeric equivalence against a single-device oracle (that
+  stronger correctness bar is what Task 5.2's now-optional oracle test would
+  add). Verdict: **works as-is**, no gather → Newton–Schulz → scatter adapter
+  needed to unblock Phase 5; Task 5.2 is skipped unless HSDP training
+  instability surfaces in practice and points back at Muon's DTensor path.
 - Open sub-decision (resolve during Phase 5 planning): keep accelerate's FSDP2
   wrapping vs. go native torch for the sharded path.
 
