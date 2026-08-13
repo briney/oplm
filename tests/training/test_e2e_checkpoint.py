@@ -8,11 +8,16 @@ resumed from a mid-run checkpoint restores the training counters, the LR schedul
 position, reaches the new target, and continues with a finite, non-discontinuous
 loss.
 
-Note on scope: OPLM's training stream is an ``IterableDataset`` that restarts at
-the top of the epoch when a resumed trainer rebuilds its iterator, so the exact
-sequence of post-resume batches (and therefore ``tokens_seen``) does not match an
-uninterrupted run. We assert counter *restoration* and trajectory *continuity*
-rather than bit-exact equivalence against a non-resumed control.
+Note on scope: as of Phase 3 (Tasks 3.1-3.3), resume is data-exact whenever the
+resuming run's layout (``world_size``, ``num_workers``, ``per_rank_batch``, ``seed``)
+matches the checkpoint's recorded :class:`~oplm.data.DataCursor` and
+``train.resume_data_position`` is left at its default ``true`` — the resumed stream is
+the exact suffix an uninterrupted run would have produced, so counters (including
+``tokens_seen``) match a non-resumed control exactly, not merely within a continuity
+band. This file's own ``test_resume_restores_state_and_continues`` asserts that exact
+equality directly; ``tests/training/test_e2e_data_exact.py`` is the dedicated Phase 3
+acceptance test, covering the ``num_workers>1`` worker-cycle alignment and
+epoch-boundary-crossing cases this file does not.
 """
 
 from __future__ import annotations
@@ -277,6 +282,13 @@ def test_resume_restores_state_and_continues(
     Also covers the Task 2.2 fix round: extending max_steps (4 -> 8) across an explicit
     resume_from is a supported workflow, not a schedule-compat error, but it does log a
     prominent warning (see ``validate_schedule_compat``'s asymmetric max_steps policy).
+
+    Phase 3: this test's layout qualifies for data-exact resume (single-process data
+    loading, default ``resume_data_position=true``, and the 256-row ``training_parquet``
+    fixture keeps all 8 steps inside epoch 0 -- no rollover to interact with the skip).
+    So in addition to the pre-existing continuity checks, ``tokens_seen`` is asserted
+    exactly against a third, uninterrupted control run over the same 0->8 target -- not
+    merely restored-and-continuing, but identical to a run that was never interrupted.
     """
     from oplm.training.trainer import Trainer
 
@@ -340,6 +352,17 @@ def test_resume_restores_state_and_continues(
     last_pre = dict(cb1.train_logs)[4]["train/loss"]
     first_post = post_resume[5]["train/loss"]
     assert 0.2 < first_post / last_pre < 5.0
+
+    # Phase 3 data-exactness: an uninterrupted control run over the same 0->8 target
+    # must land on exactly the same tokens_seen (see the docstring's scope note --
+    # this test's config is layout-compatible, so exactness, not just continuity,
+    # is the correct bar now).
+    control_cfg = tiny_train_cfg(
+        tmp_path / "control", training_parquet, max_steps=8, save_every=10_000, **common
+    )
+    control = Trainer(control_cfg, callbacks=[])
+    control.train()
+    assert resumed.tokens_seen == control.tokens_seen
 
 
 # --- auto_resume (Task 1.4) -------------------------------------------------------------
