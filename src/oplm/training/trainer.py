@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -22,6 +23,27 @@ if TYPE_CHECKING:
     from oplm.training.callbacks import TrainerCallback
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _StepFlags:
+    """Rank-synchronized control bundle for the just-completed optimizer step.
+
+    Every rank computes its own local inputs (raw token count, whether it
+    observed a drain signal, whether its own loss was non-finite, whether its
+    own ``save_every_minutes`` timer fired) and :meth:`Trainer._reduce_step_flags`
+    sum-reduces them into one rank-identical bundle: token counts add up
+    normally, and any boolean flag true on *any* rank becomes true on *every*
+    rank (sum > 0). This is the single rank-synchronization point later
+    resilience features plug into — the drain signal (Task 1.5) and the
+    non-finite-loss guardrail (Task 1.8) only need to change their local input
+    to this reduce, not add a new collective.
+    """
+
+    tokens_delta: int
+    drain: bool
+    nonfinite: bool
+    save_due: bool
 
 
 class Trainer:
@@ -273,6 +295,15 @@ class Trainer:
         self._epoch_at_last_opt_step = 0
         self._step_local_tokens = 0  # local tokens accumulated across the current opt step
 
+        # Wall-clock/time-based checkpoint cadence state (Task 1.3). _last_save_at
+        # uses time.monotonic() and is never persisted (meaningless across process
+        # restarts); _first_checkpoint_at/_last_time_keep_index anchor the
+        # keep_every_n_hours rule and ARE persisted (trainer_state.json) so a
+        # requeue doesn't reset the hours anchor.
+        self._last_save_at = time.monotonic()
+        self._first_checkpoint_at: float | None = None
+        self._last_time_keep_index = 0
+
         # FLOP estimation
         self.flops_per_token = estimate_flops_per_token(cfg.model)
 
@@ -325,6 +356,7 @@ class Trainer:
         data_iter = iter(self.dataloader)
         current_loss = float("nan")
         step_loss_sum = 0.0
+        last_step_did_save = False
 
         try:
             while self.global_step < self.total_steps:
@@ -378,15 +410,17 @@ class Trainer:
                 current_loss = step_loss_sum / cfg.gradient_accumulation_steps
                 step_loss_sum = 0.0
 
-                # Rank-reduce this step's tokens so tokens_seen / tokens_delta are
-                # rank-identical (the EvalContext rank-sync invariant; see design §3.2).
-                # Unconditional: a per-rank estimate would diverge on ragged batches.
-                tokens_tensor = torch.tensor(
-                    self._step_local_tokens, device=self.accelerator.device, dtype=torch.long
-                )
-                tokens_delta = int(self.accelerator.reduce(tokens_tensor, reduction="sum").item())
-                self.tokens_seen += tokens_delta
+                # Rank-sync the control bundle for this optimizer step in a single
+                # reduce: tokens (so tokens_seen / tokens_delta are rank-identical —
+                # the EvalContext rank-sync invariant; see design §3.2) plus the
+                # drain, non-finite, and time-based-save flags later resilience
+                # tasks plug into. Unconditional: a per-rank token estimate would
+                # diverge on ragged batches.
+                local_tokens = self._step_local_tokens
                 self._step_local_tokens = 0
+                flags = self._reduce_step_flags(local_tokens, save_due=self._save_timer_due())
+                tokens_delta = flags.tokens_delta
+                self.tokens_seen += tokens_delta
 
                 # Accumulate throughput window, excluding warmup steps
                 now = time.perf_counter()
@@ -411,8 +445,12 @@ class Trainer:
                     self._log_metrics(eval_metrics)
                     self._emit_eval_end(eval_metrics)
 
-                # Checkpointing
-                if cfg.save_every > 0 and self.global_step % cfg.save_every == 0:
+                # Checkpointing: step cadence OR the rank-synced save_every_minutes
+                # timer (flags.save_due is identical on every rank after the reduce
+                # above, so this decision is too).
+                step_saved = cfg.save_every > 0 and self.global_step % cfg.save_every == 0
+                last_step_did_save = step_saved or flags.save_due
+                if last_step_did_save:
                     self._save_checkpoint()
 
                 # Update progress bar
@@ -432,9 +470,10 @@ class Trainer:
                 self._step_timer_start = time.perf_counter()
 
             # Final checkpoint — guaranteed unless disabled. Skip when the last
-            # step already triggered a periodic save (avoids a redundant re-write).
-            last_step_saved = cfg.save_every > 0 and self.global_step % cfg.save_every == 0
-            if cfg.save_final and not last_step_saved:
+            # optimizer step already triggered a save, for either reason (step
+            # cadence or the save_every_minutes timer), to avoid a redundant
+            # re-write.
+            if cfg.save_final and not last_step_did_save:
                 self._save_checkpoint()
 
         finally:
@@ -471,6 +510,61 @@ class Trainer:
             return {}
         ctx = self._build_eval_context(tokens_delta)
         return self.evaluator.run_due(ctx, self.model, self.accelerator)
+
+    def _reduce_step_flags(
+        self,
+        local_tokens: int,
+        *,
+        drain: bool = False,
+        nonfinite: bool = False,
+        save_due: bool = False,
+    ) -> _StepFlags:
+        """Rank-sync the control bundle for this optimizer step in one reduce.
+
+        Packs ``[local_tokens, drain, nonfinite, save_due]`` into a single
+        4-element long tensor and sum-reduces it across ranks: the token count
+        accumulates normally, and each boolean becomes True everywhere if it was
+        True on *any* rank (sum > 0). Per-rank clock or signal skew on the boolean
+        inputs is harmless by construction — one rank tripping a flag trips it for
+        all ranks.
+
+        Args:
+            local_tokens: This rank's token count for the just-completed optimizer
+                step.
+            drain: This rank's local drain signal (SIGUSR1/SIGTERM/SLURM end-time
+                margin). Hardwired False until Task 1.5 wires the real signal.
+            nonfinite: This rank's local non-finite-loss signal. Hardwired False
+                until Task 1.8 wires the real signal.
+            save_due: This rank's local ``save_every_minutes`` timer signal.
+
+        Returns:
+            A rank-identical :class:`_StepFlags`.
+        """
+        bundle = torch.tensor(
+            [int(local_tokens), int(drain), int(nonfinite), int(save_due)],
+            device=self.accelerator.device,
+            dtype=torch.long,
+        )
+        reduced = self.accelerator.reduce(bundle, reduction="sum").tolist()
+        tokens_delta, drain_sum, nonfinite_sum, save_due_sum = (int(x) for x in reduced)
+        return _StepFlags(
+            tokens_delta=tokens_delta,
+            drain=drain_sum > 0,
+            nonfinite=nonfinite_sum > 0,
+            save_due=save_due_sum > 0,
+        )
+
+    def _save_timer_due(self) -> bool:
+        """Return True if this rank's ``save_every_minutes`` wall-clock timer fired.
+
+        Uses ``time.monotonic()`` (never persisted — meaningless across process
+        restarts); ``self._last_save_at`` is reset every time a checkpoint is
+        actually saved, in :meth:`_save_checkpoint`.
+        """
+        save_every_minutes = self.cfg.train.save_every_minutes
+        if save_every_minutes is None:
+            return False
+        return (time.monotonic() - self._last_save_at) >= save_every_minutes * 60
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -547,10 +641,37 @@ class Trainer:
         self._log_metrics(metrics)
 
     def _save_checkpoint(self) -> None:
-        """Save a training checkpoint."""
-        from oplm.training.checkpoint import save_checkpoint
+        """Save a training checkpoint.
+
+        Updates ``self._last_save_at`` (monotonic) so the ``save_every_minutes``
+        timer restarts from this save. On the main process, also anchors
+        ``self._first_checkpoint_at`` (wall clock, on the first checkpoint ever)
+        and applies the ``keep_every_n_hours`` rule: once wall-clock time since
+        that anchor crosses a new multiple of ``keep_every_n_hours * 3600``,
+        this checkpoint is marked permanent via
+        :func:`~oplm.training.checkpoint.mark_permanent`. Both anchor and index
+        are persisted into ``trainer_state.json`` (``first_checkpoint_unix`` /
+        ``last_time_keep_index``) so a requeue resumes the hours anchor instead
+        of restarting it.
+        """
+        from oplm.training.checkpoint import mark_permanent, save_checkpoint
 
         checkpoint_dir = Path(self.cfg.train.output_dir) / f"checkpoint-{self.global_step}"
+
+        should_mark_permanent = False
+        if self.accelerator.is_main_process:
+            now_wall = time.time()
+            if self._first_checkpoint_at is None:
+                self._first_checkpoint_at = now_wall
+            keep_every_n_hours = self.cfg.train.keep_every_n_hours
+            if keep_every_n_hours is not None:
+                interval_seconds = keep_every_n_hours * 3600
+                elapsed = now_wall - self._first_checkpoint_at
+                current_time_keep_index = int(elapsed // interval_seconds)
+                if current_time_keep_index > self._last_time_keep_index:
+                    should_mark_permanent = True
+                    self._last_time_keep_index = current_time_keep_index
+
         save_checkpoint(
             accelerator=self.accelerator,
             model=self.model,
@@ -562,7 +683,16 @@ class Trainer:
             tokens_seen=self.tokens_seen,
             save_total_limit=self.cfg.train.save_total_limit,
             keep_every_n_steps=self.cfg.train.keep_every_n_steps,
+            extra_state={
+                "first_checkpoint_unix": self._first_checkpoint_at,
+                "last_time_keep_index": self._last_time_keep_index,
+            },
         )
+        self._last_save_at = time.monotonic()
+
+        if should_mark_permanent:
+            mark_permanent(checkpoint_dir)
+
         self._emit_checkpoint_saved(checkpoint_dir)
 
     def _resume_from_checkpoint(self, checkpoint_dir: str) -> None:
@@ -576,6 +706,10 @@ class Trainer:
         self._samples_seen = int(
             state.get("samples_seen", self.global_step * self._global_effective_batch_size())
         )
+        # keep_every_n_hours anchor: restore rather than reset, so a requeue keeps
+        # accumulating toward the same wall-clock boundary instead of starting over.
+        self._first_checkpoint_at = state.get("first_checkpoint_unix")
+        self._last_time_keep_index = int(state.get("last_time_keep_index", 0))
         self._set_dataset_epoch(self.epoch)
 
         # Reset per-opt-step snapshot markers so the first post-resume step computes

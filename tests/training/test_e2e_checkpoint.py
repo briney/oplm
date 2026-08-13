@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import time as time_module
 from typing import TYPE_CHECKING
 
 import pytest
@@ -32,6 +33,25 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.slow
 
 _BATCH_SIZE = 4
+
+
+class _FakeClock:
+    """A fake monotonic/wall clock that advances by a fixed step on every call.
+
+    Installed via ``monkeypatch.setattr(time_module, "monotonic", ...)`` (or
+    ``"time"``) so it stands in for the exact stdlib attribute the trainer calls —
+    patching the module attribute (not a local ``from time import monotonic``
+    binding) is what makes the fake take effect inside ``trainer.py``.
+    """
+
+    def __init__(self, step: float = 30.0, start: float = 0.0) -> None:
+        self._value = start
+        self._step = step
+
+    def __call__(self) -> float:
+        value = self._value
+        self._value += self._step
+        return value
 
 
 def _checkpoint_names(output_dir: Path) -> list[str]:
@@ -110,6 +130,113 @@ def test_save_final_disabled_skips_final_checkpoint(training_parquet: Path, tmp_
     callback = FullRecordingCallback()
     Trainer(cfg, callbacks=[callback]).train()
     assert callback.checkpoint_steps == [4]
+
+
+def test_save_every_minutes_triggers_time_based_checkpoint(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A save_every_minutes timer fires a checkpoint independent of save_every.
+
+    The fake monotonic clock advances 30s per call; ``Trainer.__init__`` consumes
+    the first tick (anchoring ``_last_save_at`` at t=0), so the per-step due-check
+    sees t=30 at step 1 (not due) and t=60 at step 2 — exactly the 60s
+    (save_every_minutes=1) threshold, so the checkpoint appears at step 2.
+    """
+    from oplm.training.trainer import Trainer
+
+    monkeypatch.setattr(time_module, "monotonic", _FakeClock(step=30.0))
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=3,
+        batch_size=_BATCH_SIZE,
+        save_every=0,
+        save_every_minutes=1,
+        save_final=False,
+    )
+    callback = FullRecordingCallback()
+    Trainer(cfg, callbacks=[callback]).train()
+
+    assert callback.checkpoint_steps == [2]
+
+
+def test_keep_every_n_hours_marks_crossing_checkpoint_permanent(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crossing a keep_every_n_hours boundary marks that checkpoint permanent.
+
+    The fake wall clock advances 2000s per checkpoint; with keep_every_n_hours=1
+    (3600s), the anchor is set at the step-1 checkpoint (t=0) and the boundary is
+    crossed at the step-3 checkpoint (elapsed=4000s >= 3600s). save_total_limit=1
+    means only the newest rolling checkpoint would normally survive — the KEEP
+    marker on checkpoint-3 exempts it, and it is the newest anyway.
+    """
+    from oplm.training.trainer import Trainer
+
+    monkeypatch.setattr(time_module, "time", _FakeClock(step=2000.0))
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=3,
+        batch_size=_BATCH_SIZE,
+        save_every=1,
+        save_total_limit=1,
+        keep_every_n_hours=1.0,
+    )
+    callback = FullRecordingCallback()
+    Trainer(cfg, callbacks=[callback]).train()
+
+    assert callback.checkpoint_steps == [1, 2, 3]
+    assert _checkpoint_names(tmp_path) == ["checkpoint-3"]
+    assert (tmp_path / "checkpoint-3" / "KEEP").exists()
+
+    state = json.loads((tmp_path / "checkpoint-3" / "trainer_state.json").read_text())
+    assert state["first_checkpoint_unix"] == 0.0
+    assert state["last_time_keep_index"] == 1
+
+
+def test_first_checkpoint_unix_anchor_survives_resume(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The keep_every_n_hours anchor is restored from trainer_state.json on resume.
+
+    A requeue must not reset ``first_checkpoint_unix`` to the resumed trainer's
+    own start time — otherwise a long-running job that requeues every few hours
+    would never accumulate enough wall-clock time to cross a keep_every_n_hours
+    boundary.
+    """
+    from oplm.training.trainer import Trainer
+
+    monkeypatch.setattr(time_module, "time", _FakeClock(step=100.0))
+
+    cfg1 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=1,
+        batch_size=_BATCH_SIZE,
+        save_every=1,
+        keep_every_n_hours=1.0,
+    )
+    Trainer(cfg1, callbacks=[]).train()
+
+    state1 = json.loads((tmp_path / "checkpoint-1" / "trainer_state.json").read_text())
+    assert state1["first_checkpoint_unix"] == 0.0
+
+    # A fresh trainer resumes; even though its own wall clock keeps advancing,
+    # the anchor loaded from trainer_state.json must be reused, not reset.
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=2,
+        batch_size=_BATCH_SIZE,
+        save_every=1,
+        keep_every_n_hours=1.0,
+        resume_from=str(tmp_path / "checkpoint-1"),
+    )
+    resumed = Trainer(cfg2, callbacks=[])
+    assert resumed._first_checkpoint_at == 0.0
 
 
 def test_resume_restores_state_and_continues(training_parquet: Path, tmp_path: Path) -> None:

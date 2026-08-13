@@ -35,6 +35,7 @@ def save_checkpoint(
     tokens_seen: int,
     save_total_limit: int = 3,
     keep_every_n_steps: int | None = None,
+    extra_state: dict[str, Any] | None = None,
 ) -> None:
     """Save a training checkpoint atomically via a tmp-dir + rename commit.
 
@@ -71,6 +72,11 @@ def save_checkpoint(
         keep_every_n_steps: When set, checkpoints whose step is a multiple of this
             value are permanent and never rotated away, regardless of
             ``save_total_limit``.
+        extra_state: Additional key/value pairs merged into ``trainer_state.json``
+            (e.g. the ``keep_every_n_hours`` bookkeeping keys ``first_checkpoint_unix``
+            and ``last_time_keep_index``). Merged on top of the base keys below, so
+            callers must not collide with ``global_step``, ``epoch``, ``samples_seen``,
+            or ``tokens_seen``.
     """
     from oplm.config import serialize_config
     from oplm.data import get_tokenizer
@@ -86,6 +92,8 @@ def save_checkpoint(
             "samples_seen": samples_seen,
             "tokens_seen": tokens_seen,
         }
+        if extra_state:
+            state.update(extra_state)
         state_path = tmp_dir / "trainer_state.json"
         state_path.write_text(json.dumps(state, indent=2))
 
