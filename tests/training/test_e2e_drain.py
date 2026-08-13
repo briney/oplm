@@ -52,13 +52,20 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     """A SIGUSR1 mid-run commits exactly one checkpoint, exits 85, and resumes past it."""
     run_dir = tmp_path / "run"
 
-    # save_every=0 disables step-cadence checkpointing; save_final only fires if the
-    # loop reaches max_steps=200 normally, which a drain this early never does. So
-    # the only checkpoint that can appear is the one the drain branch itself writes.
+    # save_every=0 disables step-cadence checkpointing; save_final only fires if the loop
+    # reaches max_steps normally, which a drain this early never does -- the signal is
+    # sent as soon as config.yaml appears, long before even one training step completes,
+    # so any max_steps comfortably above the (dynamically discovered) drained_step below
+    # works. Kept small (rather than the very large value used pre-Task-2.2) because the
+    # follow-up resume below must not *decrease* max_steps relative to this run's own
+    # config -- validate_schedule_compat's asymmetric max_steps policy (Task 2.2 fix
+    # round) raises on any decrease -- and a small original value keeps the follow-up
+    # resume.train() call (which runs from drained_step up to original_max_steps + 2) fast.
+    original_max_steps = 6
     cfg = tiny_train_cfg(
         run_dir,
         training_parquet,
-        max_steps=200,
+        max_steps=original_max_steps,
         save_every=0,
         log_every=1,
     )
@@ -147,10 +154,17 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     assert checkpoint_tokens_seen == control.tokens_seen > 0
 
     # Follow-up: a requeued run with auto_resume=true picks up past the drained step.
+    # max_steps must not *decrease* relative to the drained checkpoint's own config
+    # (original_max_steps, saved into its config.yaml) -- validate_schedule_compat's
+    # asymmetric max_steps policy raises on any decrease (Task 2.2 fix round) -- so this
+    # takes whichever of "past the drained step" or "past the original target" is
+    # larger, guaranteeing a genuine increase (allowed, logs a warning) rather than a
+    # decrease (rejected).
+    resume_max_steps = max(drained_step + 2, original_max_steps + 2)
     resume_cfg = tiny_train_cfg(
         run_dir,
         training_parquet,
-        max_steps=drained_step + 2,
+        max_steps=resume_max_steps,
         save_every=0,
         auto_resume=True,
         log_every=1,
@@ -161,4 +175,4 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     assert resumed.tokens_seen == checkpoint_tokens_seen
 
     resumed.train()
-    assert resumed.global_step == drained_step + 2
+    assert resumed.global_step == resume_max_steps

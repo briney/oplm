@@ -40,13 +40,14 @@ _SCALER_SIDECAR_NAME = "scaler.pt"
 # change across a resume). See _restore_rng_sidecar for the full rationale.
 _ALLOW_MISSING_RNG_ENV = "OPLM_ALLOW_MISSING_RNG"
 
-# Schedule-related TrainConfig fields compared by validate_schedule_compat.
-# Deliberately EXCLUDES max_steps -- see validate_schedule_compat's docstring for why
-# (extending max_steps across a resume, to keep training past the original target, is
-# an existing, tested, and desired workflow -- both explicit resume_from and
-# auto_resume -- not the accidental-drift hazard this check exists to catch). Also not
-# exhaustive of everything that affects the LR trajectory: e.g. mixed_precision does
-# not belong here at all.
+# Schedule-related TrainConfig fields compared for exact equality by
+# validate_schedule_compat. max_steps is deliberately EXCLUDED from this tuple -- it
+# gets its own asymmetric policy (see validate_schedule_compat's docstring) because,
+# unlike these fields, deliberately *increasing* it across a resume to keep training
+# past the original target is an existing, tested, desired workflow (both explicit
+# resume_from and auto_resume), not the accidental-drift hazard this check exists to
+# catch. Also not exhaustive of everything that affects the LR trajectory: e.g.
+# mixed_precision does not belong here at all.
 _SCHEDULE_COMPAT_FIELDS = ("warmup_steps", "stable_steps", "scheduler", "lr", "min_lr")
 
 
@@ -375,7 +376,11 @@ def save_checkpoint(
     return final_dir
 
 
-def validate_schedule_compat(checkpoint_dir: Path, cfg: OplmConfig) -> None:
+def validate_schedule_compat(
+    checkpoint_dir: Path,
+    cfg: OplmConfig,
+    checkpoint_global_step: int | None = None,
+) -> None:
     """Raise if the checkpoint's LR-schedule config disagrees with the live config.
 
     Resuming into a scheduler rebuilt with different ``warmup_steps``/``stable_steps``/
@@ -386,28 +391,46 @@ def validate_schedule_compat(checkpoint_dir: Path, cfg: OplmConfig) -> None:
     curve*, with no error. Comparing the checkpoint's own ``config.yaml`` against the live
     config before ``dcp.load`` even runs closes that hole with a loud, specific error
     instead of a silent LR discontinuity discovered days later in a wandb chart.
+    ``_SCHEDULE_COMPAT_FIELDS`` (everything above) is checked for exact equality.
 
-    Note on ``max_steps`` (deliberately excluded from ``_SCHEDULE_COMPAT_FIELDS``):
-    training the checkpoint past its original target by resuming with a *larger*
-    ``max_steps`` -- deliberately reshaping the remaining LR curve to accommodate the
-    new, longer target -- is an existing, tested, and desired workflow for both explicit
-    ``resume_from`` and ``auto_resume`` (e.g. ``test_resume_restores_state_and_continues``,
-    ``test_auto_resume_picks_up_the_newest_committed_checkpoint``). Because the very
-    thing this check exists to prevent -- a schedule reshaped differently than the
-    operator intended -- is also the *mechanism* of that legitimate workflow, ``max_steps``
-    can't be compared for exact equality without breaking it; distinguishing "deliberately
-    extended" from "accidentally drifted" would need more than a field-equality check
-    (out of scope here -- see the task brief: "don't over-engineer"). ``max_epochs``-derived
-    ``total_steps`` changes are not covered at all, for the same reason.
+    ``max_steps`` gets its own **asymmetric** policy instead of exact equality, because
+    unlike the fields above, deliberately increasing it across a resume -- to keep
+    training past the original target, reshaping the *remaining* portion of the curve to
+    reach the new, longer target -- is an existing, tested, desired workflow for both
+    explicit ``resume_from`` and ``auto_resume`` (e.g.
+    ``test_resume_restores_state_and_continues``,
+    ``test_auto_resume_picks_up_the_newest_committed_checkpoint``):
+
+      - ``live max_steps < checkpoint max_steps`` (any decrease): raises. A shrunk
+        schedule on resume is essentially always accidental, and the checkpoint's own
+        ``global_step`` can even already exceed the new, smaller total.
+      - ``live max_steps <= checkpoint_global_step`` (resuming into a target already
+        met or passed by the checkpoint's own recorded progress): raises, independent of
+        whether ``max_steps`` moved -- there would be nothing left to train. Skipped
+        when ``checkpoint_global_step`` is unknown (``None``).
+      - ``live max_steps > checkpoint max_steps`` (increase, and not already caught by
+        the ``global_step`` check above): allowed, but logged as a prominent warning --
+        the decay portion of the schedule will differ from an uninterrupted run to the
+        new target, which is expected for a deliberate run extension, not silently
+        swallowed.
+      - Equal: silent.
+
+    ``max_epochs``-derived ``total_steps`` changes are not covered at all -- only the
+    ``max_steps`` config field itself is compared (out of scope here -- see the task
+    brief: "don't over-engineer").
 
     Args:
         checkpoint_dir: Path to the committed checkpoint directory (holds ``config.yaml``).
         cfg: The live, resolved config being trained/resumed with.
+        checkpoint_global_step: The checkpoint's own recorded ``global_step`` (from its
+            ``trainer_state.json``), used only for the ``max_steps``-vs-``global_step``
+            check above. ``None`` skips that specific check (e.g. when the caller hasn't
+            read ``trainer_state.json`` yet).
 
     Raises:
-        ValueError: One or more of ``_SCHEDULE_COMPAT_FIELDS`` differs between the
-            checkpoint's config and ``cfg``; the message names every differing field
-            with both values.
+        ValueError: A field in ``_SCHEDULE_COMPAT_FIELDS`` differs, ``max_steps``
+            decreased, or ``max_steps`` no longer leaves any training to do; the message
+            names every differing/invalid field with both values.
     """
     config_path = checkpoint_dir / "config.yaml"
     if not config_path.is_file():
@@ -430,6 +453,31 @@ def validate_schedule_compat(checkpoint_dir: Path, cfg: OplmConfig) -> None:
         for field in _SCHEDULE_COMPAT_FIELDS
         if getattr(checkpoint_cfg.train, field) != getattr(cfg.train, field)
     ]
+
+    checkpoint_max_steps = checkpoint_cfg.train.max_steps
+    live_max_steps = cfg.train.max_steps
+    if live_max_steps < checkpoint_max_steps:
+        mismatches.append(
+            f"max_steps (checkpoint={checkpoint_max_steps!r}, live={live_max_steps!r}) "
+            "-- live max_steps is smaller than the checkpoint's; a shrunk schedule on "
+            "resume is essentially always accidental"
+        )
+    elif checkpoint_global_step is not None and live_max_steps <= checkpoint_global_step:
+        mismatches.append(
+            f"max_steps (checkpoint={checkpoint_max_steps!r}, live={live_max_steps!r}) "
+            f"<= the checkpoint's own global_step ({checkpoint_global_step!r}) -- "
+            "resuming would already be past the end of training"
+        )
+    elif live_max_steps > checkpoint_max_steps:
+        logger.warning(
+            "Checkpoint %s: resuming with a larger max_steps (checkpoint=%d, live=%d). "
+            "The decay portion of the LR schedule will differ from an uninterrupted run "
+            "to the new, longer target -- expected for a deliberate run extension.",
+            checkpoint_dir,
+            checkpoint_max_steps,
+            live_max_steps,
+        )
+
     if mismatches:
         raise ValueError(
             f"Checkpoint {checkpoint_dir} is not schedule-compatible with the current "
@@ -478,11 +526,11 @@ def validate_checkpoint_for_resume(checkpoint_dir: Path, cfg: OplmConfig) -> Non
             of DCP's metadata deserialization, not part of this function's contract).
     """
     state_path = checkpoint_dir / "trainer_state.json"
-    json.loads(state_path.read_text())
+    state: dict[str, Any] = json.loads(state_path.read_text())
 
     FileSystemReader(str(checkpoint_dir)).read_metadata()
 
-    validate_schedule_compat(checkpoint_dir, cfg)
+    validate_schedule_compat(checkpoint_dir, cfg, checkpoint_global_step=state.get("global_step"))
 
 
 def load_checkpoint(
@@ -530,7 +578,17 @@ def load_checkpoint(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
-    validate_schedule_compat(ckpt_path, cfg)
+    # Read trainer_state.json up front (rather than after dcp.load, as in Task 2.1's
+    # minimal conversion): validate_schedule_compat's max_steps-vs-global_step check
+    # needs the checkpoint's own global_step, and failing fast on a missing/corrupt
+    # state file before touching model/optimizer state is strictly better ordering
+    # anyway. Reused for the return value below instead of re-reading.
+    state_path = ckpt_path / "trainer_state.json"
+    if not state_path.exists():
+        raise FileNotFoundError(f"trainer_state.json not found in {checkpoint_dir}")
+    state: dict[str, Any] = json.loads(state_path.read_text())
+
+    validate_schedule_compat(ckpt_path, cfg, checkpoint_global_step=state.get("global_step"))
 
     unwrapped_schedulers = [_unwrap_scheduler(s) for s in schedulers]
     dcp_state: dict[str, Any] = {
@@ -546,11 +604,6 @@ def load_checkpoint(
     _restore_rng_sidecar(ckpt_path, accelerator.process_index)
     _restore_scaler_sidecar(ckpt_path, accelerator)
 
-    state_path = ckpt_path / "trainer_state.json"
-    if not state_path.exists():
-        raise FileNotFoundError(f"trainer_state.json not found in {checkpoint_dir}")
-
-    state: dict[str, Any] = json.loads(state_path.read_text())
     return state
 
 

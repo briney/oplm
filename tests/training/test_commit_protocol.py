@@ -555,3 +555,55 @@ def test_explicit_resume_from_corrupted_checkpoint_raises_at_load(tmp_path: Path
             str(committed),
             cfg,
         )
+
+
+# --- Task 2.2 fix round: auto_map regression (serialize_config / load_config) --------
+
+
+@pytest.mark.slow
+def test_second_checkpoints_config_yaml_round_trips_through_load_config(tmp_path: Path) -> None:
+    """Regression: a checkpoint saved after the first one must still ``load_config``.
+
+    ``OplmConfig.register_for_auto_class`` (called once at ``oplm`` package import, see
+    ``oplm/__init__.py``) plus ``PreTrainedModel.save_pretrained`` stamp ``auto_map`` onto
+    the shared, mutable ``cfg.model`` instance *in place* the first time
+    ``save_pretrained`` runs against it -- this checkpoint's own ``hf/`` export, written a
+    few lines after ``config.yaml`` inside ``save_checkpoint``. Every checkpoint saved by
+    the same process *after* the first one therefore has its ``config.yaml`` written
+    *after* that mutation already landed. If ``serialize_config`` ever again stopped
+    stripping ``auto_map`` (see its ``model_dict.pop("auto_map", None)`` line), this test
+    fails with ``ValueError: Unknown model config key(s): ['auto_map']`` when
+    ``load_config`` tries to reload the second checkpoint's ``config.yaml`` (raised by
+    ``oplm.config._reject_unknown_model_keys``, since a freshly constructed default
+    ``OplmModelConfig()`` instance's own ``to_dict()`` never has ``auto_map`` either --
+    it is only ever added by ``save_pretrained``, never by construction).
+    """
+    from oplm.config import load_config
+
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+
+    for step in (4, 8):
+        save_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            optimizers=[optimizer],
+            schedulers=[scheduler],
+            cfg=cfg,
+            output_dir=str(tmp_path),
+            global_step=step,
+            epoch=1,
+            samples_seen=step * 4,
+            tokens_seen=step * 40,
+        )
+
+    # The FIRST checkpoint's config.yaml is written before any save_pretrained call has
+    # ever run against cfg.model, so it never had auto_map to strip in the first place --
+    # it would pass even with the fix reverted. The bug (and the fix) only shows up on
+    # the SECOND checkpoint onward, which is what this test targets.
+    second_config_path = tmp_path / "checkpoint-8" / "config.yaml"
+    assert "auto_map" not in second_config_path.read_text()
+
+    reloaded = load_config(["--config", str(second_config_path)])
+    assert reloaded.model.hidden_size == cfg.model.hidden_size
+    assert reloaded.model.num_hidden_layers == cfg.model.num_hidden_layers

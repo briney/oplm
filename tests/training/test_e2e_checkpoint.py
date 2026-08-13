@@ -18,6 +18,7 @@ rather than bit-exact equivalence against a non-resumed control.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import time as _real_time
 from typing import TYPE_CHECKING
@@ -268,8 +269,15 @@ def test_first_checkpoint_unix_anchor_survives_resume(
     assert resumed._first_checkpoint_at == 0.0
 
 
-def test_resume_restores_state_and_continues(training_parquet: Path, tmp_path: Path) -> None:
-    """Resuming restores counters + LR position, reaches the new target, stays finite."""
+def test_resume_restores_state_and_continues(
+    training_parquet: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Resuming restores counters + LR position, reaches the new target, stays finite.
+
+    Also covers the Task 2.2 fix round: extending max_steps (4 -> 8) across an explicit
+    resume_from is a supported workflow, not a schedule-compat error, but it does log a
+    prominent warning (see ``validate_schedule_compat``'s asymmetric max_steps policy).
+    """
     from oplm.training.trainer import Trainer
 
     lr = 1e-3
@@ -302,7 +310,11 @@ def test_resume_restores_state_and_continues(training_parquet: Path, tmp_path: P
         **common,
     )
     cb2 = FullRecordingCallback()
-    resumed = Trainer(cfg2, callbacks=[cb2])
+    with caplog.at_level(logging.WARNING):
+        resumed = Trainer(cfg2, callbacks=[cb2])
+
+    # max_steps increased (4 -> 8): allowed, but warned about loudly.
+    assert "max_steps" in caplog.text
 
     # Counters are restored from the checkpoint at construction time.
     assert resumed.global_step == saved_state["global_step"] == 4
@@ -334,13 +346,15 @@ def test_resume_restores_state_and_continues(training_parquet: Path, tmp_path: P
 
 
 def test_auto_resume_picks_up_the_newest_committed_checkpoint(
-    training_parquet: Path, tmp_path: Path
+    training_parquet: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """``auto_resume=true`` with no explicit ``resume_from`` finds and resumes the checkpoint.
 
     Mirrors ``test_resume_restores_state_and_continues`` but exercises the scanning path
     (``Trainer`` discovers ``checkpoint-4`` under ``output_dir`` itself) instead of an
-    operator-pinned ``resume_from`` -- the requeue scenario auto_resume exists for.
+    operator-pinned ``resume_from`` -- the requeue scenario auto_resume exists for. Also
+    covers the Task 2.2 fix round: extending max_steps (4 -> 8) through the auto_resume
+    pre-validation + load path warns (not errors) too.
     """
     from oplm.training.trainer import Trainer
 
@@ -362,7 +376,11 @@ def test_auto_resume_picks_up_the_newest_committed_checkpoint(
         log_every=1,
     )
     assert cfg2.train.resume_from is None
-    resumed = Trainer(cfg2, callbacks=[])
+    with caplog.at_level(logging.WARNING):
+        resumed = Trainer(cfg2, callbacks=[])
+
+    # max_steps increased (4 -> 8): allowed, but warned about loudly.
+    assert "max_steps" in caplog.text
 
     # Counters are restored from the discovered checkpoint at construction time -- the same
     # contract an explicit resume_from gives.

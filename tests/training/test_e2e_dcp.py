@@ -491,6 +491,132 @@ def test_load_checkpoint_schedule_mismatch_error_names_both_values(tmp_path: Pat
     assert "max_steps" not in message
 
 
+# --- Task 2.2 fix round: asymmetric max_steps policy ----------------------------------
+
+
+def test_load_checkpoint_raises_when_live_max_steps_decreases(tmp_path: Path) -> None:
+    """A ``max_steps`` *decrease* between save and resume raises, naming the field.
+
+    Unlike an increase (a supported run-extension workflow -- see the next test), a
+    smaller live ``max_steps`` is essentially always accidental, and the checkpoint's own
+    ``global_step`` could even already exceed the new, shrunk total.
+    """
+    save_cfg = _cfg()
+    save_cfg.train.max_steps = 100
+    accelerator, model, optimizer, scheduler = _prepared_model(save_cfg)
+    _take_optimizer_step(save_cfg, accelerator, model, optimizer, scheduler)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=save_cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    load_cfg = _cfg()
+    load_cfg.train.max_steps = 50  # decreased from 100
+
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(load_cfg)
+    with pytest.raises(ValueError, match="max_steps"):
+        load_checkpoint(
+            fresh_accelerator,
+            fresh_model,
+            [fresh_optimizer],
+            [fresh_scheduler],
+            str(tmp_path / "checkpoint-10"),
+            load_cfg,
+        )
+
+
+def test_load_checkpoint_raises_when_live_max_steps_leaves_nothing_to_train(
+    tmp_path: Path,
+) -> None:
+    """``live max_steps <= checkpoint global_step`` raises even though ``max_steps`` rose.
+
+    global_step=10 with checkpoint max_steps=10 (training already reached its target at
+    save time); resuming with live max_steps=10 (unchanged, not even a decrease) would
+    have nothing left to train, so this is still rejected.
+    """
+    save_cfg = _cfg()
+    save_cfg.train.max_steps = 10
+    accelerator, model, optimizer, scheduler = _prepared_model(save_cfg)
+    _take_optimizer_step(save_cfg, accelerator, model, optimizer, scheduler)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=save_cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    load_cfg = _cfg()
+    load_cfg.train.max_steps = 10  # equal to checkpoint's max_steps, but == global_step too
+
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(load_cfg)
+    with pytest.raises(ValueError, match="max_steps"):
+        load_checkpoint(
+            fresh_accelerator,
+            fresh_model,
+            [fresh_optimizer],
+            [fresh_scheduler],
+            str(tmp_path / "checkpoint-10"),
+            load_cfg,
+        )
+
+
+def test_load_checkpoint_warns_and_proceeds_when_live_max_steps_increases(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ``max_steps`` *increase* (deliberate run extension) warns but does not raise."""
+    save_cfg = _cfg()
+    save_cfg.train.max_steps = 10
+    accelerator, model, optimizer, scheduler = _prepared_model(save_cfg)
+    _take_optimizer_step(save_cfg, accelerator, model, optimizer, scheduler)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=save_cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    load_cfg = _cfg()
+    load_cfg.train.max_steps = 20  # increased from 10 -- deliberate extension
+
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(load_cfg)
+    with caplog.at_level(logging.WARNING):
+        state = load_checkpoint(
+            fresh_accelerator,
+            fresh_model,
+            [fresh_optimizer],
+            [fresh_scheduler],
+            str(tmp_path / "checkpoint-10"),
+            load_cfg,
+        )
+
+    assert state["global_step"] == 10
+    assert "max_steps" in caplog.text
+    assert "10" in caplog.text and "20" in caplog.text
+
+
 # --- Task 2.2: hard RNG-sidecar error + OPLM_ALLOW_MISSING_RNG escape hatch -----------
 
 
