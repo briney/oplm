@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "9fad56ab9fe7",
+  "strategy": "manual-commit",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 8,
+  "files_touched": [
+    "docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/9f/ad56ab9fe7/0/metadata.json",
+      "transcript": "/9f/ad56ab9fe7/0/full.jsonl",
+      "compact_transcript": "/9f/ad56ab9fe7/0/transcript.jsonl",
+      "content_hash": "/9f/ad56ab9fe7/0/content_hash.txt",
+      "prompt": "/9f/ad56ab9fe7/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 34,
+    "cache_creation_tokens": 168915,
+    "cache_read_tokens": 806555,
+    "output_tokens": 39276,
+    "api_call_count": 18
+  }
+}

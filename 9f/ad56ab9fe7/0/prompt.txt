@@ -1,0 +1,255 @@
+We're planning to do some larger/longer training runs in the relatively near future -- on the order of weeks to months, and using hundrerds of GPUs. At this scale (small for the LM field generally, but large for us), node/GPU failures become a real risk, and my assumption is that for runs near the higher end (> a month, on the order of 64 nodes, so 512 GPUs) I'd expect a failure once a week or perhaps even every few days. I want to make sure we're as resilient as possible: 1) appropriate checkpointing, both in terms of interval and also making sure that we're actually saving everything we need to save at each checkpoint to rapidly perform a bitwise-clean resume; and 2) make sure we're managing everything correctly on the SUNK (CoreWeave's slurm on kubernetes) end so that resumes can happenen automatically on failures. Let's brainstorm about what in the codebase works alreacy, what's kinda there but needs some work to make optimally robust, and what's missing entirely and needs to be built from the ground up.
+
+---
+
+<task-notification>
+<task-id>a34486b5fd1c2915e</task-id>
+<tool-use-id>toolu_01LZUtynhWEJUp1XsnytTkAH</tool-use-id>
+<output-file>/tmp/claude-1001/-home-briney-git-oplm/c91a2791-761a-46aa-b56d-699f9f84dfd3/tasks/a34486b5fd1c2915e.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit checkpoint/resume/slurm code" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Here is the audit. Everything marked **EXISTS** was read directly; **INFERRED** items are my reasoning from library code (paths given so you can verify).
+
+---
+
+# 1. CHECKPOINTING
+
+## Where / who
+- **`/home/briney/git/oplm/src/oplm/training/checkpoint.py`** — the only checkpoint writer/reader. `save_checkpoint()` (lines 20–85), `load_checkpoint()` (88–119), `_rotate_checkpoints()` (122–135).
+- Called from **`/home/briney/git/oplm/src/oplm/training/trainer.py:524-540`** (`Trainer._save_checkpoint`), triggered at `trainer.py:390-391`:
+  ```python
+  if cfg.save_every &gt; 0 and self.global_step % cfg.save_every == 0:
+      self._save_checkpoint()
+  ```
+  and the end-of-run save at `trainer.py:409-413`:
+  ```python
+  last_step_saved = cfg.save_every &gt; 0 and self.global_step % cfg.save_every == 0
+  if cfg.save_final and not last_step_saved:
+      self._save_checkpoint()
+  ```
+- Callback hook `on_checkpoint_saved` (`trainer.py:614-620`, interface at `src/oplm/training/callbacks.py:25`) — main-process only, notification only; no callback writes checkpoints.
+- Layout: `output_dir/checkpoint-&lt;global_step&gt;/` (`checkpoint.py:54`). No `checkpoints/` subdir (accelerate's `automatic_checkpoint_naming` is not used — no `ProjectConfiguration` is passed to `Accelerator`, see `trainer.py:72-79`).
+
+## What is saved — EXACT
+`checkpoint.py:55`: `accelerator.save_state(str(checkpoint_dir))` — everything below comes from accelerate 1.13.0 (`/home/briney/git/oplm/.venv/lib/python3.12/site-packages/accelerate/checkpointing.py:63-179`, `accelerator.py:3567-3700`):
+
+| Item | Saved? | File | Notes |
+|---|---|---|---|
+| Model weights | yes | `model.safetensors` | from `get_state_dict(model, unwrap=False)` → **DDP-wrapped** state dict (`accelerator.py:4049-4052`), so keys are `module.`-prefixed under multi-GPU (**INFERRED** from `unwrap=False` + DDP path). Written **only on the global main process** (`accelerate/utils/other.py:386-389`). |
+| Optimizer state | yes, **all** optimizers | `optimizer.bin`, `optimizer_1.bin` | `checkpointing.py:117-122`. Accelerate saves every optimizer passed to `prepare`. |
+| **Muon** optimizer state | **yes** | `optimizer.bin` (index 0) | `optim.py:221-234` returns `[Muon, auxiliary AdamW]`, both go through `accelerator.prepare` (`trainer.py:146`) and land in `accelerator._optimizers`. `torch.optim.Muon` state is `state["momentum_buffer"]` (`torch/optim/_muon.py:154-160`), a normal per-param entry in `state_dict()` → serialized. |
+| LR scheduler state | yes, **one per optimizer** | `scheduler.bin`, `scheduler_1.bin` | `checkpointing.py:124-129`; schedulers built 1:1 (`optim.py:317-332`). NOTE: `LambdaLR.state_dict()` does **not** save the lambda (it's rebuilt from config at construction) — a config change to `warmup_steps`/`max_steps` silently changes the resumed schedule shape. |
+| GradScaler | only if it exists | `scaler.pt` | `checkpointing.py:149-153`. With the default `mixed_precision: bf16` (`configs/train/base.yaml:65`) `accelerator.scaler is None`, so nothing is written. It is written under `fp16`. |
+| RNG states, **per rank** | yes | `random_states_&lt;process_index&gt;.pkl` | `checkpointing.py:154-179`: Python `random.getstate()`, `np.random.get_state()`, `torch.get_rng_state()`, `torch.cuda.get_rng_state_all()`, plus accelerate's internal `step`. Written by **every** rank (plain `torch.save`, not gated on main process). |
+| Dataloader / sampler / shard position | **NO** | — | `checkpointing.py:130-146` writes a sampler only for `SeedableRandomSampler`, and a dataloader state only when `use_stateful_dataloader` is true. The trainer sets `DataLoaderConfiguration(dispatch_batches=False)` only (`trainer.py:77`) — `use_stateful_dataloader` is left at its default `False`, and the dataset is a custom `IterableDataset`, so **no sampler.bin / dl_state_dict.bin is ever written**. |
+| Custom objects | none | — | `grep` finds **no** `accelerator.register_for_checkpointing` anywhere in `src/`. |
+| EMA weights | **none exist** | — | No EMA implementation in the repo (`grep -i ema` hits only an EMA-smoothed *logging* helper in `src/oplm/training/mup.py:253`). |
+| Trainer counters | yes | `trainer_state.json` | `checkpoint.py:59-66`: exactly `{"global_step", "epoch", "samples_seen", "tokens_seen"}`. Main process only. |
+| Config | yes | `config.yaml` | `checkpoint.py:69-70` via `serialize_config` (`src/oplm/config.py:588-603`); round-trip tested (`tests/training/test_checkpoint.py:80-102`). Also a top-level copy at `output_dir/config.yaml` (`trainer.py:109-112`). |
+| HF export | yes | `hf/` | `checkpoint.py:72-80`: `config.json` + `model.safetensors` + tokenizer files. Explicitly *not* used for resume (`docs/OVERVIEW.md:1613-1614`). Peels `_orig_mod` for `torch.compile` (`checkpoint.py:77-78`). |
+
+## Cadence
+- **Steps only.** `train.save_every` (int steps, default `10_000`) — `src/oplm/config.py:83`, `src/oplm/configs/train/base.yaml:57`. **There is no time-based / wall-clock checkpoint trigger anywhere.**
+- `train.save_final: true` (config.py:88, base.yaml:59) guarantees an end-of-run save.
+- Sweep cells override to 8 saves/run: `src/oplm/sweep/phases.py:182-184`
+  ```python
+  # Checkpoint eight times per cell so a requeue loses at most ~12% of the run, and keep only
+  # the newest: these checkpoints exist solely to make requeue cheap.
+  save_every = max(1, max_steps // 8)
+  ```
+  with `train.save_total_limit=1` (`phases.py:211`).
+- Production scaling config: `save_every: 10000`, `save_total_limit: 3` over `max_steps: 100000` (`configs/scaling.yaml:29-30`).
+
+## Async / distributed / atomicity / retention
+- **Blocking.** `save_state` is a synchronous `torch.save`/`safe_save_file`; `save_checkpoint` ends with `accelerator.wait_for_everyone()` (`checkpoint.py:85`). No async/background save, no double-buffering.
+- **Rank-0-only for the heavy artifacts.** Model/optimizer/scheduler go through `accelerate.utils.other.save()` which writes only on `PartialState().is_main_process` (`save_on_each_node=False`). RNG files are per-rank. `trainer_state.json`, `config.yaml`, `hf/`, and rotation are inside `if accelerator.is_main_process:` (`checkpoint.py:57`).
+- **NOT torch.distributed.checkpoint / DCP.** No `torch.distributed.checkpoint` import anywhere in `src/`. No FSDP/DeepSpeed path is active (DeepSpeed is explicitly disabled unless `OPLM_ENABLE_DEEPSPEED`, `src/oplm/train.py:23-83`).
+- **No atomic write.** `grep` for `os.replace`/`.tmp`/`rename(` in `src/` returns **nothing**. Files are written in place into `checkpoint-&lt;step&gt;/`; a kill mid-write leaves a partial directory.
+  - Mitigating accident (**INFERRED**, not designed): `trainer_state.json` is written *after* `save_state`, and `load_checkpoint` hard-fails if it's missing (`checkpoint.py:114-116`), so a torn checkpoint usually raises `FileNotFoundError` rather than silently resuming from garbage. But `sweep.run.latest_checkpoint` selects purely by directory name, so a torn newest dir makes auto-resume **crash**, not fall back.
+- **Rotation:** `_rotate_checkpoints` (`checkpoint.py:122-135`) sorts by numeric step suffix and `shutil.rmtree`s the oldest beyond `save_total_limit` (default 3). `save_total_limit &lt;= 0` disables rotation. Tested: `tests/training/test_checkpoint.py:158-176`, `tests/training/test_e2e_checkpoint.py:41-76`.
+- **No `latest` symlink, no pointer/manifest file.** Nothing writes a `latest`/`LATEST`/`last_checkpoint` marker. Discovery is by directory-name scan only.
+
+---
+
+# 2. RESUME
+
+## Mechanism
+- **Single knob:** `train.resume_from: str | None` (`src/oplm/config.py:89`, `configs/train/base.yaml:60`). It is a **config field, not a CLI flag** — set as `oplm train ... train.resume_from=outputs/run/checkpoint-50000` (`docs/TRAIN.md:327-334`, `docs/CONFIG.md:269`). The CLI (`src/oplm/cli.py:81-99`) has only `--config/--preset/--name/overrides`.
+- `Trainer.__init__` (`trainer.py:263-266`):
+  ```python
+  if cfg.train.resume_from is not None:
+      _status("[dim]Resuming from checkpoint...[/dim]")
+      self._resume_from_checkpoint(cfg.train.resume_from)
+  ```
+- **`oplm.train` does NOT auto-detect the latest checkpoint.** Documented explicitly: `docs/SLURM.md:291-293` — *"`oplm.train`'s `Trainer` only resumes when `train.resume_from` names a checkpoint directory explicitly … it does not scan `train.output_dir` for the newest checkpoint on its own."*
+- **Auto-detect exists only in the sweep runner:** `src/oplm/sweep/run.py:15-40` (`latest_checkpoint`, numeric-suffix max) and `:63-66`:
+  ```python
+  if cfg.train.resume_from is None:
+      checkpoint = latest_checkpoint(Path(cfg.train.output_dir))
+      if checkpoint is not None:
+          cfg.train.resume_from = str(checkpoint)
+  ```
+  Only `oplm.sweep.run` (the module launched by sweep array jobs, `phases.py:377`) gets this. Plain training jobs generated by `oplm slurm generate` launch `oplm.train` (`slurm/cli.py:77-79`) and therefore **restart at step 0 on requeue** unless someone edits the config.
+
+## What gets restored
+`trainer.py:542-568` + `checkpoint.py:88-119`:
+- Via `accelerator.load_state`: model weights, **all** optimizer states (incl. Muon momentum buffers), all scheduler states, GradScaler (fp16 only), per-rank RNG (python/numpy/torch-CPU/torch-CUDA), accelerate's internal `step`.
+- From `trainer_state.json`: `global_step`, `epoch`, `tokens_seen`, `samples_seen` (with a back-compat fallback `global_step * effective_batch`, `trainer.py:550-552`).
+- `self._set_dataset_epoch(self.epoch)` (`trainer.py:553`) → `DataLoaderShard.set_epoch` → `IterableDatasetShard.set_epoch` → `ShardedProteinDataset.set_epoch` (verified chain: `accelerate/data_loader.py:613-630`, `:320-323`; `src/oplm/data/sequence/dataset.py:177-187`).
+- `_epoch_at_last_opt_step` and `_step_local_tokens` reset (`trainer.py:555-559`).
+- **RNG caveat:** accelerate swallows RNG-load failures — `except Exception: logger.info("Could not load random states")` (`accelerate/checkpointing.py:315-316`). If the world size grew, `random_states_&lt;rank&gt;.pkl` is missing for new ranks and the failure is silent.
+
+## Is resume exact/bitwise?
+**No, and the repo says so.** `tests/training/test_e2e_checkpoint.py:11-15` (module docstring):
+&gt; *"OPLM's training stream is an `IterableDataset` that restarts at the top of the epoch when a resumed trainer rebuilds its iterator, so the exact sequence of post-resume batches (and therefore `tokens_seen`) does not match an uninterrupted run. We assert counter *restoration* and trajectory *continuity* rather than bit-exact equivalence against a non-resumed control."*
+
+Concretely: `Trainer.train()` does `data_iter = iter(self.dataloader)` at `trainer.py:300` with **no skip-ahead**, so a run resumed at step 50 000 re-reads the epoch from row 0. **Data is re-seen; no sample-skipping mechanism exists.**
+
+## Tests of resume correctness (EXISTS)
+- `tests/training/test_e2e_checkpoint.py:115-174` — train to step 4, checkpoint, fresh `Trainer` with `resume_from`, assert restored `global_step`/`tokens_seen`/`samples_seen`/`epoch`; post-resume logs cover exactly steps 5–8; LR at step 5 matches `get_schedule_fn(..., total_steps=8)(5)`; loss-continuity band `0.2 &lt; first_post/last_pre &lt; 5.0`. **No loss-equality test vs. an uninterrupted control.**
+- `tests/training/test_checkpoint.py:105-124` — `load_checkpoint` returns metadata; `:55-77`/`:127-155` HF export round-trip (incl. `torch.compile`); `:158-176` rotation.
+- `tests/sweep/test_run.py:46-100` — requeue simulation: second run with `resume_from` unset resumes from `checkpoint-2`; asserts `checkpoint-1`'s mtime is unchanged (proof it didn't restart at 0).
+- `tests/training/test_e2e_checkpoint.py:78-112` — `save_final` on/off.
+
+---
+
+# 3. DATA PIPELINE
+
+- **Custom iterable parquet reader.** No webdataset, no HF `datasets` streaming, no map-style dataset, no `DistributedSampler`.
+  - `src/oplm/data/sequence/dataset.py`: `ShardedProteinDataset(IterableDataset)` (line 97) over `.parquet/.parq/.pq` files or a directory of shards; `InterleavedDataset(IterableDataset)` (line 260) mixes several sources by fraction.
+  - `src/oplm/data/sequence/loaders.py:42-99` `build_train_dataloader` → plain `torch.utils.data.DataLoader` (`:158-180`) with `num_workers`, `pin_memory`, `prefetch_factor` from `data.*`.
+- **Sharding:** the dataset does its own rank/worker striping — `_resolve_distributed_context()` (`dataset.py:57-81`, uses `dist.get_rank()` or `RANK`/`WORLD_SIZE` env) and `_joint_stripe()` (`:84-94`, `joint_index = rank*num_workers + worker_id`, `stride = world_size*num_workers`); `__iter__` selects rows where `(base + offset) % stride == joint_index` (`:206-229`).
+  - **Note (INFERRED, worth checking):** under multi-process, `accelerate.prepare_data_loader` additionally wraps any `IterableDataset` in `IterableDatasetShard` (`accelerate/data_loader.py:1213-1231`), which itself yields only every `process_index`-th batch. That is a *second* layer of rank sharding on top of the dataset's own striping. I found no code, comment, or test in this repo that acknowledges it. Under `num_processes = N` this would mean each rank consumes ~1/N of its already-1/N stripe.
+- **Deterministic resume: NO.** There is no `state_dict`/`load_state_dict` on either dataset, no row/shard cursor, no "skip to sample K". Resume restarts the epoch (`trainer.py:300`, and the epoch-rollover path `:307-313`). Consequences are documented for eval cadence too: *"Epoch cadence is deferred precisely because a mid-epoch checkpoint restarts the dataloader at the epoch start"* (`docs/OVERVIEW.md:1244-1247`).
+- **Shuffle seed handling (deterministic, epoch-keyed):** `dataset.py:37-49`
+  ```python
+  _PHI = 0x9E3779B97F4A7C15
+  def _epoch_seed(base, epoch): return ((_PHI ^ base) + epoch * _PRIME) &amp; _MASK32
+  def _shard_row_seed(epoch_seed, s): return (epoch_seed + 1009 + s) &amp; _MASK32
+  ```
+  Shard order (`:189-196`) and per-shard row order (`:198-204`) are `torch.randperm` under a manual-seeded `torch.Generator` — pure functions of `(seed, epoch)`, identical across ranks and runs. Base seed = `cfg.train.seed` (`loaders.py:72`, `:84`, `:96`). `InterleavedDataset` seeds source choice per `(epoch, rank, worker)`: `manual_seed((_epoch_seed(seed, epoch) + joint_index) &amp; _MASK32)` (`dataset.py:343-348`).
+  - So: **shuffle order is reproducible; position within it is not persisted.** Resuming at the same `epoch` replays the same order from the start.
+- **Masking RNG:** training uses `deterministic=False` → the collator uses the *global* torch RNG in each worker (`src/oplm/data/sequence/collate.py:240-253`, `generator = None`), so masks are not reproducible across a restart (worker RNG is re-seeded by DataLoader worker seeding, not by the checkpointed RNG state). Eval uses `deterministic=True` with a per-batch counter seed + `_ResettingDataLoader` (`loaders.py:140-155`).
+- `set_epoch` propagation is the only per-epoch state (`trainer.py:479-487`).
+
+---
+
+# 4. SLURM / SUNK
+
+## What exists
+- **`src/oplm/slurm/`**: `render.py` (script text), `config.py` (`slurm:` YAML block schema), `cli.py` (`oplm slurm generate|submit|status`), `submit.py` (`sbatch`/`squeue` wrappers). Tests in `tests/slurm/`. Docs: `docs/SLURM.md`.
+- **No static `.sbatch` files or `scripts/`/`slurm/` shell directory in the repo** — scripts are generated at runtime into `--out`.
+- Generated header (`render.py:49-86`): `--job-name`, `--partition`, optional `--account`, `--nodes=&lt;N&gt;`, `--ntasks-per-node=1`, `--gres=gpu:&lt;gpus_per_node&gt;`, `--cpus-per-task`, `--mem`, `--exclusive`, `--time=&lt;limit&gt;`, **`#SBATCH --requeue` (unconditional, line 74)**, `--output/--error`, and for arrays `--array=0-&lt;n-1&gt;%&lt;max_concurrent&gt;`.
+- Body (`render.py:118-152`):
+  ```bash
+  set -euo pipefail
+  source &lt;env_file&gt;                       # creates JOB_WORK_DIR, exports object-store / W&amp;B creds
+  srun --nodes=$SLURM_NNODES --ntasks-per-node=1 mkdir -p "$JOB_WORK_DIR"
+  MASTER_ADDR=$(hostname --ip-address); export MASTER_ADDR
+  export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))
+  export NCCL_DEBUG=INFO
+  export OMP_NUM_THREADS=1
+  srun ... --container-image=... --container-mounts=... bash -c '&lt;install&gt; &amp;&amp; &lt;accelerate launch ...&gt;'
+  ```
+- Launcher (`render.py:156-175`): **`accelerate launch`**, not `torchrun` directly:
+  ```
+  accelerate launch --multi_gpu --mixed_precision bf16 \
+    --num_machines $SLURM_NNODES --num_processes $((SLURM_NNODES * &lt;gpus_per_node&gt;)) \
+    --machine_rank $SLURM_PROCID --main_process_ip "$MASTER_ADDR" --main_process_port $MASTER_PORT \
+    -m &lt;module&gt; &lt;args&gt;
+  ```
+  `module = "oplm.train"` for plain jobs (`slurm/cli.py:77-79`) and for the `scale` phase (`phases.py:1493-1496`); `module = "oplm.sweep.run"` for sweep arrays (`phases.py:376-380`).
+- Job dependencies use `afterany`, never `afterok` (`render.py:178-201`, `submit.py:25-64`) so a failed upstream doesn't wedge downstream in `DependencyNeverSatisfied`.
+- `submit.py`: `sbatch --parsable` with **deliberately no timeout** to avoid double-submission (`:48-51`); `squeue` with a 30 s timeout (`:22`, `:140-185`); `status` distinguishes "scheduler unreachable" from "nothing running" (`slurm/cli.py:117-130`).
+
+## What does NOT exist
+- **No signal handling at all.** `grep -rn "signal|SIGTERM|SIGUSR"` over `src/` returns zero handler code (only unrelated word matches). No `signal.signal`, no `--signal=B:USR1@...` in the rendered header, no checkpoint-on-preemption, no graceful drain.
+- **No `scontrol requeue` call**, no self-requeue loop, no retry/restart loop in the generated script (`set -euo pipefail` + a single `srun`: first failure ends the job).
+- **No time-limit awareness in the trainer.** Nothing reads `SLURM_JOB_END_TIME`/`squeue --Format TimeLeft`; no "stop and checkpoint before wall clock" logic. `--time` is purely an sbatch directive resolved from the `slurm.time_limit` table (`slurm/config.py:137`, `configs/scaling.yaml:69-70` → `default: "168:00:00"` = 7 days).
+- **No node-failure handling / elasticity.** `accelerate launch` here uses the **static** rendezvous (`--main_process_ip/--main_process_port/--machine_rank`); accelerate's defaults are `--rdzv_backend static` and **`--max_restarts 0`** (`accelerate/commands/launch.py:327-345`), and none of these flags are passed by `accelerate_command()`. No c10d/etcd rendezvous, no `torchrun --standalone`, no elastic agent restarts. (**INFERRED** from library defaults + the generated command.)
+- **No k8s / SUNK-specific code.** `grep` finds no k8s, SUNK, or CoreWeave-specific logic; the only mention is a comment about ephemeral SUNK/CoreWeave pods causing a cold Inductor cache (`trainer.py:212-215`).
+- Requeue semantics are documented honestly in `docs/SLURM.md:283-300`: `--requeue` restarts the *job*, but plain `oplm.train` restarts training at step 0 unless `train.resume_from` is manually maintained.
+
+---
+
+# 5. WANDB / LOGGING ON RESUME
+
+- Init: `trainer.py:94-106`
+  ```python
+  wandb_kwargs: dict[str, Any] = {"dir": cfg.train.output_dir}
+  if cfg.train.wandb_run_name is not None:
+      wandb_kwargs["name"] = cfg.train.wandb_run_name
+  self.accelerator.init_trackers(project_name=cfg.train.wandb_project,
+                                 config=_config_to_flat_dict(cfg),
+                                 init_kwargs={"wandb": wandb_kwargs})
+  ```
+- **No `id=`, no `resume=`, no run-id persistence anywhere.** `grep -rn "wandb" src/` shows only `wandb_project` / `wandb_run_name` / `wandb_enabled` and the block above. Nothing writes a `wandb_run_id` into the checkpoint or `trainer_state.json`; `trainer_state.json` carries exactly four integer keys.
+- Accelerate's tracker calls `wandb.init(project=self.run_name, **self.init_kwargs)` on the main process only (`accelerate/tracking.py:317-322`).
+- **Therefore a resumed job starts a NEW W&amp;B run** (same name if `wandb_run_name` is set → duplicate-named runs in the project), and metrics are logged with `step=global_step` (`trainer.py:591`), so the new run's chart starts at the resumed step. (**INFERRED** — no test asserts this either way; `tests/training/test_e2e_wandb.py` exists but covers logging, not resume identity.)
+- Only escape hatch (**INFERRED, not in code**): `WANDB_RUN_ID` / `WANDB_RESUME` env vars set externally in the `.env` sourced by the sbatch script (`render.py:122-124`) would be honored by wandb itself.
+- Sweep runs prefix the W&amp;B name with the phase to disambiguate (`phases.py:174-179`, `:214`).
+
+---
+
+# 6. OTHER FAULT-TOLERANCE-ADJACENT
+
+**Exists:**
+- **NCCL:** only `export NCCL_DEBUG=INFO` in the generated script (`render.py:140`). **No `TORCH_NCCL_*` settings, no `NCCL_TIMEOUT`, no `InitProcessGroupKwargs(timeout=...)`, no `TORCH_NCCL_ASYNC_ERROR_HANDLING`, no `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC`, no flight-recorder/dump settings.** The default 10-minute NCCL watchdog applies unmodified (**INFERRED**).
+- **Rank-sync invariant** (the main hang-avoidance design): every field of `EvalContext` is rank-identical so all ranks agree on `is_due` and enter collectives together — `trainer.py:356-364` unconditionally rank-reduces per-step tokens; design rationale at `docs/OVERVIEW.md:1180-1191` (*"a per-rank `is_due` disagreement would hang at the NCCL timeout"*). Schedules are pure functions with no persisted counters, hence resume-safe (`docs/OVERVIEW.md:1195-1198`, `src/oplm/eval/schedule.py`).
+- Related: the stability-diagnostics probe is deliberately main-process-safe/collective-free — comment at `src/oplm/training/mup.py:351` and `docs/LR_SWEEP.md:480` (a prior probe that ran on every rank *"hung multi-GPU runs with an NCCL timeout"*).
+- **Eval is fully blocking/inline** — `Evaluator.run_due` runs synchronously in the training loop (`trainer.py:381`, `src/oplm/eval/evaluator.py:72-92`). No background/non-blocking eval, no separate eval job. The step timer is restarted after eval/checkpoint so their wall time is excluded from throughput (`trainer.py:405-407`).
+- **Unreachable-schedule warning** at Evaluator construction (`evaluator.py:48-70`) — fail-early sanity, not a health check.
+- **Environment bootstrap** `_bootstrap_training_environment` (`src/oplm/train.py:68-83`): forces a writable `TRITON_CACHE_DIR` (`~/.cache/oplm/triton/autotune` → tmp fallback) and disables DeepSpeed env leakage unless `OPLM_ENABLE_DEEPSPEED`. Prevents a class of ephemeral-pod startup failures.
+- **Inductor workaround** for a torch 2.10/2.11 crash that only surfaces on a cold Inductor cache (ephemeral SUNK/CoreWeave pods): `_inductor_config.triton.mix_order_reduction = False` (`trainer.py:207-223`).
+- **Sweep-level health checks:** `oplm sweep status` classifies cells as done/running/needs-resubmit and prints ready-to-paste `sbatch --array=...` resubmit lines (`phases.py:994-1086`); `docs/LR_SWEEP.md:195-201` notes W&amp;B covers training health while a cell that dies before writing `result.json` "looks healthy in W&amp;B".
+- `result.json` records the installed `oplm` version for provenance (`tests/sweep/test_run.py:43`, TODOS Phase 8 "Resilience", `TODOS.md:2548`).
+
+**Does NOT exist:**
+- No heartbeat, no watchdog thread, no liveness/hang detector, no straggler detection.
+- No loss-spike/NaN detection or auto-rollback to a previous checkpoint (loss is logged; nothing guards on it).
+- No checkpoint validation on load beyond `Path.exists()` on the dir and on `trainer_state.json` (`checkpoint.py:108-118`) — no checksum, no shape/step/config-consistency check, no verification that the resumed config matches the checkpoint's `config.yaml`.
+- No GPU health check / ECC / NVLink probe before training.
+- No `torch.distributed` barrier timeouts or custom process-group kwargs — the `Accelerator` is constructed with only `mixed_precision`, `gradient_accumulation_steps`, `log_with`, `project_dir`, `dataloader_config`, `step_scheduler_with_optimizer` (`trainer.py:72-79`).
+
+---
+
+## Summary of the concrete gaps for a long multi-node run
+
+1. Dataloader position is never checkpointed and cannot be — resume replays the epoch from row 0 (data re-seen, epoch-boundary accounting drifts).
+2. `oplm.train` does not auto-resume; only `oplm.sweep.run` does. A requeued production `oplm slurm generate` job silently restarts at step 0.
+3. No SIGTERM/SIGUSR1 handling → preemption/time-limit loses everything since the last `save_every` (10 000 steps by default in `configs/scaling.yaml`).
+4. `max_restarts=0`, static rendezvous → any single-node failure kills the whole job; requeue restarts the container from scratch.
+5. Non-atomic checkpoint writes + name-based "latest" selection → a torn checkpoint makes sweep auto-resume raise instead of falling back.
+6. W&amp;B starts a new run on every resume (no run-id persistence).
+7. No NCCL timeout/async-error-handling tuning; only `NCCL_DEBUG=INFO`.</result>
+<usage><subagent_tokens>153829</subagent_tokens><tool_uses>63</tool_uses><duration_ms>387936</duration_ms></usage>
+</task-notification>
+
+---
+
+these are exclusively being trained on B200s (~180GB of memory), so a 6-12B param model should fit pretty easily with a 8-16 batch per GPU, right? i can envision trainijg somwthing in the 24-30B range as an absolute top end, so would you recommend planning for FSDP right from the jump?
+
+---
+
+agree, A is the best choice. one question before we start: will the autoresume behavior impair our ability to start a quick one-off training run on metal using oplm train (or more likely, accelerate launch -m oplm.train)? nothing is going to be hard-coded for coreweave's infra, right? the idea is to release all of this as open source (training tooling included) so people can reuse, so tailoring too tightly to our current situation is suboptimal (but acceptable if absolutely necessary)
+
+---
+
+one addition -- id also like `keep_every_n_steps` so that i can permanently keep checkpoints at every 100k steps or something. this, along with the `keep_every_n_hours` equivalent, should be immune from the save total limit, which is designed to cull the rolling checkpoints not eliminate those that are supposed to be permanently kept
+
+---
+
+Yes, looks right and you're correct -- we should check the potential double-sharding issue and fix if necessary while we're in there. Go ahead with Section 3
+
+---
+
+looks good
+
+---
+
+looks good
+
+---
+
+yes, write up the spec

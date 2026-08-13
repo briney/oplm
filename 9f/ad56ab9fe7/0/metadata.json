@@ -1,0 +1,88 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "9fad56ab9fe7",
+  "session_id": "be5c66b2-dc2d-461c-9e87-d6bcff4e05a9",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-13T04:48:48.754271614Z",
+  "branch": "docs/mup-lr-sweep",
+  "checkpoints_count": 8,
+  "files_touched": [
+    "docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "f5a30de020fa",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 34,
+    "cache_creation_tokens": 168915,
+    "cache_read_tokens": 806555,
+    "output_tokens": 39276,
+    "api_call_count": 18
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_01XeAfqMFvGBaZaJXtN5JdL9",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "superpowers:brainstorming"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "f5a30de020fa",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 17,
+        "end": 18,
+        "entry_ids": [
+          "1c072b43-373c-43da-8251-74ef05ca12c2"
+        ],
+        "tool_use_id": "toolu_01XeAfqMFvGBaZaJXtN5JdL9"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01XeAfqMFvGBaZaJXtN5JdL9"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: superpowers:brainstorming",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 8
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-13T04:48:48.723138289Z",
+    "agent_lines": 329,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 329,
+    "total_lines_changed": 329,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 325,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/agents/entire-search.md": 25,
+        ".claude/plans/i-d-like-to-add-dreamy-creek.md": 162,
+        ".claude/settings.json": 84,
+        ".claude/settings.local.json": 14,
+        ".cursor/hooks.json": 40
+      }
+    }
+  ]
+}
