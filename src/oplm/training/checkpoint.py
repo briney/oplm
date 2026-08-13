@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 _CHECKPOINT_PREFIX = "checkpoint-"
 _TMP_SUFFIX = ".tmp"
+_OLD_SUFFIX = ".old"
 _LATEST_POINTER_NAME = "latest"
 
 
@@ -44,6 +45,14 @@ def save_checkpoint(
     rewrite the ``latest`` pointer file, and rotate old checkpoints. This guarantees a process
     killed mid-save leaves behind only an invisible ``.tmp`` directory — never a resume
     candidate.
+
+    Re-saving at the same step (e.g. a requeue that saves before reaching a later step)
+    never deletes the previously committed dir before the new one exists: the old
+    ``checkpoint-<step>/`` is first moved aside to ``checkpoint-<step>.old/``, the ``.tmp``
+    dir is renamed onto the now-free ``checkpoint-<step>/`` name, and only then is the
+    ``.old`` dir removed. A kill between those two renames leaves a recoverable
+    ``checkpoint-<step>.old/`` dir (restored by :func:`clean_stale_checkpoint_dirs` at next
+    trainer start) rather than a gap where neither the old nor the new checkpoint survives.
 
     Args:
         accelerator: The HuggingFace Accelerator instance.
@@ -92,11 +101,16 @@ def save_checkpoint(
 
     if accelerator.is_main_process:
         final_dir = tmp_dir.with_name(f"{_CHECKPOINT_PREFIX}{global_step}")
+        aside_dir = final_dir.with_name(f"{final_dir.name}{_OLD_SUFFIX}")
         if final_dir.exists():
-            # Re-saving at the same step after a requeue: replace atomically-enough —
-            # the old committed dir is only removed once the new one is fully staged.
-            shutil.rmtree(final_dir)
+            # Re-saving at the same step after a requeue: move the previous commit
+            # aside first — never delete it before the new one is renamed into place.
+            # A kill between these two renames leaves a recoverable checkpoint-<N>.old/
+            # dir instead of a window where neither the old nor the new dir exists.
+            final_dir.rename(aside_dir)
         tmp_dir.rename(final_dir)
+        if aside_dir.exists():
+            shutil.rmtree(aside_dir)
         _write_latest_pointer(Path(output_dir), final_dir.name)
         _rotate_checkpoints(Path(output_dir), save_total_limit)
 
@@ -145,8 +159,10 @@ def latest_checkpoint(output_dir: Path) -> Path | None:
     Checkpoints are named ``checkpoint-<global_step>`` (see
     :func:`save_checkpoint`), so ordering is numeric on the suffix — lexicographic ordering
     would rank ``checkpoint-9000`` above ``checkpoint-10000``. In-flight ``checkpoint-<step>.tmp``
-    staging directories are never committed and are always ignored, so a process killed
-    mid-save can never produce a resume candidate.
+    staging directories and ``checkpoint-<step>.old`` replace-in-progress directories are never
+    committed and are always ignored (the numeric-suffix check alone excludes both, since neither
+    ``<step>.tmp`` nor ``<step>.old`` is all-digit), so a process killed mid-save or mid-replace can
+    never produce a resume candidate.
 
     Args:
         output_dir: The training output directory (may not exist yet).
@@ -170,23 +186,53 @@ def latest_checkpoint(output_dir: Path) -> Path | None:
     return max(candidates)[1]
 
 
-def clean_stale_tmp_checkpoints(output_dir: Path) -> None:
-    """Delete any ``checkpoint-*.tmp`` staging dirs left behind by a killed-mid-save process.
+def clean_stale_checkpoint_dirs(output_dir: Path) -> None:
+    """Resolve any torn ``.tmp``/``.old`` checkpoint dirs left by a killed-mid-save process.
 
-    By definition, a ``.tmp`` directory that survives past process exit was never committed
-    (the commit rename removes the ``.tmp`` name in the same step that creates the final
-    dir), so it is torn and unusable. Call once at trainer start, on the main process only,
-    before any resume logic runs.
+    Two kinds of leftovers are possible from an interrupted :func:`save_checkpoint`:
+
+    - ``checkpoint-<step>.tmp/``: a staging dir that never got renamed onto its final name.
+      It was never committed and is unconditionally deleted — by definition torn and
+      unusable (the commit rename removes the ``.tmp`` suffix in the same step that creates
+      the final dir).
+    - ``checkpoint-<step>.old/``: the *previous* commit at that step, moved aside during a
+      same-step replace (see :func:`save_checkpoint`) and not yet cleaned up. If
+      ``checkpoint-<step>`` also exists, the replace finished committing before the kill, so
+      the ``.old`` dir is stale and is deleted. If ``checkpoint-<step>`` does *not* exist, the
+      kill landed between the two renames — the old commit is the only surviving checkpoint
+      at that step, so it is recovered by renaming ``.old`` back onto the final name.
+
+    Call once at trainer start, on the main process only, before any resume logic runs.
 
     Args:
         output_dir: The training output directory (may not exist yet).
     """
     if not output_dir.is_dir():
         return
+
     for path in output_dir.glob(f"{_CHECKPOINT_PREFIX}*{_TMP_SUFFIX}"):
         if path.is_dir():
             logger.info("Removing stale checkpoint staging dir: %s", path)
             shutil.rmtree(path)
+
+    for aside_dir in output_dir.glob(f"{_CHECKPOINT_PREFIX}*{_OLD_SUFFIX}"):
+        if not aside_dir.is_dir():
+            continue
+        final_dir = aside_dir.with_name(aside_dir.name.removesuffix(_OLD_SUFFIX))
+        if final_dir.exists():
+            # The replace that created this .old dir finished committing before the
+            # kill: the new checkpoint is in place, so the old one is truly stale.
+            logger.info("Removing stale replaced-checkpoint dir: %s", aside_dir)
+            shutil.rmtree(aside_dir)
+        else:
+            # The kill landed between the two renames: the old commit is the only
+            # checkpoint that survives at this step. Recover it.
+            logger.warning(
+                "Recovering checkpoint %s from an interrupted same-step replace (%s)",
+                final_dir,
+                aside_dir,
+            )
+            aside_dir.rename(final_dir)
 
 
 def _write_latest_pointer(output_dir: Path, checkpoint_name: str) -> None:
@@ -205,9 +251,9 @@ def _write_latest_pointer(output_dir: Path, checkpoint_name: str) -> None:
 def _rotate_checkpoints(output_dir: Path, save_total_limit: int) -> None:
     """Delete oldest committed checkpoints to keep at most ``save_total_limit``.
 
-    ``.tmp`` staging directories are ignored entirely: they neither count toward the limit
-    nor are they ever deleted here (a killed-mid-save ``.tmp`` dir is cleaned up separately
-    by :func:`clean_stale_tmp_checkpoints`).
+    ``.tmp`` staging directories and ``.old`` replace-in-progress directories are ignored
+    entirely: they neither count toward the limit nor are they ever deleted here (they are
+    resolved separately by :func:`clean_stale_checkpoint_dirs`).
     """
     if save_total_limit <= 0:
         return

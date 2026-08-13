@@ -21,7 +21,12 @@ import pytest
 from oplm.config import DataConfig, OplmConfig, TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM
-from oplm.training.checkpoint import _rotate_checkpoints, latest_checkpoint, save_checkpoint
+from oplm.training.checkpoint import (
+    _rotate_checkpoints,
+    clean_stale_checkpoint_dirs,
+    latest_checkpoint,
+    save_checkpoint,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -133,6 +138,64 @@ def test_rotation_ignores_tmp_dirs(tmp_path: Path) -> None:
     assert (tmp_path / "checkpoint-100").exists() is False
     assert (tmp_path / "checkpoint-200").exists()
     assert (tmp_path / "checkpoint-300.tmp").exists()
+
+
+def test_old_dir_with_committed_final_is_removed_as_stale(tmp_path: Path) -> None:
+    """Crash state (a): a kill *after* the new commit landed leaves both dirs present.
+
+    The replace that produced ``checkpoint-10.old`` already finished (``checkpoint-10``
+    exists), so the ``.old`` dir is stale and simply removed; the final commit is kept as-is.
+    """
+    final_dir = tmp_path / "checkpoint-10"
+    final_dir.mkdir()
+    (final_dir / "marker").write_text("new")
+    aside_dir = tmp_path / "checkpoint-10.old"
+    aside_dir.mkdir()
+    (aside_dir / "marker").write_text("old")
+
+    clean_stale_checkpoint_dirs(tmp_path)
+
+    assert final_dir.is_dir()
+    assert (final_dir / "marker").read_text() == "new"
+    assert not aside_dir.exists()
+
+
+def test_old_dir_without_committed_final_is_recovered(tmp_path: Path) -> None:
+    """Crash state (b): a kill *between* the two renames leaves only the aside dir.
+
+    ``checkpoint-10`` does not exist (the ``.tmp`` -> final rename never happened), so the
+    aside dir — the only surviving checkpoint at this step — is recovered onto the final name.
+    """
+    aside_dir = tmp_path / "checkpoint-10.old"
+    aside_dir.mkdir()
+    (aside_dir / "marker").write_text("old")
+
+    clean_stale_checkpoint_dirs(tmp_path)
+
+    final_dir = tmp_path / "checkpoint-10"
+    assert final_dir.is_dir()
+    assert (final_dir / "marker").read_text() == "old"
+    assert not aside_dir.exists()
+
+
+def test_old_dir_invisible_to_latest_checkpoint(tmp_path: Path) -> None:
+    """Crash state (c): an orphaned ``.old`` dir never wins discovery, even if newer-numbered."""
+    (tmp_path / "checkpoint-9000").mkdir()
+    (tmp_path / "checkpoint-10000.old").mkdir()
+    assert latest_checkpoint(tmp_path) == tmp_path / "checkpoint-9000"
+
+
+def test_old_dir_invisible_to_rotation(tmp_path: Path) -> None:
+    """Crash state (c): an orphaned ``.old`` dir neither counts toward the limit nor is deleted."""
+    (tmp_path / "checkpoint-100").mkdir()
+    (tmp_path / "checkpoint-200").mkdir()
+    (tmp_path / "checkpoint-100.old").mkdir()
+
+    _rotate_checkpoints(tmp_path, save_total_limit=1)
+
+    assert not (tmp_path / "checkpoint-100").exists()
+    assert (tmp_path / "checkpoint-200").exists()
+    assert (tmp_path / "checkpoint-100.old").exists()
 
 
 def test_sweep_run_uses_committed_only() -> None:

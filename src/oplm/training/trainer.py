@@ -91,12 +91,14 @@ class Trainer:
             Path(cfg.train.output_dir).mkdir(parents=True, exist_ok=True)
 
             # A checkpoint-<step>.tmp/ staging dir surviving to trainer start means the
-            # process that created it was killed mid-save: it was never committed (the
-            # commit rename removes the .tmp suffix atomically) and is therefore torn.
-            # Clean it up before any resume logic below can consider it.
-            from oplm.training.checkpoint import clean_stale_tmp_checkpoints
+            # process that created it was killed mid-save (torn, unconditionally deleted).
+            # A checkpoint-<step>.old/ dir means it was killed mid-replace (the previous
+            # commit at that step, moved aside before the new one landed) — recovered back
+            # onto checkpoint-<step>/ if the new commit never landed. Resolve both before
+            # any resume logic below can consider the directory listing.
+            from oplm.training.checkpoint import clean_stale_checkpoint_dirs
 
-            clean_stale_tmp_checkpoints(Path(cfg.train.output_dir))
+            clean_stale_checkpoint_dirs(Path(cfg.train.output_dir))
 
         # Init wandb early so login prompt appears before slow setup steps
         if cfg.train.wandb_enabled:
