@@ -978,6 +978,12 @@ def test_dcp_checkpoint_saved_at_world_size_2_resumes_at_world_size_1(
     and world-size-agnostic, which is what lets a many-node run be inspected, debugged,
     or resumed at a different world size without a checkpoint format change.
 
+    Both ranks here train under plain DDP (CPU/gloo, no FSDP2), so every rank already
+    holds the full, unsharded model/optimizer state -- this test proves the format's
+    world-size-agnostic save/load *contract*, not an actual shard-boundary reshard
+    across a change in shard count. That arrives with FSDP2/HSDP (Phase 5); this test
+    should be revisited then to add an FSDP2-sharded variant.
+
     Phase 1 launches ``tests/training/_reshard_dcp_worker.py`` under
     ``torch.distributed.run --nproc_per_node=2`` (forced onto CPU via
     ``ACCELERATE_USE_CPU``/``CUDA_VISIBLE_DEVICES=""``, mirroring
@@ -1094,7 +1100,11 @@ def test_dcp_checkpoint_saved_at_world_size_2_resumes_at_world_size_1(
 
     resumed_unwrapped = resumed.accelerator.unwrap_model(resumed.model)
     resumed_weight = resumed_unwrapped.lm_head.decoder.bias.detach()
-    assert torch.allclose(resumed_weight, reference_weight)
+    # Bit-exact, not merely close: this is a load-only comparison (no training happens
+    # between the checkpoint commit and this assertion) of the same dtype (float32), so
+    # DCP's round-trip must reproduce the saved bytes exactly -- torch.allclose's default
+    # tolerance would silently paper over a real precision-losing bug in the reshard path.
+    assert torch.equal(resumed_weight, reference_weight)
 
     resumed.train()
     assert resumed.global_step == resume_max_steps

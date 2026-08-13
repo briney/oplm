@@ -44,6 +44,14 @@ def main(run_dir: str, train_data: str, out_dir: str, max_steps: int) -> None:
     trainer = Trainer(cfg, callbacks=[])
     trainer.train()
 
+    # trainer.train() force-finalizes any still-pending async save and barriers before
+    # returning, so the checkpoint must already be committed here on every rank -- assert
+    # it explicitly (rather than only implicitly relying on the parent test's own check)
+    # so a regression in that finalize-before-return guarantee fails fast, attributed to
+    # this worker, instead of surfacing later as a confusing missing-reference-weight
+    # error in the parent process.
+    assert (Path(run_dir) / f"checkpoint-{max_steps}").is_dir()
+
     rank = trainer.accelerator.process_index
     if rank == 0:
         unwrapped = trainer.accelerator.unwrap_model(trainer.model)
