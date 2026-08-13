@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from oplm.eval.context import EvalContext
     from oplm.eval.evaluator import Evaluator
     from oplm.training.callbacks import TrainerCallback
+    from oplm.training.checkpoint import PendingSave
 
 logger = logging.getLogger(__name__)
 
@@ -49,19 +50,53 @@ class _StepFlags:
 
     Every rank computes its own local inputs (raw token count, whether it
     observed a drain signal, whether its own loss was non-finite, whether its
-    own ``save_every_minutes`` timer fired) and :meth:`Trainer._reduce_step_flags`
-    sum-reduces them into one rank-identical bundle: token counts add up
-    normally, and any boolean flag true on *any* rank becomes true on *every*
-    rank (sum > 0). This is the single rank-synchronization point later
-    resilience features plug into — the drain signal (Task 1.5) and the
-    non-finite-loss guardrail (Task 1.8) only need to change their local input
-    to this reduce, not add a new collective.
+    own ``save_every_minutes`` timer fired, whether its own pending async save's
+    local write is done) and :meth:`Trainer._reduce_step_flags` sum-reduces them
+    into one rank-identical bundle: token counts add up normally, and any boolean
+    flag true on *any* rank becomes true on *every* rank (sum > 0). This is the
+    single rank-synchronization point later resilience features plug into — the
+    drain signal (Task 1.5) and the non-finite-loss guardrail (Task 1.8) only
+    need to change their local input to this reduce, not add a new collective.
+
+    ``pending_done_count`` is deliberately kept as the raw sum rather than
+    booleanized like the others: an async checkpoint save (Task 2.3) may only be
+    safely committed once *every* rank's local write is done, so the trainer
+    needs to compare this count against ``accelerator.num_processes`` exactly --
+    a partial count (some but not all ranks done) must never look like "true" the
+    way the other flags' any-rank-trips-it-for-everyone semantics intend.
     """
 
     tokens_delta: int
     drain: bool
     nonfinite: bool
     save_due: bool
+    pending_done_count: int
+
+
+@dataclass(frozen=True)
+class _PendingAsyncSave:
+    """Trainer-local wrapper around a checkpoint.py ``PendingSave`` handle.
+
+    ``checkpoint.py``'s :func:`~oplm.training.checkpoint.save_checkpoint` /
+    :func:`~oplm.training.checkpoint.finalize_pending_save` know nothing about the
+    ``keep_every_n_hours`` permanent-marker rule (Task 1.3) -- that decision is made
+    entirely on the trainer side, from wall-clock state ``save_checkpoint`` never sees.
+    This wrapper carries the decision alongside the handle: ``should_mark_permanent``
+    is computed at TRIGGER time in :meth:`Trainer._save_checkpoint` (identically to the
+    synchronous path, which also decides it before saving), and applied at FINALIZE
+    time in :meth:`Trainer._finalize_pending_save`, once the checkpoint has actually
+    been renamed into its final, markable location.
+
+    ``global_step`` is also captured at TRIGGER time -- by the time
+    :meth:`Trainer._finalize_pending_save` runs, ``self.global_step`` may already have
+    advanced past the step this checkpoint was actually saved at (that is the entire
+    point of deferring the commit), so ``on_checkpoint_saved`` must be told the
+    checkpoint's own step explicitly rather than reading the trainer's live counter.
+    """
+
+    handle: PendingSave
+    should_mark_permanent: bool
+    global_step: int
 
 
 class Trainer:
@@ -416,6 +451,14 @@ class Trainer:
         self._first_checkpoint_at: float | None = None
         self._last_time_keep_index = 0
 
+        # At most one outstanding async periodic save (Task 2.3): set by
+        # _save_checkpoint(blocking=False), cleared by _finalize_pending_save once its
+        # deferred commit tail (barrier + rename + pointer + rotation) has run. Never
+        # persisted across a resume -- a Future can't survive a process restart, and a
+        # kill while this is set intentionally leaves only a .tmp dir (see
+        # clean_stale_checkpoint_dirs), never a resume candidate.
+        self._pending_save: _PendingAsyncSave | None = None
+
         # FLOP estimation
         self.flops_per_token = estimate_flops_per_token(cfg.model)
 
@@ -536,9 +579,23 @@ class Trainer:
                     drain=self._drain_signal.requested,
                     nonfinite=not math.isfinite(current_loss),
                     save_due=self._save_timer_due(),
+                    pending_done=(
+                        self._pending_save is not None and self._pending_save.handle.future.done()
+                    ),
                 )
                 tokens_delta = flags.tokens_delta
                 self.tokens_seen += tokens_delta
+
+                # Opportunistically commit a pending async save (Task 2.3) once every
+                # rank's local write has actually finished, not merely started --
+                # pending_done_count is the raw sum, so this only fires once every rank
+                # agrees (== num_processes), never on a partial-done count. A cheap no-op
+                # guard when there is nothing pending.
+                if (
+                    self._pending_save is not None
+                    and flags.pending_done_count == self.accelerator.num_processes
+                ):
+                    self._finalize_pending_save()
 
                 # Non-finite loss guard (Task 1.8, spec §6): a NaN/inf loss on ANY rank trips
                 # this flag on EVERY rank (it is post-reduce), so all ranks raise together
@@ -546,8 +603,14 @@ class Trainer:
                 # with where the drain branch sits below), but before eval/checkpoint can act
                 # on a poisoned step. The requeue loop then resumes from the last checkpoint,
                 # an automatic rollback; two such restarts with no step advance trips the
-                # no-progress crash-loop guard instead of requeueing forever.
+                # no-progress crash-loop guard instead of requeueing forever. A still-pending
+                # async save is force-finalized first (blocks on its future) so the process
+                # doesn't raise/exit with a background write in flight (Task 2.3): the commit
+                # protocol invariants demand that, absent this, a torn write left behind would
+                # be a kill mid-async -- fine on a true kill, but not on a controlled raise.
                 if flags.nonfinite:
+                    if self._pending_save is not None:
+                        self._finalize_pending_save()
                     logger.error(
                         "non-finite training loss %s at step %d", current_loss, self.global_step
                     )
@@ -567,8 +630,12 @@ class Trainer:
                 # bookkeeping (tokens_seen, throughput window) is already complete above,
                 # so the checkpoint below carries tokens_seen consistent with global_step
                 # across a drain+resume -- but we still check before eval so a drain never
-                # starts a long eval.
+                # starts a long eval. A pending async save is finalized (blocking) FIRST
+                # (Task 2.3): the drain's own save must always be blocking, and must never
+                # be preceded by a torn/uncommitted async save left dangling behind it.
                 if flags.drain:
+                    if self._pending_save is not None:
+                        self._finalize_pending_save()
                     self._save_checkpoint()
                     logger.warning(
                         "Drain requested: checkpoint saved at step %d; exiting %d",
@@ -592,11 +659,17 @@ class Trainer:
 
                 # Checkpointing: step cadence OR the rank-synced save_every_minutes
                 # timer (flags.save_due is identical on every rank after the reduce
-                # above, so this decision is too).
+                # above, so this decision is too). Periodic saves default to async
+                # (Task 2.3): a prior pending save that hasn't been finalized yet (the
+                # opportunistic gate above didn't catch it this step) is force-finalized
+                # first -- at most one outstanding async save at a time -- then this
+                # save is triggered without blocking on its own write.
                 step_saved = cfg.save_every > 0 and self.global_step % cfg.save_every == 0
                 last_step_did_save = step_saved or flags.save_due
                 if last_step_did_save:
-                    self._save_checkpoint()
+                    if self._pending_save is not None:
+                        self._finalize_pending_save()
+                    self._save_checkpoint(blocking=False)
 
                 # Update progress bar
                 if progress is not None and task_id is not None:
@@ -613,6 +686,16 @@ class Trainer:
                 # Restart the step timer AFTER eval/checkpoint so their wall time
                 # is excluded from the next step's measurement.
                 self._step_timer_start = time.perf_counter()
+
+            # A still-outstanding async save must be finalized before the run ends
+            # normally (Task 2.3) -- otherwise its background dcp.async_save write
+            # could still be in flight when the process exits, and its commit rename
+            # would never happen at all. This does not apply to the drain/non-finite
+            # exit paths above: those raise/exit through the `finally` below without
+            # reaching this point, by design (their own pending-save handling already
+            # ran, and a genuine kill is meant to leave nothing but a `.tmp`).
+            if self._pending_save is not None:
+                self._finalize_pending_save()
 
             # Final checkpoint — guaranteed unless disabled. Skip when the last
             # optimizer step already triggered a save, for either reason (step
@@ -663,15 +746,18 @@ class Trainer:
         drain: bool = False,
         nonfinite: bool = False,
         save_due: bool = False,
+        pending_done: bool = False,
     ) -> _StepFlags:
         """Rank-sync the control bundle for this optimizer step in one reduce.
 
-        Packs ``[local_tokens, drain, nonfinite, save_due]`` into a single
-        4-element long tensor and sum-reduces it across ranks: the token count
-        accumulates normally, and each boolean becomes True everywhere if it was
-        True on *any* rank (sum > 0). Per-rank clock or signal skew on the boolean
-        inputs is harmless by construction — one rank tripping a flag trips it for
-        all ranks.
+        Packs ``[local_tokens, drain, nonfinite, save_due, pending_done]`` into a
+        single 5-element long tensor and sum-reduces it across ranks: the token count
+        accumulates normally, ``drain``/``nonfinite``/``save_due`` each become True
+        everywhere if True on *any* rank (sum > 0), and ``pending_done`` is instead
+        returned as the raw sum (see :class:`_StepFlags`'s docstring for why it alone
+        needs the exact count rather than any-rank-trips-it semantics). Per-rank clock
+        or signal skew on the boolean inputs is harmless by construction — one rank
+        tripping a flag trips it for all ranks.
 
         Args:
             local_tokens: This rank's token count for the just-completed optimizer
@@ -682,22 +768,28 @@ class Trainer:
                 ``not math.isfinite(current_loss)`` for this rank's just-computed loss
                 (Task 1.8).
             save_due: This rank's local ``save_every_minutes`` timer signal.
+            pending_done: This rank's local signal that its pending async save's
+                write has finished (Task 2.3): ``self._pending_save is not None and
+                self._pending_save.handle.future.done()``.
 
         Returns:
             A rank-identical :class:`_StepFlags`.
         """
         bundle = torch.tensor(
-            [int(local_tokens), int(drain), int(nonfinite), int(save_due)],
+            [int(local_tokens), int(drain), int(nonfinite), int(save_due), int(pending_done)],
             device=self.accelerator.device,
             dtype=torch.long,
         )
         reduced = self.accelerator.reduce(bundle, reduction="sum").tolist()
-        tokens_delta, drain_sum, nonfinite_sum, save_due_sum = (int(x) for x in reduced)
+        tokens_delta, drain_sum, nonfinite_sum, save_due_sum, pending_done_sum = (
+            int(x) for x in reduced
+        )
         return _StepFlags(
             tokens_delta=tokens_delta,
             drain=drain_sum > 0,
             nonfinite=nonfinite_sum > 0,
             save_due=save_due_sum > 0,
+            pending_done_count=pending_done_sum,
         )
 
     def _save_timer_due(self) -> bool:
@@ -821,7 +913,7 @@ class Trainer:
                 "loss spike: %.4f vs EMA %.4f at step %d", loss, self._loss_ema, self.global_step
             )
 
-    def _save_checkpoint(self) -> None:
+    def _save_checkpoint(self, *, blocking: bool = True) -> None:
         """Save a training checkpoint.
 
         Updates ``self._last_save_at`` (monotonic) so the ``save_every_minutes``
@@ -833,9 +925,29 @@ class Trainer:
         :func:`~oplm.training.checkpoint.mark_permanent`. Both anchor and index
         are persisted into ``trainer_state.json`` (``first_checkpoint_unix`` /
         ``last_time_keep_index``) so a requeue resumes the hours anchor instead
-        of restarting it.
+        of restarting it. The ``keep_every_n_hours`` decision itself is always made
+        here, at TRIGGER time, regardless of ``blocking`` -- only *applying* it
+        (:func:`~oplm.training.checkpoint.mark_permanent`) is deferred for an async
+        save (see :class:`_PendingAsyncSave`).
+
+        Args:
+            blocking: When ``True`` (default), calls ``save_checkpoint(...,
+                blocking=True)`` and the checkpoint is fully committed --
+                ``on_checkpoint_saved`` fires -- before this method returns. When
+                ``False`` (the default for periodic saves, set by the caller in
+                :meth:`train`), the write is handed to ``dcp.async_save`` and this
+                method returns as soon as the (synchronous) sidecars are written and
+                the model/optimizer write has started; the commit itself, and
+                ``on_checkpoint_saved``, are deferred to :meth:`_finalize_pending_save`.
+                Asserts ``self._pending_save is None`` on entry -- callers must finalize
+                any existing pending save before triggering a new one (see
+                :meth:`train`'s "new trigger while pending" handling).
         """
-        from oplm.training.checkpoint import mark_permanent, save_checkpoint
+        from oplm.training.checkpoint import PendingSave, mark_permanent, save_checkpoint
+
+        assert blocking or self._pending_save is None, (
+            "at most one outstanding async save at a time -- caller must finalize first"
+        )
 
         checkpoint_dir = Path(self.cfg.train.output_dir) / f"checkpoint-{self.global_step}"
 
@@ -853,7 +965,7 @@ class Trainer:
                     should_mark_permanent = True
                     self._last_time_keep_index = current_time_keep_index
 
-        save_checkpoint(
+        result = save_checkpoint(
             accelerator=self.accelerator,
             model=self.model,
             optimizers=self.optimizers,
@@ -867,13 +979,47 @@ class Trainer:
             save_total_limit=self.cfg.train.save_total_limit,
             keep_every_n_steps=self.cfg.train.keep_every_n_steps,
             extra_state=self._checkpoint_extra_state(),
+            blocking=blocking,
         )
         self._last_save_at = time.monotonic()
 
-        if should_mark_permanent:
-            mark_permanent(checkpoint_dir)
+        if blocking:
+            assert isinstance(result, Path)
+            if should_mark_permanent:
+                mark_permanent(checkpoint_dir)
+            self._emit_checkpoint_saved(checkpoint_dir, self.global_step)
+        else:
+            assert isinstance(result, PendingSave)
+            self._pending_save = _PendingAsyncSave(
+                handle=result,
+                should_mark_permanent=should_mark_permanent,
+                global_step=self.global_step,
+            )
 
-        self._emit_checkpoint_saved(checkpoint_dir)
+    def _finalize_pending_save(self) -> None:
+        """Block on the pending async save's future (a no-op if already done) and commit it.
+
+        Runs the deferred commit tail via
+        :func:`~oplm.training.checkpoint.finalize_pending_save` (barrier, rank-0 rename +
+        pointer + rotation, second barrier), applies the ``keep_every_n_hours``
+        permanent-marker decision made at trigger time (see :class:`_PendingAsyncSave`),
+        fires ``on_checkpoint_saved`` with the checkpoint's own (trigger-time) step --
+        NOT ``self.global_step``, which may have advanced past it by now -- and clears
+        :attr:`_pending_save`. Called both from the opportunistic "every rank already
+        reported its write done" gate in :meth:`train` (where the ``.result()`` inside
+        is a no-op) and from the force-finalize paths (new trigger while pending,
+        drain, and end-of-training), where it may actually block.
+        """
+        from oplm.training.checkpoint import finalize_pending_save, mark_permanent
+
+        pending = self._pending_save
+        assert pending is not None, "_finalize_pending_save called with no pending save"
+
+        final_dir = finalize_pending_save(self.accelerator, pending.handle)
+        if pending.should_mark_permanent:
+            mark_permanent(final_dir)
+        self._pending_save = None
+        self._emit_checkpoint_saved(final_dir, pending.global_step)
 
     def _checkpoint_extra_state(self) -> dict[str, Any]:
         """Build the ``extra_state`` payload merged into ``trainer_state.json``.
@@ -974,13 +1120,21 @@ class Trainer:
         for callback in self.callbacks:
             callback.on_eval_end(self, dict(metrics), self.global_step)
 
-    def _emit_checkpoint_saved(self, checkpoint_dir: Path) -> None:
-        """Notify callbacks that a checkpoint was saved."""
+    def _emit_checkpoint_saved(self, checkpoint_dir: Path, step: int) -> None:
+        """Notify callbacks that a checkpoint was saved.
+
+        Args:
+            checkpoint_dir: The committed checkpoint directory.
+            step: The checkpoint's own step -- explicit rather than reading
+                ``self.global_step``, since a deferred async commit (Task 2.3) may run
+                after ``self.global_step`` has already advanced past the step the
+                checkpoint was actually saved at.
+        """
         if not self.accelerator.is_main_process:
             return
 
         for callback in self.callbacks:
-            callback.on_checkpoint_saved(self, checkpoint_dir, self.global_step)
+            callback.on_checkpoint_saved(self, checkpoint_dir, step)
 
     def _emit_train_end(self) -> None:
         """Notify callbacks that training has ended."""

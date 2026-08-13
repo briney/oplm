@@ -21,7 +21,12 @@ import torch
 from oplm.config import DataConfig, OplmConfig, TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM
-from oplm.training.checkpoint import load_checkpoint, save_checkpoint
+from oplm.training.checkpoint import (
+    PendingSave,
+    finalize_pending_save,
+    load_checkpoint,
+    save_checkpoint,
+)
 from oplm.training.optim import build_optimizers, build_schedulers
 
 if TYPE_CHECKING:
@@ -691,3 +696,263 @@ def test_load_checkpoint_allows_missing_rng_sidecar_via_env_escape_hatch(
     assert state["global_step"] == 10
     assert "RNG sidecar not found" in caplog.text
     assert "OPLM_ALLOW_MISSING_RNG" in caplog.text
+
+
+# --- Task 2.3: async save --------------------------------------------------------------
+
+
+def test_save_checkpoint_async_writes_sidecars_without_committing(tmp_path: Path) -> None:
+    """``blocking=False`` writes sidecars synchronously into ``tmp_dir`` but defers the commit.
+
+    ``dcp.async_save``'s synchronous staging step returns fast (the actual disk write
+    runs on a background thread), but the sidecars -- RNG, ``trainer_state.json``,
+    ``config.yaml``, ``hf/`` export -- are always written synchronously regardless of
+    ``blocking``, since they must snapshot trigger-time state. The commit (rename to
+    ``checkpoint-<step>/``, ``latest`` pointer, rotation) must NOT have happened yet:
+    that is exactly what :func:`finalize_pending_save` defers.
+    """
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    _take_optimizer_step(cfg, accelerator, model, optimizer, scheduler)
+
+    result = save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+        blocking=False,
+    )
+
+    assert isinstance(result, PendingSave)
+    assert result.final_dir == tmp_path / "checkpoint-10"
+
+    tmp_dir = tmp_path / "checkpoint-10.tmp"
+    assert tmp_dir.is_dir()
+    assert (tmp_dir / "rng_state_0.pt").exists()
+    assert (tmp_dir / "trainer_state.json").exists()
+    assert (tmp_dir / "config.yaml").exists()
+    assert (tmp_dir / "hf" / "config.json").exists()
+
+    # Not committed yet: no final dir, no latest pointer.
+    assert not (tmp_path / "checkpoint-10").exists()
+    assert not (tmp_path / "latest").exists()
+
+    # Clean up the still-pending write so this test doesn't leak a background thread
+    # holding file handles open past the test's tmp_path teardown.
+    result.future.result()
+
+
+def test_finalize_pending_save_completes_the_commit(tmp_path: Path) -> None:
+    """``finalize_pending_save`` blocks on the future and runs the exact same commit tail.
+
+    The committed checkpoint produced via the async path must be indistinguishable
+    from one produced via the blocking path: same DCP shard/metadata files, same
+    sidecars, same ``latest`` pointer, no leftover ``.tmp`` dir.
+    """
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    _take_optimizer_step(cfg, accelerator, model, optimizer, scheduler)
+
+    pending = save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+        blocking=False,
+    )
+    assert isinstance(pending, PendingSave)
+
+    final_dir = finalize_pending_save(accelerator, pending)
+
+    assert final_dir == tmp_path / "checkpoint-10"
+    committed = tmp_path / "checkpoint-10"
+    assert committed.is_dir()
+    assert (committed / ".metadata").exists()
+    assert list(committed.glob("__*.distcp"))
+    assert (committed / "rng_state_0.pt").exists()
+    assert (committed / "trainer_state.json").exists()
+    assert (committed / "hf" / "model.safetensors").exists()
+    assert not (tmp_path / "checkpoint-10.tmp").exists()
+    assert (tmp_path / "latest").read_text().strip() == "checkpoint-10"
+
+    # Round-trips through load_checkpoint exactly like a blocking-saved checkpoint.
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(cfg)
+    state = load_checkpoint(
+        fresh_accelerator, fresh_model, [fresh_optimizer], [fresh_scheduler], str(committed), cfg
+    )
+    assert state["global_step"] == 10
+    assert state["tokens_seen"] == 400
+
+
+def test_async_periodic_saves_defer_commit_past_the_triggering_step(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real pilot run: ``save_every=2``/``max_steps=8`` commits 4 checkpoints via async saves.
+
+    Periodic saves default to ``blocking=False`` (Task 2.3): ``dcp.async_save`` returns a
+    ``Future`` immediately and the trainer keeps training while the background write
+    proceeds; the actual commit (rename/pointer/rotation) is deferred to a later,
+    rank-synchronized point. This spies on both the trigger point
+    (``oplm.training.checkpoint.save_checkpoint`` called with ``blocking=False``,
+    recording ``global_step``) and the finalize/commit point
+    (``Trainer._finalize_pending_save``, recording ``global_step`` at commit time) to
+    prove that at least one checkpoint's commit happens strictly after further training
+    steps ran -- not merely that ``async_save`` "returns fast" (a trivially-fast
+    background write could satisfy that even under a synchronous same-step commit).
+    """
+    from oplm.training import checkpoint as checkpoint_module
+    from oplm.training.trainer import Trainer
+    from tests.training.conftest import FullRecordingCallback, tiny_train_cfg
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=8,
+        save_every=2,
+        save_total_limit=10,
+        log_every=1,
+    )
+    callback = FullRecordingCallback()
+    trainer = Trainer(cfg, callbacks=[callback])
+
+    trigger_steps: list[int] = []
+    real_save_checkpoint = checkpoint_module.save_checkpoint
+
+    def _spy_save_checkpoint(*args: object, **kwargs: object) -> object:
+        if kwargs.get("blocking", True) is False:
+            trigger_steps.append(int(kwargs["global_step"]))  # type: ignore[arg-type]
+        return real_save_checkpoint(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(checkpoint_module, "save_checkpoint", _spy_save_checkpoint)
+
+    commit_steps: list[int] = []
+    real_finalize = trainer._finalize_pending_save
+
+    def _spy_finalize() -> None:
+        commit_steps.append(trainer.global_step)
+        real_finalize()
+
+    monkeypatch.setattr(trainer, "_finalize_pending_save", _spy_finalize)
+
+    trainer.train()
+
+    assert trigger_steps == [2, 4, 6, 8]
+    assert len(commit_steps) == 4
+    # commit_steps records the trainer's live global_step at the moment each commit
+    # actually runs -- necessarily >= the checkpoint's own (trigger-time) step, since
+    # commits only happen at or after the step that triggered them, never before.
+    assert callback.checkpoint_steps == [2, 4, 6, 8]
+    for trigger, commit in zip(trigger_steps, commit_steps, strict=True):
+        assert commit >= trigger
+
+    # The key regression this test guards against: at least one checkpoint's commit
+    # must land strictly after the step that triggered its async save -- i.e. the
+    # commit was genuinely deferred, not folded back into a synchronous same-step
+    # rename.
+    assert any(
+        commit > trigger for trigger, commit in zip(trigger_steps, commit_steps, strict=True)
+    )
+
+    committed = sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("checkpoint-"))
+    assert committed == ["checkpoint-2", "checkpoint-4", "checkpoint-6", "checkpoint-8"]
+    assert list(tmp_path.glob("checkpoint-*.tmp")) == []
+    assert trainer._pending_save is None
+
+
+def test_drain_during_pending_async_save_finalizes_then_takes_blocking_save(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drain landing while an async periodic save is still pending finalizes it first.
+
+    Forces the async save's ``Future`` to still be unresolved at the exact moment drain
+    is observed (via a controlled ``concurrent.futures.Future`` substituted for the real
+    one, with the real write still happening synchronously underneath -- see
+    ``_fake_async_save`` below), so the force-finalize branch in ``Trainer.train``'s
+    drain handling is what actually completes the commit, not the opportunistic
+    per-step gate. Drain's own checkpoint must then be a separate, blocking save: both
+    checkpoints must exist, in commit order, and no ``PendingSave``/``.tmp`` dir must be
+    left behind.
+    """
+    from concurrent.futures import Future
+
+    from oplm.training import checkpoint as checkpoint_module
+    from oplm.training.trainer import Trainer
+    from tests.training.conftest import FullRecordingCallback, tiny_train_cfg
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=20,
+        save_every=2,
+        save_total_limit=10,
+        log_every=1,
+    )
+    callback = FullRecordingCallback()
+    trainer = Trainer(cfg, callbacks=[callback])
+
+    real_dcp_save = checkpoint_module.dcp.save
+
+    def _fake_async_save(state_dict: object, *, checkpoint_id: str, **_: object) -> Future[object]:
+        # Do the real write synchronously -- only the Future's completion signal is
+        # test-controlled, so the on-disk result is genuine while the "still pending"
+        # window is fully deterministic instead of racing a real background thread.
+        real_dcp_save(state_dict, checkpoint_id=checkpoint_id)
+        return Future()
+
+    monkeypatch.setattr(checkpoint_module.dcp, "async_save", _fake_async_save)
+
+    # Drain becomes "requested" only once training has passed step 2 -- i.e. after the
+    # save_every=2 periodic save has already triggered (and is still pending, since its
+    # controlled Future is never resolved except by the spy below).
+    class _DrainAfterStep:
+        def __init__(self, trainer: Trainer, step_threshold: int) -> None:
+            self._trainer = trainer
+            self._step_threshold = step_threshold
+
+        @property
+        def requested(self) -> bool:
+            return self._trainer.global_step >= self._step_threshold
+
+    monkeypatch.setattr(trainer, "_drain_signal", _DrainAfterStep(trainer, 3))
+
+    finalize_future_done_at_call: list[bool] = []
+    real_finalize = trainer._finalize_pending_save
+
+    def _spy_finalize() -> None:
+        pending = trainer._pending_save
+        assert pending is not None
+        finalize_future_done_at_call.append(pending.handle.future.done())
+        if not pending.handle.future.done():
+            pending.handle.future.set_result(None)
+        real_finalize()
+
+    monkeypatch.setattr(trainer, "_finalize_pending_save", _spy_finalize)
+
+    with pytest.raises(SystemExit) as excinfo:
+        trainer.train()
+
+    from oplm.training.signals import DRAIN_EXIT_CODE
+
+    assert excinfo.value.code == DRAIN_EXIT_CODE
+
+    # The force-finalize branch (drain), not the opportunistic per-step gate, is what
+    # completed the commit: the future was genuinely still pending when observed.
+    assert finalize_future_done_at_call == [False]
+
+    assert callback.checkpoint_steps == [2, 3]
+    assert (tmp_path / "checkpoint-2").is_dir()
+    assert (tmp_path / "checkpoint-3").is_dir()
+    assert list(tmp_path.glob("checkpoint-*.tmp")) == []
+    assert trainer._pending_save is None

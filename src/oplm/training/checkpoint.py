@@ -7,9 +7,9 @@ import logging
 import os
 import random
 import shutil
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -20,6 +20,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from concurrent.futures import Future
 
     from accelerate import Accelerator
 
@@ -213,6 +214,129 @@ def _restore_scaler_sidecar(checkpoint_dir: Path, accelerator: Accelerator) -> N
         )
 
 
+@dataclass
+class PendingSave:
+    """Handle for an in-flight async checkpoint save awaiting its deferred commit.
+
+    Returned by :func:`save_checkpoint` when called with ``blocking=False`` (the
+    default for periodic saves -- see ``oplm.training.trainer.Trainer._save_checkpoint``).
+    ``dcp.async_save`` has already staged the model/optimizer state (a synchronous CPU
+    copy) and handed the actual disk write to a background thread by the time this
+    object exists; the sidecars (RNG, scaler, ``trainer_state.json``, ``config.yaml``,
+    ``hf/`` export) have already been written synchronously into ``tmp_dir`` too, since
+    they must snapshot trigger-time state regardless of blocking. What has *not*
+    happened yet is the commit: the barrier, the rank-0 rename of ``tmp_dir`` onto
+    ``final_dir``, the ``latest`` pointer rewrite, and rotation -- all deferred to
+    :func:`finalize_pending_save`, which must be called once every rank's local
+    background write has actually finished (not merely started).
+
+    Attributes:
+        future: The ``Future`` returned by ``dcp.async_save``; resolves (or raises) once
+            this rank's model/optimizer state has been fully written to ``tmp_dir``.
+        tmp_dir: The staging directory (``checkpoint-<step>.tmp/``) the async write and
+            sidecars were written into.
+        final_dir: The committed directory name this save will become
+            (``checkpoint-<step>/``) once :func:`finalize_pending_save` runs.
+        output_dir: The training output directory (parent of both ``tmp_dir`` and
+            ``final_dir``), needed by the deferred pointer rewrite and rotation.
+        save_total_limit: Captured at trigger time; passed through to the deferred
+            :func:`_rotate_checkpoints` call.
+        keep_every_n_steps: Captured at trigger time; passed through to the deferred
+            :func:`_rotate_checkpoints` call.
+    """
+
+    future: Future[Any]
+    tmp_dir: Path
+    final_dir: Path
+    output_dir: Path
+    save_total_limit: int
+    keep_every_n_steps: int | None
+
+
+def _commit_checkpoint(
+    accelerator: Accelerator,
+    tmp_dir: Path,
+    final_dir: Path,
+    output_dir: Path,
+    save_total_limit: int,
+    keep_every_n_steps: int | None,
+) -> Path:
+    """Run the commit tail shared by the blocking and deferred-async save paths.
+
+    Barrier (every rank has finished writing into ``tmp_dir`` -- for the async path,
+    the caller has already blocked on the write's ``Future`` before reaching here, see
+    :func:`finalize_pending_save`), rank-0 rename of ``tmp_dir`` onto ``final_dir`` (with
+    the same-step ``.old``-aside recoverability guarantee documented on
+    :func:`save_checkpoint`), a ``latest`` pointer rewrite, rotation, and a second
+    barrier so no rank proceeds until the commit is fully visible everywhere.
+
+    Args:
+        accelerator: The HuggingFace Accelerator instance.
+        tmp_dir: The staging directory to commit.
+        final_dir: The committed directory name to rename ``tmp_dir`` onto.
+        output_dir: The training output directory (parent of both).
+        save_total_limit: Maximum number of rolling checkpoints to keep (see
+            :func:`_rotate_checkpoints`).
+        keep_every_n_steps: Permanent-checkpoint step boundary (see
+            :func:`_rotate_checkpoints`).
+
+    Returns:
+        ``final_dir``, identical on every rank.
+    """
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        aside_dir = final_dir.with_name(f"{final_dir.name}{_OLD_SUFFIX}")
+        if final_dir.exists():
+            # Re-saving at the same step after a requeue: move the previous commit
+            # aside first — never delete it before the new one is renamed into place.
+            # A kill between these two renames leaves a recoverable checkpoint-<N>.old/
+            # dir instead of a window where neither the old nor the new dir exists.
+            final_dir.rename(aside_dir)
+        tmp_dir.rename(final_dir)
+        if aside_dir.exists():
+            shutil.rmtree(aside_dir)
+        _write_latest_pointer(output_dir, final_dir.name)
+        _rotate_checkpoints(output_dir, save_total_limit, keep_every_n_steps=keep_every_n_steps)
+
+    # Second barrier: no rank proceeds (e.g. to a subsequent resume) until the
+    # rename, latest-pointer update, and rotation on the main process are done.
+    accelerator.wait_for_everyone()
+
+    return final_dir
+
+
+def finalize_pending_save(accelerator: Accelerator, pending: PendingSave) -> Path:
+    """Block on ``pending.future`` (a no-op if already done) and run the commit tail.
+
+    Safe to call whether or not the future has already completed: a completed future's
+    ``.result()`` returns immediately, so this same function serves both the
+    "every rank already reported its local write done" fast path (the trainer's
+    control-bundle gate, ``pending_done_count == num_processes``) and the "force
+    finalize before a new trigger/drain/final save" path (where it actually blocks) --
+    both need the identical barrier + rename + rotate tail, just reached with or
+    without a genuine wait. A write that failed in the background re-raises here,
+    from ``.result()``, rather than being silently swallowed.
+
+    Args:
+        accelerator: The HuggingFace Accelerator instance (the same one passed to the
+            :func:`save_checkpoint` call that produced ``pending``).
+        pending: The handle returned by ``save_checkpoint(..., blocking=False)``.
+
+    Returns:
+        The committed checkpoint directory path (``pending.final_dir``).
+    """
+    pending.future.result()
+    return _commit_checkpoint(
+        accelerator,
+        pending.tmp_dir,
+        pending.final_dir,
+        pending.output_dir,
+        pending.save_total_limit,
+        pending.keep_every_n_steps,
+    )
+
+
 def save_checkpoint(
     accelerator: Accelerator,
     model: torch.nn.Module,
@@ -229,7 +353,8 @@ def save_checkpoint(
     keep_every_n_steps: int | None = None,
     extra_state: dict[str, Any] | None = None,
     cursor: Any | None = None,
-) -> Path:
+    blocking: bool = True,
+) -> Path | PendingSave:
     """Save a training checkpoint atomically via a tmp-dir + rename commit.
 
     Every rank writes into a staging directory named ``checkpoint-<step>.tmp/``. Model
@@ -292,10 +417,27 @@ def save_checkpoint(
             set, its ``dataclasses.asdict`` form is recorded in ``trainer_state.json``
             under ``cursor`` for human inspection (the authoritative resumable copy will
             live wherever Task 3.1 places it).
+        blocking: When ``True`` (the default), model/optimizer state is written via
+            ``dcp.save`` and the full commit (barrier, rename, pointer, rotation) has
+            already happened by the time this call returns -- this is the only mode
+            used before Task 2.3, and remains what drain, the final/end-of-training
+            save, and the non-finite-loss guard use (see ``Trainer.train``). When
+            ``False`` (the default for the trainer's *periodic* saves), model/optimizer
+            state is written via ``dcp.async_save`` instead: it stages a CPU copy
+            synchronously and hands the actual disk write to a background thread,
+            returning a ``Future`` immediately. The sidecars below are still written
+            synchronously either way -- they must snapshot trigger-time state
+            regardless of blocking -- but the commit itself is deferred: this call
+            returns a :class:`PendingSave` handle instead of the committed path, and
+            the caller must later call :func:`finalize_pending_save` once every rank's
+            local write has actually finished.
 
     Returns:
-        The path the checkpoint is committed to (``<output_dir>/checkpoint-<global_step>``),
-        identical on every rank regardless of which rank actually performs the rename.
+        When ``blocking=True`` (default): the path the checkpoint is committed to
+        (``<output_dir>/checkpoint-<global_step>``), identical on every rank regardless
+        of which rank actually performs the rename. When ``blocking=False``: a
+        :class:`PendingSave` handle for the caller to finalize later via
+        :func:`finalize_pending_save`.
     """
     from oplm.config import serialize_config
     from oplm.data import get_tokenizer
@@ -303,15 +445,28 @@ def save_checkpoint(
     tmp_dir = Path(output_dir) / f"{_CHECKPOINT_PREFIX}{global_step}{_TMP_SUFFIX}"
     final_dir = tmp_dir.with_name(f"{_CHECKPOINT_PREFIX}{global_step}")
 
-    # Model + optimizer state through DCP (all ranks participate; dcp.save is
-    # internally collective and creates tmp_dir as part of that collective, so it
+    # Model + optimizer state through DCP (all ranks participate; dcp.save/dcp.async_save
+    # are internally collective and create tmp_dir as part of that collective, so it
     # exists on every rank by the time this call returns -- verified single-process,
     # with torch.compile, and 2-rank DDP without requiring a pre-created directory).
     dcp_state: dict[str, Any] = {
         "app": _ModelOptState(model, optimizers),
         "schedulers": [_unwrap_scheduler(s).state_dict() for s in schedulers],
     }
-    dcp.save(dcp_state, checkpoint_id=str(tmp_dir))
+    future: Future[Any] | None = None
+    if blocking:
+        dcp.save(dcp_state, checkpoint_id=str(tmp_dir))
+    else:
+        # dcp.async_save's synchronous staging step does NOT create tmp_dir itself
+        # (verified: only the background write thread does) -- pre-create it so the
+        # sidecar writes just below, which must run synchronously regardless of
+        # blocking, don't race a FileNotFoundError against the background thread.
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        # dcp.async_save's return type is Future | AsyncSaveResponse; it is only ever
+        # an AsyncSaveResponse when async_checkpointer_type=PROCESS, which this codebase
+        # never passes (the default THREAD type is used throughout), so the result is
+        # always a Future in practice.
+        future = cast("Future[Any]", dcp.async_save(dcp_state, checkpoint_id=str(tmp_dir)))
 
     # Per-rank RNG sidecar (Task 2.1 spec): not part of the DCP state dict (see
     # _write_rng_sidecar), written before the commit barrier below.
@@ -350,30 +505,23 @@ def save_checkpoint(
         unwrapped.save_pretrained(hf_dir)  # config.json + model.safetensors
         get_tokenizer().save_pretrained(hf_dir)  # tokenizer files for round-trip
 
-    # Barrier: every rank has finished writing into tmp_dir before anyone commits it.
-    accelerator.wait_for_everyone()
-
-    if accelerator.is_main_process:
-        aside_dir = final_dir.with_name(f"{final_dir.name}{_OLD_SUFFIX}")
-        if final_dir.exists():
-            # Re-saving at the same step after a requeue: move the previous commit
-            # aside first — never delete it before the new one is renamed into place.
-            # A kill between these two renames leaves a recoverable checkpoint-<N>.old/
-            # dir instead of a window where neither the old nor the new dir exists.
-            final_dir.rename(aside_dir)
-        tmp_dir.rename(final_dir)
-        if aside_dir.exists():
-            shutil.rmtree(aside_dir)
-        _write_latest_pointer(Path(output_dir), final_dir.name)
-        _rotate_checkpoints(
-            Path(output_dir), save_total_limit, keep_every_n_steps=keep_every_n_steps
+    if blocking:
+        return _commit_checkpoint(
+            accelerator, tmp_dir, final_dir, Path(output_dir), save_total_limit, keep_every_n_steps
         )
 
-    # Second barrier: no rank proceeds (e.g. to a subsequent resume) until the
-    # rename, latest-pointer update, and rotation on the main process are done.
-    accelerator.wait_for_everyone()
-
-    return final_dir
+    # Deferred commit: no barrier here -- the caller must rank-synchronize the commit
+    # tail itself (see finalize_pending_save) once every rank's local dcp.async_save
+    # background write has actually finished, not merely started.
+    assert future is not None  # set above whenever blocking is False
+    return PendingSave(
+        future=future,
+        tmp_dir=tmp_dir,
+        final_dir=final_dir,
+        output_dir=Path(output_dir),
+        save_total_limit=save_total_limit,
+        keep_every_n_steps=keep_every_n_steps,
+    )
 
 
 def validate_schedule_compat(
