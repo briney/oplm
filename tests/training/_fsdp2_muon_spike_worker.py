@@ -4,8 +4,10 @@ Builds a toy 2-layer ``nn.Linear`` stack, shards it with FSDP2's ``fully_shard``
 over a 1-D CPU/gloo mesh (so every parameter becomes a 2-D DTensor), and
 attempts to construct and step ``torch.optim.Muon`` directly over those
 DTensor params. Records the outcome (construction/step success or failure,
-per-step loss, and whether ``get_state_dict`` round-trips the optimizer state)
-to ``out_dir/rank<i>.json`` so the parent test process can render the verdict.
+per-step loss, and whether ``get_state_dict`` round-trips the optimizer state
+with momentum buffers still sharded ``(Shard(0),)`` rather than gathered to
+full tensors) to ``out_dir/rank<i>.json`` so the parent test process can
+render the verdict.
 
 This is the spike artifact referenced by
 ``docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md`` §7 and
@@ -33,6 +35,7 @@ def main(out_dir: str) -> None:
     from torch.distributed.checkpoint.state_dict import get_state_dict
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
+    from torch.distributed.tensor import DTensor, Shard
 
     dist.init_process_group(backend="gloo")
     rank = dist.get_rank()
@@ -90,8 +93,24 @@ def main(out_dir: str) -> None:
 
     try:
         _, optim_state_dict = get_state_dict(model, [muon])
-        result["checkpoint_status"] = "ok"
+        momentum_buffers = [
+            buf
+            for state in optim_state_dict["state"].values()
+            for key, buf in state.items()
+            if key == "momentum_buffer"
+        ]
+        # The memory-efficiency claim in spec §7 ("no regression") is that
+        # get_state_dict keeps momentum buffers sharded rather than gathering
+        # them to full tensors; verify that directly instead of just checking
+        # that get_state_dict didn't raise.
+        buffers_stay_sharded = bool(momentum_buffers) and all(
+            isinstance(buf, DTensor) and buf.placements == (Shard(0),) for buf in momentum_buffers
+        )
+        result["checkpoint_status"] = "ok" if buffers_stay_sharded else "unsharded_state"
         result["checkpoint_state_keys"] = list(optim_state_dict.keys())
+        result["momentum_buffer_placements"] = [
+            str(getattr(buf, "placements", None)) for buf in momentum_buffers
+        ]
     except (NotImplementedError, RuntimeError) as exc:
         result["checkpoint_status"] = "failed"
         result["checkpoint_error"] = f"{type(exc).__name__}: {exc}"

@@ -44,8 +44,9 @@ def test_muon_optimizer_on_fsdp2_dtensor_params(tmp_path: Path) -> None:
     outcome to ``rank<i>.json``. If Muon rejected the DTensor params (at
     construction or during ``step()``), this test *records that verdict via
     skip* rather than failing, per the Task 0.3 brief. Otherwise it asserts the
-    spike's success criteria: no exception, loss decreased, params changed,
-    and (informationally) whether the checkpoint round-trip succeeded.
+    spike's success criteria (no exception, loss decreased, params changed)
+    plus a second, separate hard gate on the checkpoint probe: that
+    ``get_state_dict`` round-trips with momentum buffers still sharded.
     """
     worker = Path(__file__).with_name("_fsdp2_muon_spike_worker.py")
     subprocess.run(
@@ -76,10 +77,16 @@ def test_muon_optimizer_on_fsdp2_dtensor_params(tmp_path: Path) -> None:
         assert losses[-1] < losses[0], f"loss did not decrease: {losses}"
         assert result["param_changed"], "Muon step did not change the sharded parameter"
 
-    # Informational: record but don't hard-fail on the checkpoint probe, since
-    # the brief asks us to *record* whether get_state_dict round-trips, not to
-    # gate the Muon-acceptance verdict on it.
+    # This is a second, separate hard gate from the Muon-acceptance verdict
+    # above: it asserts the checkpoint round-trip itself, including the
+    # "momentum buffers stay sharded" claim recorded in spec §7 (the worker
+    # checks each momentum buffer is a DTensor with Shard(0) placement, not a
+    # gathered full tensor). A failure here means get_state_dict either
+    # raised or silently gathered state -- report it distinctly from a Muon
+    # construction/step failure so the two verdicts don't get conflated.
     checkpoint_statuses = {result["checkpoint_status"] for result in results}
     assert checkpoint_statuses == {"ok"}, (
-        f"expected get_state_dict to round-trip on all ranks, got {results}"
+        "checkpoint round-trip probe failed (separately from the Muon-acceptance "
+        f"verdict above): expected get_state_dict to round-trip with sharded momentum "
+        f"buffers on all ranks, got {results}"
     )
