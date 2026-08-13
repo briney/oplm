@@ -146,7 +146,25 @@ class RemoteStore:
         Discovers every file already uploaded under ``<uri>/<name>/`` (excluding any
         prior ``manifest.json``) and records each one's remote size. Written LAST --
         after this call, and only after this call, is ``<uri>/<name>/`` visible to
-        :meth:`latest_committed` and :meth:`rotate`.
+        :meth:`latest_committed` and :meth:`rotate`. Calling ``finalize`` again on an
+        already-committed checkpoint (e.g. after uploading additional files) is safe
+        and simply rewrites the manifest from a fresh listing -- the prior
+        ``manifest.json`` is excluded from that listing by name, so it is never
+        recorded as one of its own checkpoint's files.
+
+        **Hard precondition -- call only once every writer has confirmed that every
+        file it is contributing has fully uploaded and is remotely visible.** In the
+        trainer flow (Task 4.2), that means calling this only *after* the all-nodes
+        upload barrier, once every rank has reported its uploads done -- never
+        speculatively, and never from a single rank before the others have finished.
+        This method has no way to know which files *should* eventually exist; it only
+        records what it can currently list. **Violating this precondition does not
+        raise.** A file uploaded a moment too late (or never) is simply absent from
+        the manifest, silently, with no error here or anywhere else in this class --
+        :meth:`download_checkpoint` only ever iterates the manifest's own entries, so
+        it will happily "successfully" download an incomplete checkpoint missing one
+        or more shards, with nothing to indicate the omission short of whatever fails
+        much later when that checkpoint is actually loaded/resumed from.
 
         Args:
             name: The checkpoint directory name (e.g. ``"checkpoint-100"``).
@@ -205,7 +223,14 @@ class RemoteStore:
             The committed local path, ``dest / name``.
 
         Raises:
-            RuntimeError: A downloaded file's size disagrees with the manifest.
+            RuntimeError: A downloaded file's size disagrees with the manifest -- i.e.
+                the file exists remotely but came down corrupted/truncated/wrong-sized.
+            OSError: A file the manifest lists does not exist remotely at all (e.g. it
+                was deleted out from under this store after ``finalize`` ran). This is
+                *not* translated into ``RuntimeError`` -- it surfaces as whatever
+                native exception the underlying fsspec filesystem's ``get_file``
+                raises for a missing path (``FileNotFoundError``, a subclass of
+                ``OSError``, on local/S3-like filesystems).
         """
         manifest = self._read_manifest(self._join(name, _MANIFEST_NAME))
 

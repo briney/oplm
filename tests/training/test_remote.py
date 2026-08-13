@@ -73,6 +73,39 @@ def test_upload_without_manifest_then_finalize_separately(tmp_path: Path) -> Non
     assert manifest["files"] == {"a.txt": 3}
 
 
+def test_finalize_twice_is_safe_and_excludes_its_own_manifest(tmp_path: Path) -> None:
+    """Re-finalizing rewrites the manifest without ever listing itself as a file.
+
+    Guards the ``relpath == _MANIFEST_NAME`` exclusion in ``finalize``'s listing --
+    without it, a second ``finalize`` call would fold the previous ``manifest.json``
+    into its own ``files`` dict.
+    """
+    local_dir = tmp_path / "local" / "checkpoint-600"
+    relpaths = _write_local_checkpoint(local_dir, {"a.txt": "hello"})
+    remote_root = tmp_path / "remote"
+    store = RemoteStore(f"file://{remote_root}")
+
+    store.upload_checkpoint(local_dir, files=relpaths, permanent=False, write_manifest=True)
+    first_result = store.latest_committed()
+    assert first_result is not None
+    assert first_result[1]["files"] == {"a.txt": 5}
+
+    # Upload one more file, then re-finalize (e.g. re-committing after an incremental
+    # upload) as permanent this time.
+    extra_relpaths = _write_local_checkpoint(local_dir, {"b.txt": "more!!"})
+    store.upload_checkpoint(local_dir, files=extra_relpaths, permanent=True, write_manifest=False)
+    store.finalize("checkpoint-600", permanent=True)
+
+    result = store.latest_committed()
+    assert result is not None
+    name, manifest = result
+    assert name == "checkpoint-600"
+    assert manifest["permanent"] is True
+    # manifest.json itself must never appear as one of its own checkpoint's files,
+    # on either the first or a subsequent finalize.
+    assert manifest["files"] == {"a.txt": 5, "b.txt": 6}
+
+
 def test_checkpoint_without_manifest_is_invisible_to_latest_committed(tmp_path: Path) -> None:
     """A ``checkpoint-<step>/`` dir with files but no manifest.json is not discovered."""
     local_dir = tmp_path / "local" / "checkpoint-300"
