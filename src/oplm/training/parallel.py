@@ -34,14 +34,33 @@ The checkpoint path is unaffected by the choice either way: Phase 2 saves throug
 ``get_state_dict``/``set_state_dict``, which handle DTensor parameters natively (spec §7),
 so an HSDP checkpoint loads under DDP and vice versa.
 
-**Known limitation (deliberate, documented):** ``Accelerator.no_sync`` looks for a
-``no_sync`` attribute on the model, which ``FSDPModule`` does not define, so under
-gradient accumulation every micro-batch reduce-scatters its gradients instead of only the
-last one. That is *correct* (gradients accumulate into the sharded ``.grad``), just extra
-communication. The fix is FSDP2's ``set_requires_gradient_sync``/``set_is_last_backward``
-pair, which has to be driven per micro-batch from the training loop; it is a throughput
-optimization, not a correctness fix, and is deliberately left out of Task 5.1 rather than
-half-wired.
+**Known limitations, all deliberate and all verified rather than assumed:**
+
+1. **In-loop eval deadlocks, and is refused.** ``fully_shard`` mutates the module in
+   place, so ``accelerator.unwrap_model`` hands the evaluator the ``FSDPModule`` itself and
+   every eval forward all-gathers. Eval tasks stripe their work across ranks
+   (``[rank::world_size]``), so ranks run different numbers of forwards, the short ranks
+   stop issuing all-gathers, and the group wedges until ``dist_timeout_minutes``. Reproduced
+   in review. ``oplm.config.validate_parallelism_compat`` therefore refuses
+   ``parallelism="hsdp"`` together with a configured ``data.eval``. The real fix --
+   rank-padded forward counts, or gathering the model once into an unsharded eval copy --
+   is follow-up work; evaluate an HSDP run's checkpoints with a separate ``ddp`` job until
+   then.
+2. **Gradient accumulation reduce-scatters every micro-batch.** ``Accelerator.no_sync``
+   looks for a ``no_sync`` attribute on the model, which ``FSDPModule`` does not define, so
+   it degrades to a null context. That is *correct* (gradients accumulate into the sharded
+   ``.grad``), just extra communication. The fix is FSDP2's
+   ``set_requires_gradient_sync``/``set_is_last_backward`` pair, driven per micro-batch
+   from the training loop; getting only half of that pair right silently corrupts
+   gradients, so it is left out rather than half-wired. Throughput, not correctness.
+3. **Muon's numerics on DTensor params are unvalidated.** ``torch.optim.Muon`` has no
+   DTensor-specific handling: its Newton-Schulz iteration runs as real distributed matmuls
+   over sharded operands, so the update is not bit-identical to the unsharded one (review
+   measured ~3% divergence against a single-device oracle on a toy model; Task 0.3's spike
+   only established that it *runs* and checkpoints, never that it matches). Nothing
+   suggests it is wrong -- distributed matmul is the mathematically correct way to compute
+   it -- but the composition of sharded NS with bf16 compute is unproven at scale. Watch
+   the first real Muon+HSDP run's loss curve against a DDP control.
 """
 
 from __future__ import annotations
@@ -107,6 +126,21 @@ def resolve_mesh_dims(world_size: int, local_world_size: int | None) -> tuple[in
         )
 
     if local_world_size is None or local_world_size <= 0:
+        # Degrading to one node means sharding every parameter across ALL ranks -- on a
+        # multi-node job that turns each all-gather into an inter-node collective instead
+        # of an intra-node one (an order-of-magnitude bandwidth cliff, silent apart from
+        # throughput). Warn loudly; it is a launcher problem, not a config error, and
+        # refusing outright would break genuinely single-node launchers that omit the var.
+        if world_size > 1:
+            logger.warning(
+                "LOCAL_WORLD_SIZE is unset or invalid with world size %d: assuming a "
+                "single node and building a (1, %d) mesh, which shards every parameter "
+                "across every rank. If this job spans multiple nodes that is a large, "
+                "silent throughput regression (cross-node all-gathers) -- export "
+                "LOCAL_WORLD_SIZE from the launcher.",
+                world_size,
+                world_size,
+            )
         local_world_size = world_size
 
     if local_world_size > world_size or world_size % local_world_size != 0:
@@ -165,6 +199,28 @@ def _mixed_precision_policy(mixed_precision: str) -> Any | None:
     the standard large-scale pretraining recipe (bf16's 8-bit mantissa loses meaningful
     gradient precision when summed over thousands of ranks) and it costs bandwidth, not
     memory: the fp32 master weights already exist either way.
+
+    **bf16 numerics differ between the ddp and hsdp paths -- deliberately, and this is the
+    one place it is decided.** On the ddp path Accelerate wraps the model's forward in
+    ``torch.autocast``, which keeps an allowlist of ops (normalizations, softmax,
+    reductions) in fp32 while casting matmuls to bf16. There is no autocast on the sharded
+    path: ``param_dtype=bfloat16`` casts the parameters themselves, so every op consuming
+    them computes in bf16. Two things bound the blast radius, which is why this is
+    documented rather than "fixed":
+
+    - The loss path is already explicitly fp32 in the model, independent of either
+      mechanism: ``OplmForMaskedLM.forward`` calls ``.float()`` on the logits before
+      ``cross_entropy``, so logits and loss are fp32 under ddp *and* hsdp.
+    - The gradient reduction is fp32 here (see above), i.e. *more* precise than
+      Accelerate's own FSDP2 default.
+
+    Forcing parity would mean either ``output_dtype=float32`` (an fp32 upcast of the
+    activations at every FSDP module boundary -- real memory and bandwidth cost, and it
+    still would not restore autocast's per-op fp32 for normalizations, so it buys the cost
+    without the property) or stacking autocast on top of the policy (double casting). The
+    param-dtype-only policy is what torchtitan and Accelerate's own FSDP2 path do; a
+    bit-for-bit ddp/hsdp match is not a goal, and a ddp control run is the way to check a
+    real HSDP run's loss curve.
 
     Args:
         mixed_precision: ``cfg.train.mixed_precision``.

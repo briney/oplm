@@ -30,7 +30,14 @@ import sys
 from pathlib import Path
 
 
-def main(run_dir: str, train_data: str, out_dir: str, max_steps: int, auto_resume: bool) -> None:
+def main(
+    run_dir: str,
+    train_data: str,
+    out_dir: str,
+    max_steps: int,
+    auto_resume: bool,
+    mixed_precision: str,
+) -> None:
     """Train ``max_steps`` steps under HSDP on 2 ranks and commit one checkpoint.
 
     Args:
@@ -42,6 +49,9 @@ def main(run_dir: str, train_data: str, out_dir: str, max_steps: int, auto_resum
             save).
         auto_resume: ``cfg.train.auto_resume`` -- ``True`` for the second launch, which
             must pick up the first launch's committed checkpoint.
+        mixed_precision: ``cfg.train.mixed_precision`` -- ``"bf16"`` exercises
+            ``MixedPrecisionPolicy`` (the production default), ``"no"`` exercises
+            ``fully_shard``'s default policy.
     """
     from torch.distributed.tensor import DTensor
 
@@ -56,6 +66,7 @@ def main(run_dir: str, train_data: str, out_dir: str, max_steps: int, auto_resum
         auto_resume=auto_resume,
         log_every=1,
         parallelism="hsdp",
+        mixed_precision=mixed_precision,
         gradient_accumulation_steps=2,
         gradient_checkpointing=True,
         max_grad_norm=1.0,
@@ -96,9 +107,35 @@ def main(run_dir: str, train_data: str, out_dir: str, max_steps: int, auto_resum
         "mesh_shape": mesh_shape,
         "mesh_dim_names": mesh_dim_names,
         "placements": placements,
+        "master_weight_dtype": str(weight.dtype),
+        "mp_param_dtype": _fsdp_param_dtype(unwrapped),
     }
     Path(out_dir, f"rank{rank}.json").write_text(json.dumps(payload))
 
 
+def _fsdp_param_dtype(model: object) -> str | None:
+    """Return the compute dtype ``fully_shard`` was given, as a string, or ``None``.
+
+    Reaches into FSDP2's private state (``_get_fsdp_state()._mp_policy``) on purpose: it is
+    the only way to prove from the outside that ``MixedPrecisionPolicy`` was actually
+    attached, rather than that a ``mixed_precision="bf16"`` config was silently ignored --
+    which is exactly the regression the bf16 parametrization exists to catch. Returns
+    ``None`` when no policy dtype is set (``mixed_precision="no"``) *or* when the private
+    path disappears; the parent test asserts an exact expected value per parametrization,
+    so a torch rename surfaces as a loud failure rather than a silently weakened test.
+    """
+    state = getattr(model, "_get_fsdp_state", None)
+    policy = getattr(state(), "_mp_policy", None) if callable(state) else None
+    param_dtype = getattr(policy, "param_dtype", None)
+    return str(param_dtype) if param_dtype is not None else None
+
+
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5] == "true")
+    main(
+        sys.argv[1],
+        sys.argv[2],
+        sys.argv[3],
+        int(sys.argv[4]),
+        sys.argv[5] == "true",
+        sys.argv[6],
+    )

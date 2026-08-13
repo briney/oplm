@@ -111,9 +111,17 @@ def _gather_hf_state_dict(model: torch.nn.Module, cfg: OplmConfig) -> dict[str, 
 
     **Collective:** ``get_model_state_dict(full_state_dict=True)`` communicates across
     ranks, so every rank must call this -- callers must keep it outside any
-    ``is_main_process`` branch. ``cpu_offload=True`` keeps the gathered copy off the
-    accelerator, so the transient cost is host memory for one full replica, not device
-    memory (the same amount ``save_pretrained`` already materializes on the DDP path).
+    ``is_main_process`` branch. With ``cpu_offload=True`` and a live process group, DCP
+    gathers ``ranks_only=(0,)``: only rank 0 receives the populated dict (on host memory),
+    and every other rank gets an empty one. That matches how the caller uses it -- the
+    ``hf/`` export is written on the main process only -- and means the extra host-memory
+    cost is one full replica on rank 0, not one per rank.
+
+    **Cost at scale:** this is a synchronous all-gather of the entire model, so on the
+    async-save path it stalls training for its duration even though the DCP write itself is
+    backgrounded. That is the price of keeping the ``hf/`` export on every checkpoint;
+    decoupling the export's cadence from the checkpoint cadence (or writing it from the
+    already-committed DCP shards offline) is ledgered follow-up work, not this task.
 
     The gate is ``cfg.train.parallelism``, not an inspection of the model: config is
     rank-identical by construction, so every rank makes the same call/skip decision
@@ -124,9 +132,11 @@ def _gather_hf_state_dict(model: torch.nn.Module, cfg: OplmConfig) -> dict[str, 
         cfg: The live config, read only for ``train.parallelism``.
 
     Returns:
-        The gathered full state dict when the model is FSDP2-sharded, else ``None``,
-        meaning "let ``save_pretrained`` use the module's own state dict" -- the exact
-        pre-Task-5.1 behavior for every DDP run.
+        ``None`` on the DDP path, meaning "let ``save_pretrained`` use the module's own
+        state dict" -- the exact pre-Task-5.1 behavior. Under HSDP, a dict: fully populated
+        with gathered full tensors on rank 0, and empty on every other rank (see the
+        collective note above), so only the main process's copy is ever usable -- which is
+        exactly where ``save_checkpoint`` consumes it.
     """
     if cfg.train.parallelism != "hsdp":
         return None
@@ -510,6 +520,9 @@ def save_checkpoint(
     #     save -- including DCP's own collectives -- on a background thread over this same
     #     process group, so a collective issued here afterward could interleave with it
     #     and mismatch across ranks.
+    # Being synchronous, it also stalls training for the length of a full-model all-gather
+    # even on the async path (see _gather_hf_state_dict); decoupling the hf/ export cadence
+    # from the checkpoint cadence is ledgered follow-up work.
     # None on the DDP path, where save_pretrained's own state_dict() is already plain and
     # complete (byte-identical behavior to before Task 5.1).
     hf_state_dict = _gather_hf_state_dict(model, cfg)

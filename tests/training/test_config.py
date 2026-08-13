@@ -595,6 +595,44 @@ def test_parallelism_hsdp_allows_grad_norm_only_diagnostics() -> None:
     assert cfg.stability_diagnostics is True
 
 
+def test_parallelism_hsdp_rejects_configured_eval() -> None:
+    """``hsdp`` + any eval dataset raises: in-loop eval deadlocks under FSDP2.
+
+    Eval tasks stripe their forwards across ranks, so ranks issue different numbers of
+    all-gathers and the group wedges (reproduced in review) -- a hang, which is far worse
+    than a clean refusal.
+    """
+    from oplm.config import OplmConfig, validate_parallelism_compat
+
+    cfg = OplmConfig(
+        train=TrainConfig(parallelism="hsdp"),
+        data=DataConfig(eval={"proteingym": "some/path.parquet"}),
+    )
+    with pytest.raises(ValueError, match="data.eval"):
+        validate_parallelism_compat(cfg)
+
+
+def test_parallelism_hsdp_without_eval_is_accepted() -> None:
+    """The guard is scoped to configured eval; a plain hsdp training config passes."""
+    from oplm.config import OplmConfig, validate_parallelism_compat
+
+    validate_parallelism_compat(
+        OplmConfig(train=TrainConfig(parallelism="hsdp"), data=DataConfig(eval=None))
+    )
+
+
+def test_parallelism_ddp_with_eval_is_accepted() -> None:
+    """The guard must not touch the default ddp path, which evaluates in-loop normally."""
+    from oplm.config import OplmConfig, validate_parallelism_compat
+
+    validate_parallelism_compat(
+        OplmConfig(
+            train=TrainConfig(parallelism="ddp"),
+            data=DataConfig(eval={"proteingym": "some/path.parquet"}),
+        )
+    )
+
+
 def test_parallelism_roundtrips_through_load_config(tmp_path: "Path") -> None:
     """``train.parallelism`` survives a serialize_config -> load_config round trip."""
     cfg = load_config(["train.parallelism=hsdp"])

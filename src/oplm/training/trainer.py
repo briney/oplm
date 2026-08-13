@@ -191,6 +191,7 @@ class Trainer:
         from accelerate.utils import DataLoaderConfiguration, InitProcessGroupKwargs, set_seed
         from rich.console import Console
 
+        from oplm.config import validate_parallelism_compat
         from oplm.data import DeviceDataLoader, build_train_dataloader
         from oplm.model import OplmForMaskedLM
         from oplm.training.flops import estimate_flops_per_token
@@ -199,6 +200,12 @@ class Trainer:
 
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
+
+        # Cross-section config guard (Task 5.1), first thing and before any process-group
+        # work: a config built directly (tests, sweeps, notebooks) never went through
+        # load_config's copy of this check. Currently refuses hsdp + configured eval --
+        # see validate_parallelism_compat for the deadlock it prevents.
+        validate_parallelism_compat(cfg)
 
         # Drain trigger (Task 1.5): SIGUSR1/SIGTERM handlers plus the Slurm
         # SLURM_JOB_END_TIME wall-clock margin. Installed immediately so a signal

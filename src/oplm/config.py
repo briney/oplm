@@ -443,6 +443,44 @@ class OplmConfig:
     data: DataConfig = field(default_factory=DataConfig)
 
 
+def validate_parallelism_compat(cfg: OplmConfig) -> None:
+    """Reject cross-section config combinations that would deadlock under HSDP.
+
+    ``TrainConfig.__post_init__`` validates everything inside ``train.*``; this covers the
+    one incompatibility that spans sections, so it needs both ``cfg.train`` and
+    ``cfg.data``. Called from :func:`load_config` (so a CLI/YAML mistake fails at parse
+    time) and again at the top of ``Trainer.__init__`` (so a directly-constructed config --
+    tests, sweeps, notebooks -- cannot bypass it). Idempotent and pure; no collectives, and
+    its inputs are rank-identical, so every rank raises identically.
+
+    **Eval under HSDP deadlocks.** ``fully_shard`` mutates the module in place, so
+    ``accelerator.unwrap_model`` hands the evaluator the ``FSDPModule`` itself, and every
+    eval forward all-gathers sharded parameters. The eval tasks stripe their work across
+    ranks (``[rank::world_size]``), so ranks run *different numbers* of forwards -- the
+    ranks that finish early never issue the matching all-gathers and the group wedges until
+    ``dist_timeout_minutes``, then crash-loops through the requeue. Making eval
+    HSDP-safe (rank-padded forward counts, or gathering the model once into an unsharded
+    eval copy) is follow-up work; until then this refuses the combination up front rather
+    than letting a multi-node run hang at its first eval.
+
+    Args:
+        cfg: The fully resolved root config.
+
+    Raises:
+        ValueError: ``train.parallelism="hsdp"`` with any eval dataset configured.
+    """
+    if cfg.train.parallelism == "hsdp" and cfg.data.eval is not None:
+        raise ValueError(
+            "train.parallelism='hsdp' is incompatible with configured eval datasets "
+            "(data.eval): eval tasks stripe their forwards across ranks, but under FSDP2 "
+            "every forward all-gathers sharded parameters -- ranks with fewer forwards "
+            "stop issuing all-gathers and the whole group hangs until dist_timeout_minutes. "
+            "Run eval as a separate ddp job against the checkpoint, or set "
+            "train.parallelism='ddp'. See oplm.training.parallel for the limitation and "
+            "the planned fix."
+        )
+
+
 def get_preset_config(preset: str) -> DictConfig:
     """Load a model size preset by name.
 
@@ -653,6 +691,10 @@ def load_config(argv: list[str]) -> OplmConfig:
                 f"model.max_position_embeddings ({max_pos}); "
                 f"{max_pos} % {ptm} = {max_pos % ptm}"
             )
+
+    # Cross-section compatibility (train.parallelism vs data.eval); also re-checked at
+    # Trainer.__init__ for configs built without load_config.
+    validate_parallelism_compat(cfg)
 
     cfg.train.config_path = config_path
 

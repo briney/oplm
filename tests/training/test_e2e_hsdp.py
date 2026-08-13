@@ -53,7 +53,13 @@ def _child_env() -> dict[str, str]:
 
 
 def _run_hsdp_pilot(
-    run_dir: Path, training_parquet: Path, out_dir: Path, *, max_steps: int, auto_resume: bool
+    run_dir: Path,
+    training_parquet: Path,
+    out_dir: Path,
+    *,
+    max_steps: int,
+    auto_resume: bool,
+    mixed_precision: str,
 ) -> list[dict[str, object]]:
     """Launch the 2-rank HSDP worker and return both ranks' recorded payloads."""
     worker = Path(__file__).with_name("_hsdp_worker.py")
@@ -71,6 +77,7 @@ def _run_hsdp_pilot(
             str(out_dir),
             str(max_steps),
             "true" if auto_resume else "false",
+            mixed_precision,
         ],
         check=True,
         timeout=600,
@@ -79,8 +86,12 @@ def _run_hsdp_pilot(
     return [json.loads((out_dir / f"rank{rank}.json").read_text()) for rank in (0, 1)]
 
 
+@pytest.mark.parametrize("mixed_precision", ["no", "bf16"])
 def test_hsdp_pilot_trains_resumes_and_its_checkpoint_loads_under_ddp(
-    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mixed_precision: str,
+    training_parquet: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A 2-rank HSDP run trains, auto-resumes itself, and hands its checkpoint to ddp.
 
@@ -103,6 +114,14 @@ def test_hsdp_pilot_trains_resumes_and_its_checkpoint_loads_under_ddp(
     exactly as the Phase-3 cursor layout guard demands -- the *parallelism* change is
     irrelevant to data striping (``ShardedProteinDataset`` stripes by rank count, which
     HSDP does not alter), only the world-size change is.
+
+    Parametrized over ``mixed_precision``: ``"no"`` (pure fp32) and ``"bf16"``, which is
+    the production default and therefore the configuration a real HSDP run will actually
+    use -- it exercises ``MixedPrecisionPolicy`` (bf16 all-gather, fp32 reduce-scatter)
+    rather than ``fully_shard``'s default policy. Phase 3 deliberately resumes in fp32
+    regardless: the checkpoint stores fp32 master weights either way, so the bit-exact
+    weight comparison also proves an HSDP-bf16 checkpoint restores exactly into an fp32
+    DDP run.
     """
     from oplm.training.trainer import Trainer
 
@@ -113,7 +132,12 @@ def test_hsdp_pilot_trains_resumes_and_its_checkpoint_loads_under_ddp(
 
     # Phase 1: fresh 2-rank HSDP run.
     results = _run_hsdp_pilot(
-        run_dir, training_parquet, out_dir, max_steps=_HSDP_STEPS, auto_resume=False
+        run_dir,
+        training_parquet,
+        out_dir,
+        max_steps=_HSDP_STEPS,
+        auto_resume=False,
+        mixed_precision=mixed_precision,
     )
     for result in results:
         assert result["resumed_from_step"] == 0
@@ -122,6 +146,11 @@ def test_hsdp_pilot_trains_resumes_and_its_checkpoint_loads_under_ddp(
         assert result["mesh_shape"] == [1, 2]
         assert result["mesh_dim_names"] == ["replicate", "shard"]
         assert result["placements"] == ["Replicate", "Shard"]
+        # The MixedPrecisionPolicy really reached fully_shard (bf16 compute dtype), and
+        # the sharded parameters themselves stay fp32 master weights either way.
+        expected_param_dtype = "torch.bfloat16" if mixed_precision == "bf16" else None
+        assert result["mp_param_dtype"] == expected_param_dtype
+        assert result["master_weight_dtype"] == "torch.float32"
 
     committed = run_dir / f"checkpoint-{_HSDP_STEPS}"
     assert committed.is_dir()
@@ -134,7 +163,12 @@ def test_hsdp_pilot_trains_resumes_and_its_checkpoint_loads_under_ddp(
 
     # Phase 2: same topology, auto-resume, train to _HSDP_RESUME_STEPS.
     results = _run_hsdp_pilot(
-        run_dir, training_parquet, out_dir, max_steps=_HSDP_RESUME_STEPS, auto_resume=True
+        run_dir,
+        training_parquet,
+        out_dir,
+        max_steps=_HSDP_RESUME_STEPS,
+        auto_resume=True,
+        mixed_precision=mixed_precision,
     )
     for result in results:
         assert result["resumed_from_step"] == _HSDP_STEPS
@@ -178,6 +212,29 @@ def test_hsdp_pilot_trains_resumes_and_its_checkpoint_loads_under_ddp(
 
     resumed.train()
     assert resumed.global_step == _DDP_RESUME_STEPS
+
+
+def test_hsdp_with_configured_eval_refuses_at_trainer_init(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The eval-deadlock guard is wired into ``Trainer.__init__``, not only ``load_config``.
+
+    A config built directly (tests, sweeps, notebooks) never passes through
+    ``load_config``, so the trainer re-checks it -- before the Accelerator exists, so the
+    refusal costs nothing and cannot itself desynchronize ranks.
+    """
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=1,
+        parallelism="hsdp",
+        eval={"heldout": str(training_parquet)},
+    )
+    with pytest.raises(ValueError, match="data.eval"):
+        Trainer(cfg, callbacks=[])
 
 
 def test_hsdp_on_a_single_process_refuses_with_an_actionable_error(
