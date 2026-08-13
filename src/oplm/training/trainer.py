@@ -449,18 +449,6 @@ class Trainer:
                     drain=self._drain_signal.requested,
                     save_due=self._save_timer_due(),
                 )
-
-                # Drain takes priority over everything else this step: check it before
-                # eval or periodic-save decisions so a drain never starts a long eval.
-                if flags.drain:
-                    self._save_checkpoint()
-                    logger.warning(
-                        "Drain requested: checkpoint saved at step %d; exiting %d",
-                        self.global_step,
-                        DRAIN_EXIT_CODE,
-                    )
-                    raise SystemExit(DRAIN_EXIT_CODE)
-
                 tokens_delta = flags.tokens_delta
                 self.tokens_seen += tokens_delta
 
@@ -473,6 +461,20 @@ class Trainer:
                     self._tput_window_seconds += now - self._step_timer_start
                     self._tput_window_tokens += tokens_delta
                     self._tput_window_steps += 1
+
+                # Drain takes priority over logging/eval/periodic-save: this step's
+                # bookkeeping (tokens_seen, throughput window) is already complete above,
+                # so the checkpoint below carries tokens_seen consistent with global_step
+                # across a drain+resume -- but we still check before eval so a drain never
+                # starts a long eval.
+                if flags.drain:
+                    self._save_checkpoint()
+                    logger.warning(
+                        "Drain requested: checkpoint saved at step %d; exiting %d",
+                        self.global_step,
+                        DRAIN_EXIT_CODE,
+                    )
+                    raise SystemExit(DRAIN_EXIT_CODE)
 
                 # Logging
                 if self.global_step % cfg.log_every == 0:
