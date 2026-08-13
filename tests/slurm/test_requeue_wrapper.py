@@ -50,9 +50,17 @@ def _run_wrapper(
 ) -> subprocess.CompletedProcess[str]:
     """Render the wrapper, prepend `preamble` (sets `$?` for `STATUS=$?`), and run it.
 
+    Runs under exactly the production shell options: the real script has `set -euo pipefail`
+    active from the top, then `set +e` right before the srun (so a nonzero training exit
+    doesn't immediately kill the script) -- `set -e`/`set +e` toggle `errexit` only, they never
+    touch `pipefail`, which stays on the whole time. A harness that dropped `set -euo pipefail`
+    (as an earlier version of this file did) cannot catch pipefail-only bugs in the wrapper's
+    command substitutions -- see `CURRENT_STEP=$(... || true)` in `render.py`.
+
     Args:
-        preamble: A shell snippet run immediately before the wrapper, whose exit status the
-            wrapper's `STATUS=$?` captures (e.g. `"true"`, `"false"`, `"(exit 85)"`).
+        preamble: A shell snippet run immediately before the wrapper (under `set +e`, matching
+            where the real srun runs), whose exit status the wrapper's `STATUS=$?` captures
+            (e.g. `"true"`, `"false"`, `"(exit 85)"`).
         progress_dir: Passed straight through to the rendered `JobSpec`.
         restarts: Value for `SLURM_RESTART_COUNT`; omitted (unset) when `None`.
         scontrol_log: Where the stub `scontrol` records its argv; defaults to a fresh file.
@@ -66,7 +74,9 @@ def _run_wrapper(
         f'#!/bin/bash\necho "$@" >> "{scontrol_log}"\n',
     )
     script = tmp_path / "wrapper.sh"
-    script.write_text(f"{preamble}\n{_wrapper_text(progress_dir=progress_dir)}\n")
+    script.write_text(
+        f"set -euo pipefail\nset +e\n{preamble}\n{_wrapper_text(progress_dir=progress_dir)}\n"
+    )
     env = dict(os.environ)
     env["SLURM_JOB_ID"] = job_id
     if restarts is not None:
@@ -98,6 +108,24 @@ def test_exit_zero_reports_complete_and_does_not_requeue(
 
 
 # --- case 2: exit 85 -> requeue even at high restart count below budget -----------------
+
+
+def test_drain_exit_at_budget_cap_does_not_requeue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 85 bypasses the no-progress guard, but never the budget cap itself."""
+    log = tmp_path / "scontrol.log"
+    result = _run_wrapper(
+        tmp_path,
+        monkeypatch,
+        preamble="(exit 85)",
+        progress_dir=None,
+        restarts=20,
+        scontrol_log=log,
+    )
+    assert result.returncode == 85
+    assert "requeue budget (20) exhausted" in result.stderr
+    assert not log.exists() or log.read_text() == ""
 
 
 def test_drain_exit_requeues_even_with_stale_step(
@@ -211,6 +239,38 @@ def test_budget_exhausted_exits_without_requeueing(
     assert result.returncode == 1
     assert "requeue budget (20) exhausted" in result.stderr
     assert not log.exists() or log.read_text() == ""
+
+
+# --- regression: no checkpoint has ever been committed (a job's first restart cycle) ----
+
+
+def test_empty_progress_dir_still_requeues(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pre-checkpoint-1 case: `ls checkpoint-*` matches nothing at all.
+
+    Under the script's top-level `set -o pipefail`, `ls`'s nonzero exit (no match) and
+    `grep`'s nonzero exit (no numeric line) both propagate into the `CURRENT_STEP=$(...)`
+    assignment; without a fix, `set -e` aborts the whole wrapper right there -- no stdout, no
+    `STEP_FILE`, no `scontrol requeue` -- instead of falling through to `CURRENT_STEP=0`. This
+    is the most common real case: every job hits it on its first restart, before checkpoint 1
+    exists.
+    """
+    progress_dir = tmp_path / "output"
+    progress_dir.mkdir()
+    log = tmp_path / "scontrol.log"
+
+    result = _run_wrapper(
+        tmp_path,
+        monkeypatch,
+        preamble="false",
+        progress_dir=str(progress_dir),
+        restarts=0,
+        scontrol_log=log,
+    )
+    assert result.returncode == 0
+    assert "requeueing" in result.stdout
+    assert "step=0" in result.stdout
+    assert log.read_text().strip() == "requeue 424242"
+    assert (progress_dir / ".last_requeue_step").read_text().strip() == "0"
 
 
 # --- case 6 / committed-only property: .tmp and .old dirs are not committed steps -------

@@ -200,8 +200,16 @@ def _requeue_wrapper(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
     if spec.progress_dir is not None:
         lines += [
             f'STEP_FILE="{spec.progress_dir}/.last_requeue_step"',
+            # `|| true` guards the whole pipeline, not just `grep`: under the script's
+            # top-level `set -o pipefail`, `ls` finding no `checkpoint-*` match (the common
+            # case on a job's first restart, before any checkpoint is committed) and `grep`
+            # finding no numeric line (a `.tmp`/`.old`-only dir) both exit nonzero, and
+            # pipefail propagates the rightmost failure into this assignment. Without `||
+            # true`, `set -e` would abort the whole script right here -- silently, with no
+            # STEP_FILE write and no `scontrol requeue` -- instead of falling through to the
+            # `CURRENT_STEP=${CURRENT_STEP:-0}` default below.
             f'CURRENT_STEP=$(ls -d "{spec.progress_dir}"/checkpoint-* 2>/dev/null \\',
-            "  | sed 's/.*checkpoint-//' | grep -E '^[0-9]+$' | sort -n | tail -1)",
+            "  | sed 's/.*checkpoint-//' | grep -E '^[0-9]+$' | sort -n | tail -1 || true)",
             "CURRENT_STEP=${CURRENT_STEP:-0}",
             'if [ "$STATUS" -ne 85 ] && [ "$RESTARTS" -ge 1 ]; then',
             '  PREV_STEP=$(cat "$STEP_FILE" 2>/dev/null || echo -1)',
