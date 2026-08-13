@@ -16,8 +16,8 @@ integration stays thin (per-checkpoint calls, no threading/collective details):
 
 - :func:`build_upload_group` -- a dedicated GLOO subgroup of this run's node
   leaders (``accelerator.local_process_index == 0``), created once at trainer
-  init. The background upload thread barriers on this group, never on the
-  trainer's own (typically NCCL) default process group.
+  init. The background upload thread's collectives run on this group, never on
+  the trainer's own (typically NCCL) default process group.
 - :func:`build_upload_job` -- partitions a committed checkpoint directory's files
   into the files *this node's* ranks wrote (DCP shard files are named
   ``__<rank>_<n>.distcp``; each rank also has its own ``rng_state_<rank>.pt``) plus,
@@ -25,9 +25,10 @@ integration stays thin (per-checkpoint calls, no threading/collective details):
   ``config.yaml``, ``scaler.pt``, ``KEEP``, ``hf/``).
 - :class:`UploadManager` -- serializes uploads to a single background daemon
   thread (one in flight; a new commit while uploading replaces at most one queued
-  job, dropping the superseded one), barriers node leaders once their local upload
-  lands, and -- on the global leader only -- finalizes and rotates the remote
-  manifest.
+  job, dropping the superseded one), cross-checks every node leader's job
+  identity (not a bare barrier -- see :meth:`UploadManager._upload_one`'s
+  docstring) once their local upload lands, and -- on the global leader only,
+  and only if every leader agreed -- finalizes and rotates the remote manifest.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ from typing import TYPE_CHECKING, Any
 from fsspec.core import url_to_fs
 
 if TYPE_CHECKING:
+    from datetime import timedelta
+
     from accelerate import Accelerator
     from fsspec.spec import AbstractFileSystem
     from torch.distributed import ProcessGroup
@@ -326,7 +329,9 @@ class RemoteStore:
             self._fs.rm(remote_dir, recursive=True)
 
 
-def build_upload_group(accelerator: Accelerator) -> ProcessGroup | None:
+def build_upload_group(
+    accelerator: Accelerator, *, timeout: timedelta | None = None
+) -> ProcessGroup | None:
     """Create a dedicated GLOO subgroup of this run's node leaders (local rank 0).
 
     Must be called collectively, exactly once, by **every** rank in the default
@@ -337,14 +342,31 @@ def build_upload_group(accelerator: Accelerator) -> ProcessGroup | None:
     caller (``Trainer.__init__``) is responsible for reaching it identically on
     every rank whenever a remote URI is configured.
 
-    This group exists so :class:`UploadManager`'s background-thread barrier never
-    touches the trainer's own default process group -- typically NCCL, which is not
-    safe to drive collectives on from a thread other than the one owning the
+    This group exists so :class:`UploadManager`'s background-thread collectives
+    never touch the trainer's own default process group -- typically NCCL, which is
+    not safe to drive collectives on from a thread other than the one owning the
     training loop. GLOO has no such restriction.
+
+    Also verifies (once, here, collectively -- not per-checkpoint) that the
+    contiguous-per-node rank layout :func:`build_upload_job` assumes actually holds:
+    ``_local_world_size(accelerator) * <number of node leaders> == accelerator.
+    num_processes``. A mismatch means either ``LOCAL_WORLD_SIZE`` disagrees with the
+    real topology or ranks aren't laid out contiguously per node -- either way,
+    :func:`build_upload_job`'s per-node file partitioning would silently misattribute
+    files, so this raises loudly instead, identically on every rank (the inputs to
+    the check are rank-identical after the gather below), before any checkpoint
+    upload ever runs.
 
     Args:
         accelerator: The trainer's Accelerator, called right after it is
             constructed and before any checkpoint save.
+        timeout: Passed to ``torch.distributed.new_group`` so a genuinely stuck
+            collective on this group fails attributably within this bound instead
+            of waiting on GLOO's own (unrelated) default timeout. ``None`` leaves
+            the torch default. Callers should pass
+            ``timedelta(minutes=cfg.train.dist_timeout_minutes)`` to match the
+            trainer's own default process group timeout
+            (``InitProcessGroupKwargs``).
 
     Returns:
         The new GLOO ``ProcessGroup`` for a node-leader rank (``local_process_index
@@ -353,6 +375,11 @@ def build_upload_group(accelerator: Accelerator) -> ProcessGroup | None:
         :class:`UploadManager` from a non-leader rank's return value, only leader
         ranks do; or ``None`` when there is no process group at all (a
         single-process run), which callers must treat as "no barrier needed".
+
+    Raises:
+        RuntimeError: The gathered node-leader count is inconsistent with
+            ``_local_world_size(accelerator)`` and ``accelerator.num_processes`` --
+            see above.
     """
     import torch.distributed as dist
 
@@ -362,7 +389,23 @@ def build_upload_group(accelerator: Accelerator) -> ProcessGroup | None:
     local_ranks: list[int | None] = [None] * accelerator.num_processes
     dist.all_gather_object(local_ranks, accelerator.local_process_index)
     leader_ranks = sorted(rank for rank, local_rank in enumerate(local_ranks) if local_rank == 0)
-    return dist.new_group(ranks=leader_ranks, backend="gloo")
+
+    local_world_size = _local_world_size(accelerator)
+    num_nodes = len(leader_ranks)
+    if local_world_size * num_nodes != accelerator.num_processes:
+        raise RuntimeError(
+            f"Inconsistent node topology for remote checkpoint upload: "
+            f"LOCAL_WORLD_SIZE-derived local_world_size={local_world_size} * "
+            f"observed node-leader count={num_nodes} != "
+            f"accelerator.num_processes={accelerator.num_processes}. This means either "
+            f"LOCAL_WORLD_SIZE disagrees with the real per-node rank count, or ranks "
+            f"are not laid out contiguously per node -- build_upload_job's per-node "
+            f"file partitioning assumes both. Fix the launcher's LOCAL_WORLD_SIZE, or "
+            f"disable train.remote_checkpoint_uri for this topology."
+        )
+
+    kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+    return dist.new_group(ranks=leader_ranks, backend="gloo", **kwargs)
 
 
 @dataclass(frozen=True)
@@ -520,17 +563,33 @@ class UploadManager:
     Each call to :meth:`submit` uploads ``job.files`` (this node's own shard files)
     and, when ``job.shared_files`` is not ``None`` (the global leader only), the
     shared artifacts too -- then, if this manager was built with an
-    ``upload_group`` (multi-node), barriers on it so no leader finalizes before
-    every node's upload has landed. Only the global leader
-    (``accelerator.is_main_process`` at construction time) then calls
-    ``store.finalize`` and ``store.rotate``. This is exactly the ordering
-    ``RemoteStore.finalize``'s hard precondition requires: finalize only after
-    every writer's files are confirmed uploaded.
+    ``upload_group`` (multi-node), exchanges each node leader's job identity via
+    ``all_gather_object`` over that group so every leader can confirm every other
+    leader just finished uploading the *same* checkpoint before anyone finalizes
+    (see :meth:`_upload_one`'s docstring for why a bare barrier is not enough: it
+    pairs calls by order, not identity, and per-node drop-oldest queuing can
+    desynchronize which checkpoint each node's Nth call is actually about). Only on
+    unanimous agreement does the global leader (``accelerator.is_main_process`` at
+    construction time) call ``store.finalize`` and ``store.rotate``; on any
+    disagreement, finalize/rotate is skipped for that round (logged loudly) rather
+    than ever committing a manifest some node's files never landed for. This is
+    exactly the ordering ``RemoteStore.finalize``'s hard precondition requires:
+    finalize only after every writer's files are confirmed uploaded.
 
     Single-process degradation: ``upload_group=None`` and (necessarily, since
     there is only one process) ``is_global_leader=True`` -- upload, skip the
-    barrier entirely, finalize, rotate; exactly Task 4.1's own direct
-    ``upload_checkpoint(..., write_manifest=True)`` flow.
+    identity check entirely (nothing to check against), finalize, rotate; exactly
+    Task 4.1's own direct ``upload_checkpoint(..., write_manifest=True)`` flow.
+
+    **Known limitation (flagged, not solved by the identity check above):**
+    drop-oldest queuing is independent per node. If commit cadence outpaces upload
+    speed asymmetrically across nodes for long enough, node leaders' *executed*
+    job counts can diverge permanently, at which point every future round's
+    identity check fails and nothing ever finalizes again until the queues
+    happen to realign. The identity check turns that failure mode from "silent,
+    incomplete manifest" into "loud, visible, no manifest" -- a strict
+    improvement -- but does not prevent the underlying desync. A future
+    hardening could coordinate drop decisions globally instead of per-node.
     """
 
     def __init__(
@@ -602,11 +661,40 @@ class UploadManager:
             next_thread.start()
 
     def _upload_one(self, job: UploadJob) -> None:
-        """Upload ``job``'s files, barrier (if configured), then finalize + rotate.
+        """Upload ``job``'s files, cross-check every leader's identity, then finalize + rotate.
 
-        See :meth:`RemoteStore.finalize`'s hard precondition -- finalize only runs
-        after the barrier confirms every node leader's upload for this exact job has
-        landed (or immediately, single-process, where there is nothing to wait for).
+        **Why not a bare barrier (fix for a Critical review finding):** a plain
+        ``dist.barrier()`` pairs calls by ORDER -- the Nth call any leader makes on
+        this group is paired with the Nth call every *other* leader makes, whatever
+        checkpoint each of them actually just finished uploading. Because
+        :meth:`submit`'s drop-oldest queuing is per-node (this node's upload speed
+        decides what it drops, independently of every other node's), two leaders'
+        Nth calls are not guaranteed to be about the *same* checkpoint -- e.g. node A's
+        (N+1)-th call (for checkpoint 200) could pair with node B's (N+1)-th call (for
+        checkpoint 300, because B dropped 200 while A did not). A bare barrier cannot
+        see this: both calls return, rank 0 finalizes whatever job it itself is
+        holding, and the manifest silently omits node A's checkpoint-300 shards (A
+        never uploaded them) while still being marked committed.
+
+        Exchanging each leader's own job identity (``job.local_dir.name``) via
+        ``all_gather_object`` over the SAME group turns that same order-paired call
+        into something verifiable: every leader can see what every other leader
+        actually just uploaded. On any disagreement, finalize/rotate is skipped for
+        this round entirely (logged loudly) rather than ever finalizing a set that no
+        leader can vouch for in full -- the checkpoint simply stays uncommitted
+        remotely, and the next round where every leader's identity agrees commits
+        normally (see :meth:`RemoteStore.finalize`'s hard precondition).
+
+        This gather call is unconditional and sits before any branch that could skip
+        it -- a mismatch detected below only skips *this round's* finalize/rotate,
+        never the gather call itself, and never a future round's processing (handled
+        entirely by :meth:`_run`'s independent pending-job chaining). This keeps the
+        group's collective call count, from this leader's own perspective, advancing
+        by exactly one call per processed (non-dropped) job -- the same as a bare
+        barrier would have -- so this change alone does not introduce any new
+        divergence beyond what per-node drop-oldest queuing can already cause (see
+        the class docstring's "known limitation" note); it only makes an existing
+        divergence observable and safe instead of silent and unsafe.
         """
         self._store.upload_checkpoint(
             job.local_dir, files=job.files, permanent=job.permanent, write_manifest=False
@@ -619,7 +707,20 @@ class UploadManager:
         if self._upload_group is not None:
             import torch.distributed as dist
 
-            dist.barrier(group=self._upload_group)
+            group_size = dist.get_world_size(group=self._upload_group)
+            identities: list[str | None] = [None] * group_size
+            dist.all_gather_object(identities, job.local_dir.name, group=self._upload_group)
+            if len(set(identities)) != 1:
+                logger.error(
+                    "Checkpoint upload round desync: this run's node leaders finished "
+                    "uploading different checkpoints (%s) -- one or more nodes' upload "
+                    "queues have drifted out of step with each other (see UploadManager's "
+                    "docstring). Skipping finalize/rotate for this round rather than "
+                    "committing a manifest some node's files never landed for; a later "
+                    "round where every leader agrees will commit normally.",
+                    sorted(name for name in identities if name is not None),
+                )
+                return
 
         if self._is_global_leader:
             self._store.finalize(job.local_dir.name, permanent=job.permanent)

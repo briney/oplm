@@ -267,7 +267,10 @@ class Trainer:
         if cfg.train.remote_checkpoint_uri is not None:
             from oplm.training.remote import RemoteStore, UploadManager, build_upload_group
 
-            upload_group = build_upload_group(self.accelerator)
+            upload_group = build_upload_group(
+                self.accelerator,
+                timeout=timedelta(minutes=cfg.train.dist_timeout_minutes),
+            )
             if self.accelerator.local_process_index == 0:
                 self._remote_upload_manager = UploadManager(
                     RemoteStore(cfg.train.remote_checkpoint_uri),

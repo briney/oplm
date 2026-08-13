@@ -21,7 +21,10 @@ and an unset URI is a total no-op (the zero-behavior-change contract).
 from __future__ import annotations
 
 import json
+import logging
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -391,6 +394,49 @@ def test_upload_manager_drain_bounded_by_timeout(tmp_path: Path) -> None:
     assert store.uploaded == ["checkpoint-1"]
 
 
+def test_upload_manager_skips_finalize_on_identity_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A desynced round (leaders finished uploading DIFFERENT checkpoints) never finalizes.
+
+    Critical review fix: a bare ``dist.barrier()`` pairs calls by ORDER, not identity --
+    two node leaders' independently-drop-oldest-queued uploads can land on the same
+    barrier call while actually being about different checkpoints, and the barrier alone
+    gives no way to detect that. This fakes the multi-node collective (``get_world_size``/
+    ``all_gather_object`` on ``torch.distributed``, patched regardless of the -- here,
+    inert -- ``upload_group`` sentinel passed in) so the gather comes back reporting two
+    different checkpoint names, simulating exactly that desync. ``UploadManager`` must
+    detect the disagreement, log it, and skip finalize/rotate for that round entirely.
+    """
+    import torch.distributed as dist
+
+    from oplm.training.remote import UploadManager
+
+    def _fake_get_world_size(group: object) -> int:
+        return 2
+
+    def _fake_all_gather_object(out_list: list[Any], obj: Any, group: object) -> None:
+        # This leader's own identity, plus a peer that finished a DIFFERENT (later)
+        # checkpoint -- the exact desync scenario a bare barrier can't detect.
+        out_list[0] = obj
+        out_list[1] = "checkpoint-999"
+
+    monkeypatch.setattr(dist, "get_world_size", _fake_get_world_size)
+    monkeypatch.setattr(dist, "all_gather_object", _fake_all_gather_object)
+
+    store = _SlowFakeStore(sleep_seconds=0.0)
+    manager = UploadManager(store, _FakeAccelerator(), upload_group=object())
+
+    with caplog.at_level(logging.ERROR, logger="oplm.training.remote"):
+        manager.submit(_job(tmp_path / "checkpoint-100"))
+        manager.drain(timeout=5.0)
+
+    assert store.uploaded == ["checkpoint-100"]  # the upload itself still happened
+    assert store.finalized == []  # but finalize/rotate never ran on the mismatch
+    assert store.rotated == []
+    assert any("desync" in record.getMessage() for record in caplog.records)
+
+
 def test_remote_rotation_via_upload_manager_honors_keep_every_n_steps(tmp_path: Path) -> None:
     """The UploadManager finalize -> rotate tail (Task 4.2) honors ``keep_every_n_steps``.
 
@@ -434,6 +480,58 @@ def test_remote_rotation_via_upload_manager_honors_keep_every_n_steps(tmp_path: 
     # set is already just {6}, well within the limit, so nothing more is removed.
     # checkpoint-4 and checkpoint-8 are permanent (keep_every_n_steps=4 boundary).
     assert remote_names == ["checkpoint-4", "checkpoint-6", "checkpoint-8"]
+
+
+@pytest.mark.slow
+def test_two_node_leaders_upload_through_the_real_collective_path(tmp_path: Path) -> None:
+    """2 real CPU/gloo processes, real ``build_upload_group``/``UploadManager`` collectives.
+
+    Important review fix: the identity-mismatch unit test above fakes
+    ``torch.distributed`` entirely; this test instead launches
+    ``_upload_manager_worker.py`` under ``torch.distributed.run --nproc_per_node=2``
+    (mirroring ``tests/training/test_resume_target_broadcast.py``'s worker pattern) so
+    ``build_upload_group``'s real ``all_gather_object``/``new_group`` calls and
+    ``UploadManager``'s real ``get_world_size``/``all_gather_object`` identity-check
+    gather all run over a genuine 2-process GLOO process group -- not fakes. Both
+    ranks simulate being node leaders (see the worker's docstring for why a literal
+    ``--nproc_per_node=2`` topology needs help to produce two leaders) and each
+    uploads its own DCP shard file; the resulting remote manifest must contain both
+    ranks' files plus rank 0's shared artifacts -- proof the real collective path
+    does not drop or duplicate a node's files.
+    """
+    worker = Path(__file__).with_name("_upload_manager_worker.py")
+    remote_root = tmp_path / "remote"
+    checkpoint_dir = tmp_path / "local" / "checkpoint-100"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node=2",
+            "--rdzv_backend=c10d",
+            "--rdzv_endpoint=localhost:0",
+            str(worker),
+            f"file://{remote_root}",
+            str(checkpoint_dir),
+            str(out_dir),
+        ],
+        check=True,
+        timeout=300,
+    )
+
+    result = json.loads((out_dir / "result.json").read_text())
+    assert result["name"] == "checkpoint-100"
+    assert result["files"] == [
+        "__0_0.distcp",
+        "__1_0.distcp",
+        "config.yaml",
+        "rng_state_0.pt",
+        "rng_state_1.pt",
+        "trainer_state.json",
+    ]
 
 
 def test_consult_remote_resume_candidate_noop_when_uri_unset(tmp_path: Path) -> None:
