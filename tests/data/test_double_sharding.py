@@ -71,6 +71,7 @@ def _fixture_ids(shard_dir: Path) -> set[str]:
 @pytest.mark.slow
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "Task 0.1 audit: accelerate's IterableDatasetShard re-stripes "
         "ShardedProteinDataset's already rank/worker-striped stream, dropping rows. "
