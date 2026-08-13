@@ -12,7 +12,12 @@ unchanged from Phase 1.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -28,10 +33,9 @@ from oplm.training.checkpoint import (
     save_checkpoint,
 )
 from oplm.training.optim import build_optimizers, build_schedulers
+from tests.training.conftest import configure_accelerator_device, tiny_train_cfg
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from accelerate import Accelerator
 
 pytestmark = pytest.mark.slow
@@ -956,3 +960,141 @@ def test_drain_during_pending_async_save_finalizes_then_takes_blocking_save(
     assert (tmp_path / "checkpoint-3").is_dir()
     assert list(tmp_path.glob("checkpoint-*.tmp")) == []
     assert trainer._pending_save is None
+
+
+# --- Task 2.4: reshard e2e (world-size 2 -> 1) -----------------------------------------
+
+_RESHARD_WORKER_MAX_STEPS = 3
+_RESHARD_RESUME_EXTRA_STEPS = 2
+
+
+def test_dcp_checkpoint_saved_at_world_size_2_resumes_at_world_size_1(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ws=2 pilot's checkpoint loads at ws=1: restored step, weights, and continued training.
+
+    This is the headline resilience property the DCP checkpoint format exists to
+    provide: ``get_state_dict``/``set_state_dict`` make the on-disk format parallelism-
+    and world-size-agnostic, which is what lets a many-node run be inspected, debugged,
+    or resumed at a different world size without a checkpoint format change.
+
+    Phase 1 launches ``tests/training/_reshard_dcp_worker.py`` under
+    ``torch.distributed.run --nproc_per_node=2`` (forced onto CPU via
+    ``ACCELERATE_USE_CPU``/``CUDA_VISIBLE_DEVICES=""``, mirroring
+    ``test_resume_target_broadcast.py``'s subprocess pattern): 2 ranks train 3 steps and
+    commit ``checkpoint-3``. Phase 2 (this process, single rank, also forced onto CPU
+    for a hermetic device match) constructs a fresh ``Trainer`` with ``auto_resume=True``
+    against the same ``run_dir`` and asserts it restores ``global_step == 3`` and the
+    exact ``lm_head.decoder.bias`` values rank 0 saved, then trains 2 more steps to
+    ``global_step == 5`` without error.
+
+    Two documented, deliberately out-of-scope wrinkles:
+
+    - **RNG sidecars are per-rank and asymmetric across this direction.** A checkpoint
+      saved at world size 2 has ``rng_state_0.pt`` and ``rng_state_1.pt``; a
+      world-size-1 resume only ever reads rank 0's sidecar, so this direction (2 -> 1)
+      never hits the missing-sidecar error path. The *reverse* direction (a checkpoint
+      saved at world size 1, resumed at world size 2) would hard-error for rank 1 --
+      ``_restore_rng_sidecar`` raises ``RuntimeError`` unless
+      ``OPLM_ALLOW_MISSING_RNG=1`` is set (see
+      ``test_load_checkpoint_raises_on_missing_rng_sidecar`` above) -- but exercising
+      that direction is out of scope here.
+    - **Data-exactness across the world-size change is not asserted.** The data cursor
+      (Phase 3) does not exist yet, and ``ShardedProteinDataset`` stripes by world size,
+      so the world-size-1 resumed run sees a different data striping than the
+      world-size-2 run did -- it does NOT continue from "the same" data position. That
+      is fine for what this test asserts (state restoration + training continuing
+      without error), but once Phase 3 lands, its data-cursor layout guard will make a
+      world-size change across a resume require ``train.resume_data_position=false``
+      explicitly. That setting is passed on the resume config below now, ahead of
+      Phase 3, so this test does not need updating when the guard lands.
+    """
+    from oplm.training.trainer import Trainer
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    worker = Path(__file__).with_name("_reshard_dcp_worker.py")
+
+    # The worker imports tests.training.conftest (tiny_train_cfg), so the repo root --
+    # not just src/ -- must be on the child's PYTHONPATH; this parent process only
+    # inherits src/ from its own launch env (see the ENV GOTCHA note in the task brief).
+    repo_root = Path(__file__).resolve().parents[2]
+    src_dir = repo_root / "src"
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    child_pythonpath = os.pathsep.join(
+        p for p in (str(repo_root), str(src_dir), existing_pythonpath) if p
+    )
+    env = {
+        **os.environ,
+        "ACCELERATE_USE_CPU": "true",
+        # See test_resume_target_broadcast.py's identical env for why CUDA must be
+        # hidden entirely from the child processes: accelerate's wait_for_everyone
+        # calls torch.distributed.barrier(device_ids=[local_process_index]) even for
+        # a gloo process group, which maps local_process_index onto a CUDA device
+        # ordinal and fails once it exceeds the visible GPU count.
+        "CUDA_VISIBLE_DEVICES": "",
+        "PYTHONPATH": child_pythonpath,
+    }
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node=2",
+            "--rdzv_backend=c10d",
+            "--rdzv_endpoint=localhost:0",
+            str(worker),
+            str(run_dir),
+            str(training_parquet),
+            str(out_dir),
+            str(_RESHARD_WORKER_MAX_STEPS),
+        ],
+        check=True,
+        timeout=300,
+        env=env,
+    )
+
+    committed = run_dir / f"checkpoint-{_RESHARD_WORKER_MAX_STEPS}"
+    assert committed.is_dir()
+    assert (committed / "rng_state_0.pt").exists()
+    assert (committed / "rng_state_1.pt").exists()
+
+    rank0_state = json.loads((out_dir / "rank0.json").read_text())
+    rank1_state = json.loads((out_dir / "rank1.json").read_text())
+    assert rank0_state["global_step"] == rank1_state["global_step"] == _RESHARD_WORKER_MAX_STEPS
+
+    reference_weight = torch.load(out_dir / "reference_weight.pt", weights_only=True)
+
+    # Phase 2: single-process resume, forced onto CPU to match the pilot run's device
+    # (this box may have a GPU; the point of this test is the world-size change, not
+    # an incidental device change stacked on top of it).
+    configure_accelerator_device("cpu", monkeypatch)
+
+    resume_max_steps = _RESHARD_WORKER_MAX_STEPS + _RESHARD_RESUME_EXTRA_STEPS
+    resume_cfg = tiny_train_cfg(
+        run_dir,
+        training_parquet,
+        max_steps=resume_max_steps,
+        save_every=resume_max_steps,
+        auto_resume=True,
+        log_every=1,
+    )
+    # Future-proofing for Phase 3 (data cursor): ShardedProteinDataset stripes by
+    # world size, so this world-size-2-to-1 resume sees different data striping than
+    # the original run -- fine for this test (state restoration is what's asserted,
+    # not data exactness), but once the Phase 3 cursor layout guard lands, a
+    # world-size change across a resume will require this explicitly. The field
+    # exists now (default True, currently unread), so set it ahead of that landing.
+    resume_cfg.train.resume_data_position = False
+
+    resumed = Trainer(resume_cfg, callbacks=[])
+    assert resumed.global_step == _RESHARD_WORKER_MAX_STEPS
+
+    resumed_unwrapped = resumed.accelerator.unwrap_model(resumed.model)
+    resumed_weight = resumed_unwrapped.lm_head.decoder.bias.detach()
+    assert torch.allclose(resumed_weight, reference_weight)
+
+    resumed.train()
+    assert resumed.global_step == resume_max_steps
