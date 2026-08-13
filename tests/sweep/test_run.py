@@ -136,6 +136,12 @@ def test_latest_checkpoint_ignores_non_directory_matches(tmp_path: Path) -> None
 
 # ---------------------------------------------------------------------------
 # main(): auto-resume wiring (heavy imports stubbed out; no real training)
+#
+# The checkpoint scan itself lives in Trainer.__init__ (Task 1.4's single resume code
+# path) -- main() only needs to opt every cell into it by setting auto_resume=True, so
+# these tests assert that wiring rather than the scan (covered by
+# tests/training/test_e2e_checkpoint.py's real end-to-end auto_resume tests, and by
+# test_mup_run_auto_resumes_without_explicit_resume_from below through the real Trainer).
 # ---------------------------------------------------------------------------
 
 
@@ -158,12 +164,12 @@ def _patch_main_dependencies(monkeypatch: pytest.MonkeyPatch, cfg: OplmConfig) -
     monkeypatch.setattr("oplm.training.trainer.Trainer", _RecordingTrainer)
 
 
-def test_main_auto_resumes_from_latest_checkpoint(
+def test_main_sets_auto_resume_and_leaves_resume_from_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Every cell opts into auto_resume; main() no longer scans for a checkpoint itself."""
     output_dir = tmp_path / "cell"
-    (output_dir / "checkpoint-3000").mkdir(parents=True)
-    (output_dir / "checkpoint-9000").mkdir(parents=True)  # numeric max must win
+    (output_dir / "checkpoint-9000").mkdir(parents=True)
 
     cfg = OplmConfig(train=TrainConfig(output_dir=str(output_dir), resume_from=None))
     _patch_main_dependencies(monkeypatch, cfg)
@@ -172,13 +178,15 @@ def test_main_auto_resumes_from_latest_checkpoint(
     config_path.touch()
     run.main(config=config_path, result=tmp_path / "result.json")
 
-    assert cfg.train.resume_from == str(output_dir / "checkpoint-9000")
+    assert cfg.train.auto_resume is True
+    assert cfg.train.resume_from is None
 
 
 def test_main_preserves_explicit_resume_from(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An operator-pinned resume_from must survive even when a newer checkpoint exists."""
+    """An operator-pinned resume_from must survive: main() never mutates it, and setting
+    auto_resume=True is harmless -- Trainer's explicit resume_from always wins over the scan."""
     output_dir = tmp_path / "cell"
     (output_dir / "checkpoint-9000").mkdir(parents=True)
     pinned = str(tmp_path / "elsewhere" / "checkpoint-42")
@@ -191,18 +199,4 @@ def test_main_preserves_explicit_resume_from(
     run.main(config=config_path, result=tmp_path / "result.json")
 
     assert cfg.train.resume_from == pinned
-
-
-def test_main_leaves_resume_from_none_without_a_checkpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    output_dir = tmp_path / "cell"
-    output_dir.mkdir()
-    cfg = OplmConfig(train=TrainConfig(output_dir=str(output_dir), resume_from=None))
-    _patch_main_dependencies(monkeypatch, cfg)
-
-    config_path = tmp_path / "run.yaml"
-    config_path.touch()
-    run.main(config=config_path, result=tmp_path / "result.json")
-
-    assert cfg.train.resume_from is None
+    assert cfg.train.auto_resume is True

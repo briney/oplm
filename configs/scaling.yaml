@@ -28,6 +28,36 @@ train:
   warmup_steps: 5000
   save_every: 10000
   save_total_limit: 3
+  # Also checkpoint every 30 wall-clock minutes (in addition to the save_every step
+  # cadence) so a preemption never loses more than ~30 minutes of progress on a long run.
+  save_every_minutes: 30
+  # Retain a permanent checkpoint every 100k steps, exempt from save_total_limit rotation.
+  keep_every_n_steps: 100000
+  # Explicit here (this config only ever runs under Slurm, via `oplm slurm generate`): resume
+  # from the newest committed checkpoint under output_dir automatically on every restart, so a
+  # requeue after preemption/failure continues training instead of restarting from step 0.
+  auto_resume: true
+  # Additionally mirror every committed checkpoint to remote object storage for durability
+  # beyond /mnt/home (Task 4.2). Uncomment and point at a real bucket/prefix to enable --
+  # requires the `s3` extra for s3:// URIs (`pip install oplm[s3]`) and valid AWS credentials
+  # in the environment (never in this file). Left commented by default: opt in per run.
+  # remote_checkpoint_uri: s3://oplm-checkpoints/scaling
+  # Parallelism strategy (see docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md
+  # §2 and docs/TRAIN.md's "Fault tolerance" knob table for the full memory picture):
+  #   - 6B fits DDP comfortably; 12B fits DDP only barely (~145 GB param+grad+optim states on
+  #     a 180 GB B200 -- no headroom for activations at any real batch size without gradient
+  #     checkpointing). 24-30B does not fit DDP at all (Muon's 12 B/param states put a 30B
+  #     model at ~360 GB, double a single B200's memory) and REQUIRES hsdp.
+  #   - Explicit `ddp` here, not `hsdp`, even though this config is meant to scale up to the
+  #     12B/24-30B range eventually: this config sets `data.eval` (see below), and
+  #     `oplm.config.validate_parallelism_compat` refuses `parallelism=hsdp` together with any
+  #     configured `data.eval` -- in-loop eval under FSDP2 all-gathers on rank-striped forward
+  #     counts and deadlocks (known limitation; the fix is rank-padded forward counts or a
+  #     gathered eval copy of the model, tracked as follow-up work, not yet implemented). A
+  #     24-30B run on this config today must either run eval as a separate ddp job against
+  #     periodic checkpoints (dropping `data.eval` from the training config, then switching
+  #     `parallelism: hsdp`), or wait for that follow-up.
+  parallelism: ddp
   eval_every: {steps: 5000}
   compile: true
   wandb_project: oplm-scaling
@@ -84,5 +114,7 @@ slurm:
     - /tmp:/tmp
   install: pip install oplm[train]
   max_concurrent: 4
+  # Requeue budget for the rendered sbatch requeue wrapper -- see docs/SLURM.md §8.
+  max_requeues: 20
   nodes: {170M: 4, 400M: 8, 800M: 16, 1B: 16}
   max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}

@@ -71,8 +71,16 @@ evaluate it. Four subsystems compose cleanly along stable contracts:
    shared components — no `DeterministicMLMCollator`, no parallel "eval dataset."
 6. **Typed config over loose dicts.** YAML enters as dicts at boundaries and is
    cast once into frozen, validated dataclasses.
-7. **Accelerate is the only distribution layer.** No manual `torch.distributed`
-   wiring in the trainer.
+7. **Accelerate is the only distribution layer, with one deliberate exception.**
+   `train.parallelism="hsdp"` shards the model directly via native
+   `torch.distributed.fsdp.fully_shard` (kept out of `accelerator.prepare` — see
+   `oplm.training.parallel`'s module docstring for why); every other Accelerate
+   service (process groups, device resolution, collectives, gradient-accumulation
+   bookkeeping, trackers) still owns everything else, on both the `ddp` and `hsdp`
+   paths. The checkpoint commit protocol and the remote-upload finalization gather
+   (§31) also run their own dedicated process groups, deliberately separate from
+   Accelerate's default one — see [TRAIN.md
+   §16](TRAIN.md#16-fault-tolerance).
 
 **Packaging.** Python ≥ 3.11; `torch ≥ 2.10` (which ships `torch.optim.Muon`).
 torch 2.11 adds the FlashAttention-4 backend on Blackwell — reached via
@@ -1595,11 +1603,16 @@ carried for forward compatibility).
 
 ## 31. Checkpointing, logging, callbacks
 
-**`save_checkpoint`** writes `checkpoint-{step}/`:
+**`save_checkpoint`** writes `checkpoint-{step}/` (or, mid-write, an invisible
+`checkpoint-{step}.tmp/` — see "Fault tolerance and resilience architecture" below):
 
-- **Accelerate state** at top level (`accelerator.save_state(...)`) — model,
-  optimizer(s), scheduler(s), RNG — the resumable state.
-- **`trainer_state.json`** — `global_step`, `epoch`, `samples_seen`, `tokens_seen`.
+- **Model + optimizer state** via `torch.distributed.checkpoint` (DCP)'s
+  `get_state_dict()`/`set_state_dict()` on a `Stateful` app-state dict — parallelism-agnostic
+  (uniform across DDP prefix-stripping and FSDP2/DTensor sharding), written with
+  `dcp.save`/`dcp.async_save`. This replaced `accelerator.save_state(...)` (Phase 1's
+  interim format) once the DCP layer landed.
+- **`trainer_state.json`** — `global_step`, `epoch`, `samples_seen`, `tokens_seen`, the data
+  cursor (§4 of the design spec), and the persisted W&B run id.
 - **HF export** under `checkpoint-{step}/hf/` via the unwrapped model
   (`unwrap_model(model).save_pretrained(.../hf)` → `config.json` +
   `model.safetensors`, honoring tied weights) plus the tokenizer
@@ -1610,9 +1623,11 @@ carried for forward compatibility).
 The run config is persisted for provenance via `cfg.model.to_dict()` + OmegaConf
 YAML for `train`/`data` (this replaces the broken `OmegaConf.structured(cfg)` that
 can't structure a `PretrainedConfig`). `_rotate_checkpoints` keeps at most
-`save_total_limit`. Resume reads Accelerate state + `trainer_state.json` from the
-top level (the `hf/` export is for downstream loading, not resume), re-seeds the
-dataset epoch, and resets per-opt-step delta markers.
+`save_total_limit` **rolling** checkpoints; `keep_every_n_steps`/`keep_every_n_hours`
+mark additional checkpoints permanent, exempt from that rotation. Resume reads DCP
+state + `trainer_state.json` from the top level (the `hf/` export is for downstream
+loading, not resume), re-seeds the dataset epoch, resumes the data cursor (unless
+`resume_data_position=false`), and resets per-opt-step delta markers.
 
 **Logging / wandb:** `accelerator.log(metrics, step=global_step)`; training metrics
 `train/{loss,epoch,samples,tokens,flops,lr}`; eval metrics `eval/<task>/<metric>`.
@@ -1621,6 +1636,34 @@ dataset epoch, and resets per-opt-step delta markers.
 the HF config). **Callbacks** (`callbacks.py`): `TrainerCallback` with
 `on_train_start`, `on_log`, `on_eval_end`, `on_checkpoint_saved`, `on_train_end`,
 all invoked on the main process only; the rich progress bar is main-process only.
+
+### Fault tolerance and resilience architecture
+
+Long (weeks-to-months, ~64-node/512-GPU) runs treat node/GPU failure as routine rather than
+exceptional. The recovery model is **requeue-centric**, not elastic in-job recovery: any
+failure ends the training process with a nonzero exit code (`85` for a clean signal/walltime
+drain, distinct from `0` for reaching `max_steps` and from any other nonzero crash code); a
+Slurm requeue wrapper around the rendered `sbatch` script (see [SLURM.md
+§8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard)) resubmits the job,
+subject to a requeue budget (`slurm.max_requeues`) and a no-progress guard that stops a
+deterministic crash loop rather than requeueing forever; the new attempt's `Trainer` auto-resumes
+(`train.auto_resume`) from the newest **committed** checkpoint — local `output_dir` first, then
+the remote object-store mirror if a local one is missing or behind — and continues logging into
+the **same** W&B run (a persisted run id, not a fresh one). Resume is **data-exact**
+(`train.resume_data_position`, default on): the dataloader cursor recorded in the checkpoint lets
+the resumed run replay precisely the row-level position it was interrupted at, so no training row
+is re-seen or skipped and `tokens_seen` matches an uninterrupted control run bit-for-bit (masking
+RNG is untouched, so masks themselves still differ — data-exact, not bitwise). Periodic
+checkpoints save asynchronously via DCP (`dcp.async_save`): a brief CPU-staging stall, then
+serialization/IO on a background thread while training continues, with the atomic commit —
+rename onto the checkpoint's final name, `latest` pointer update, rotation — deferred until every
+rank's write has actually finished, so a crash mid-write never produces a torn *committed*
+checkpoint. A drain (`SIGUSR1`/`SIGTERM`, or a wall-clock margin computed from Slurm's
+`SLURM_JOB_END_TIME`) finishes the in-flight optimizer step, forces a **synchronous** checkpoint,
+and exits `85` — the trigger that starts the requeue → auto-resume cycle above. See [TRAIN.md
+§16](TRAIN.md#16-fault-tolerance) for the full knob reference, the remote-mirror mechanism, and
+the consolidated list of known limitations (eval-under-HSDP refusal, Muon+HSDP numerics, and
+others).
 
 ## 32. CLI & inference
 

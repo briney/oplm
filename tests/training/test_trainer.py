@@ -358,9 +358,249 @@ def test_compile_dynamic_false_no_pad_emits_warning(
         trainer_module.logger.removeHandler(handler)
 
     warning_msgs = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
-    assert any(
-        "thrash" in m or "unbounded" in m for m in warning_msgs
-    ), (
+    assert any("thrash" in m or "unbounded" in m for m in warning_msgs), (
         "Expected a warning about unbounded shapes / recompile thrashing; "
         f"got warning messages: {warning_msgs!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Process-group timeout wiring (Task 1.8)
+# ---------------------------------------------------------------------------
+
+
+def test_accelerator_pg_timeout_uses_dist_timeout_minutes(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`train.dist_timeout_minutes` must reach the Accelerator as an InitProcessGroupKwargs."""
+    from datetime import timedelta
+
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1)
+    cfg.train.dist_timeout_minutes = 7
+    trainer = Trainer(cfg)
+
+    assert trainer.accelerator.init_handler is not None
+    assert trainer.accelerator.init_handler.timeout == timedelta(minutes=7)
+
+
+def test_accelerator_pg_timeout_uses_config_default(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default dist_timeout_minutes=15 must reach the Accelerator too."""
+    from datetime import timedelta
+
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1)
+    assert cfg.train.dist_timeout_minutes == 15
+    trainer = Trainer(cfg)
+
+    assert trainer.accelerator.init_handler.timeout == timedelta(minutes=15)
+
+
+# ---------------------------------------------------------------------------
+# Preflight check wiring (Task 1.8)
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_runs_before_output_dir_is_touched(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing preflight aborts Trainer.__init__ before anything touches output_dir.
+
+    Patches `oplm.training.preflight.run_preflight` (the module Trainer.__init__ imports
+    it from) to raise, and asserts the failure surfaces before the stale-checkpoint-cleanup
+    /output_dir.mkdir block that follows Accelerator construction.
+    """
+    from oplm.training import preflight as preflight_module
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    calls: list[object] = []
+
+    def _boom(accelerator: object) -> None:
+        calls.append(accelerator)
+        raise RuntimeError("preflight check failed on host fakehost: boom")
+
+    monkeypatch.setattr(preflight_module, "run_preflight", _boom)
+
+    run_dir = tmp_path / "run"
+    cfg = tiny_train_cfg(run_dir, training_parquet, max_steps=1)
+
+    with pytest.raises(RuntimeError, match="preflight check failed"):
+        Trainer(cfg)
+
+    assert len(calls) == 1
+    assert not run_dir.exists(), "output_dir must not be created before preflight passes"
+
+
+# ---------------------------------------------------------------------------
+# Loss-spike warn-only detector (Task 1.8)
+# ---------------------------------------------------------------------------
+
+
+def test_log_step_suppresses_loss_spike_warning_during_warmup(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No loss-spike warning fires within the first 50 logged steps, however extreme."""
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1, compile=False)
+    trainer = Trainer(cfg)
+    monkeypatch.setattr(trainer, "_log_metrics", lambda m: None)
+
+    with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
+        for _ in range(49):
+            trainer._log_step(1.0)
+        trainer._log_step(100.0)  # a 100x spike, but still within the warmup window
+
+    assert not any("loss spike" in r.getMessage() for r in caplog.records)
+
+
+def test_log_step_warns_on_loss_spike_after_warmup(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A loss > 3x the EMA warns (does not raise) once past the 50-logged-step warmup."""
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1, compile=False)
+    trainer = Trainer(cfg)
+    monkeypatch.setattr(trainer, "_log_metrics", lambda m: None)
+
+    with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
+        for _ in range(50):
+            trainer._log_step(1.0)
+        trainer._log_step(10.0)  # 51st logged step; EMA is ~1.0, so 10 > 3x it
+
+    assert any("loss spike" in r.getMessage() for r in caplog.records)
+
+
+def test_log_step_does_not_warn_below_spike_threshold(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A mild loss increase (below 3x EMA) past warmup does not warn."""
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=1, compile=False)
+    trainer = Trainer(cfg)
+    monkeypatch.setattr(trainer, "_log_metrics", lambda m: None)
+
+    with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
+        for _ in range(50):
+            trainer._log_step(1.0)
+        trainer._log_step(2.0)  # well under 3x the ~1.0 EMA
+
+    assert not any("loss spike" in r.getMessage() for r in caplog.records)
+
+
+# --- _SaveDeferral (Task 3.3 controller addition: worker-cycle save alignment) ----------
+
+
+def _run_deferral(
+    triggers: dict[int, bool],
+    *,
+    num_workers: int,
+    batches_by_step: dict[int, int],
+    last_step: int,
+) -> list[int]:
+    """Drive a fresh ``_SaveDeferral`` over steps ``1..last_step``; return steps it fires on."""
+    from oplm.training.trainer import _SaveDeferral
+
+    deferral = _SaveDeferral()
+    fired = []
+    for step in range(1, last_step + 1):
+        if deferral.decide(
+            triggered=triggers.get(step, False),
+            batches_in_epoch=batches_by_step[step],
+            num_workers=num_workers,
+            global_step=step,
+        ):
+            fired.append(step)
+    return fired
+
+
+def test_save_deferral_fires_immediately_when_aligned() -> None:
+    """An already-aligned trigger (batches_in_epoch % num_workers == 0) fires the same step."""
+    fired = _run_deferral({2: True}, num_workers=2, batches_by_step={1: 1, 2: 2, 3: 3}, last_step=3)
+    assert fired == [2]
+
+
+def test_save_deferral_waits_for_the_next_aligned_step() -> None:
+    """A misaligned trigger defers until the first later step where alignment holds."""
+    # Trigger at step 1 (batches_in_epoch=1, odd); alignment arrives at step 2 (batches=2).
+    fired = _run_deferral({1: True}, num_workers=2, batches_by_step={1: 1, 2: 2, 3: 3}, last_step=3)
+    assert fired == [2]
+
+
+def test_save_deferral_num_workers_le_1_never_defers() -> None:
+    """``num_workers<=1`` is always "aligned" -- no deferral, identical to pre-3.3 behavior."""
+    fired = _run_deferral(
+        {1: True, 3: True}, num_workers=1, batches_by_step={1: 7, 2: 8, 3: 9}, last_step=3
+    )
+    assert fired == [1, 3]
+
+
+def test_save_deferral_budget_expires_and_forces_a_save() -> None:
+    """A pathological grad-accum/num_workers combo that never aligns forces a save anyway.
+
+    ``num_workers=2`` with a step-to-step batch delta of 2 (grad_accum=2) never changes
+    ``batches_in_epoch``'s parity once it starts odd, so alignment is unreachable -- the
+    budget (``num_workers - 1 == 1`` extra step) must expire and force the save on the
+    very next step instead of deferring forever.
+    """
+    fired = _run_deferral(
+        {1: True},
+        num_workers=2,
+        batches_by_step={1: 1, 2: 3, 3: 5, 4: 7},
+        last_step=4,
+    )
+    # Deferred at step 1 (odd, budget not yet expired); forced at step 2 (still odd, but
+    # the 1-extra-step budget for num_workers=2 has expired).
+    assert fired == [2]
+
+
+def test_save_deferral_only_defers_while_a_trigger_is_pending() -> None:
+    """With nothing triggered and nothing pending, ``decide`` never fires."""
+    fired = _run_deferral({}, num_workers=2, batches_by_step={1: 1, 2: 2, 3: 4}, last_step=3)
+    assert fired == []
+
+
+def test_save_deferral_resets_after_firing_so_a_later_trigger_gets_its_own_budget() -> None:
+    """After firing, a later trigger starts its own fresh deferral window."""
+    # Step 1 triggers, misaligned (odd) -> defers to step 2 (aligned, fires).
+    # Step 3 triggers again, misaligned (odd) -> defers to step 4 (aligned, fires).
+    fired = _run_deferral(
+        {1: True, 3: True},
+        num_workers=2,
+        batches_by_step={1: 1, 2: 2, 3: 3, 4: 4},
+        last_step=4,
+    )
+    assert fired == [2, 4]

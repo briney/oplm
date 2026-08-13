@@ -65,6 +65,30 @@ def _sequence_of(item: Mapping[str, object] | str) -> str:
     raise TypeError(f"batch items must be str or mapping, got {type(item).__name__}")
 
 
+def _sequence_id_of(item: Mapping[str, object] | str) -> str:
+    """Extract the ``sequence_id`` from a batch item (for ``keep_sequence_ids=True``).
+
+    Args:
+        item: A mapping with a ``"sequence_id"`` key.
+
+    Returns:
+        The row's ``sequence_id``.
+
+    Raises:
+        KeyError: If ``item`` is a raw ``str`` (which carries no id) or a mapping
+            missing the ``"sequence_id"`` key.
+    """
+    if isinstance(item, str):
+        raise KeyError("keep_sequence_ids=True requires mapping batch items, got a raw str")
+    if isinstance(item, Mapping):
+        if "sequence_id" not in item:
+            raise KeyError("batch item mapping is missing required 'sequence_id' key")
+        return str(item["sequence_id"])
+    raise KeyError(
+        f"keep_sequence_ids=True requires mapping batch items, got {type(item).__name__}"
+    )
+
+
 def tokenize_and_pad(
     batch: Sequence[Mapping[str, object] | str],
     tokenizer: OplmTokenizerFast,
@@ -156,6 +180,11 @@ class MLMCollator:
             sequence axis is padded to the smallest multiple of this value ≥ the
             batch's longest member. ``None`` (default) pads to exactly the batch's
             longest member, reproducing today's behavior.
+        keep_sequence_ids: Surface each row's ``sequence_id`` as a plain
+            ``list[str]`` under ``"sequence_ids"`` in the returned batch dict
+            (excluded from tensor collation). Off by default; used by tests and
+            tooling that need to trace which rows a dataloader actually served
+            (e.g. the double-sharding verification test) rather than by training.
 
     Raises:
         ValueError: If any probability is outside ``[0, 1]`` or
@@ -174,6 +203,7 @@ class MLMCollator:
         deterministic: bool = False,
         seed: int = 0,
         pad_to_multiple_of: int | None = None,
+        keep_sequence_ids: bool = False,
     ) -> None:
         _validate_probs(mask_prob, mask_token_prob, random_token_prob)
         self._tokenizer = tokenizer
@@ -185,6 +215,7 @@ class MLMCollator:
         self._deterministic = deterministic
         self._seed = seed
         self._pad_to_multiple_of = pad_to_multiple_of
+        self._keep_sequence_ids = keep_sequence_ids
 
         # Derived id constants (computed once from the tokenizer, never hardcoded).
         self._mask_token_id = mask_token_id(tokenizer)
@@ -194,8 +225,14 @@ class MLMCollator:
         self._batch_idx = 0
         self._warned_missing_weights = False
 
-    def __call__(self, batch: Sequence[Mapping[str, object] | str]) -> dict[str, Tensor]:
-        """Collate ``batch`` into ``{input_ids, attention_mask, labels}``."""
+    def __call__(
+        self, batch: Sequence[Mapping[str, object] | str]
+    ) -> dict[str, Tensor | list[str]]:
+        """Collate ``batch`` into ``{input_ids, attention_mask, labels}``.
+
+        Also carries ``"sequence_ids"`` (a plain ``list[str]``, not collated into a
+        tensor) when ``keep_sequence_ids=True``.
+        """
         generator = self._next_generator()
 
         raw_weights = self._collect_weights(batch) if self._weighted_masking else None
@@ -222,7 +259,23 @@ class MLMCollator:
         weights = weights.masked_fill(~eligible, 0.0)
 
         self._mask_batch(input_ids, labels, eligible, weights, generator)
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        out: dict[str, Tensor | list[str]] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+        if self._keep_sequence_ids:
+            out["sequence_ids"] = self._collect_sequence_ids(batch)
+        return out
+
+    def _collect_sequence_ids(self, batch: Sequence[Mapping[str, object] | str]) -> list[str]:
+        """Pull each row's ``sequence_id`` from the batch, in row order.
+
+        Raises:
+            KeyError: If a mapping item lacks a ``"sequence_id"`` key, or an item
+                is a raw ``str`` (which carries no id).
+        """
+        return [_sequence_id_of(item) for item in batch]
 
     def reset_batch_index(self) -> None:
         """Reset the per-batch counter so the next call is batch index 0 again.

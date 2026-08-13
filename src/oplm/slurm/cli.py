@@ -9,6 +9,7 @@ from typing import Annotated, Any
 import typer
 from rich.console import Console
 
+from oplm.config import load_config
 from oplm.slurm.config import load_slurm_config
 from oplm.slurm.render import JobSpec, SubmitEntry, accelerate_command, render_job
 from oplm.slurm.submit import running_job_ids, submit_all
@@ -61,6 +62,13 @@ def generate(
             nodes if nodes is not None else slurm.nodes.resolve(phase=None, preset=preset)
         )
         resolved_time = time_limit or slurm.time_limit.resolve(phase=None, preset=preset)
+        # The requeue wrapper's no-progress guard needs this run's own output_dir to scan for
+        # committed checkpoints -- resolve it the same way the training command itself will
+        # (--config, then --preset), not just the raw YAML default.
+        train_argv = ["--config", str(config)]
+        if preset is not None:
+            train_argv += ["--preset", preset]
+        progress_dir = str(load_config(train_argv).train.output_dir)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     except KeyError as exc:
@@ -70,6 +78,9 @@ def generate(
     args = f"--config {config}"
     if preset is not None:
         args += f" --preset {preset}"
+    # Requeued jobs (Slurm --requeue) must resume from the newest committed checkpoint under
+    # output_dir instead of restarting at step 0 -- see Trainer's auto_resume handling.
+    args += " train.auto_resume=true"
     spec = JobSpec(
         name=job_name,
         nodes=resolved_nodes,
@@ -77,6 +88,7 @@ def generate(
         command=accelerate_command(
             module="oplm.train", gpus_per_node=slurm.gpus_per_node, args=args
         ),
+        progress_dir=progress_dir,
     )
     out.mkdir(parents=True, exist_ok=True)
     script = out / f"{job_name}.sbatch"

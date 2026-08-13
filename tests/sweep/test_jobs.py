@@ -51,6 +51,19 @@ def test_transfer_emits_single_170m_array_across_depths(transfer_phase: Path) ->
     assert {run_id.split("-")[1] for run_id in ids} == {"d12", "d24", "d48"}
 
 
+def test_array_job_wires_run_dir_progress_for_the_requeue_wrapper(coarse_phase: Path) -> None:
+    """Each array task's no-progress guard must key off its own `$RUN_DIR/output`."""
+    text = (coarse_phase.parent / "jobs" / "170M.sbatch").read_text()
+    assert 'STEP_FILE="$RUN_DIR/output/.last_requeue_step"' in text
+
+
+def test_analyze_job_has_no_progress_guard(coarse_phase: Path) -> None:
+    """The analyze job is not a training job -- no checkpoints, no no-progress guard."""
+    text = (coarse_phase.parent / "jobs" / "analyze.sbatch").read_text()
+    assert "STEP_FILE" not in text
+    assert "PREV_STEP" not in text
+
+
 def test_analyze_job_is_cpu_only(coarse_phase: Path) -> None:
     text = (coarse_phase.parent / "jobs" / "analyze.sbatch").read_text()
     assert "--gres" not in text

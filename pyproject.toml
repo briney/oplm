@@ -37,9 +37,20 @@ dependencies = [
     "rich>=13.0",
     "numpy>=1.26",
     "pyarrow>=14.0",
+    # Remote checkpoint mirror (oplm.training.remote.RemoteStore, Phase 4): fsspec is
+    # already pulled in transitively (pyarrow/torch), but Task 4.1 uses its
+    # filesystem-resolution API (fsspec.core.url_to_fs) directly, so it is promoted to
+    # an explicit core dependency rather than relying on someone else's transitive pin.
+    "fsspec>=2023.1.0",
 ]
 
 [project.optional-dependencies]
+s3 = [
+    # s3fs registers the "s3://" fsspec protocol; not required unless RemoteStore is
+    # pointed at an S3 (or S3-compatible) bucket. Credentials come from standard AWS
+    # env/config conventions, never from this codebase.
+    "s3fs>=2023.1.0",
+]
 train = [
     "accelerate>=0.30",
     "deepspeed>=0.14",

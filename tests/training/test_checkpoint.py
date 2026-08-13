@@ -42,25 +42,31 @@ def _cfg() -> OplmConfig:
     )
 
 
-def _prepared_model(cfg: OplmConfig) -> tuple[Accelerator, OplmForMaskedLM]:
-    """Build and prepare a tiny model on CPU so ``save_state`` has something to save."""
+def _prepared_model(
+    cfg: OplmConfig,
+) -> tuple[Accelerator, OplmForMaskedLM, torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
+    """Build and prepare a tiny model + optimizer + scheduler on CPU for DCP save/load."""
     from accelerate import Accelerator
 
     accelerator = Accelerator(cpu=True, mixed_precision="no")
     model = OplmForMaskedLM(cfg.model)
-    model = accelerator.prepare(model)
-    return accelerator, model
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    model, optimizer = accelerator.prepare(model, optimizer)
+    return accelerator, model, optimizer, scheduler
 
 
 def test_hf_export_round_trips(tmp_path: Path) -> None:
     """``checkpoint-N/hf`` reloads via ``from_pretrained`` with matching weights."""
     cfg = _cfg()
-    accelerator, model = _prepared_model(cfg)
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
     original_bias = accelerator.unwrap_model(model).lm_head.decoder.bias.detach().clone()
 
     save_checkpoint(
         accelerator=accelerator,
         model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
         cfg=cfg,
         output_dir=str(tmp_path),
         global_step=10,
@@ -82,10 +88,12 @@ def test_config_yaml_is_reloadable(tmp_path: Path) -> None:
     from oplm.config import load_config
 
     cfg = _cfg()
-    accelerator, model = _prepared_model(cfg)
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
     save_checkpoint(
         accelerator=accelerator,
         model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
         cfg=cfg,
         output_dir=str(tmp_path),
         global_step=10,
@@ -103,12 +111,27 @@ def test_config_yaml_is_reloadable(tmp_path: Path) -> None:
 
 
 def test_load_checkpoint_restores_state(tmp_path: Path) -> None:
-    """``load_checkpoint`` returns the trainer-state metadata and restores Accelerate state."""
+    """``load_checkpoint`` returns the trainer-state metadata and restores model/optim state."""
     cfg = _cfg()
-    accelerator, model = _prepared_model(cfg)
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+
+    # Advance the optimizer/scheduler so their state is non-trivial (momentum buffers,
+    # step count) before saving, so the restore below is a meaningful check.
+    inputs = torch.randint(0, cfg.model.vocab_size, (2, 8))
+    loss = model(input_ids=inputs, labels=inputs).loss
+    accelerator.backward(loss)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
+
+    original_weight = accelerator.unwrap_model(model).lm_head.decoder.bias.detach().clone()
+    original_scheduler_state = scheduler.state_dict()
+
     save_checkpoint(
         accelerator=accelerator,
         model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
         cfg=cfg,
         output_dir=str(tmp_path),
         global_step=10,
@@ -117,11 +140,26 @@ def test_load_checkpoint_restores_state(tmp_path: Path) -> None:
         tokens_seen=400,
     )
 
-    state = load_checkpoint(accelerator, str(tmp_path / "checkpoint-10"))
+    # Fresh model/optimizer/scheduler with different (random-init) weights, so restore
+    # is actually exercised rather than trivially matching pre-existing values.
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(cfg)
+
+    state = load_checkpoint(
+        fresh_accelerator,
+        fresh_model,
+        [fresh_optimizer],
+        [fresh_scheduler],
+        str(tmp_path / "checkpoint-10"),
+        cfg,
+    )
     assert state["global_step"] == 10
     assert state["epoch"] == 1
     assert state["samples_seen"] == 40
     assert state["tokens_seen"] == 400
+
+    restored_weight = fresh_accelerator.unwrap_model(fresh_model).lm_head.decoder.bias.detach()
+    assert torch.allclose(restored_weight, original_weight)
+    assert fresh_scheduler.state_dict() == original_scheduler_state
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -136,10 +174,14 @@ def test_hf_export_round_trips_with_compile(tmp_path: Path, reset_dynamo: None) 
     model = accelerator.prepare(model)
 
     original_bias = accelerator.unwrap_model(model)._orig_mod.lm_head.decoder.bias.detach().clone()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
 
     save_checkpoint(
         accelerator=accelerator,
         model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
         cfg=cfg,
         output_dir=str(tmp_path),
         global_step=10,
@@ -158,11 +200,13 @@ def test_hf_export_round_trips_with_compile(tmp_path: Path, reset_dynamo: None) 
 def test_rotation_keeps_save_total_limit(tmp_path: Path) -> None:
     """Saving beyond ``save_total_limit`` deletes the oldest checkpoints."""
     cfg = _cfg()
-    accelerator, model = _prepared_model(cfg)
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
     for step in (10, 20, 30):
         save_checkpoint(
             accelerator=accelerator,
             model=model,
+            optimizers=[optimizer],
+            schedulers=[scheduler],
             cfg=cfg,
             output_dir=str(tmp_path),
             global_step=step,

@@ -381,6 +381,9 @@ def _write_jobs(
             array_size=len(group),
             array_index_file=index_file,
             base_dir=out,
+            # `$RUN_DIR` is exported by the array-lookup block before this line renders, and
+            # matches the `output` subdir `_write_run_config` gives each cell's `train.output_dir`.
+            progress_dir="$RUN_DIR/output",
         )
         script = jobs / f"{preset}.sbatch"
         script.write_text(render_job(spec, slurm))
@@ -1481,6 +1484,10 @@ def scale(
                 f"train.mup_depth_lr_exponent={_as_float(winner['depth_exponent'])}",
                 f"train.output_dir={run_dir / 'output'}",
                 f"train.wandb_run_name=oplm-{preset}-scale",
+                # These are days-to-weeks production runs, submitted for requeue -- bake
+                # auto-resume into the run config itself (the rendered command is just
+                # `--config run.yaml`, so this is the only place to set it).
+                "train.auto_resume=true",
             ]
             cfg = load_config(["--config", str(config), "--preset", preset, *overrides])
             run_yaml = run_dir / "run.yaml"
@@ -1495,6 +1502,9 @@ def scale(
                     gpus_per_node=slurm.gpus_per_node,
                     args=f"--config {run_yaml}",
                 ),
+                # These are the days-to-weeks production runs the requeue wrapper matters most
+                # for; its output_dir is known at render time (unlike an array job's $RUN_DIR).
+                progress_dir=str(run_dir / "output"),
             )
             (jobs / f"{name}.sbatch").write_text(render_job(spec, slurm))
         typer.echo(f"wrote {len(list(jobs.glob('*.sbatch')))} scaling scripts to {jobs}")

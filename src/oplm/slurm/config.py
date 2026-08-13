@@ -148,6 +148,11 @@ class SlurmConfig:
     exclusive: bool = True
     max_concurrent: int = 4
     account: str | None = None
+    # Requeue budget for the wrapper `render_job` appends after the training `srun` -- see
+    # `oplm.slurm.render._requeue_wrapper`.
+    max_requeues: int = 20
+    # Rendered as the job script's `NCCL_DEBUG` export (see `oplm.slurm.render.render_job`).
+    nccl_debug: str = "WARN"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> SlurmConfig:
@@ -183,6 +188,8 @@ class SlurmConfig:
             exclusive=bool(raw.get("exclusive", True)),
             max_concurrent=_positive_int(raw, "max_concurrent", 4),
             account=str(raw["account"]) if raw.get("account") is not None else None,
+            max_requeues=_positive_int(raw, "max_requeues", 20),
+            nccl_debug=str(raw.get("nccl_debug", "WARN")),
         )
 
 

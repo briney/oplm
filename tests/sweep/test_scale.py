@@ -81,6 +81,30 @@ def test_scale_carries_the_confirmed_winner(confirm_phase: Path, tmp_path: Path)
     assert cfg.model.mup_output_mult == winner["output_mult"]
 
 
+def test_scale_wires_progress_dir_for_the_requeue_wrapper(
+    confirm_phase: Path, tmp_path: Path
+) -> None:
+    """A production `scale` run must key its no-progress guard off its own output_dir."""
+    out = tmp_path / "scale"
+    _run_scale(confirm_phase, out, "170M")
+    text = (out / "jobs" / "oplm-170M-scale.sbatch").read_text()
+    step_file = out / "170M" / "output" / ".last_requeue_step"
+    assert f'STEP_FILE="{step_file}"' in text
+
+
+def test_scale_injects_auto_resume(confirm_phase: Path, tmp_path: Path) -> None:
+    """A requeued production run must resume rather than restart -- see Trainer.auto_resume.
+
+    `scale`'s rendered command is just ``--config run.yaml`` (every other setting is baked
+    into the config), so auto_resume must be baked into the written run.yaml itself, not
+    appended as a command-line override.
+    """
+    out = tmp_path / "scale"
+    _run_scale(confirm_phase, out, "170M")
+    cfg = load_config(["--config", str(out / "170M" / "run.yaml")])
+    assert cfg.train.auto_resume is True
+
+
 def test_scale_keeps_the_full_eval_suite(confirm_phase: Path, tmp_path: Path) -> None:
     """Sweep cells run one eval; scale runs the production suite."""
     out = tmp_path / "scale"
