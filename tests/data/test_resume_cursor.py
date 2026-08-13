@@ -1,9 +1,11 @@
-"""Tests for skip-aware ``ShardedProteinDataset`` resume (Task 3.1).
+"""Tests for skip-aware dataset resume (Task 3.1: ``ShardedProteinDataset``; Task 3.2:
+``InterleavedDataset``).
 
 Covers the index-arithmetic skip: baseline-suffix equality for several skip
 values, a ``pq.read_table`` call-count assertion proving fully-skipped shards
-are never read, ``stream_length()`` correctness, and a ``num_workers=2``
-DataLoader batch-level resume check.
+are never read, ``stream_length()`` correctness, a ``num_workers=2`` DataLoader
+batch-level resume check, and the multi-source ``InterleavedDataset`` skip that
+arms each source's own sample-count skip from this worker's ``choices`` draws.
 """
 
 from __future__ import annotations
@@ -17,10 +19,11 @@ from torch.utils.data import DataLoader
 
 import oplm.data.sequence.dataset as dataset_mod
 from oplm.data.sequence.collate import MLMCollator
-from oplm.data.sequence.dataset import DataCursor, ShardedProteinDataset
+from oplm.data.sequence.dataset import DataCursor, InterleavedDataset, ShardedProteinDataset
 from oplm.data.tokenizer import get_tokenizer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -281,3 +284,150 @@ def test_data_cursor_holds_fields_and_is_frozen() -> None:
     assert cursor.seed == 0
     with pytest.raises(dataclasses.FrozenInstanceError):
         cursor.epoch = 3  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# InterleavedDataset skip-aware resume (Task 3.2)
+# --------------------------------------------------------------------------- #
+
+
+def _interleaved_ids(inter: InterleavedDataset) -> list[str]:
+    """Materialize the ``sequence_id`` stream from an ``InterleavedDataset`` iteration."""
+    return [str(row["sequence_id"]) for row in inter]
+
+
+def _arm_interleaved_skip(inter: InterleavedDataset, skip: int) -> None:
+    """Arm ``inter`` so that its resolved skip (single-process, worker 0) equals ``skip``.
+
+    Same reasoning as :func:`_arm_skip`: ``per_rank_batch=1``, ``num_workers=1`` makes
+    the resolved raw skip exactly ``batches_in_epoch`` (mod this stream's step count).
+    """
+    inter.set_resume_skip(batches_in_epoch=skip, per_rank_batch=1, num_workers=1)
+
+
+def test_interleaved_resumed_stream_is_baseline_suffix(
+    tmp_path: Path,
+    make_sequence_shards: Callable[..., Path],
+    real_records: list[tuple[str, str]],
+) -> None:
+    """Armed skip yields ``baseline[skip:]`` exactly, crossing several refills of the small source."""
+    small_dir = (tmp_path / "small").resolve()
+    large_dir = (tmp_path / "large").resolve()
+    small_dir.mkdir()
+    large_dir.mkdir()
+    make_sequence_shards(small_dir, real_records[:3], n_shards=1, id_prefix="small_")
+    make_sequence_shards(large_dir, real_records[3:15], n_shards=2, id_prefix="large_")
+
+    num_samples = 60  # the 3-row small source refills roughly 10x over this many draws
+
+    def _build() -> InterleavedDataset:
+        inter = InterleavedDataset(
+            [ShardedProteinDataset(small_dir, seed=0), ShardedProteinDataset(large_dir, seed=0)],
+            [0.5, 0.5],
+            num_samples=num_samples,
+            seed=0,
+        )
+        inter.set_epoch(0)
+        return inter
+
+    baseline = _interleaved_ids(_build())
+
+    for skip in (0, 1, 5, 13, 30, 59):
+        armed = _build()
+        _arm_interleaved_skip(armed, skip)
+        resumed = _interleaved_ids(armed)
+        assert resumed == baseline[skip:], f"mismatch for skip={skip}"
+
+
+def test_interleaved_refill_does_not_reapply_skip(
+    tmp_path: Path,
+    make_sequence_shards: Callable[..., Path],
+    real_records: list[tuple[str, str]],
+) -> None:
+    """A source's armed skip is one-shot: refilling it after exhaustion is unskipped."""
+    small_dir = (tmp_path / "single_small").resolve()
+    small_dir.mkdir()
+    make_sequence_shards(small_dir, real_records[:3], n_shards=1, id_prefix="s_")
+
+    num_samples = 10  # spans 3+ refill cycles of the 3-row source
+
+    def _build() -> InterleavedDataset:
+        inter = InterleavedDataset(
+            [ShardedProteinDataset(small_dir, seed=0)], [1.0], num_samples=num_samples, seed=0
+        )
+        inter.set_epoch(0)
+        return inter
+
+    baseline = _interleaved_ids(_build())
+    assert len(baseline) == num_samples
+    # A single source at fraction 1.0 just cycles its 3 ids every refill.
+    assert baseline == [baseline[i % 3] for i in range(num_samples)]
+
+    skip = 4  # lands one row into the *second* refill cycle
+    armed = _build()
+    _arm_interleaved_skip(armed, skip)
+    resumed = _interleaved_ids(armed)
+
+    # If the skip were (incorrectly) reapplied on every refill, later cycles would
+    # drop extra rows too, shortening the stream and shifting the cycle phase.
+    assert len(resumed) == num_samples - skip
+    assert resumed == baseline[skip:]
+
+
+def test_interleaved_clear_resume_skip_restores_full_stream(
+    tmp_path: Path,
+    make_sequence_shards: Callable[..., Path],
+    real_records: list[tuple[str, str]],
+) -> None:
+    """After clearing an armed skip, the next iteration yields the full baseline stream."""
+    small_dir = (tmp_path / "clear_small").resolve()
+    large_dir = (tmp_path / "clear_large").resolve()
+    small_dir.mkdir()
+    large_dir.mkdir()
+    make_sequence_shards(small_dir, real_records[:3], n_shards=1, id_prefix="cs_")
+    make_sequence_shards(large_dir, real_records[3:15], n_shards=2, id_prefix="cl_")
+
+    def _build() -> InterleavedDataset:
+        inter = InterleavedDataset(
+            [ShardedProteinDataset(small_dir, seed=0), ShardedProteinDataset(large_dir, seed=0)],
+            [0.5, 0.5],
+            num_samples=30,
+            seed=0,
+        )
+        inter.set_epoch(0)
+        return inter
+
+    baseline = _interleaved_ids(_build())
+
+    ds = _build()
+    _arm_interleaved_skip(ds, 7)
+    ds.clear_resume_skip()
+    assert _interleaved_ids(ds) == baseline
+
+
+def test_interleaved_unarmed_skip_is_byte_identical_to_baseline(
+    tmp_path: Path,
+    make_sequence_shards: Callable[..., Path],
+    real_records: list[tuple[str, str]],
+) -> None:
+    """With nothing armed, iteration output is unchanged from the pre-3.2 contract."""
+    dir0 = (tmp_path / "u0").resolve()
+    dir1 = (tmp_path / "u1").resolve()
+    dir0.mkdir()
+    dir1.mkdir()
+    make_sequence_shards(dir0, real_records[:8], n_shards=2, id_prefix="a_")
+    make_sequence_shards(dir1, real_records[8:16], n_shards=2, id_prefix="b_")
+
+    def _build() -> InterleavedDataset:
+        inter = InterleavedDataset(
+            [ShardedProteinDataset(dir0, seed=0), ShardedProteinDataset(dir1, seed=0)],
+            [0.6, 0.4],
+            num_samples=40,
+            seed=0,
+        )
+        inter.set_epoch(3)
+        return inter
+
+    rows1 = list(_build())
+    rows2 = list(_build())
+    assert rows1 == rows2
