@@ -14,6 +14,7 @@ sweep/training identity) do not need torch and run fast.
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
@@ -26,7 +27,10 @@ from oplm.training.checkpoint import (
     _rotate_checkpoints,
     clean_stale_checkpoint_dirs,
     latest_checkpoint,
+    list_committed_checkpoints,
+    load_checkpoint,
     mark_permanent,
+    nth_latest_checkpoint,
     save_checkpoint,
 )
 
@@ -297,3 +301,257 @@ def test_stale_tmp_cleanup_at_trainer_start(tmp_path: Path, training_parquet: Pa
     Trainer(cfg).train()
 
     assert not (tmp_path / "checkpoint-3.tmp").exists()
+
+
+# --- Task 2.2: list_committed_checkpoints / nth_latest_checkpoint --------------------
+
+
+def test_list_committed_checkpoints_orders_newest_first(tmp_path: Path) -> None:
+    """Committed dirs come back newest-step-first; ``.tmp``/``.old`` are excluded."""
+    for step in (100, 300, 200):
+        (tmp_path / f"checkpoint-{step}").mkdir()
+    (tmp_path / "checkpoint-9000.tmp").mkdir()
+    (tmp_path / "checkpoint-8000.old").mkdir()
+
+    result = list_committed_checkpoints(tmp_path)
+
+    assert [p.name for p in result] == ["checkpoint-300", "checkpoint-200", "checkpoint-100"]
+
+
+def test_list_committed_checkpoints_empty_or_missing_dir(tmp_path: Path) -> None:
+    """No committed checkpoints (fresh or nonexistent output_dir) yields an empty list."""
+    assert list_committed_checkpoints(tmp_path) == []
+    assert list_committed_checkpoints(tmp_path / "does-not-exist") == []
+
+
+def test_nth_latest_checkpoint_walks_backward_from_newest(tmp_path: Path) -> None:
+    """``n=0`` is the newest, ``n=1`` the next-newest, etc.; out of range is ``None``."""
+    for step in (100, 200, 300):
+        (tmp_path / f"checkpoint-{step}").mkdir()
+
+    assert nth_latest_checkpoint(tmp_path, 0) == tmp_path / "checkpoint-300"
+    assert nth_latest_checkpoint(tmp_path, 1) == tmp_path / "checkpoint-200"
+    assert nth_latest_checkpoint(tmp_path, 2) == tmp_path / "checkpoint-100"
+    assert nth_latest_checkpoint(tmp_path, 3) is None
+
+
+# --- Task 2.2: auto_resume fallback to the previous committed checkpoint -------------
+
+
+@pytest.mark.slow
+def test_auto_resume_falls_back_to_previous_checkpoint_on_torn_metadata(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A torn ``.metadata`` on the newest checkpoint falls back to the previous one.
+
+    Mirrors the requeue scenario a corrupted-shard kill would produce: the newest
+    checkpoint's ``.metadata`` is truncated post-commit (simulating a kill mid-``dcp.
+    save`` that ``save_checkpoint``'s own commit-rename protocol does not protect
+    against -- see ``validate_checkpoint_for_resume``'s docstring). ``auto_resume``
+    must resolve to the next-newest *committed* checkpoint instead, with a loud warning.
+    """
+    from oplm.training.trainer import _resolve_resume_target
+
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+
+    for step in (4, 8):
+        save_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            optimizers=[optimizer],
+            schedulers=[scheduler],
+            cfg=cfg,
+            output_dir=str(tmp_path),
+            global_step=step,
+            epoch=1,
+            samples_seen=step * 4,
+            tokens_seen=step * 40,
+        )
+
+    (tmp_path / "checkpoint-8" / ".metadata").write_bytes(b"not a valid dcp metadata blob")
+
+    with caplog.at_level(logging.WARNING):
+        resolved = _resolve_resume_target(
+            accelerator,
+            resume_from=None,
+            auto_resume=True,
+            output_dir=str(tmp_path),
+            cfg=cfg,
+        )
+
+    assert resolved == str(tmp_path / "checkpoint-4")
+    assert "checkpoint-8" in caplog.text
+    assert "falling back" in caplog.text.lower()
+
+
+@pytest.mark.slow
+def test_auto_resume_falls_back_on_schedule_incompatible_newest_checkpoint(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A schedule-incompatible newest checkpoint also triggers the fallback path.
+
+    ``validate_checkpoint_for_resume`` runs the same schedule-compat check
+    ``load_checkpoint`` does. Checkpoint-4 is saved with the schedule the live config
+    still matches; checkpoint-8 is saved with a different ``warmup_steps`` (as if a
+    separate, differently-configured run had written into the same ``output_dir`` --
+    contrived, but it exercises the same "newest candidate fails validation" branch a
+    real config-vs-checkpoint drift would). The newest is rejected before the
+    broadcast, exactly like torn DCP metadata is, and checkpoint-4 is selected instead.
+    """
+    from oplm.training.trainer import _resolve_resume_target
+
+    live_cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(live_cfg)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=live_cfg,
+        output_dir=str(tmp_path),
+        global_step=4,
+        epoch=1,
+        samples_seen=16,
+        tokens_seen=160,
+    )
+
+    incompatible_cfg = _cfg()
+    incompatible_cfg.train.warmup_steps = live_cfg.train.warmup_steps + 500
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=incompatible_cfg,
+        output_dir=str(tmp_path),
+        global_step=8,
+        epoch=1,
+        samples_seen=32,
+        tokens_seen=320,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        resolved = _resolve_resume_target(
+            accelerator,
+            resume_from=None,
+            auto_resume=True,
+            output_dir=str(tmp_path),
+            cfg=live_cfg,
+        )
+
+    assert resolved == str(tmp_path / "checkpoint-4")
+    assert "warmup_steps" in caplog.text
+
+
+@pytest.mark.slow
+def test_auto_resume_raises_when_every_candidate_fails_validation(tmp_path: Path) -> None:
+    """All candidates corrupted (newest + every fallback) raises, rank-identically."""
+    from oplm.training.trainer import _resolve_resume_target
+
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+
+    for step in (4, 8):
+        save_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            optimizers=[optimizer],
+            schedulers=[scheduler],
+            cfg=cfg,
+            output_dir=str(tmp_path),
+            global_step=step,
+            epoch=1,
+            samples_seen=step * 4,
+            tokens_seen=step * 40,
+        )
+        (tmp_path / f"checkpoint-{step}" / ".metadata").write_bytes(b"garbage")
+
+    with pytest.raises(RuntimeError, match="auto_resume"):
+        _resolve_resume_target(
+            accelerator,
+            resume_from=None,
+            auto_resume=True,
+            output_dir=str(tmp_path),
+            cfg=cfg,
+        )
+
+
+@pytest.mark.slow
+def test_explicit_resume_from_never_falls_back_even_when_corrupted(tmp_path: Path) -> None:
+    """An explicit ``resume_from`` is returned unchanged, even if it is corrupted.
+
+    Falling back is an ``auto_resume``-only behavior; an operator-pinned ``resume_from``
+    is never second-guessed at resolve time -- if it's bad, the failure surfaces later,
+    loudly, at ``dcp.load`` (see the next test), not silently as a swap to a different
+    checkpoint the operator didn't ask for.
+    """
+    from oplm.training.trainer import _resolve_resume_target
+
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+
+    for step in (4, 8):
+        save_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            optimizers=[optimizer],
+            schedulers=[scheduler],
+            cfg=cfg,
+            output_dir=str(tmp_path),
+            global_step=step,
+            epoch=1,
+            samples_seen=step * 4,
+            tokens_seen=step * 40,
+        )
+
+    # Corrupt the *older* checkpoint and pin resume_from to it explicitly. Note
+    # auto_resume=True here too -- resume_from must still win with zero validation.
+    (tmp_path / "checkpoint-4" / ".metadata").write_bytes(b"garbage")
+
+    resolved = _resolve_resume_target(
+        accelerator,
+        resume_from=str(tmp_path / "checkpoint-4"),
+        auto_resume=True,
+        output_dir=str(tmp_path),
+        cfg=cfg,
+    )
+
+    assert resolved == str(tmp_path / "checkpoint-4")
+
+
+@pytest.mark.slow
+def test_explicit_resume_from_corrupted_checkpoint_raises_at_load(tmp_path: Path) -> None:
+    """A corrupted checkpoint loaded via explicit ``resume_from`` raises at load time."""
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=4,
+        epoch=1,
+        samples_seen=16,
+        tokens_seen=160,
+    )
+    committed = tmp_path / "checkpoint-4"
+    (committed / ".metadata").write_bytes(b"garbage")
+
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(cfg)
+    # dcp.load's collective plan exchange wraps a corrupted-metadata failure in
+    # torch.distributed.checkpoint.api.CheckpointException, which subclasses
+    # BaseException directly (not Exception) -- broader than a bare `Exception` catch.
+    with pytest.raises(BaseException):  # noqa: B017 -- DCP's error type is an internal detail
+        load_checkpoint(
+            fresh_accelerator,
+            fresh_model,
+            [fresh_optimizer],
+            [fresh_scheduler],
+            str(committed),
+            cfg,
+        )

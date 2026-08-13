@@ -12,6 +12,7 @@ unchanged from Phase 1.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
@@ -146,13 +147,20 @@ def test_dcp_save_load_round_trip_restores_model_optimizer_and_scheduler(tmp_pat
     )
 
     fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(cfg)
-    load_checkpoint(
+    state = load_checkpoint(
         fresh_accelerator,
         fresh_model,
         [fresh_optimizer],
         [fresh_scheduler],
         str(tmp_path / "checkpoint-10"),
+        cfg,
     )
+
+    # Task 2.2: load_checkpoint's returned trainer-state dict restores step/epoch/tokens.
+    assert state["global_step"] == 10
+    assert state["epoch"] == 1
+    assert state["tokens_seen"] == 400
+    assert state["samples_seen"] == 40
 
     fresh_unwrapped = fresh_accelerator.unwrap_model(fresh_model)
     assert torch.allclose(fresh_unwrapped.lm_head.decoder.bias.detach(), original_weight)
@@ -211,7 +219,9 @@ def test_dcp_save_load_round_trip_with_compile(tmp_path: Path, reset_dynamo: Non
     fresh_model = OplmForMaskedLM(cfg.model)
     fresh_optimizer = torch.optim.AdamW(fresh_model.parameters(), lr=1e-3)
     fresh_scheduler = torch.optim.lr_scheduler.LambdaLR(fresh_optimizer, lambda _step: 1.0)
-    load_checkpoint(accelerator, fresh_model, [fresh_optimizer], [fresh_scheduler], str(committed))
+    load_checkpoint(
+        accelerator, fresh_model, [fresh_optimizer], [fresh_scheduler], str(committed), cfg
+    )
     assert torch.allclose(fresh_model.lm_head.decoder.bias.detach(), original_weight)
 
 
@@ -270,6 +280,7 @@ def test_scaler_sidecar_round_trips_fp16_gradscaler_state(tmp_path: Path) -> Non
         [fresh_optimizer],
         [fresh_scheduler],
         str(committed),
+        cfg,
     )
 
     assert fresh_accelerator.scaler.state_dict() == non_default_scaler_state
@@ -374,13 +385,19 @@ def test_dcp_round_trip_preserves_muon_and_aux_adamw_ordering(tmp_path: Path) ->
     fresh_model = OplmForMaskedLM(cfg.model)
     fresh_optimizers = build_optimizers(fresh_model, cfg.train)
     fresh_schedulers = build_schedulers(fresh_optimizers, cfg.train, total_steps=100)
-    load_checkpoint(
+    state = load_checkpoint(
         accelerator,
         fresh_model,
         fresh_optimizers,
         fresh_schedulers,
         str(tmp_path / "checkpoint-10"),
+        cfg,
     )
+
+    # Task 2.2: step/epoch/tokens restore alongside Muon's own momentum buffer below.
+    assert state["global_step"] == 10
+    assert state["epoch"] == 1
+    assert state["tokens_seen"] == 400
 
     fresh_muon_optimizer = getattr(fresh_optimizers[0], "optimizer", fresh_optimizers[0])
     fresh_adamw_optimizer = getattr(fresh_optimizers[1], "optimizer", fresh_optimizers[1])
@@ -392,3 +409,159 @@ def test_dcp_round_trip_preserves_muon_and_aux_adamw_ordering(tmp_path: Path) ->
 
     assert torch.allclose(restored_muon_momentum, original_muon_momentum)
     assert torch.allclose(restored_adamw_exp_avg, original_adamw_exp_avg)
+
+
+# --- Task 2.2: schedule-compat validation --------------------------------------------
+
+
+def test_load_checkpoint_raises_on_schedule_mismatch(tmp_path: Path) -> None:
+    """A ``warmup_steps`` change between save and resume raises, naming the field."""
+    save_cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(save_cfg)
+    _take_optimizer_step(save_cfg, accelerator, model, optimizer, scheduler)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=save_cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    load_cfg = _cfg()
+    load_cfg.train.warmup_steps = save_cfg.train.warmup_steps + 500
+
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(load_cfg)
+    with pytest.raises(ValueError, match="warmup_steps"):
+        load_checkpoint(
+            fresh_accelerator,
+            fresh_model,
+            [fresh_optimizer],
+            [fresh_scheduler],
+            str(tmp_path / "checkpoint-10"),
+            load_cfg,
+        )
+
+
+def test_load_checkpoint_schedule_mismatch_error_names_both_values(tmp_path: Path) -> None:
+    """The mismatch error names both the checkpoint's and the live config's values."""
+    save_cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(save_cfg)
+    _take_optimizer_step(save_cfg, accelerator, model, optimizer, scheduler)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=save_cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+
+    load_cfg = _cfg()
+    load_cfg.train.min_lr = save_cfg.train.min_lr + 1e-5
+    load_cfg.train.scheduler = "wsd_linear"
+    load_cfg.train.stable_steps = save_cfg.train.stable_steps + 1
+
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(load_cfg)
+    with pytest.raises(ValueError) as excinfo:
+        load_checkpoint(
+            fresh_accelerator,
+            fresh_model,
+            [fresh_optimizer],
+            [fresh_scheduler],
+            str(tmp_path / "checkpoint-10"),
+            load_cfg,
+        )
+
+    message = str(excinfo.value)
+    for field in ("min_lr", "scheduler", "stable_steps"):
+        assert field in message
+    # warmup_steps/max_steps/lr were unchanged and must not be flagged.
+    assert "warmup_steps" not in message
+    assert "max_steps" not in message
+
+
+# --- Task 2.2: hard RNG-sidecar error + OPLM_ALLOW_MISSING_RNG escape hatch -----------
+
+
+def test_load_checkpoint_raises_on_missing_rng_sidecar(tmp_path: Path) -> None:
+    """A missing ``rng_state_<rank>.pt`` sidecar is a hard error by default."""
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    _take_optimizer_step(cfg, accelerator, model, optimizer, scheduler)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+    committed = tmp_path / "checkpoint-10"
+    (committed / "rng_state_0.pt").unlink()
+
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(cfg)
+    with pytest.raises(RuntimeError, match="RNG sidecar not found"):
+        load_checkpoint(
+            fresh_accelerator,
+            fresh_model,
+            [fresh_optimizer],
+            [fresh_scheduler],
+            str(committed),
+            cfg,
+        )
+
+
+def test_load_checkpoint_allows_missing_rng_sidecar_via_env_escape_hatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``OPLM_ALLOW_MISSING_RNG=1`` turns a missing sidecar into a warning, not an error."""
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    _take_optimizer_step(cfg, accelerator, model, optimizer, scheduler)
+
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+    committed = tmp_path / "checkpoint-10"
+    (committed / "rng_state_0.pt").unlink()
+
+    monkeypatch.setenv("OPLM_ALLOW_MISSING_RNG", "1")
+    fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(cfg)
+    with caplog.at_level(logging.WARNING):
+        state = load_checkpoint(
+            fresh_accelerator,
+            fresh_model,
+            [fresh_optimizer],
+            [fresh_scheduler],
+            str(committed),
+            cfg,
+        )
+
+    assert state["global_step"] == 10
+    assert "RNG sidecar not found" in caplog.text
+    assert "OPLM_ALLOW_MISSING_RNG" in caplog.text

@@ -192,6 +192,7 @@ class Trainer:
             cfg.train.resume_from,
             cfg.train.auto_resume,
             cfg.train.output_dir,
+            cfg,
             status=_status,
         )
         self._resolved_resume_target = resume_target  # exposed for tests/observability
@@ -895,7 +896,12 @@ class Trainer:
         from oplm.training.checkpoint import load_checkpoint
 
         state = load_checkpoint(
-            self.accelerator, self.model, self.optimizers, self.schedulers, checkpoint_dir
+            self.accelerator,
+            self.model,
+            self.optimizers,
+            self.schedulers,
+            checkpoint_dir,
+            self.cfg,
         )
         self.global_step = state["global_step"]
         self.epoch = state["epoch"]
@@ -985,28 +991,128 @@ class Trainer:
             callback.on_train_end(self)
 
 
+# auto_resume fallback budget: the newest committed checkpoint plus this many
+# next-newest candidates, before giving up and raising fatally.
+_MAX_AUTO_RESUME_FALLBACK_ATTEMPTS = 2
+
+
+def _select_auto_resume_candidate(
+    output_dir: Path,
+    cfg: OplmConfig,
+    status: Callable[[str], None] | None,
+) -> Path | None:
+    """Pick the newest committed checkpoint that passes cheap pre-load validation.
+
+    Called on the main process only, from within :func:`_resolve_resume_target`, before
+    the auto-resume target is broadcast -- see that function's docstring for why the
+    fallback decision has to be made and validated *before* the broadcast rather than
+    after a failed ``dcp.load``.
+
+    Walks ``checkpoint`` :func:`oplm.training.checkpoint.list_committed_checkpoints`
+    (newest first) and returns the first one that passes
+    :func:`oplm.training.checkpoint.validate_checkpoint_for_resume`, logging loudly (main
+    process only) about every candidate skipped along the way. Gives up after the newest
+    checkpoint plus :data:`_MAX_AUTO_RESUME_FALLBACK_ATTEMPTS` next-newest candidates.
+
+    Args:
+        output_dir: The training output directory to scan.
+        cfg: The live, resolved config being trained/resumed with (for schedule-compat
+            validation).
+        status: Optional main-process-only status callback; ``None`` suppresses it.
+
+    Returns:
+        The selected checkpoint path, or ``None`` if there is no committed checkpoint at
+        all (a fresh ``output_dir`` -- not an error, auto_resume is simply a no-op).
+
+    Raises:
+        Exception: Re-raises the *last* candidate's validation error if every candidate
+            (newest plus fallbacks) fails validation. The caller
+            (:func:`_resolve_resume_target`) turns this into a rank-identical
+            ``RuntimeError`` broadcast to every rank instead of letting it propagate from
+            the main process alone.
+    """
+    from oplm.training.checkpoint import list_committed_checkpoints, validate_checkpoint_for_resume
+
+    candidates = list_committed_checkpoints(output_dir)
+    if not candidates:
+        return None
+
+    attempts = candidates[: _MAX_AUTO_RESUME_FALLBACK_ATTEMPTS + 1]
+    last_error: Exception | None = None
+    for index, candidate in enumerate(attempts):
+        try:
+            validate_checkpoint_for_resume(candidate, cfg)
+        except Exception as exc:  # noqa: BLE001 -- any validation failure triggers fallback
+            remaining = len(attempts) - index - 1
+            logger.error(
+                "auto_resume: checkpoint %s failed pre-load validation (%s: %s); %s",
+                candidate,
+                type(exc).__name__,
+                exc,
+                f"trying the next-newest committed checkpoint ({remaining} attempt(s) left)"
+                if remaining > 0
+                else "no further fallback attempts left",
+            )
+            last_error = exc
+            continue
+
+        if index > 0:
+            logger.warning(
+                "auto_resume: falling back to checkpoint %s after %d newer checkpoint(s) "
+                "failed pre-load validation",
+                candidate,
+                index,
+            )
+        if status is not None:
+            status(f"[dim]Auto-resuming from {candidate.name}[/dim]")
+        return candidate
+
+    assert last_error is not None  # at least one attempt ran (candidates is non-empty)
+    raise last_error
+
+
 def _resolve_resume_target(
     accelerator: Accelerator,
     resume_from: str | None,
     auto_resume: bool,
     output_dir: str,
+    cfg: OplmConfig,
     status: Callable[[str], None] | None = None,
 ) -> str | None:
     """Resolve the checkpoint path to resume from, rank-identical by construction.
 
     An explicit ``resume_from`` is already rank-identical (it's config), so no scan is
-    needed for it. When ``auto_resume`` applies instead (no explicit path given), ONLY the
-    main process scans the filesystem for the newest committed checkpoint
-    (:func:`oplm.training.checkpoint.latest_checkpoint`). A non-main rank never performs
-    this scan itself: the recovery renames in
+    needed for it -- and, per the binding constraint that explicit ``resume_from`` never
+    falls back, it is never validated or substituted here either: if it turns out to be
+    corrupt, ``Trainer._resume_from_checkpoint`` raises and the job dies (test (d)).
+
+    When ``auto_resume`` applies instead (no explicit path given), ONLY the main process
+    scans the filesystem and selects a candidate (:func:`_select_auto_resume_candidate`).
+    A non-main rank never performs this scan itself: the recovery renames in
     :func:`oplm.training.checkpoint.clean_stale_checkpoint_dirs` (also main-only) plus
     shared-filesystem directory-listing caches on a multi-node cluster mean a rank's own
     scan is not guaranteed to see what the main rank sees, even after a barrier -- so the
     only way to guarantee a rank-identical result is to compute it once and hand it to
-    everyone. The resolved value (main-only path, or ``None``) is broadcast to every other
-    rank via :func:`accelerate.utils.broadcast_object_list`, which is a no-op on a single
-    process. ``resume_from`` is threaded through the same broadcast for one code path
-    instead of two -- harmless since it is already identical everywhere.
+    everyone.
+
+    Auto-resume fallback design (Task 2.2): ``dcp.load`` is collective, so retrying a
+    *different* checkpoint after a failed ``dcp.load`` would require ranks to agree, mid
+    failure, to retry together -- exactly the desynchronized-exception/hang risk
+    rank-sync discipline exists to avoid. Instead, everything cheap to validate without
+    the collective (``trainer_state.json`` readability, ``.metadata`` readability,
+    schedule compatibility -- see
+    :func:`oplm.training.checkpoint.validate_checkpoint_for_resume`) runs here, on the
+    main process, *before* the broadcast: a torn or schedule-incompatible candidate is
+    rejected identically on every rank, and the next-newest committed checkpoint is
+    substituted (and broadcast) in its place, up to
+    :data:`_MAX_AUTO_RESUME_FALLBACK_ATTEMPTS` times. If every candidate fails, the main
+    process's last validation error is packaged into the broadcast payload (rather than
+    raised locally, which would leave every other rank hanging at the broadcast call) and
+    every rank raises an identical ``RuntimeError`` from it. A genuine failure *inside*
+    ``dcp.load`` after a candidate has already passed this validation is treated as
+    fatal: it is allowed to propagate straight out of ``Trainer._resume_from_checkpoint``,
+    the job dies, and the external requeue loop retries -- which, given the pre-validation
+    above, should be rare.
 
     Args:
         accelerator: The trainer's Accelerator, called after the ``wait_for_everyone``
@@ -1015,26 +1121,39 @@ def _resolve_resume_target(
             ``None``.
         auto_resume: ``cfg.train.auto_resume``.
         output_dir: The training output directory to scan when ``auto_resume`` applies.
+        cfg: The live, resolved config being trained/resumed with (threaded into
+            candidate validation for schedule-compat checking).
         status: Optional main-process-only status callback (mirrors the trainer's
             ``_status`` helper); ``None`` suppresses it.
 
     Returns:
         The resolved checkpoint directory path, identical on every rank, or ``None`` if
         there is nothing to resume.
+
+    Raises:
+        RuntimeError: Every auto-resume candidate (newest plus fallbacks) failed pre-load
+            validation. Raised identically on every rank.
     """
     from accelerate.utils import broadcast_object_list
 
     resume_target: str | None = resume_from
+    resolve_error: str | None = None
     if resume_target is None and auto_resume and accelerator.is_main_process:
-        from oplm.training.checkpoint import latest_checkpoint
+        try:
+            found = _select_auto_resume_candidate(Path(output_dir), cfg, status)
+        except Exception as exc:  # noqa: BLE001 -- packaged into the broadcast, see above
+            resolve_error = (
+                f"auto_resume: no usable checkpoint found under {output_dir} after "
+                f"{_MAX_AUTO_RESUME_FALLBACK_ATTEMPTS + 1} attempt(s); last error: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            resume_target = str(found) if found is not None else None
 
-        found = latest_checkpoint(Path(output_dir))
-        if found is not None:
-            resume_target = str(found)
-            if status is not None:
-                status(f"[dim]Auto-resuming from {found.name}[/dim]")
-
-    return broadcast_object_list([resume_target])[0]
+    resume_target, resolve_error = broadcast_object_list([resume_target, resolve_error])
+    if resolve_error is not None:
+        raise RuntimeError(resolve_error)
+    return resume_target
 
 
 def _read_resume_wandb_run_id(resume_target: str, output_dir: str) -> str | None:

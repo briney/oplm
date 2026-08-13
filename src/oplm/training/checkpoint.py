@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
@@ -33,6 +34,20 @@ _LATEST_POINTER_NAME = "latest"
 _KEEP_MARKER_NAME = "KEEP"
 _RNG_SIDECAR_PREFIX = "rng_state_"
 _SCALER_SIDECAR_NAME = "scaler.pt"
+
+# Escape hatch for _restore_rng_sidecar: set to "1" to start this rank's RNG fresh
+# instead of hard-erroring when its sidecar is missing (e.g. a deliberate world-size
+# change across a resume). See _restore_rng_sidecar for the full rationale.
+_ALLOW_MISSING_RNG_ENV = "OPLM_ALLOW_MISSING_RNG"
+
+# Schedule-related TrainConfig fields compared by validate_schedule_compat.
+# Deliberately EXCLUDES max_steps -- see validate_schedule_compat's docstring for why
+# (extending max_steps across a resume, to keep training past the original target, is
+# an existing, tested, and desired workflow -- both explicit resume_from and
+# auto_resume -- not the accidental-drift hazard this check exists to catch). Also not
+# exhaustive of everything that affects the LR trajectory: e.g. mixed_precision does
+# not belong here at all.
+_SCHEDULE_COMPAT_FIELDS = ("warmup_steps", "stable_steps", "scheduler", "lr", "min_lr")
 
 
 def _unwrap_optimizer(optimizer: Any) -> Any:
@@ -106,17 +121,38 @@ def _write_rng_sidecar(tmp_dir: Path, rank: int) -> None:
 def _restore_rng_sidecar(checkpoint_dir: Path, rank: int) -> None:
     """Restore this rank's RNG state from the sidecar written by :func:`_write_rng_sidecar`.
 
-    A missing sidecar (e.g. a checkpoint saved at a different world size than the one
-    loading it) is logged and skipped rather than raised: reshard-on-load RNG semantics
-    are Task 2.4's concern. This minimal load-side conversion only needs same-world-size
-    resume to work for Task 2.1/2.2.
+    A missing sidecar is a **hard error** by default: silently skipping RNG restore was
+    a swallowed-failure hole (a resumed run would quietly diverge from what it would have
+    produced without the interruption, with no signal that anything was wrong). The
+    likely cause is a world-size change across the resume -- a checkpoint saved with N
+    ranks only has sidecars ``rng_state_0.pt``..``rng_state_<N-1>.pt`` -- since
+    reshard-on-load RNG semantics are Task 2.4's concern, not this one.
+
+    The single escape hatch is the ``OPLM_ALLOW_MISSING_RNG=1`` environment variable: when
+    set, a missing sidecar is logged and skipped (this rank's RNG starts fresh) instead of
+    raising. There is deliberately no config-level bypass -- an explicit ``train.
+    resume_from`` does not relax this check, so an operator has to opt in explicitly and
+    visibly (an env var, not a config field that could be committed and forgotten).
     """
     sidecar_path = checkpoint_dir / f"{_RNG_SIDECAR_PREFIX}{rank}.pt"
     if not sidecar_path.is_file():
-        logger.warning(
-            "RNG sidecar not found for rank %d at %s; RNG state not restored", rank, sidecar_path
+        if os.environ.get(_ALLOW_MISSING_RNG_ENV) == "1":
+            logger.warning(
+                "RNG sidecar not found for rank %d at %s; %s=1 is set, so this rank's RNG "
+                "state is starting fresh instead of being restored.",
+                rank,
+                sidecar_path,
+                _ALLOW_MISSING_RNG_ENV,
+            )
+            return
+        raise RuntimeError(
+            f"RNG sidecar not found for rank {rank} at {sidecar_path}. This usually means "
+            "the checkpoint was saved at a different world size than the one resuming "
+            "(each rank's RNG state lives in its own rng_state_<rank>.pt sidecar, so a "
+            "checkpoint saved with N ranks only has sidecars 0..N-1). To resume anyway and "
+            f"start this rank's RNG fresh, set the environment variable "
+            f"{_ALLOW_MISSING_RNG_ENV}=1."
         )
-        return
 
     rng_state: dict[str, Any] = torch.load(sidecar_path, weights_only=False)
     random.setstate(rng_state["python"])
@@ -339,25 +375,133 @@ def save_checkpoint(
     return final_dir
 
 
+def validate_schedule_compat(checkpoint_dir: Path, cfg: OplmConfig) -> None:
+    """Raise if the checkpoint's LR-schedule config disagrees with the live config.
+
+    Resuming into a scheduler rebuilt with different ``warmup_steps``/``stable_steps``/
+    ``scheduler``/``lr``/``min_lr`` silently reshapes the LR trajectory --
+    ``torch.optim.lr_scheduler.LambdaLR.load_state_dict`` only restores ``last_epoch`` and
+    a couple of counters, not the lambda itself, so a scheduler rebuilt with a different
+    ``warmup_steps`` (say) resumes at the *same step index* but a *different point on the
+    curve*, with no error. Comparing the checkpoint's own ``config.yaml`` against the live
+    config before ``dcp.load`` even runs closes that hole with a loud, specific error
+    instead of a silent LR discontinuity discovered days later in a wandb chart.
+
+    Note on ``max_steps`` (deliberately excluded from ``_SCHEDULE_COMPAT_FIELDS``):
+    training the checkpoint past its original target by resuming with a *larger*
+    ``max_steps`` -- deliberately reshaping the remaining LR curve to accommodate the
+    new, longer target -- is an existing, tested, and desired workflow for both explicit
+    ``resume_from`` and ``auto_resume`` (e.g. ``test_resume_restores_state_and_continues``,
+    ``test_auto_resume_picks_up_the_newest_committed_checkpoint``). Because the very
+    thing this check exists to prevent -- a schedule reshaped differently than the
+    operator intended -- is also the *mechanism* of that legitimate workflow, ``max_steps``
+    can't be compared for exact equality without breaking it; distinguishing "deliberately
+    extended" from "accidentally drifted" would need more than a field-equality check
+    (out of scope here -- see the task brief: "don't over-engineer"). ``max_epochs``-derived
+    ``total_steps`` changes are not covered at all, for the same reason.
+
+    Args:
+        checkpoint_dir: Path to the committed checkpoint directory (holds ``config.yaml``).
+        cfg: The live, resolved config being trained/resumed with.
+
+    Raises:
+        ValueError: One or more of ``_SCHEDULE_COMPAT_FIELDS`` differs between the
+            checkpoint's config and ``cfg``; the message names every differing field
+            with both values.
+    """
+    config_path = checkpoint_dir / "config.yaml"
+    if not config_path.is_file():
+        # No config.yaml to compare against (e.g. a pre-Task-1 checkpoint, or one
+        # written by a caller that skipped it). Nothing to validate against; proceed
+        # rather than block resume on missing provenance.
+        logger.warning(
+            "Checkpoint %s has no config.yaml; skipping schedule-compatibility validation.",
+            checkpoint_dir,
+        )
+        return
+
+    from oplm.config import load_config
+
+    checkpoint_cfg = load_config(["--config", str(config_path)])
+
+    mismatches = [
+        f"{field} (checkpoint={getattr(checkpoint_cfg.train, field)!r}, "
+        f"live={getattr(cfg.train, field)!r})"
+        for field in _SCHEDULE_COMPAT_FIELDS
+        if getattr(checkpoint_cfg.train, field) != getattr(cfg.train, field)
+    ]
+    if mismatches:
+        raise ValueError(
+            f"Checkpoint {checkpoint_dir} is not schedule-compatible with the current "
+            f"config -- resuming would silently reshape the LR schedule. Mismatched "
+            f"field(s): {'; '.join(mismatches)}"
+        )
+
+
+def validate_checkpoint_for_resume(checkpoint_dir: Path, cfg: OplmConfig) -> None:
+    """Cheaply validate a checkpoint before it is used as a (broadcast) auto-resume target.
+
+    ``dcp.load`` is a collective: every rank must call it together, and a corrupt shard
+    can raise on all ranks (a torn ``.metadata``, read during the collective's own
+    metadata exchange) or in principle just one, which is the exact hang scenario
+    rank-synchronization discipline exists to avoid. Rather than let the auto-resume path
+    call ``dcp.load`` speculatively and retry a different candidate on failure -- which
+    would need a *second* rank-agreed decision mid-recovery -- this function runs
+    everything that is cheap to check *without* the collective, on the main process only,
+    before the (single) resume target is broadcast to every rank (see
+    ``oplm.training.trainer._resolve_resume_target``). A torn/invalid candidate is
+    therefore rejected identically on every rank, and the fallback candidate chosen in its
+    place is what gets broadcast -- never a candidate resolved after ranks disagree.
+
+    Checks, in order (first failure wins):
+      - ``trainer_state.json`` exists and parses as JSON.
+      - ``.metadata`` exists and is readable as DCP metadata (catches a truncated file
+        left by a kill during ``dcp.save``'s own write, distinct from the tmp-dir commit
+        rename ``save_checkpoint`` otherwise protects against).
+      - The checkpoint is schedule-compatible with ``cfg`` (see
+        :func:`validate_schedule_compat`).
+
+    A genuine mid-``dcp.load`` failure *after* this validation has passed (e.g. corruption
+    that these cheap checks don't catch) is intentionally left fatal -- see
+    ``oplm.training.trainer._resolve_resume_target``'s docstring for why.
+
+    Args:
+        checkpoint_dir: Path to a committed ``checkpoint-<step>/`` directory.
+        cfg: The live, resolved config being trained/resumed with.
+
+    Raises:
+        FileNotFoundError: ``trainer_state.json`` or ``.metadata`` is missing.
+        json.JSONDecodeError: ``trainer_state.json`` exists but is not valid JSON.
+        ValueError: The checkpoint is not schedule-compatible with ``cfg``.
+        Exception: Any other error ``FileSystemReader.read_metadata`` raises for a
+            corrupted/truncated ``.metadata`` file (the exact type is an internal detail
+            of DCP's metadata deserialization, not part of this function's contract).
+    """
+    state_path = checkpoint_dir / "trainer_state.json"
+    json.loads(state_path.read_text())
+
+    FileSystemReader(str(checkpoint_dir)).read_metadata()
+
+    validate_schedule_compat(checkpoint_dir, cfg)
+
+
 def load_checkpoint(
     accelerator: Accelerator,
     model: torch.nn.Module,
     optimizers: Sequence[Any],
     schedulers: Sequence[Any],
     checkpoint_dir: str,
+    cfg: OplmConfig,
 ) -> dict[str, Any]:
     """Load a training checkpoint and return trainer state metadata.
 
-    Restores model and optimizer state via ``torch.distributed.checkpoint`` (DCP; see
-    :class:`_ModelOptState`), restores each scheduler's state, restores this rank's RNG
-    state from its sidecar (see :func:`_restore_rng_sidecar`), and restores the fp16
-    ``GradScaler``'s state (see :func:`_restore_scaler_sidecar`) when both the checkpoint
-    and the current run have one. Reads and returns the trainer state dict.
-
-    This is a **minimal** conversion of the load path to the DCP format that
-    :func:`save_checkpoint` (Task 2.1) now writes -- just enough to keep resume working
-    end to end. Task 2.2 owns the full load rework (schema validation, world-size
-    mismatch fallback, etc.); this function does not attempt any of that.
+    Validates that the checkpoint is schedule-compatible with ``cfg`` (see
+    :func:`validate_schedule_compat`) before touching any state, then restores model and
+    optimizer state via ``torch.distributed.checkpoint`` (DCP; see :class:`_ModelOptState`),
+    restores each scheduler's state, restores this rank's RNG state from its sidecar (a
+    missing sidecar is a hard error -- see :func:`_restore_rng_sidecar`), and restores the
+    fp16 ``GradScaler``'s state (see :func:`_restore_scaler_sidecar`) when both the
+    checkpoint and the current run have one. Reads and returns the trainer state dict.
 
     Args:
         accelerator: The HuggingFace Accelerator instance.
@@ -368,6 +512,8 @@ def load_checkpoint(
         schedulers: All LR schedulers to restore, in the same order as ``optimizers``
             (may be Accelerate-wrapped or bare).
         checkpoint_dir: Path to the checkpoint directory.
+        cfg: The live, resolved config being resumed with; compared against the
+            checkpoint's own ``config.yaml`` for schedule compatibility.
 
     Returns:
         Dict with keys ``global_step``, ``epoch``, ``tokens_seen``, and
@@ -375,10 +521,16 @@ def load_checkpoint(
 
     Raises:
         FileNotFoundError: If the checkpoint directory or state file is missing.
+        ValueError: If the checkpoint's LR schedule config disagrees with ``cfg`` (see
+            :func:`validate_schedule_compat`).
+        RuntimeError: If this rank's RNG sidecar is missing and
+            ``OPLM_ALLOW_MISSING_RNG=1`` is not set (see :func:`_restore_rng_sidecar`).
     """
     ckpt_path = Path(checkpoint_dir)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    validate_schedule_compat(ckpt_path, cfg)
 
     unwrapped_schedulers = [_unwrap_scheduler(s) for s in schedulers]
     dcp_state: dict[str, Any] = {
@@ -402,16 +554,42 @@ def load_checkpoint(
     return state
 
 
+def list_committed_checkpoints(output_dir: Path) -> list[Path]:
+    """Return every *committed* checkpoint under ``output_dir``, newest step first.
+
+    Checkpoints are named ``checkpoint-<global_step>`` (see :func:`save_checkpoint`), so
+    ordering is numeric on the suffix — lexicographic ordering would rank
+    ``checkpoint-9000`` above ``checkpoint-10000``. In-flight ``checkpoint-<step>.tmp``
+    staging directories and ``checkpoint-<step>.old`` replace-in-progress directories are
+    never committed and are always excluded (the numeric-suffix check alone excludes
+    both, since neither ``<step>.tmp`` nor ``<step>.old`` is all-digit), so a process
+    killed mid-save or mid-replace can never produce a resume candidate.
+
+    Shared discovery machinery behind :func:`latest_checkpoint` (index 0 of this list)
+    and :func:`nth_latest_checkpoint` (auto-resume's committed-fallback chain).
+
+    Args:
+        output_dir: The training output directory (may not exist yet).
+
+    Returns:
+        Committed checkpoint directories sorted by step, newest first. Empty if
+        ``output_dir`` does not exist or holds no well-formed checkpoint directory.
+    """
+    if not output_dir.is_dir():
+        return []
+    candidates: list[tuple[int, Path]] = []
+    for path in output_dir.glob(f"{_CHECKPOINT_PREFIX}*"):
+        if not path.is_dir() or path.name.endswith(_TMP_SUFFIX):
+            continue
+        suffix = path.name.removeprefix(_CHECKPOINT_PREFIX)
+        if suffix.isdigit():
+            candidates.append((int(suffix), path))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in candidates]
+
+
 def latest_checkpoint(output_dir: Path) -> Path | None:
     """Return the highest-step *committed* checkpoint under ``output_dir``, or ``None``.
-
-    Checkpoints are named ``checkpoint-<global_step>`` (see
-    :func:`save_checkpoint`), so ordering is numeric on the suffix — lexicographic ordering
-    would rank ``checkpoint-9000`` above ``checkpoint-10000``. In-flight ``checkpoint-<step>.tmp``
-    staging directories and ``checkpoint-<step>.old`` replace-in-progress directories are never
-    committed and are always ignored (the numeric-suffix check alone excludes both, since neither
-    ``<step>.tmp`` nor ``<step>.old`` is all-digit), so a process killed mid-save or mid-replace can
-    never produce a resume candidate.
 
     Args:
         output_dir: The training output directory (may not exist yet).
@@ -421,18 +599,28 @@ def latest_checkpoint(output_dir: Path) -> Path | None:
         ``None`` if ``output_dir`` does not exist or holds no well-formed checkpoint
         directory.
     """
-    if not output_dir.is_dir():
-        return None
-    candidates: list[tuple[int, Path]] = []
-    for path in output_dir.glob(f"{_CHECKPOINT_PREFIX}*"):
-        if not path.is_dir() or path.name.endswith(_TMP_SUFFIX):
-            continue
-        suffix = path.name.removeprefix(_CHECKPOINT_PREFIX)
-        if suffix.isdigit():
-            candidates.append((int(suffix), path))
-    if not candidates:
-        return None
-    return max(candidates)[1]
+    checkpoints = list_committed_checkpoints(output_dir)
+    return checkpoints[0] if checkpoints else None
+
+
+def nth_latest_checkpoint(output_dir: Path, n: int) -> Path | None:
+    """Return the ``n``-th newest *committed* checkpoint under ``output_dir`` (0 = latest).
+
+    Used by the trainer's auto-resume fallback (Task 2.2) to walk backward through
+    committed checkpoints when the newest one fails pre-load validation (see
+    ``oplm.training.checkpoint.validate_checkpoint_for_resume``): ``n=0`` is
+    :func:`latest_checkpoint`, ``n=1`` is the next-newest, and so on.
+
+    Args:
+        output_dir: The training output directory (may not exist yet).
+        n: Zero-based rank from the newest checkpoint (0 = newest).
+
+    Returns:
+        The ``n``-th newest committed checkpoint directory, or ``None`` if fewer than
+        ``n + 1`` committed checkpoints exist.
+    """
+    checkpoints = list_committed_checkpoints(output_dir)
+    return checkpoints[n] if 0 <= n < len(checkpoints) else None
 
 
 def clean_stale_checkpoint_dirs(output_dir: Path) -> None:

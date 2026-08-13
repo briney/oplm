@@ -636,8 +636,23 @@ def serialize_config(cfg: OplmConfig) -> str:
     """
     from dataclasses import asdict
 
+    model_dict = cfg.model.to_dict()
+    # `auto_map` is HF `register_for_auto_class`/`save_pretrained` plumbing for
+    # trust_remote_code loading (see oplm/__init__.py's registration calls), not
+    # something a user ever sets. `PretrainedConfig.register_for_auto_class` stamps
+    # it onto the config instance *in place* the first time any `save_pretrained`
+    # call runs against it -- e.g. this very checkpoint's own `hf/` export just
+    # below in `save_checkpoint`, or an earlier checkpoint's, since `cfg.model` is
+    # one shared, mutable object across every checkpoint in a run. Once stamped, it
+    # sticks for the rest of the process, so every checkpoint after the first one
+    # saved would otherwise carry it into config.yaml -- and fail to round-trip
+    # through `load_config` (`_reject_unknown_model_keys` rejects it: a freshly
+    # constructed default instance's own `to_dict()` never has it either, since it
+    # is only ever added by `save_pretrained`, not by construction).
+    model_dict.pop("auto_map", None)
+
     config_dict = {
-        "model": cfg.model.to_dict(),
+        "model": model_dict,
         "train": asdict(cfg.train),
         "data": asdict(cfg.data),
     }

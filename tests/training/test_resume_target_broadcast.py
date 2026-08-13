@@ -89,6 +89,12 @@ def test_two_ranks_agree_on_the_resolved_resume_target(
         "ACCELERATE_USE_CPU": "true",
         "CUDA_VISIBLE_DEVICES": "",
         "PYTHONPATH": child_pythonpath,
+        # Phase 1 saves with a single rank (only rng_state_0.pt exists); phase 2 resumes
+        # with 2 ranks. Rank 1 has no sidecar to restore -- a genuine world-size change,
+        # which Task 2.2 makes a hard error by default. This test's purpose is
+        # rank-agreement on the *resume target*, not RNG-sidecar behavior, so it opts into
+        # the documented escape hatch rather than exercising the error path here.
+        "OPLM_ALLOW_MISSING_RNG": "1",
     }
     subprocess.run(
         [
@@ -127,6 +133,7 @@ def test_non_main_rank_never_scans_for_the_latest_checkpoint(
     here specifically so that, if the gating were ever removed, the scan (and this test)
     would notice it running.
     """
+    from oplm.config import OplmConfig
     from oplm.training import checkpoint as checkpoint_module
     from oplm.training.trainer import _resolve_resume_target
 
@@ -134,13 +141,18 @@ def test_non_main_rank_never_scans_for_the_latest_checkpoint(
     (tmp_path / "checkpoint-4" / "trainer_state.json").write_text("{}")
 
     calls: list[object] = []
-    original_latest_checkpoint = checkpoint_module.latest_checkpoint
+    # list_committed_checkpoints (not latest_checkpoint directly) is what
+    # _select_auto_resume_candidate calls since Task 2.2's fallback rework; patching it
+    # is what would actually notice a regression that removed the is_main_process gate.
+    original_list_committed_checkpoints = checkpoint_module.list_committed_checkpoints
 
-    def _counting_latest_checkpoint(output_dir: object) -> object:
+    def _counting_list_committed_checkpoints(output_dir: object) -> object:
         calls.append(output_dir)
-        return original_latest_checkpoint(output_dir)  # ty: ignore[invalid-argument-type]
+        return original_list_committed_checkpoints(output_dir)  # ty: ignore[invalid-argument-type]
 
-    monkeypatch.setattr(checkpoint_module, "latest_checkpoint", _counting_latest_checkpoint)
+    monkeypatch.setattr(
+        checkpoint_module, "list_committed_checkpoints", _counting_list_committed_checkpoints
+    )
 
     class _FakeNonMainAccelerator:
         """Minimal stand-in exposing only what ``_resolve_resume_target`` reads."""
@@ -152,6 +164,7 @@ def test_non_main_rank_never_scans_for_the_latest_checkpoint(
         _FakeNonMainAccelerator(),  # ty: ignore[invalid-argument-type]
         resume_from=None,
         auto_resume=True,
+        cfg=OplmConfig(),
         output_dir=str(tmp_path),
     )
 

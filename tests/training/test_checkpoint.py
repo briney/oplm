@@ -150,6 +150,7 @@ def test_load_checkpoint_restores_state(tmp_path: Path) -> None:
         [fresh_optimizer],
         [fresh_scheduler],
         str(tmp_path / "checkpoint-10"),
+        cfg,
     )
     assert state["global_step"] == 10
     assert state["epoch"] == 1
