@@ -123,9 +123,20 @@ rank-synchronized step boundary (same discipline as the eval scheduler).
 load (corrupt shard, bad metadata), fall back to the next-newest with a loud
 warning, bounded to a small number of attempts. Resume verifies the loaded
 `config.yaml` is schedule-compatible with the live config (`warmup_steps`,
-`max_steps`, LR shape) and fails loudly on mismatch — closing the silent
-`LambdaLR` rebuild-from-config hazard. RNG-restore failures are surfaced as
-errors, not swallowed.
+`stable_steps`, `scheduler`, `lr`, `min_lr`) and fails loudly on any mismatch —
+closing the silent `LambdaLR` rebuild-from-config hazard. RNG-restore failures
+are surfaced as errors, not swallowed.
+
+`max_steps` ships with a deliberately **asymmetric** policy instead of exact
+equality (Task 2.2), because extending a run past its original target on
+resume is an existing, tested, desired workflow: a decrease raises (a shrunk
+schedule on resume is essentially always accidental), resuming into a target
+the checkpoint's own `global_step` already meets or exceeds raises regardless
+of whether `max_steps` moved (nothing left to train), an increase is allowed
+but logged as a prominent warning (the decay portion of the schedule differs
+from an uninterrupted run to the new, longer target — expected, not silently
+swallowed), and an unchanged value is silent. See
+`oplm.training.checkpoint.validate_schedule_compat`.
 
 ---
 
@@ -209,7 +220,19 @@ fsspec/S3, credentials from env; unset = pure-local):
 - *Save:* shards land on node-local NVMe; a per-node background uploader
   (local-rank-0) pushes that node's shards; global rank 0 uploads metadata and
   writes a remote **manifest last** (lists every shard + size) as the remote
-  commit marker.
+  commit marker. Finalizing that manifest is **not a bare barrier** (Task 4.2's
+  shipped implementation, after a critical-review fix on an earlier barrier-based
+  draft): every node leader that just finished uploading exchanges its checkpoint
+  identity (which step it uploaded) with every other leader over a dedicated GLOO
+  process group, and the manifest is written only if every leader agrees on the
+  step. A barrier alone can't detect two leaders having finished uploading
+  *different* checkpoints (one node's upload queue coalesced onto a different step
+  than its peers), which would otherwise let a manifest commit while silently
+  missing that node's files; on disagreement the round is left uncommitted
+  (self-healing — the next round where every leader lands on the same step commits
+  normally) rather than ever finalized incomplete. See
+  [TRAIN.md's "Remote checkpoint mirror"](../../TRAIN.md#remote-checkpoint-mirror)
+  for the full mechanism.
 - *Load:* no bulk pre-download — DCP's fsspec storage reader reads directly
   from the object store; each rank fetches only the byte ranges its load plan
   needs.
@@ -271,8 +294,18 @@ log with `step=global_step`, so a resumed run continues one W&B run.
   add). Verdict: **works as-is**, no gather → Newton–Schulz → scatter adapter
   needed to unblock Phase 5; Task 5.2 is skipped unless HSDP training
   instability surfaces in practice and points back at Muon's DTensor path.
-- Open sub-decision (resolve during Phase 5 planning): keep accelerate's FSDP2
-  wrapping vs. go native torch for the sharded path.
+- **Resolved (Task 5.1): native `fully_shard`, not Accelerate's FSDP2 plugin.**
+  The model is sharded directly via `torch.distributed.fsdp.fully_shard` and kept
+  out of `accelerator.prepare` (only optimizers/schedulers are prepared); every
+  other Accelerate service — process-group setup, device resolution,
+  `reduce`/`broadcast`, gradient-accumulation bookkeeping, trackers — is
+  unchanged on both paths. Rationale, briefly: Accelerate's FSDP2 integration
+  never engages on CPU/gloo (falls through to plain DDP), which would make the
+  HSDP pilot untestable in CI; it reorders `torch.compile` ahead of sharding,
+  breaking the trainer's SAC/`optimize_ddp`/cache-sizing ordering; and it rewrites
+  optimizer params by canonicalized name post-sharding, a path with documented
+  sharp edges for `OplmForMaskedLM`'s tied embeddings. See
+  `oplm.training.parallel`'s module docstring for the full writeup.
 
 ---
 

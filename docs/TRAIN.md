@@ -547,7 +547,7 @@ no-progress guard), see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget
 | `keep_every_n_steps` | `null` | Checkpoints on a step multiple of this value are permanent: excluded from `save_total_limit` rotation entirely. `null` disables the exemption. |
 | `keep_every_n_hours` | `null` | Marks a checkpoint permanent at least this many wall-clock hours after the previous permanent one (independent of `keep_every_n_steps`). `null` disables the exemption. |
 | `auto_resume` | `false` | Resume from the newest **committed** checkpoint under `output_dir` automatically at trainer start, with no `resume_from` needed. An explicit `resume_from` always wins over `auto_resume`. `oplm slurm generate` injects `train.auto_resume=true` into every job it renders (see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard)); `configs/scaling.yaml` also sets it explicitly, since that config only ever runs under Slurm. |
-| `resume_data_position` | `true` | **Reserved, wired in a later phase (Phase 3).** The field exists and round-trips through config serialization, but nothing in the trainer reads it yet — a resume always restarts the dataloader from the beginning of the current epoch (see "What a resume restores" below). |
+| `resume_data_position` | `true` | **Data-exact resume (Phase 3 — live).** When a checkpoint carries a data cursor and this is `true` (the default), a resume replays the exact row-level position the run was at when the checkpoint was taken — no row re-seen or skipped, same order as an uninterrupted run — instead of restarting the epoch's data stream from row 0. The cursor's layout (`world_size`, `num_workers`, per-rank batch size, seed) is validated against the live run; a mismatch raises, naming the escape hatch. Set `false` to opt back into the pre-Phase-3 behavior (restart the current epoch from row 0) — the escape hatch for resuming into a different world size/worker count, or a pre-Task-3.3 checkpoint with no cursor at all. See "What a resume restores" below. |
 | `dist_timeout_minutes` | `15` | Timeout passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. A genuine hang raises within this window instead of wedging until the Slurm time limit; a no-op on a single process. |
 | `remote_checkpoint_uri` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background (Task 4.2) — durability beyond local/shared storage. `null` (default) disables it entirely: zero behavior change, no import of `oplm.training.remote`, no fsspec call. See "Remote checkpoint mirror" below. |
 | `parallelism` | `ddp` | `ddp` (one full replica per rank, gradients all-reduced) or `hsdp` (FSDP2 `fully_shard` over a 2-D mesh: shard within a node, replicate across nodes). Checkpoints are parallelism-agnostic, so the same checkpoint resumes under either setting at any world size. `hsdp` requires world size > 1 and currently refuses three combinations, each of which would otherwise hang or silently diverge: **configured `data.eval`** (in-loop eval all-gathers on rank-striped forward counts and deadlocks — evaluate an HSDP run's checkpoints with a separate `ddp` job), `mixed_precision=fp16` (the GradScaler's inf-check is not shard-aware), and `stability_diagnostics` with `stability_probe_every > 0` (the probe's main-process-only forward all-gathers). See `oplm.training.parallel` for the full limitation list; deeper HSDP docs land with Task 5.3. |
@@ -628,7 +628,8 @@ blocked behind — or preceded by — a torn, uncommitted periodic save.
 
 ### What a resume restores
 
-A resume (`resume_from` or `auto_resume`) restores, via Accelerate's `save_state`/`load_state`:
+A resume (`resume_from` or `auto_resume`) restores, via `torch.distributed.checkpoint` (DCP;
+model/optimizer state) plus per-rank sidecars (RNG, and the fp16 `GradScaler` when in use):
 
 - model weights,
 - **all** optimizer state — including Muon's, not just AdamW's,
@@ -637,12 +638,22 @@ A resume (`resume_from` or `auto_resume`) restores, via Accelerate's `save_state
 - the trainer's own step counters (`global_step`, `epoch`, `samples_seen`, `tokens_seen`, plus the
   `keep_every_n_hours` bookkeeping and the persisted W&B run id — see below).
 
-**What it does not yet restore: dataloader position.** `resume_data_position` is reserved for a
-later phase (Phase 3, data-exact resume); today a resume always restarts the data stream from the
-beginning of the current epoch rather than the exact row it was on when interrupted. For a
-shuffled, many-epoch pretraining run this is a minor efficiency cost (some rows get seen twice
-sooner than they otherwise would), not a correctness issue — but it is real, and worth knowing
-before assuming a resume is bit-exact.
+**Dataloader position: data-exact resume (Phase 3).** Every checkpoint additionally carries a
+data cursor (`{epoch, batches_consumed_this_epoch}` plus the layout it was recorded under —
+world size, worker count, per-rank batch size, seed). With `resume_data_position=true` (the
+default), a resume converts that cursor into a per-stream sample offset and skips there **by
+arithmetic** — walking shard metadata (row counts) rather than reading and discarding rows — so
+the resumed run sees exactly the same sequence of training examples, in the same order, as an
+uninterrupted control run; no row is re-seen or skipped, and `tokens_seen` matches the
+uninterrupted run exactly. Masking is unaffected by this: the collator's masking RNG is untouched,
+so post-resume masks differ bit-for-bit from an uninterrupted run even though the *data* stream is
+identical (data-exact, not bitwise). A cursor whose recorded layout doesn't match the live run's
+(different world size, worker count, batch size, or seed) raises rather than silently reproducing
+the wrong data order or coverage; the fix is either to resume at the original layout or set
+`resume_data_position=false` to fall back to the pre-Phase-3 behavior (restart the current epoch's
+data stream from row 0 — a minor efficiency cost, not a correctness issue, for a shuffled,
+many-epoch run). A checkpoint saved before Task 3.3 (no cursor at all) always takes that same
+restart-from-row-0 fallback, regardless of `resume_data_position`.
 
 ### W&B continuity
 
@@ -683,6 +694,56 @@ preemptions.
 
 **Guarantee:** after this phase of work, a requeued production job resumes from the newest
 committed checkpoint automatically, with no operator intervention.
+
+### Known limitations
+
+Everything above is implemented and tested; these are the specific, deliberate gaps to know
+about before relying on it in production:
+
+- **Eval is refused under HSDP.** `train.parallelism=hsdp` together with any configured
+  `data.eval` raises at config-load time (`oplm.config.validate_parallelism_compat`), not just
+  a documentation warning. Mechanism: `fully_shard` mutates the model in place, so the evaluator
+  gets handed the `FSDPModule` itself, and every eval forward all-gathers sharded parameters;
+  eval tasks stripe their work across ranks (`[rank::world_size]`), so ranks issue *different
+  numbers* of forwards, and the ranks that finish early never issue the matching all-gathers —
+  the whole group wedges until `dist_timeout_minutes`, then crash-loops through the requeue.
+  Follow-up work (not yet implemented): rank-padded forward counts, or gathering the model once
+  into an unsharded eval copy. Until then, evaluate an HSDP run's checkpoints with a separate
+  `ddp` job against the same checkpoint.
+- **Muon's numerics on HSDP's sharded (DTensor) parameters are on the first-real-run watch
+  list.** `torch.optim.Muon` has no DTensor-specific handling — its Newton–Schulz iteration runs
+  as real distributed matmuls over sharded operands. Task 0.3's spike established that this
+  *runs* and checkpoints correctly (loss decreases, state round-trips), not that it is
+  numerically identical to the unsharded computation; review measured ~3% divergence against a
+  single-device oracle on a toy model. Nothing suggests it is wrong — distributed matmul is the
+  mathematically correct way to compute it — but watch the first real Muon+HSDP production run's
+  loss curve against a DDP control.
+- **HSDP refuses `mixed_precision=fp16`.** `TrainConfig.__post_init__` raises on
+  `parallelism=hsdp` + `mixed_precision=fp16`: under FSDP2 every gradient is a sharded DTensor,
+  and `torch.amp.GradScaler`'s inf-check runs per rank over local shards with no cross-rank
+  reduction, so ranks could disagree about skipping a step and silently desynchronize. Use
+  `bf16` (default) or `no` under `hsdp`.
+- **Gradient accumulation reduce-scatters every micro-batch under HSDP**, not just at the
+  optimizer-step boundary. `Accelerator.no_sync` looks for a `no_sync` attribute that
+  `FSDPModule` doesn't define, so it degrades to a null context — correct (gradients still
+  accumulate into the sharded `.grad`) but extra communication on every micro-batch instead of
+  just the last one. The proper fix (FSDP2's `set_requires_gradient_sync`/
+  `set_is_last_backward`, driven per micro-batch) is left out rather than half-wired, since
+  getting only one half of that pair right silently corrupts gradients. Throughput cost, not a
+  correctness issue.
+- **GPU/NCCL and real multi-node paths are verified structurally, not exercised in CI.** The
+  test suite runs on CPU/gloo only (2-process `tests/training/test_e2e_hsdp.py`,
+  `tests/training/test_fsdp2_muon_spike.py`; `tests/slurm/` renders and asserts sbatch script
+  text without submitting to a scheduler) — there is no GPU or real-Slurm CI runner. Everything
+  NCCL-specific (flight recorder paths, `TORCH_NCCL_ASYNC_ERROR_HANDLING`, actual multi-node
+  rendezvous) is reviewed and unit-tested at the config/rendering level but has not run against
+  real GPUs or a live multi-node Slurm allocation as part of this work.
+- **Manifest-less remote checkpoint directories accumulate (storage hygiene, not correctness).**
+  A skipped or torn upload-finalization round (see "Remote checkpoint mirror" above) leaves a
+  `checkpoint-<step>/` directory with no `manifest.json` sitting in the remote store forever;
+  rotation never touches it because nothing without a manifest is ever counted or deleted. Safe
+  (never mistaken for a valid checkpoint) but requires an operator to clean up stale
+  manifest-less directories periodically on long-running production buckets.
 
 ---
 
