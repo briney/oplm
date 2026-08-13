@@ -11,13 +11,25 @@ the *global* interleaving order — not just each worker's own substream — mat
 
 This module is the property's acceptance test: for both ``num_workers=0`` (no ``DataLoader``
 worker processes) and ``num_workers=2`` (the round-robin/alignment machinery actually
-exercised), an INTERRUPTED run (train to step 6, checkpoint, fresh ``Trainer`` with
-``auto_resume=true`` finishing to step 12) must reproduce a CONTROL run's (uninterrupted,
-straight to step 12) per-step ``sequence_ids`` stream *exactly* when the interrupted run's two
-halves are concatenated, and the final ``tokens_seen`` must match exactly too. Two fixture
-sizes are used so the checkpoint lands mid-epoch in one variant and inside epoch 1 (having
-already crossed one epoch boundary) in the other — proving ``epoch`` and ``batches_in_epoch``
-compose correctly across the rollover, not just within a single epoch.
+exercised), an INTERRUPTED run (train to the point ``save_every=5``'s trigger actually
+commits a checkpoint, then a fresh ``Trainer`` with ``auto_resume=true`` finishing to step 12)
+must reproduce a CONTROL run's (uninterrupted, straight to step 12) per-step ``sequence_ids``
+stream *exactly* when the interrupted run's two halves are concatenated, and the final
+``tokens_seen`` must match exactly too. Two fixture sizes are used so the checkpoint lands
+mid-epoch in one variant and inside epoch 1 (having already crossed one epoch boundary) in the
+other — proving ``epoch`` and ``batches_in_epoch`` compose correctly across the rollover, not
+just within a single epoch; each variant asserts the crossing (or non-crossing) actually
+happened, so a rollover regression cannot silently collapse one variant into the other.
+
+Falsifiability: ``save_final`` is disabled on the interrupted run's first phase, so the *only*
+checkpoint it produces comes from the ``save_every=5`` periodic trigger routed through Task
+3.3's ``_SaveDeferral`` — a broken deferral (e.g. one that ignores worker-cycle alignment and
+saves immediately) lands the checkpoint on a different step than the run actually stops at,
+which the ``checkpoint_step == run1.global_step == stop_step`` assertion below catches directly
+(and, independently, the stream-equality assertion would also fail, since a checkpoint short of
+the true stop step makes the resumed run re-derive already-consumed data). ``stop_step`` is
+chosen per ``num_workers`` to be exactly where a *correct* deferral commits (see the
+``pytest.mark.parametrize`` comment) rather than backstopped by an unconditional final save.
 
 Masking is untouched by this tier: masks are dynamic (redrawn every call, docs/DATA_TOOLING.md
 §4.5) and may differ bit-for-bit between the control and the interrupted-then-resumed run even
@@ -37,6 +49,7 @@ delegates ``dataset``/``set_epoch``/``__len__`` — the trainer never sees the d
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -56,7 +69,18 @@ pytestmark = pytest.mark.slow
 
 _BATCH_SIZE = 4
 _TOTAL_STEPS = 12
-_STOP_STEP = 6
+
+# (num_workers, stop_step): stop_step is exactly the batch count at which a *correctly*
+# functioning deferral commits the save_every=5 checkpoint, for each num_workers value,
+# given batch_size=4 and both fixtures below (mid-epoch and epoch-boundary-crossing both
+# happen to leave an odd batches_in_epoch count at the trigger step, so both need exactly
+# one extra deferred step for num_workers=2 -- see the module docstring's Falsifiability
+# paragraph for why this must be derived from correct-mechanism behavior, not backstopped).
+# num_workers<=1: _SaveDeferral.decide's `aligned` is unconditionally True, so the trigger
+# at step 5 commits immediately.
+# num_workers=2: batches_in_epoch is odd (5 in the mid-epoch fixture, 1 in the
+# epoch-boundary fixture, both odd) at step 5, so the commit defers exactly one step to 6.
+_NUM_WORKERS_STOP_STEPS = [(0, 5), (2, 6)]
 
 
 class _SequenceIdRecorder:
@@ -109,6 +133,9 @@ def _force_keep_sequence_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     class _RecordingCollator(MLMCollator):
         def __init__(self, *args: object, **kwargs: object) -> None:
             kwargs["keep_sequence_ids"] = True
+            # args/kwargs are whatever build_train_dataloader passes MLMCollator (tokenizer
+            # positional, the rest kwargs) -- MLMCollator.__init__ itself validates them, so
+            # no narrower signature is needed here.
             super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(loaders_mod, "MLMCollator", _RecordingCollator)
@@ -117,19 +144,32 @@ def _force_keep_sequence_ids(monkeypatch: pytest.MonkeyPatch) -> None:
 def _wrap_recorder(trainer: Trainer) -> _SequenceIdRecorder:
     """Swap ``trainer.dataloader`` for a recording wrapper around the same loader."""
     recorder = _SequenceIdRecorder(trainer.dataloader)
+    # _SequenceIdRecorder duck-types DeviceDataLoader (dataset/set_epoch/__len__/__iter__ --
+    # every attribute Trainer touches on self.dataloader); Trainer's own annotation is the
+    # concrete DeviceDataLoader type, hence the mismatch here.
     trainer.dataloader = recorder  # type: ignore[assignment]
     return recorder
 
 
-def _assert_data_exact_resume(train_data: Path, tmp_path: Path, num_workers: int) -> None:
-    """Control (0->12) vs. interrupted (0->6, checkpoint) + resumed (auto_resume->12).
+def _assert_data_exact_resume(
+    train_data: Path,
+    tmp_path: Path,
+    num_workers: int,
+    stop_step: int,
+    *,
+    expect_epoch_crossing: bool,
+) -> None:
+    """Control (0->12) vs. interrupted (0->stop_step, checkpoint) + resumed (auto_resume->12).
 
     Asserts the concatenated ``sequence_ids`` stream of the interrupted run's two
     halves equals the control's stream exactly, and that final ``tokens_seen``
-    matches exactly. Does not assume which step the checkpoint that resume actually
-    uses lands on (Task 3.3's worker-cycle save-alignment deferral can push a
-    ``save_every=5`` trigger to a later, worker-aligned step) — it is read back from
-    the recording callback and checked, never hardcoded.
+    matches exactly. ``stop_step`` is the caller-supplied step at which a *correct*
+    save-alignment deferral commits the ``save_every=5`` checkpoint (see the module
+    docstring); it is not re-derived here, but every claim about where the actual
+    checkpoint landed is read back from the recording callback and checked, not
+    assumed. ``expect_epoch_crossing`` asserts whether the checkpoint's epoch is >= 1
+    (already rolled over once) or exactly 0, cross-checked against both the trainer's
+    own counter and the checkpoint's persisted cursor.
     """
     from oplm.training.trainer import Trainer
 
@@ -149,16 +189,17 @@ def _assert_data_exact_resume(train_data: Path, tmp_path: Path, num_workers: int
     control_recorder = _wrap_recorder(control)
     control.train()
 
-    # Interrupted run, phase 1: train only to step 6. save_every=5 exercises the
-    # worker-cycle alignment machinery for num_workers=2 (the trigger at step 5 is
-    # deferred to the next aligned batch count); save_final backstops a checkpoint
-    # at the actual stop step regardless of where the periodic trigger landed.
+    # Interrupted run, phase 1: train only to stop_step. save_final is OFF here (unlike
+    # every other test in this repo that exercises save_every) -- the checkpoint used for
+    # resume must come solely from the save_every=5 periodic trigger routed through
+    # _SaveDeferral, so a broken deferral is actually falsifiable (see module docstring).
     interrupt_dir = tmp_path / "interrupt"
     cfg1 = tiny_train_cfg(
         interrupt_dir,
         train_data,
-        max_steps=_STOP_STEP,
+        max_steps=stop_step,
         save_every=5,
+        save_final=False,
         **common,
     )
     callback = FullRecordingCallback()
@@ -168,9 +209,22 @@ def _assert_data_exact_resume(train_data: Path, tmp_path: Path, num_workers: int
 
     assert callback.checkpoint_steps, "run1 must have saved at least one checkpoint"
     checkpoint_step = callback.checkpoint_steps[-1]
-    # The checkpoint resume actually uses reflects everything run1 consumed: nothing
-    # is re-derived or duplicated across the boundary.
-    assert checkpoint_step == run1.global_step == _STOP_STEP
+    # The checkpoint resume actually uses reflects everything run1 consumed: nothing is
+    # re-derived or duplicated across the boundary. This is the assertion a broken
+    # _SaveDeferral (e.g. one that ignores worker-cycle alignment) fails: it would commit
+    # at the raw trigger step (5) instead of the aligned stop_step (6) for num_workers=2.
+    assert checkpoint_step == run1.global_step == stop_step
+
+    checkpoint_state = json.loads(
+        (interrupt_dir / f"checkpoint-{checkpoint_step}" / "trainer_state.json").read_text()
+    )
+    cursor_epoch = checkpoint_state["cursor"]["epoch"]
+    if expect_epoch_crossing:
+        assert run1.epoch >= 1, "expected the checkpoint to land after an epoch rollover"
+        assert cursor_epoch >= 1
+    else:
+        assert run1.epoch == 0, "expected the checkpoint to land within the first epoch"
+        assert cursor_epoch == 0
 
     # Interrupted run, phase 2: a fresh Trainer, auto_resume finds the newest
     # committed checkpoint in interrupt_dir and finishes the rest of the schedule.
@@ -195,12 +249,13 @@ def _assert_data_exact_resume(train_data: Path, tmp_path: Path, num_workers: int
     assert run2.tokens_seen == control.tokens_seen
 
 
-@pytest.mark.parametrize("num_workers", [0, 2])
+@pytest.mark.parametrize("num_workers, stop_step", _NUM_WORKERS_STOP_STEPS)
 def test_resume_matches_control_exactly_mid_epoch(
     training_parquet: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     num_workers: int,
+    stop_step: int,
 ) -> None:
     """256-row fixture: 64 batches/epoch keeps all 12 steps inside epoch 0.
 
@@ -208,21 +263,26 @@ def test_resume_matches_control_exactly_mid_epoch(
     within-epoch skip arithmetic from any epoch-rollover interaction.
     """
     _force_keep_sequence_ids(monkeypatch)
-    _assert_data_exact_resume(training_parquet, tmp_path, num_workers)
+    _assert_data_exact_resume(
+        training_parquet, tmp_path, num_workers, stop_step, expect_epoch_crossing=False
+    )
 
 
-@pytest.mark.parametrize("num_workers", [0, 2])
+@pytest.mark.parametrize("num_workers, stop_step", _NUM_WORKERS_STOP_STEPS)
 def test_resume_matches_control_exactly_across_epoch_boundary(
     tiny_training_parquet: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     num_workers: int,
+    stop_step: int,
 ) -> None:
     """16-row fixture: 4 batches/epoch, so the checkpoint (~step 5-6) sits in epoch 1.
 
     Proves ``epoch`` + ``batches_in_epoch`` compose across the rollover: the
     checkpoint used for resume was taken after one full epoch already elapsed, not
-    within epoch 0.
+    within epoch 0 (asserted directly, not just implied by the fixture's size).
     """
     _force_keep_sequence_ids(monkeypatch)
-    _assert_data_exact_resume(tiny_training_parquet, tmp_path, num_workers)
+    _assert_data_exact_resume(
+        tiny_training_parquet, tmp_path, num_workers, stop_step, expect_epoch_crossing=True
+    )
