@@ -151,7 +151,7 @@ class SlurmConfig:
     # Requeue budget for the wrapper `render_job` appends after the training `srun` -- see
     # `oplm.slurm.render._requeue_wrapper`.
     max_requeues: int = 20
-    # Field only for now; Task 1.8 wires this into the rendered `NCCL_DEBUG` export.
+    # Rendered as the job script's `NCCL_DEBUG` export (see `oplm.slurm.render.render_job`).
     nccl_debug: str = "WARN"
 
     @classmethod

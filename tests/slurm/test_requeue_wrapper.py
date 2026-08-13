@@ -186,6 +186,63 @@ def test_crash_loop_same_step_stops_requeueing(
     assert log.read_text().strip() == "requeue 424242"
 
 
+def test_drain_then_crash_at_same_step_still_requeues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drain must not arm the crash-loop guard for the *first* crash that follows it.
+
+    Regression for an Important review finding: the wrapper used to write `STEP_FILE` on
+    every requeue path, including the drain (exit 85) path. So the sequence
+    drain -> requeue -> crash before the next checkpoint left `CURRENT_STEP == PREV_STEP`
+    and tripped the no-progress guard after a *single* non-drain failure -- ending the
+    requeue loop of a healthy, merely-preempted job. The guard's contract is two
+    consecutive *non-drain* failures with no progress between them, so the drain leg must
+    not record a step at all (fail-open).
+    """
+    progress_dir = tmp_path / "output"
+    progress_dir.mkdir()
+    _make_checkpoint(progress_dir, 100)
+    log = tmp_path / "scontrol.log"
+
+    drained = _run_wrapper(
+        tmp_path,
+        monkeypatch,
+        preamble="(exit 85)",
+        progress_dir=str(progress_dir),
+        restarts=0,
+        scontrol_log=log,
+    )
+    assert "requeueing" in drained.stdout
+    # The drain leg records nothing: there is no non-drain failure to compare against yet.
+    assert not (progress_dir / ".last_requeue_step").exists()
+
+    crashed = _run_wrapper(
+        tmp_path,
+        monkeypatch,
+        preamble="false",
+        progress_dir=str(progress_dir),
+        restarts=1,
+        scontrol_log=log,
+    )
+    assert "crash loop" not in crashed.stderr
+    assert "requeueing" in crashed.stdout
+    assert log.read_text().splitlines() == ["requeue 424242", "requeue 424242"]
+    # ... and this first non-drain failure *does* record the step, so a second one at the
+    # same step still trips the guard.
+    assert (progress_dir / ".last_requeue_step").read_text().strip() == "100"
+
+    second_crash = _run_wrapper(
+        tmp_path,
+        monkeypatch,
+        preamble="false",
+        progress_dir=str(progress_dir),
+        restarts=2,
+        scontrol_log=log,
+    )
+    assert "crash loop" in second_crash.stderr
+    assert log.read_text().splitlines() == ["requeue 424242", "requeue 424242"]
+
+
 # --- case 4: exit 1 with an advanced step -> requeues again ------------------------------
 
 

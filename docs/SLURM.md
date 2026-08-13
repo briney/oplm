@@ -328,15 +328,19 @@ After the training `srun` exits, every generated job script runs a requeue wrapp
 `max_requeues`, exiting with the training process's own status instead — an unbounded requeue loop
 against a persistently broken node or config is not silently infinite.
 
-**No-progress guard** (crash-loop detection, non-drain exits only): the wrapper reads the highest
-committed `checkpoint-<step>` under the job's output directory and compares it to the step
-recorded at the *previous* restart (`.last_requeue_step`, written into the same directory). If the
-step has not advanced since the last restart — i.e. this is already the second consecutive
-non-drain failure with zero checkpoint progress between them — the wrapper treats it as a crash
-loop and exits without requeueing, rather than repeatedly resubmitting a job that immediately dies
-again. A first restart (`SLURM_RESTART_COUNT == 0`) always requeues on budget alone, since there is
-no previous step to compare against yet. Jobs with no `progress_dir` (non-training jobs, e.g. a
-post-processing step) skip the guard entirely and requeue on budget alone.
+**No-progress guard** (crash-loop detection, non-drain exits only): the wrapper scans the job's
+output directory for `checkpoint-<step>` directories, keeps only the ones whose suffix is purely
+numeric (so in-progress `.tmp` and `.old` directories are excluded — the same committed-only rule
+the trainer's own discovery uses) and takes the highest step, then compares it to the step
+recorded at the *previous non-drain failure* (`.last_requeue_step`, written into the same
+directory). If the step has not advanced — i.e. this is already the second consecutive non-drain
+failure with zero checkpoint progress between them — the wrapper treats it as a crash loop and
+exits without requeueing, rather than repeatedly resubmitting a job that immediately dies again.
+A first restart (`SLURM_RESTART_COUNT == 0`) always requeues on budget alone, since there is no
+previous step to compare against yet. The drain (85) path neither reads nor writes
+`.last_requeue_step`: a preemption is not a failure, so a drain must not arm the guard against
+the *first* crash that happens to follow it. Jobs with no `progress_dir` (non-training jobs, e.g.
+a post-processing step) skip the guard entirely and requeue on budget alone.
 
 ### Auto-resume: how a requeued job actually continues
 

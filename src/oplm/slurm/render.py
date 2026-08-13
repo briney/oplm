@@ -185,10 +185,11 @@ def _requeue_wrapper(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
 
     Exit 0 is a clean finish. Exit ``DRAIN_EXIT_CODE`` (85, see ``oplm.training.signals``)
     requeues unconditionally as long as the requeue budget (``slurm.max_requeues``) is not
-    exhausted -- it bypasses the no-progress guard below, but not the budget cap. Any other
-    nonzero exit requeues only if budget remains *and* checkpoint progress was made since the
-    previous restart; two consecutive restarts with no step advance is a crash loop, and the
-    job exits without requeueing.
+    exhausted -- it bypasses the no-progress guard below entirely (it neither reads nor
+    writes the guard's step file), but not the budget cap. Any other nonzero exit requeues
+    only if budget remains *and* checkpoint progress was made since the previous *non-drain*
+    failure; two consecutive non-drain failures with no step advance between them is a crash
+    loop, and the job exits without requeueing.
 
     When ``spec.progress_dir`` is ``None`` (a non-training job), the no-progress guard and its
     step-tracking file are omitted entirely -- the wrapper requeues on budget alone.
@@ -220,17 +221,26 @@ def _requeue_wrapper(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
             f'CURRENT_STEP=$(ls -d "{spec.progress_dir}"/checkpoint-* 2>/dev/null \\',
             "  | sed 's/.*checkpoint-//' | grep -E '^[0-9]+$' | sort -n | tail -1 || true)",
             "CURRENT_STEP=${CURRENT_STEP:-0}",
-            'if [ "$STATUS" -ne 85 ] && [ "$RESTARTS" -ge 1 ]; then',
-            '  PREV_STEP=$(cat "$STEP_FILE" 2>/dev/null || echo -1)',
-            '  if [ "$CURRENT_STEP" -le "$PREV_STEP" ]; then',
+            # The guard reads AND writes STEP_FILE only on non-drain exits. Writing it on
+            # the drain (85) path too would arm the guard against the very next crash:
+            # drain -> requeue -> crash before the next checkpoint commits leaves
+            # CURRENT_STEP == PREV_STEP, so a single non-drain failure after a drain would
+            # end the requeue loop. The guard's contract is two consecutive *non-drain*
+            # failures with no progress between them, so the drain leg is fail-open: it
+            # neither consults nor updates the recorded step.
+            'if [ "$STATUS" -ne 85 ]; then',
+            '  if [ "$RESTARTS" -ge 1 ]; then',
+            '    PREV_STEP=$(cat "$STEP_FILE" 2>/dev/null || echo -1)',
+            '    if [ "$CURRENT_STEP" -le "$PREV_STEP" ]; then',
             (
-                '    echo "no checkpoint progress since last restart (step $CURRENT_STEP); '
+                '      echo "no checkpoint progress since last restart (step $CURRENT_STEP); '
                 'crash loop -- not requeueing" >&2'
             ),
-            '    exit "$STATUS"',
+            '      exit "$STATUS"',
+            "    fi",
             "  fi",
+            '  echo "$CURRENT_STEP" > "$STEP_FILE"',
             "fi",
-            'echo "$CURRENT_STEP" > "$STEP_FILE"',
             'echo "requeueing (exit=$STATUS, restarts=$RESTARTS, step=$CURRENT_STEP)"',
         ]
     else:

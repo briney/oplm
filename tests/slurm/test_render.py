@@ -237,8 +237,10 @@ def test_array_job_progress_dir_uses_run_dir_expansion(tmp_path: Path) -> None:
     text = render_job(spec, SLURM)
     assert 'STEP_FILE="$RUN_DIR/output/.last_requeue_step"' in text
     assert 'ls -d "$RUN_DIR/output"/checkpoint-*' in text
-    # The no-progress guard is only meaningful once at least one restart has happened.
-    assert 'if [ "$STATUS" -ne 85 ] && [ "$RESTARTS" -ge 1 ]; then' in text
+    # The whole guard -- its step-file *write* included -- is skipped on the drain (85)
+    # path, and its comparison is only meaningful once at least one restart has happened.
+    assert 'if [ "$STATUS" -ne 85 ]; then' in text
+    assert 'if [ "$RESTARTS" -ge 1 ]; then' in text
 
 
 def test_no_progress_guard_omitted_when_progress_dir_is_none() -> None:
