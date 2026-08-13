@@ -299,3 +299,64 @@ def test_resume_restores_state_and_continues(training_parquet: Path, tmp_path: P
     last_pre = dict(cb1.train_logs)[4]["train/loss"]
     first_post = post_resume[5]["train/loss"]
     assert 0.2 < first_post / last_pre < 5.0
+
+
+# --- auto_resume (Task 1.4) -------------------------------------------------------------
+
+
+def test_auto_resume_picks_up_the_newest_committed_checkpoint(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """``auto_resume=true`` with no explicit ``resume_from`` finds and resumes the checkpoint.
+
+    Mirrors ``test_resume_restores_state_and_continues`` but exercises the scanning path
+    (``Trainer`` discovers ``checkpoint-4`` under ``output_dir`` itself) instead of an
+    operator-pinned ``resume_from`` -- the requeue scenario auto_resume exists for.
+    """
+    from oplm.training.trainer import Trainer
+
+    # Phase 1: train to step 4 and checkpoint.
+    cfg1 = tiny_train_cfg(tmp_path, training_parquet, max_steps=4, save_every=4, log_every=1)
+    Trainer(cfg1, callbacks=[]).train()
+
+    ckpt = tmp_path / "checkpoint-4"
+    saved_state = json.loads((ckpt / "trainer_state.json").read_text())
+
+    # Phase 2: a fresh trainer, resume_from unset, auto_resume=true, targets step 8 -- as a
+    # requeued Slurm relaunch of the same output_dir would.
+    cfg2 = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=8,
+        save_every=8,
+        auto_resume=True,
+        log_every=1,
+    )
+    assert cfg2.train.resume_from is None
+    resumed = Trainer(cfg2, callbacks=[])
+
+    # Counters are restored from the discovered checkpoint at construction time -- the same
+    # contract an explicit resume_from gives.
+    assert resumed.global_step == saved_state["global_step"] == 4
+    assert resumed.tokens_seen == saved_state["tokens_seen"]
+
+    resumed.train()
+    assert resumed.global_step == 8
+
+
+def test_auto_resume_with_a_fresh_output_dir_starts_at_step_zero(
+    training_parquet: Path, tmp_path: Path
+) -> None:
+    """``auto_resume=true`` against an empty output_dir is a no-op: training starts at step 0.
+
+    A fresh output_dir holds no committed checkpoint, so the scan must not raise or otherwise
+    surprise the caller -- it behaves exactly as if auto_resume were unset.
+    """
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=2, auto_resume=True, log_every=1)
+    trainer = Trainer(cfg, callbacks=[])
+    assert trainer.global_step == 0
+
+    trainer.train()
+    assert trainer.global_step == 2

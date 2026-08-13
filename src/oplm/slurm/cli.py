@@ -70,6 +70,9 @@ def generate(
     args = f"--config {config}"
     if preset is not None:
         args += f" --preset {preset}"
+    # Requeued jobs (Slurm --requeue) must resume from the newest committed checkpoint under
+    # output_dir instead of restarting at step 0 -- see Trainer's auto_resume handling.
+    args += " train.auto_resume=true"
     spec = JobSpec(
         name=job_name,
         nodes=resolved_nodes,

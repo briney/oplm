@@ -1481,6 +1481,10 @@ def scale(
                 f"train.mup_depth_lr_exponent={_as_float(winner['depth_exponent'])}",
                 f"train.output_dir={run_dir / 'output'}",
                 f"train.wandb_run_name=oplm-{preset}-scale",
+                # These are days-to-weeks production runs, submitted for requeue -- bake
+                # auto-resume into the run config itself (the rendered command is just
+                # `--config run.yaml`, so this is the only place to set it).
+                "train.auto_resume=true",
             ]
             cfg = load_config(["--config", str(config), "--preset", preset, *overrides])
             run_yaml = run_dir / "run.yaml"

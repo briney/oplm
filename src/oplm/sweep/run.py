@@ -21,9 +21,10 @@ def main(
 ) -> None:
     """Train one resolved config and write its sweep result.
 
-    Idempotent under Slurm ``--requeue``: if the cell's output directory already holds a
-    checkpoint and the config does not pin ``resume_from``, training resumes from the newest one
-    rather than restarting at step 0.
+    Idempotent under Slurm ``--requeue``: every cell opts into ``Trainer``'s auto-resume (see
+    ``oplm.training.trainer.Trainer.__init__``), so a requeued relaunch of the same cell picks up
+    from the newest committed checkpoint under its output directory rather than restarting at
+    step 0. An explicit ``resume_from`` pinned in the cell's config still wins over the scan.
     """
     from oplm.train import _bootstrap_training_environment
 
@@ -34,10 +35,7 @@ def main(
     from oplm.training.trainer import Trainer
 
     cfg = load_config(["--config", str(config)])
-    if cfg.train.resume_from is None:
-        checkpoint = latest_checkpoint(Path(cfg.train.output_dir))
-        if checkpoint is not None:
-            cfg.train.resume_from = str(checkpoint)
+    cfg.train.auto_resume = True
     Trainer(cfg, callbacks=[SweepMetricsCallback(result)]).train()
 
 

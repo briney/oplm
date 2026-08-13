@@ -316,10 +316,23 @@ class Trainer:
         # Dataset size for fractional epoch computation
         self._dataset_size = raw_dataset_size
 
-        # Resume from checkpoint
-        if cfg.train.resume_from is not None:
-            _status("[dim]Resuming from checkpoint...[/dim]")
-            self._resume_from_checkpoint(cfg.train.resume_from)
+        # Resume from checkpoint. An explicit resume_from always wins; auto_resume only
+        # fills in the gap when no explicit path was given, scanning for the newest
+        # *committed* checkpoint under output_dir (see
+        # oplm.training.checkpoint.latest_checkpoint) so a requeued job (Task 1.5) picks up
+        # where it left off instead of restarting at step 0. A fresh output_dir with no
+        # committed checkpoint yet is a no-op: training starts at step 0, exactly as if
+        # auto_resume were unset.
+        resume_target = cfg.train.resume_from
+        if resume_target is None and cfg.train.auto_resume:
+            from oplm.training.checkpoint import latest_checkpoint
+
+            found = latest_checkpoint(Path(cfg.train.output_dir))
+            if found is not None:
+                resume_target = str(found)
+                _status(f"[dim]Auto-resuming from {found.name}[/dim]")
+        if resume_target is not None:
+            self._resume_from_checkpoint(resume_target)
 
     def train(self) -> None:
         """Run the training loop."""
