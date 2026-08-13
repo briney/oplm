@@ -12,6 +12,7 @@ happens later, in the collator (``data/sequence/collate.py``). Rows are yielded 
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,8 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
+
+logger = logging.getLogger(__name__)
 
 # Parquet shard discovery accepts these suffixes (case-insensitive).
 _PARQUET_SUFFIXES = frozenset({".parquet", ".parq", ".pq"})
@@ -542,6 +545,12 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         :meth:`_arm_source_skip`. Call :meth:`clear_resume_skip` once consumed so later
         epochs are unaffected.
 
+        Data-exact resume (skipping exactly the already-consumed rows, no loss or
+        duplication) holds only for sources that expose the internal sample-skip path
+        — currently :class:`ShardedProteinDataset`. Any other ``IterableDataset``
+        source instead restarts from position 0 on resume (a logged warning, not an
+        error); see :meth:`_arm_source_skip`.
+
         Args:
             batches_in_epoch: Count of batches this rank's DataLoader has already
                 consumed this epoch (from the interrupted run's cursor).
@@ -573,7 +582,9 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         over the source: :meth:`_next_or_refill` re-iterates an exhausted source via
         plain ``iter(source)``, which is unskipped, so the one-shot skip is never
         reapplied on refill. Sources without sample-skip support (anything other than
-        :class:`ShardedProteinDataset`) fall back to a fresh, unskipped iterator.
+        :class:`ShardedProteinDataset`) fall back to a fresh, unskipped iterator — data
+        exactness degrades to a restart-from-0 for that source, logged via
+        :data:`logger`.
 
         Args:
             source_idx: Index into ``self._datasets``.
@@ -583,6 +594,15 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         arm = getattr(source, "_arm_sample_skip", None)
         if callable(arm):
             return arm(n_samples)
+        if n_samples > 0:
+            logger.warning(
+                "InterleavedDataset resume skip: source %d (%s) has no sample-skip "
+                "support; data-exact resume is unavailable for it, restarting this "
+                "source from position 0 instead of skipping %d already-consumed sample(s).",
+                source_idx,
+                type(source).__name__,
+                n_samples,
+            )
         return iter(source)
 
     def __iter__(self) -> Iterator[dict[str, object]]:

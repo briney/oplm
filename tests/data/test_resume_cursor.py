@@ -11,6 +11,7 @@ arms each source's own sample-count skip from this worker's ``choices`` draws.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
@@ -23,7 +24,7 @@ from oplm.data.sequence.dataset import DataCursor, InterleavedDataset, ShardedPr
 from oplm.data.tokenizer import get_tokenizer
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 
@@ -310,7 +311,8 @@ def test_interleaved_resumed_stream_is_baseline_suffix(
     make_sequence_shards: Callable[..., Path],
     real_records: list[tuple[str, str]],
 ) -> None:
-    """Armed skip yields ``baseline[skip:]`` exactly, crossing several refills of the small source."""
+    """Armed skip yields ``baseline[skip:]`` exactly, crossing several refills of the small
+    source."""
     small_dir = (tmp_path / "small").resolve()
     large_dir = (tmp_path / "large").resolve()
     small_dir.mkdir()
@@ -431,3 +433,45 @@ def test_interleaved_unarmed_skip_is_byte_identical_to_baseline(
     rows1 = list(_build())
     rows2 = list(_build())
     assert rows1 == rows2
+
+
+class _DummyIterableDataset:
+    """Minimal non-``ShardedProteinDataset`` iterable: no sample-skip support at all."""
+
+    def __init__(self, items: list[dict[str, str]]) -> None:
+        self._items = items
+
+    def __iter__(self) -> Iterator[dict[str, str]]:
+        return iter(self._items)
+
+
+def test_interleaved_warns_when_source_lacks_sample_skip_support(
+    tmp_path: Path,
+    make_sequence_shards: Callable[..., Path],
+    real_records: list[tuple[str, str]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-skip-aware source mixed with a real source logs a warning; iteration still works."""
+    real_dir = (tmp_path / "warn_real").resolve()
+    real_dir.mkdir()
+    make_sequence_shards(real_dir, real_records[:6], n_shards=1, id_prefix="real_")
+
+    dummy = _DummyIterableDataset(
+        [{"sequence_id": f"dummy_{i}", "sequence": "AAAA"} for i in range(3)]
+    )
+
+    # Fraction 0.0 on the real source keeps every draw on the dummy source
+    # deterministically (no flakiness from torch.multinomial), while the mix still
+    # genuinely contains a real, skip-aware source alongside the non-skip-aware one.
+    inter = InterleavedDataset(
+        [dummy, ShardedProteinDataset(real_dir, seed=0)], [1.0, 0.0], num_samples=10, seed=0
+    )
+    inter.set_epoch(0)
+    inter.set_resume_skip(batches_in_epoch=2, per_rank_batch=1, num_workers=1)
+
+    with caplog.at_level(logging.WARNING, logger=dataset_mod.__name__):
+        rows = list(inter)
+
+    assert len(rows) == 8  # 10 draws, all on the always-refilling dummy source, skip=2
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("_DummyIterableDataset" in msg and "sample-skip" in msg for msg in warnings)
