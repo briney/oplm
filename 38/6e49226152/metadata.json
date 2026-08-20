@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "386e49226152",
+  "strategy": "manual-commit",
+  "branch": "config/lr-sweep-winner-defaults",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "docs/CONFIG.md",
+    "docs/MUP.md",
+    "docs/OVERVIEW.md",
+    "src/oplm/configs/model/base.yaml",
+    "src/oplm/configs/train/base.yaml",
+    "tests/training/test_config.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/38/6e49226152/0/metadata.json",
+      "transcript": "/38/6e49226152/0/full.jsonl",
+      "compact_transcript": "/38/6e49226152/0/transcript.jsonl",
+      "content_hash": "/38/6e49226152/0/content_hash.txt",
+      "prompt": "/38/6e49226152/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 90,
+    "cache_creation_tokens": 77105,
+    "cache_read_tokens": 2688394,
+    "output_tokens": 32984,
+    "api_call_count": 45
+  }
+}

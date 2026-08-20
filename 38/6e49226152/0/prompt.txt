@@ -1,0 +1,19 @@
+OK, we've completed all of the runs for the uP learning rate stuff. Here's the output of the final stage (confirm). How do I set up the default `oplm` config to use the new LR parameters, just set lr and output multipler directly using the top scoring values (base lr=0.0035, output multiplier=0.5) from the confirm stage?
+
+(default) briney@slurm-login-0:~/projects/oplm/mup_lr_sweep$ oplm sweep status sweeps/confirm/phase.json
+                         confirm (eval/uniref/loss)
+┏━━━━━━━━┳━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓
+┃ preset ┃ idx ┃ cell                         ┃ state    ┃ eval/uniref/loss ┃
+┡━━━━━━━━╇━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩
+│ 800M   │   0 │ 800M-lr0.0035-om0.5-a0.5-s42 │ complete │           2.0539 │
+│ 800M   │   1 │ 800M-lr0.005-om0.5-a0.5-s42  │ complete │           2.0553 │
+└────────┴─────┴──────────────────────────────┴──────────┴──────────────────┘
+nothing to resubmit
+
+---
+
+Isn't the depth exponent already covered by the residual scaling (default is set to the sqrt of num_hidden_layers)? Or is the depth exponent in addition to the residual scaling?
+
+---
+
+yes, flip residual_gate to channel too
