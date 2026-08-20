@@ -6,7 +6,7 @@ Tune `train.lr` **once** at a small proxy width, then reuse the same number at
 every larger preset.
 
 μP + Muon is the **default training recipe** (`oplm train` uses it out of the box;
-`train.lr` defaults to the μP base LR `0.01`). It is a **no-op at the base width** —
+`train.lr` defaults to the μP base LR `0.0035`). It is a **no-op at the base width** —
 at `hidden_size == mup_base_width`, init, forward multipliers, and per-group LRs
 are bit-identical to a non-μP run. The production optimizer for μP is **Muon**;
 AdamW is also supported. To turn μP off (and recover the conventional ESM-C
@@ -29,16 +29,18 @@ Related references:
 ## 1. Quick start
 
 μP + Muon is the default, so training at any preset just works — `train.lr` is the
-μP base LR (`0.01`), reused unchanged at every size:
+μP base LR (`0.0035`), reused unchanged at every size:
 
 ```bash
-oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.01, by default
+oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.0035, by default
 ```
 
 The defaults live in `configs/train/base.yaml` (`optimizer: muon`,
-`muon_adjust_lr_fn: original`, `lr: 0.01`) and `configs/model/base.yaml`
-(`mup_enable: true`, `mup_base_width: 512`). With μP on, **`train.lr` is the base
-LR** and transfers across width — you do not re-tune it per preset.
+`muon_adjust_lr_fn: original`, `lr: 0.0035`, `mup_depth_lr_exponent: 0.5`) and
+`configs/model/base.yaml` (`mup_enable: true`, `mup_base_width: 768`,
+`mup_output_mult: 0.5`) — the LR-sweep 800M confirm winner (Aug 2026). With μP
+on, **`train.lr` is the base LR** and transfers across width — you do not
+re-tune it per preset.
 
 **To re-tune the base LR** for a new optimizer or data regime, follow the phased
 production workflow in [LR_SWEEP.md](LR_SWEEP.md). It ranks held-out validation
@@ -67,11 +69,11 @@ oplm train --preset 400M --config src/oplm/configs/train/vanilla_esm-c.yaml \
    conditions. The production batch bridge supplies any batch correction.
 4. **Confirm** the combined width, depth, and batch result before scaling.
 
-The general model-config fallback/default is `mup_base_width=512`, the `50M`
-preset's `hidden_size`; the width multiplier `m = hidden_size / mup_base_width`
-is `1` there. The production sweep deliberately overrides that value and forces
-`mup_base_width=768`, making the `170M` preset its production anchor. Do not mix
-results calibrated against the two different anchors.
+The run default is `mup_base_width=768`, the `170M` preset's `hidden_size`; the
+width multiplier `m = hidden_size / mup_base_width` is `1` there. This matches
+the production sweep, which forces `mup_base_width=768` in every cell, so sweep
+winners drop into the run defaults unchanged. (Results calibrated against the
+pre-Aug-2026 `512` anchor do not transfer — do not mix results across anchors.)
 
 ---
 
@@ -154,17 +156,17 @@ empirically; see [LR_SWEEP.md](LR_SWEEP.md#depth-ray-lr-transfer-check).
 
 ### Multipliers across the presets
 
-For the general `mup_base_width=512` default, `i0 = 1536` and the 50M preset is
-the `m = 1` base:
+For the production `mup_base_width=768` default, `i0 = 2048` and the 170M preset
+is the `m = 1` base:
 
 | Preset | `hidden_size` | `intermediate_size` | `m` | `m_ffn` |
 |---|---|---|---|---|
-| 50M  | 512  | 1536 | 1.00 | 1.00 |
-| 170M | 768  | 2048 | 1.50 | 1.33 |
-| 400M | 1024 | 2816 | 2.00 | 1.83 |
-| 800M | 1280 | 3584 | 2.50 | 2.33 |
-| 1B   | 1600 | 4352 | 3.12 | 2.83 |
-| 3B   | 2048 | 5632 | 4.00 | 3.67 |
+| 50M  | 512  | 1536 | 0.67 | 0.75 |
+| 170M | 768  | 2048 | 1.00 | 1.00 |
+| 400M | 1024 | 2816 | 1.33 | 1.38 |
+| 800M | 1280 | 3584 | 1.67 | 1.75 |
+| 1B   | 1600 | 4352 | 2.08 | 2.13 |
+| 3B   | 2048 | 5632 | 2.67 | 2.75 |
 
 `m_ffn ≠ m` because `intermediate_size` rounds to a multiple of 256; using the
 true per-matrix fan-in keeps the scaling exact rather than approximating
