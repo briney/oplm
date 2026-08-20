@@ -1,18 +1,22 @@
 # OPLM default model configuration (HuggingFace OplmConfig field names).
-# Authoritative defaults: loaded by oplm.config.load_config. Any field omitted
-# here falls through to the OplmConfig.__init__ default. Derived fields
-# (head_dim, intermediate_size, rope_dim, nope_dim) are omitted so they resolve
-# from the source dimensions unless explicitly overridden.
+# Authoritative defaults: loaded by oplm.config.load_config. Every OplmConfig
+# option appears here set to its run default, so this file doubles as the
+# reference for what can be overridden (presets/YAML/CLI). Derived fields
+# (head_dim, intermediate_size, rope_dim) are null so they resolve from the
+# source dimensions unless explicitly overridden.
 model:
   # Core dimensions (~400M parameters)
   vocab_size: 33
   hidden_size: 1024
   num_hidden_layers: 32
   num_attention_heads: 16
+  head_dim: null # null -> hidden_size / num_attention_heads
+  intermediate_size: null # null -> round_up(8/3 * hidden_size, 256) (4x for relu2)
   max_position_embeddings: 1024
 
   # Positional encoding (full RoPE by default: rope_dim resolves to head_dim)
   rope_theta: 10000.0
+  rope_dim: null # null -> head_dim (and forces nope_dim to 0); rope_dim + nope_dim must equal head_dim
   nope_dim: 0
 
   # Normalization
@@ -21,10 +25,10 @@ model:
   norm_strategy: sandwich # pre | sandwich | hybrid | post_sdpa
   qk_norm: true
   qk_norm_mode: channel # channel (LayerNorm/RMSNorm + 1/sqrt(d) scale) | l2 (L2-normalize + learned per-head scale)
-  qk_norm_l2_scale_init: null # l2 mode only; per-head scale init (null -> sqrt(head_dim))
+  qk_norm_l2_scale_init: null # l2 mode only; per-head scale init (null -> sqrt(head_dim)); positive if set
   post_embed_norm: false
   mask_dropout: false # zero <mask> embeddings and rescale by expected/observed mask ratio
-  mask_dropout_reference_ratio: 0.12 # expected fraction of real tokens that are <mask> (mask_prob * mask_token_prob)
+  mask_dropout_reference_ratio: 0.12 # expected fraction of real tokens that are <mask> (mask_prob * mask_token_prob); in [0, 1)
   residual_scaling: sqrt_num_layers # sqrt_num_layers | none
   residual_gate: channel # none | scalar | channel (learnable multiplicative refinement on residual writes); channel matches the swept/production architecture
   residual_gate_init: 1.0 # initial value for residual gate parameters
@@ -45,10 +49,18 @@ model:
   tie_word_embeddings: false
   mlm_head_activation: gelu # gelu | silu | relu
 
+  # Classification head (sequence-classification fine-tuning only; inert for MLM training)
+  num_labels: 2
+  classifier_pool: mean # mean | cls (sequence-level pooling)
+  classifier_dropout: 0.0
+  pre_head_norm: false # apply a norm before the classification head
+
   # Canon depthwise convolution (on by default: all four positions, k=7)
   canon_enabled: true
   canon_residual: true # residual Canon updates by default
   canon_positions: [A, B, C, D] # subset of {A, B, C, D}
+  # int (broadcast to every layer) | per-layer list[int] (length num_hidden_layers)
+  # | {schedule: linear, min: N, max: M} | {schedule: constant, value: N}; entries >= 2
   canon_kernel_sizes: 7
   canon_activation: none # none | silu | gelu
 
@@ -75,3 +87,10 @@ model:
   #              trainer auto-disables DDPOptimizer so SAC isn't collapsed to full
   #              recompute (see docs/TRAIN.md).
   gradient_checkpointing_mode: full # full | selective
+
+  # Special token ids (must match the tokenizer; see docs/DATA_TOOLING.md)
+  pad_token_id: 1
+  bos_token_id: 0
+  eos_token_id: 2
+  unk_token_id: 3
+  mask_token_id: 32

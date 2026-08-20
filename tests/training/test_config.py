@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import asdict
 from importlib.resources import files
@@ -389,8 +390,18 @@ def test_model_base_yaml_has_no_typos(key: str) -> None:
 
     ``load_config`` now rejects unknown ``model.*`` keys at runtime, but this
     guards the packaged default itself (which is merged in before any override).
+    The allowed set mirrors ``_reject_unknown_model_keys``: constructor params
+    plus ``to_dict()`` metadata (``num_labels`` is a constructor param backed by
+    ``id2label``, so it never appears in ``to_dict()``).
     """
-    assert key in set(OplmModelConfig().to_dict())
+    params = inspect.signature(OplmModelConfig.__init__).parameters
+    allowed = {
+        name
+        for name, p in params.items()
+        if name != "self" and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+    }
+    allowed |= set(OplmModelConfig().to_dict())
+    assert key in allowed
 
 
 # --- torch.compile config fields -----------------------------------------------
