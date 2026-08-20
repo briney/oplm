@@ -1,0 +1,9 @@
+one last thing -- how do I disable `save_every_minutes` if I just want to checkpoint every XX steps, not every YY minutes? Do I set `save_every_minutes` to 0, or None or something?
+
+---
+
+Open a PR to main
+
+---
+
+PR merged and branch deleted. switch back to main and fast-forward. One thing once you're back -- I'd like to update the base configs (data, model, and train) to include all of the options, set to their default. I want the default config YAMLs to be essentially self-documenting in the sense that they contain all available options set to their defaults and (when appropriate, so not necessary for true/false type config options) what the acceptable values are.

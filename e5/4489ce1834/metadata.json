@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "e54489ce1834",
+  "strategy": "manual-commit",
+  "branch": "config/self-documenting-base-configs",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "src/oplm/config.py",
+    "src/oplm/configs/data/base.yaml",
+    "src/oplm/configs/model/base.yaml",
+    "src/oplm/configs/train/base.yaml",
+    "tests/training/test_config.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/e5/4489ce1834/0/metadata.json",
+      "transcript": "/e5/4489ce1834/0/full.jsonl",
+      "compact_transcript": "/e5/4489ce1834/0/transcript.jsonl",
+      "content_hash": "/e5/4489ce1834/0/content_hash.txt",
+      "prompt": "/e5/4489ce1834/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 32,
+    "cache_creation_tokens": 41980,
+    "cache_read_tokens": 1811316,
+    "output_tokens": 18193,
+    "api_call_count": 16
+  }
+}

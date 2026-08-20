@@ -1,0 +1,71 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "e54489ce1834",
+  "session_id": "f9e1cc56-cfd1-4622-94d6-0317e1e65501",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-20T23:04:21.53892978Z",
+  "branch": "config/self-documenting-base-configs",
+  "checkpoints_count": 4,
+  "save_step_count": 1,
+  "files_touched": [
+    "src/oplm/config.py",
+    "src/oplm/configs/data/base.yaml",
+    "src/oplm/configs/model/base.yaml",
+    "src/oplm/configs/train/base.yaml",
+    "tests/training/test_config.py"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-fable-5",
+  "turn_id": "3149fede1c22",
+  "checkpoint_transcript_start": 345,
+  "transcript_lines_at_start": 345,
+  "compact_transcript_start": 67,
+  "token_usage": {
+    "input_tokens": 32,
+    "cache_creation_tokens": 41980,
+    "cache_read_tokens": 1811316,
+    "output_tokens": 18193,
+    "api_call_count": 16
+  },
+  "session_metrics": {
+    "turn_count": 7
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-20T23:04:21.503730665Z",
+    "agent_lines": 81,
+    "agent_removed": 14,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 81,
+    "total_lines_changed": 95,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 325,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/agents/entire-search.md": 25,
+        ".claude/plans/i-d-like-to-add-dreamy-creek.md": 162,
+        ".claude/settings.json": 84,
+        ".claude/settings.local.json": 14,
+        ".cursor/hooks.json": 40
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 14,
+      "user_lines_removed": 0,
+      "agent_lines_added": 392,
+      "agent_lines_removed": 14,
+      "user_added_per_file": {
+        ".claude/settings.local.json": 14
+      }
+    }
+  ]
+}
