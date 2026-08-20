@@ -1,5 +1,6 @@
 # OPLM default data configuration (mirrors oplm.config.DataConfig).
-# Authoritative defaults: loaded by oplm.config.load_config.
+# Authoritative defaults: loaded by oplm.config.load_config. Every DataConfig
+# option appears here set to its default.
 data:
   # Training dataset(s). Single path (100% sampling):
   #   data: { train: /path/to/dataset }   (CLI: data.train=/path/to/dataset)
@@ -30,10 +31,11 @@ data:
   # Collation padding: null = pad to batch-longest; N = pad to smallest multiple of N >= batch-longest.
   pad_to_multiple_of: null
 
-  # Sequence masking
-  mask_prob: 0.15
-  mask_token_prob: 0.8
-  random_token_prob: 0.1
+  # Sequence masking (see docs/DATA_TOOLING.md §4.5). Probabilities in [0, 1];
+  # mask_token_prob + random_token_prob <= 1 (the remainder keeps the original token).
+  mask_prob: 0.15 # fraction of eligible positions selected for masking
+  mask_token_prob: 0.8 # of masked positions -> <mask>
+  random_token_prob: 0.1 # of masked positions -> random canonical AA
   weighted_masking: false # set true to honor the masking_weights column
 
   # DataLoader settings

@@ -47,7 +47,7 @@ class TrainConfig:
     # Optimizer.
     # NOTE: these are conservative *library* fallbacks for bare TrainConfig() /
     # direct construction. OPLM's production training default (what `oplm train`
-    # loads) is μP + Muon with lr 0.01 — see configs/train/base.yaml and docs/MUP.md.
+    # loads) is μP + Muon with lr 0.0035 — see configs/train/base.yaml and docs/MUP.md.
     optimizer: str = "adamw"
     lr: float = 1e-4
     min_lr: float = 0.0

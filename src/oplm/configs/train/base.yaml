@@ -4,6 +4,8 @@
 # oplm.config.TrainConfig dataclass fallbacks (adamw / lr 1e-4 / match_rms_adamw),
 # which back bare TrainConfig() / direct construction. tests/training/test_config.py
 # checks every key here is a real TrainConfig field (typo guard), not value-equality.
+# Every user-settable TrainConfig option appears here set to its default; the one
+# omission is `config_path`, which is provenance populated by load_config, not a knob.
 train:
   # Duration
   max_steps: 50_000
@@ -61,14 +63,47 @@ train:
   save_every: 10_000
   save_total_limit: 3
   save_final: true            # write a final checkpoint on completion (skips if last step already saved)
-  resume_from: null
+  # Also checkpoint every N wall-clock minutes, in addition to (not instead of)
+  # the save_every step cadence; null disables the timer, > 0 if set.
+  save_every_minutes: null
+  # Retain (exempt from save_total_limit rotation) every checkpoint whose step is
+  # a multiple of N; null disables the exemption, > 0 if set.
+  keep_every_n_steps: null
+  # Retain a checkpoint at least every N wall-clock hours after the previous
+  # permanent one; null disables the exemption, > 0 if set.
+  keep_every_n_hours: null
+  resume_from: null           # path to a checkpoint to resume from
+  # Automatically resume from the newest committed checkpoint under output_dir at
+  # trainer start, without an explicit resume_from (long Slurm runs set this true).
+  auto_resume: false
+  # On resume, also restore the data-loader position (sampler/shard offsets) so
+  # training continues from the same data point instead of restarting the stream.
+  resume_data_position: true
+  # Optional remote URI (e.g. s3://bucket/prefix) that committed checkpoints are
+  # additionally synced to; null disables remote sync. s3:// needs the `s3` extra.
+  remote_checkpoint_uri: null
 
   # Infrastructure
   seed: 42
   output_dir: outputs
+  # ddp  — one full model replica per rank (default).
+  # hsdp — FSDP2 over a 2-D mesh (shard within a node, replicate across nodes);
+  #        required before ~24B, needs world size > 1, and is currently
+  #        incompatible with configured data.eval (see docs/TRAIN.md).
+  parallelism: ddp            # ddp | hsdp
+  # Process-group timeout (minutes); longer tolerates slow checkpoint writes or
+  # requeue delays without a collective abort. Must be > 0.
+  dist_timeout_minutes: 15
   mixed_precision: bf16       # bf16 | fp16 | no
   compile: false
   compile_mode: default       # default | reduce-overhead | max-autotune
   compile_dynamic: true   # true | false | null(auto) — torch.compile dynamic flag
   throughput_warmup_steps: 50
   peak_tflops: null   # set device peak (TFLOPs) to log MFU
+
+  # Training-stability diagnostics (deep-model μP debugging; see docs/LR_SWEEP.md).
+  # When true, logs the pre-clip global grad norm every training log and runs an
+  # eager diagnostic probe forward (per-depth residual RMS, logit RMS, attention
+  # entropy under diag/*) every stability_probe_every log emissions.
+  stability_diagnostics: false
+  stability_probe_every: 25   # probe cadence in log emissions; 0 logs only the grad norm
