@@ -129,7 +129,7 @@ from `configs/model/base.yaml`.
 | `model.mask_dropout` | `bool` | `false` | Zero every `<mask>` embedding row and rescale surviving embeddings by `(1 − reference_ratio) / (1 − observed_ratio)`. `input_ids` path only; the `inputs_embeds` path is unchanged. |
 | `model.mask_dropout_reference_ratio` | `float` | `0.12` | Expected fraction of real tokens that are `<mask>` under the training masking policy (`mask_prob · mask_token_prob`), **not** a fraction of mask tokens to drop. Must satisfy `0 ≤ ratio < 1`. |
 | `model.residual_scaling` | `str` | `sqrt_num_layers` | `sqrt_num_layers` (scale each sublayer's residual write by `1/√L`) or `none`. |
-| `model.residual_gate` | `str` | `none` | Learnable multiplicative gate refining each residual write on top of `residual_scaling`: `none` (no new params), `scalar` (one param per attention/FFN write), or `channel` (`(hidden_size,)` param per write). |
+| `model.residual_gate` | `str` | `channel` | Learnable multiplicative gate refining each residual write on top of `residual_scaling`: `none` (no new params), `scalar` (one param per attention/FFN write), or `channel` (`(hidden_size,)` param per write). Run default `channel` (the swept/production architecture); dataclass fallback `none`. |
 | `model.residual_gate_init` | `float` | `1.0` | Initial value for residual gate parameters. Must be finite. |
 | `model.attn_output_gate` | `str` | `sigmoid` | Post-SDPA attention output gate (arXiv:2505.06708, G1): `none` (no new params), `sigmoid`, or `silu`. Adds a bias-free `(hidden_size, hidden_size)` `gate_proj` per layer; the merged attention output is multiplied elementwise by `act(gate_proj(x))` before `o_proj`. Run default `sigmoid`; dataclass fallback `none`. |
 | `model.value_residual` | `str` | `learnable` | ResFormer value residual (arXiv:2410.17897): `none` (no new params), `fixed` (constant λ buffer, no new params), or `learnable` (one scalar λ per layer after the first). Layer 0 exposes its post-V-norm values `v₁`; every later layer blends `v' = λ·v + (1 − λ)·v₁` right after the V projection. Run default `learnable`; dataclass fallback `none`. |
@@ -191,7 +191,7 @@ Consumed by `OplmForSequenceClassification` / `OplmForTokenClassification`.
 μP makes a learning rate tuned on a small proxy model transfer to much larger
 models without re-sweeping at every scale. It is **on by default** for `oplm train`
 runs (with `train.optimizer=muon`, `train.muon_adjust_lr_fn=original`,
-`train.lr=0.01`), and a no-op at the base width. See [MUP.md](MUP.md) for the full
+`train.lr=0.0035`), and a no-op at the base width. See [MUP.md](MUP.md) for the full
 recipe and the tune-once-reuse-`train.lr` workflow; disable it with
 `configs/train/vanilla_esm-c.yaml`.
 
@@ -199,15 +199,15 @@ recipe and the tune-once-reuse-`train.lr` workflow; disable it with
 > Train table) is the **run default** from `configs/*/base.yaml` — what `oplm train`
 > loads. Bare Python construction (`OplmConfig()` / `TrainConfig()`) and
 > `from_pretrained` use conservative fallbacks instead (`mup_enable=false`,
-> `optimizer=adamw`, `lr=1e-4`, `norm_strategy=pre`, `attn_output_gate=none`,
-> `value_residual=none`, `canon_enabled=false`), so direct use and existing
-> checkpoints are unaffected.
+> `optimizer=adamw`, `lr=1e-4`, `norm_strategy=pre`, `residual_gate=none`,
+> `attn_output_gate=none`, `value_residual=none`, `canon_enabled=false`), so
+> direct use and existing checkpoints are unaffected.
 
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
 | `model.mup_enable` | `bool` | `true` | Master switch (run default; dataclass fallback `false`). When `false`, init, forward multipliers, and per-group LRs are identical to non-μP runs. |
-| `model.mup_base_width` | `int` | `512` | `hidden_size` of the proxy/base model where `m = hidden_size / mup_base_width` equals 1. The production sweep overrides this fallback/default with its forced 768-wide anchor. Must be `≥ 1`. |
-| `model.mup_output_mult` | `float` | `1.0` | Tunable O(1) multiplier on the output logits (applied as `mup_output_mult / m` on the readout matmul path). Must be `> 0`. |
+| `model.mup_base_width` | `int` | `768` | `hidden_size` of the proxy/base model where `m = hidden_size / mup_base_width` equals 1. Matches the production sweep's forced 768-wide (170M) anchor; dataclass fallback `512`. Must be `≥ 1`. |
+| `model.mup_output_mult` | `float` | `0.5` | Tunable O(1) multiplier on the output logits (applied as `mup_output_mult / m` on the readout matmul path). Run default is the LR-sweep confirm winner (Aug 2026); dataclass fallback `1.0`. Must be `> 0`. |
 
 ### Derived and validated fields
 
@@ -243,7 +243,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.batch_size` | `int` | `32` | Per-process batch size, before accumulation. |
 | `train.gradient_accumulation_steps` | `int` | `1` | Must be `≥ 1`. |
 | `train.optimizer` | `str` | `muon` | `adamw` or `muon` (hybrid Muon + AdamW). Run default `muon` (dataclass fallback `adamw`). |
-| `train.lr` | `float` | `0.01` | Peak learning rate. With μP on (the default) this is the **μP base LR** — it transfers across width, so do not retune per size; retune only if μP is disabled. Dataclass fallback `1e-4`. |
+| `train.lr` | `float` | `0.0035` | Peak learning rate. With μP on (the default) this is the **μP base LR** (LR-sweep confirm winner, Aug 2026) — it transfers across width, so do not retune per size; retune only if μP is disabled. Dataclass fallback `1e-4`. |
 | `train.min_lr` | `float` | `0.0` | Must be `≥ 0` and `≤ lr`. |
 | `train.weight_decay` | `float` | `0.01` | Decoupled weight decay. |
 | `train.adam_beta1` | `float` | `0.9` | AdamW β₁ (also Muon's auxiliary AdamW). |
@@ -253,7 +253,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.muon_momentum` | `float` | `0.95` | Must be `≥ 0`. |
 | `train.muon_nesterov` | `bool` | `true` | Muon Nesterov momentum. |
 | `train.muon_ns_steps` | `int` | `5` | Newton–Schulz steps; must be `≥ 1`. |
-| `train.mup_depth_lr_exponent` | `float` | `0.0` | Repeated-block LR exponent; finite and `>= 0`. Zero is a no-op. |
+| `train.mup_depth_lr_exponent` | `float` | `0.5` | Repeated-block LR exponent; finite and `>= 0`. Zero is a no-op; the run default `0.5` is the sweep-verified correction (no-op at the 24-layer reference depth). Dataclass fallback `0.0`. |
 | `train.mup_depth_reference_layers` | `int` | `24` | Reference layer count in `(reference/L)^exponent`; must be `>= 1`. |
 | `train.max_grad_norm` | `float` | `1.0` | Set `0` to disable clipping. |
 | `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, or `wsd_cosine`. |

@@ -147,7 +147,7 @@ def test_ablation_toggle_defaults_preserve_current_behavior() -> None:
     assert cfg.model.qk_norm_l2_scale_init is None
     assert cfg.model.mask_dropout is False
     assert cfg.model.mask_dropout_reference_ratio == 0.12
-    assert cfg.model.residual_gate == "none"
+    assert cfg.model.residual_gate == "channel"
     assert cfg.model.residual_gate_init == 1.0
     assert cfg.model.canon_residual is True
 
@@ -170,16 +170,17 @@ def test_mup_cli_overrides_apply() -> None:
 
 
 def test_default_run_uses_mup_muon_recipe() -> None:
-    """With no overrides the production default is μP + Muon at base LR 0.01."""
+    """With no overrides the production default is the confirmed μP + Muon winner."""
     cfg = load_config([])
     assert cfg.train.optimizer == "muon"
     assert cfg.train.muon_adjust_lr_fn == "original"
-    assert cfg.train.lr == pytest.approx(0.01)
+    # LR-sweep 800M confirm winner (Aug 2026), anchored at the 768-wide 170M proxy.
+    assert cfg.train.lr == pytest.approx(0.0035)
     assert cfg.model.mup_enable is True
-    assert cfg.model.mup_base_width == 512
-    assert cfg.model.mup_output_mult == 1.0
-    # Default hidden_size 1024 over base 512 ⇒ m = 2 (μP actively scales here).
-    assert cfg.model.mup_width_mult() == 2.0
+    assert cfg.model.mup_base_width == 768
+    assert cfg.model.mup_output_mult == 0.5
+    # Default hidden_size 1024 over base 768 ⇒ m = 4/3 (μP actively scales here).
+    assert cfg.model.mup_width_mult() == pytest.approx(1024 / 768)
 
 
 def test_vanilla_esmc_overlay_restores_conventional_recipe() -> None:
@@ -275,8 +276,9 @@ def test_800m_preset_uses_64_dimensional_heads() -> None:
 
 
 def test_depth_lr_defaults_are_noop_at_170m_reference() -> None:
+    """The confirmed exponent (0.5) still yields correction (24/L)**e == 1 at L=24."""
     cfg = load_config([])
-    assert cfg.train.mup_depth_lr_exponent == 0.0
+    assert cfg.train.mup_depth_lr_exponent == 0.5
     assert cfg.train.mup_depth_reference_layers == 24
 
 
@@ -361,7 +363,7 @@ _MODEL_YAML = _packaged_section("oplm.configs.model", "base.yaml", "model")
 # train/base.yaml carries OPLM's opinionated production defaults (μP + Muon), which
 # intentionally diverge from the conservative TrainConfig dataclass fallbacks for
 # these fields. Every other key must still mirror the dataclass (drift guard).
-_TRAIN_PRODUCTION_OVERRIDES = {"optimizer", "lr", "muon_adjust_lr_fn"}
+_TRAIN_PRODUCTION_OVERRIDES = {"optimizer", "lr", "muon_adjust_lr_fn", "mup_depth_lr_exponent"}
 
 
 @pytest.mark.parametrize("key", sorted(_TRAIN_YAML))

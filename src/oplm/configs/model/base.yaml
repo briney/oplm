@@ -26,7 +26,7 @@ model:
   mask_dropout: false # zero <mask> embeddings and rescale by expected/observed mask ratio
   mask_dropout_reference_ratio: 0.12 # expected fraction of real tokens that are <mask> (mask_prob * mask_token_prob)
   residual_scaling: sqrt_num_layers # sqrt_num_layers | none
-  residual_gate: none # none | scalar | channel (learnable multiplicative refinement on residual writes)
+  residual_gate: channel # none | scalar | channel (learnable multiplicative refinement on residual writes); channel matches the swept/production architecture
   residual_gate_init: 1.0 # initial value for residual gate parameters
   attn_output_gate: sigmoid # none | sigmoid | silu (post-SDPA G1 output gate, arXiv:2505.06708)
   value_residual: learnable # none | fixed | learnable (ResFormer value residual, arXiv:2410.17897)
@@ -54,13 +54,16 @@ model:
 
   # μP (maximal update parametrization) — LR transfer across width, ON by default.
   # train.lr is the μP base LR and transfers across width automatically (no manual
-  # retune per size). At this default hidden_size (1024) over mup_base_width (512),
-  # m = 2, so μP actively scales init/LR. To DISABLE μP, use the AdamW baseline
+  # retune per size). At this default hidden_size (1024) over mup_base_width (768),
+  # m = 4/3, so μP actively scales init/LR. To DISABLE μP, use the AdamW baseline
   # overlay (configs/train/vanilla_esm-c.yaml) — then train.lr must be retuned.
   # See docs/MUP.md. (The bare OplmConfig() dataclass default is mup_enable=false.)
+  # base_width, output_mult, and train.{lr, mup_depth_lr_exponent} are one tuned
+  # set (LR-sweep 800M confirm winner, Aug 2026, anchored at the 768-wide 170M
+  # proxy) — do not change one without re-validating the others.
   mup_enable: true
-  mup_base_width: 512 # hidden_size of the proxy/base model where the width multiplier m = 1
-  mup_output_mult: 1.0 # tunable O(1) readout (output-logit) multiplier
+  mup_base_width: 768 # hidden_size of the proxy/base model where the width multiplier m = 1
+  mup_output_mult: 0.5 # tunable O(1) readout (output-logit) multiplier
 
   # Init / checkpointing
   initializer_range: 0.02

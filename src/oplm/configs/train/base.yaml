@@ -17,10 +17,11 @@ train:
   optimizer: muon             # adamw | muon
   # μP base learning rate. With μP on (the default; model.mup_enable), this value
   # transfers across model width automatically — do NOT retune it per preset/size.
-  # Tuned once at mup_base_width=512 (Muon, adjust_lr_fn=original). Only retune if
-  # you DISABLE μP (e.g. via configs/train/vanilla_esm-c.yaml), where it is no
-  # longer width-correct.
-  lr: 0.01
+  # Tuned at mup_base_width=768 (Muon, adjust_lr_fn=original) via the phased sweep
+  # in docs/LR_SWEEP.md; 800M confirm winner, Aug 2026. Only retune if you DISABLE
+  # μP (e.g. via configs/train/vanilla_esm-c.yaml), where it is no longer
+  # width-correct.
+  lr: 0.0035
   min_lr: 0.0
   weight_decay: 0.01
   adam_beta1: 0.9
@@ -33,8 +34,11 @@ train:
   muon_momentum: 0.95
   muon_nesterov: true
   muon_ns_steps: 5
-  # Empirical repeated-block LR correction for the production scaling ray.
-  mup_depth_lr_exponent: 0.0
+  # Empirical repeated-block LR correction for the production scaling ray:
+  # hidden LR × (reference_layers / L) ** exponent. 0.5 is derived from the
+  # α=1/√L residual scaling and verified on the sweep's fixed-width depth ray;
+  # it is exactly 1.0 at the 24-layer (170M anchor) reference depth.
+  mup_depth_lr_exponent: 0.5
   mup_depth_reference_layers: 24
   max_grad_norm: 1.0
 

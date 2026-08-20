@@ -295,7 +295,8 @@ load-bearing stability tool for deep models (target depths up to ~80 layers). Th
 spec uses `sqrt(L)` (owner preference); `sqrt(2L)` is an equally defensible
 alternative differing only by `sqrt(2)`, revisitable at scale-up.
 
-**Residual gates** (`residual_gate`, off by default). An optional *learnable*
+**Residual gates** (`residual_gate`; run default `channel`, dataclass fallback
+`none`). An optional *learnable*
 multiplicative refinement applied on top of the fixed `α`, with a separate gate
 for each sublayer write:
 
