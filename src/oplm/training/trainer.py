@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.nn as nn
 
-from oplm.training.signals import DRAIN_EXIT_CODE, DrainSignal, seconds_until_job_end
+from oplm.training.signals import (
+    DRAIN_EXIT_CODE,
+    DrainSignal,
+    clear_stale_drain_marker,
+    seconds_until_job_end,
+    write_drain_marker,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -370,6 +376,12 @@ class Trainer:
             from oplm.training.checkpoint import clean_stale_checkpoint_dirs
 
             clean_stale_checkpoint_dirs(Path(cfg.train.output_dir))
+
+            # A drain marker surviving to trainer start means the requeue wrapper never
+            # ran after the drain that wrote it (e.g. the batch node died and Slurm
+            # itself requeued the job). Clear it so it cannot misclassify this attempt's
+            # next genuine crash as a drain -- see clear_stale_drain_marker.
+            clear_stale_drain_marker(Path(cfg.train.output_dir))
 
         # Barrier: no rank proceeds to the resume-target resolution below until the main
         # process's clean_stale_checkpoint_dirs recovery renames (checkpoint-<N>.old ->
@@ -891,6 +903,14 @@ class Trainer:
                             self._finalize_pending_save()
                         self._save_checkpoint()
                         self._drain_remote_uploads()
+                        # The marker, not the exit code, is what the requeue wrapper
+                        # actually keys the drain branch on: SystemExit(85) below only
+                        # reaches the sbatch script's $? on a launcher-less run --
+                        # `accelerate launch` flattens any worker exit to its own 1
+                        # (torchelastic ChildFailedError). Written strictly after the
+                        # drain checkpoint committed, main process only.
+                        if self.accelerator.is_main_process:
+                            write_drain_marker(Path(self.cfg.train.output_dir), self.global_step)
                         logger.warning(
                             "Drain requested: checkpoint saved at step %d; exiting %d",
                             self.global_step,

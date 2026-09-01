@@ -620,10 +620,20 @@ The trainer installs a drain trigger (`oplm.training.signals.DrainSignal`) that 
 `SIGUSR1`, `SIGTERM`, or a wall-clock margin (600 s) computed from Slurm's `SLURM_JOB_END_TIME` —
 whichever arrives first. Once true, the trainer finishes the in-flight optimizer step, saves a
 checkpoint (with `tokens_seen`/`global_step` bookkeeping already consistent for that step), logs a
-warning, and exits with a reserved exit code (`85`) distinct from `0` (finished `max_steps`) and
-any other nonzero exit (a crash). On a plain workstation `SLURM_JOB_END_TIME` is unset, so only the
-signals matter; on Slurm, `--signal=USR1@600` (rendered by `oplm slurm generate`) delivers exactly
-this signal 600 s before the job's time limit, so the two paths normally agree.
+warning, writes a `.drained` marker file into `output_dir`
+(`oplm.training.signals.DRAIN_MARKER_NAME`), and exits with a reserved exit code (`85`) distinct
+from `0` (finished `max_steps`) and any other nonzero exit (a crash). On a plain workstation
+`SLURM_JOB_END_TIME` is unset, so only the signals matter; on Slurm, `--signal=USR1@600` (rendered
+by `oplm slurm generate`) delivers exactly this signal 600 s before the job's time limit, so the
+two paths normally agree.
+
+The marker file, not the exit code, is what the Slurm requeue wrapper actually keys its drain
+branch on: the rank processes do exit 85, but `accelerate launch --multi_gpu` reports any worker
+failure as its *own* exit 1 (torchelastic's `ChildFailedError`), so on a real multi-GPU job the 85
+never survives to the sbatch script. The wrapper consumes (deletes) the marker on every requeue,
+and the trainer clears a stale one at startup (the batch node dying before the wrapper ran is the
+only way one survives), so a marker can never misclassify a later genuine crash as a drain — see
+[SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard).
 
 ### Async checkpointing
 
@@ -697,7 +707,8 @@ preemptions.
 ### The failure-recovery walkthrough
 
 1. A node fails, is preempted, or the job hits its time limit → the training process exits
-   nonzero (`85` on a clean drain; some other nonzero code on a crash).
+   nonzero (a clean drain writes the `.drained` marker and exits `85` — flattened to `1` by
+   `accelerate launch`, which is why the marker exists; a crash exits with whatever it raised).
 2. Slurm requeues the job, subject to `slurm.max_requeues` and the requeue wrapper's no-progress
    (crash-loop) guard — see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard).
 3. The new attempt's `Trainer` scans `output_dir` for the newest **committed** checkpoint

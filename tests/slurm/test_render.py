@@ -236,10 +236,11 @@ def test_array_job_progress_dir_uses_run_dir_expansion(tmp_path: Path) -> None:
     )
     text = render_job(spec, SLURM)
     assert 'STEP_FILE="$RUN_DIR/output/.last_requeue_step"' in text
+    assert 'DRAIN_MARKER="$RUN_DIR/output/.drained"' in text
     assert 'ls -d "$RUN_DIR/output"/checkpoint-*' in text
-    # The whole guard -- its step-file *write* included -- is skipped on the drain (85)
-    # path, and its comparison is only meaningful once at least one restart has happened.
-    assert 'if [ "$STATUS" -ne 85 ]; then' in text
+    # The whole guard -- its step-file *write* included -- is skipped on the drain path,
+    # and its comparison is only meaningful once at least one restart has happened.
+    assert 'if [ "$DRAINED" -ne 1 ]; then' in text
     assert 'if [ "$RESTARTS" -ge 1 ]; then' in text
 
 
@@ -254,8 +255,50 @@ def test_no_progress_guard_omitted_when_progress_dir_is_none() -> None:
     text = render_job(spec, SLURM)
     assert "STEP_FILE" not in text
     assert "PREV_STEP" not in text
+    assert "DRAIN_MARKER" not in text
     assert "no checkpoint progress" not in text
     assert 'scontrol requeue "$SLURM_JOB_ID"' in text
+
+
+def test_wrapper_recognizes_drain_by_marker_or_exit_code(tmp_path: Path) -> None:
+    """Drain detection is marker-file OR exit-85, and the marker is consumed.
+
+    `accelerate launch --multi_gpu` reports any worker failure -- including a clean
+    drain's exit 85 -- as its own exit 1 (torchelastic re-raises ChildFailedError), so
+    the wrapper cannot key the drain branch on `$STATUS` alone. The trainer's `.drained`
+    marker (oplm.training.signals.DRAIN_MARKER_NAME) is the signal that survives the
+    flattening; the bare exit-code check remains for launcher-less runs.
+    """
+    spec = JobSpec(
+        name="oplm-scale-400M",
+        nodes=8,
+        time_limit="168:00:00",
+        command="python -m oplm.train --config cfg.yaml",
+        progress_dir=str(tmp_path / "output"),
+    )
+    text = render_job(spec, SLURM)
+    assert 'if [ "$STATUS" -eq 85 ]; then DRAINED=1; fi' in text
+    assert 'if [ -f "$DRAIN_MARKER" ]; then' in text
+    assert 'rm -f "$DRAIN_MARKER"' in text
+
+
+def test_inner_bash_ignores_usr1_so_the_drain_signal_cannot_kill_the_plumbing(
+    tmp_path: Path,
+) -> None:
+    """The `bash -c` wrapper starts with `trap "" USR1`.
+
+    Slurm's `--signal=USR1@600` is delivered to every process in the step's cgroup; the
+    task-leader bash and the `accelerate launch` parent have no USR1 handler and would
+    die instantly, tearing the step down before the trainer's drain checkpoint commits.
+    SIG_IGN is inherited across exec (shielding `accelerate launch` too), while the
+    trainer ranks explicitly re-install their own handler (signal.signal overrides an
+    inherited ignore), so the drain itself still works.
+    """
+    text = render_job(_array_spec(tmp_path), SLURM)
+    assert 'bash -c \'trap "" USR1; ' in text
+    # SIGTERM stays un-ignored: torchelastic installs its own TERM handler regardless,
+    # and scancel's TERM->KILL teardown semantics must not change.
+    assert 'trap "" USR1 TERM' not in text
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")

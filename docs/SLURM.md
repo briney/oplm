@@ -301,26 +301,48 @@ the trainer can drain (checkpoint and exit) instead of being `SIGTERM`'d mid-ste
 rather than truncating it, so the pre-requeue tail — including whatever diagnosis led to the
 requeue — survives across restarts.
 
-### The trainer side: drain and exit 85
+### The trainer side: drain, the `.drained` marker, and exit 85
 
 `oplm.train`'s `Trainer` installs a drain trigger (`oplm.training.signals.DrainSignal`) that goes
 true on `SIGUSR1`, `SIGTERM`, **or** a wall-clock margin computed from Slurm's
 `SLURM_JOB_END_TIME` (600 s before the time limit — the same margin the `--signal` header uses, so
 either path can catch the job). Once true, the trainer finishes the in-flight optimizer step,
-saves a checkpoint, logs a warning, and exits with `DRAIN_EXIT_CODE` (`85`) — a code reserved
-exclusively for "drained cleanly, resume expected," distinct from `0` (reached `max_steps`) and
-any other nonzero exit (a crash). See [TRAIN.md §16](TRAIN.md#16-fault-tolerance) for the full
-knob table and what a resume restores.
+saves a checkpoint, logs a warning, writes a `.drained` marker file into `train.output_dir`
+(`oplm.training.signals.DRAIN_MARKER_NAME`), and exits with `DRAIN_EXIT_CODE` (`85`) — a code
+reserved exclusively for "drained cleanly, resume expected," distinct from `0` (reached
+`max_steps`) and any other nonzero exit (a crash). See
+[TRAIN.md §16](TRAIN.md#16-fault-tolerance) for the full knob table and what a resume restores.
+
+The marker exists because the exit code does not survive the production launch stack: the rank
+processes exit 85, but `accelerate launch --multi_gpu` reports any worker failure as its **own**
+exit `1` (torchelastic's `ChildFailedError` is re-raised inside the launcher), so the sbatch
+script's `$?` never sees the 85 on a real multi-GPU job. The wrapper below therefore keys its
+drain branch on *marker-present OR exit 85* and **consumes** (deletes) the marker every time it
+acts on one; the trainer additionally clears a stale marker at startup (possible only when the
+batch node died before the wrapper ran and Slurm itself requeued the job), so a leftover marker
+can never misclassify a later genuine crash as a drain.
+
+Two more delivery details make the drain actually reach the trainer intact:
+
+- `--signal=USR1@600` is delivered to **every** process in the step's cgroup — including the
+  `bash -c` task wrapper and the `accelerate launch` parent, neither of which handles `USR1`
+  (both would die instantly on it, tearing the step down mid-drain-checkpoint). The rendered
+  command therefore starts with `trap "" USR1`: `SIG_IGN` is inherited across `exec`, shielding
+  `accelerate launch` too, while the trainer ranks still drain because `signal.signal()`
+  overrides an inherited ignore.
+- `SIGTERM` is deliberately **not** ignored there — torchelastic installs its own `TERM` handler
+  regardless, and `scancel`'s TERM→KILL teardown semantics should stay unchanged.
 
 ### The wrapper side: budget-capped, progress-aware requeue
 
 After the training `srun` exits, every generated job script runs a requeue wrapper
-(`oplm.slurm.render._requeue_wrapper`) that decides what happens next from the exit status:
+(`oplm.slurm.render._requeue_wrapper`) that decides what happens next from the exit status and
+the `.drained` marker:
 
-| Exit status | Wrapper behavior |
+| Outcome | Wrapper behavior |
 | --- | --- |
-| `0` | Clean finish (`max_steps` reached, or `save_final`'s final save completed). Logs `training complete` and exits `0` — never requeued. |
-| `85` (drain) | Requeues **unconditionally**, as long as the requeue budget below is not exhausted. The no-progress guard is bypassed — a drain is not a crash, so there is nothing to diagnose. |
+| exit `0` | Clean finish (`max_steps` reached, or `save_final`'s final save completed). Logs `training complete` and exits `0` — never requeued. |
+| drain (`.drained` marker present, or exit `85`) | Requeues **unconditionally**, as long as the requeue budget below is not exhausted. The no-progress guard is bypassed — a drain is not a crash, so there is nothing to diagnose. The marker is deleted as it is acted on. |
 | any other nonzero | Requeues only if the budget is not exhausted **and** checkpoint progress was made since the previous restart (the no-progress guard below). |
 
 **Requeue budget** (`slurm.max_requeues`, default `20`): the wrapper reads
@@ -337,10 +359,11 @@ directory). If the step has not advanced — i.e. this is already the second con
 failure with zero checkpoint progress between them — the wrapper treats it as a crash loop and
 exits without requeueing, rather than repeatedly resubmitting a job that immediately dies again.
 A first restart (`SLURM_RESTART_COUNT == 0`) always requeues on budget alone, since there is no
-previous step to compare against yet. The drain (85) path neither reads nor writes
+previous step to compare against yet. The drain path (marker or exit 85) neither reads nor writes
 `.last_requeue_step`: a preemption is not a failure, so a drain must not arm the guard against
 the *first* crash that happens to follow it. Jobs with no `progress_dir` (non-training jobs, e.g.
-a post-processing step) skip the guard entirely and requeue on budget alone.
+a post-processing step) skip the guard entirely and requeue on budget alone — they get no drain
+marker check either.
 
 ### Auto-resume: how a requeued job actually continues
 
@@ -355,7 +378,8 @@ always wins if both are set. See [TRAIN.md §16](TRAIN.md#16-fault-tolerance) fo
 mechanics (main-rank scan + broadcast) and exactly what state a resume restores.
 
 **The end-to-end failure-recovery walkthrough:** a node fails or is preempted → the training
-process exits nonzero (drain: `85`; crash: whatever it raised) → Slurm requeues the job (subject to
+process exits nonzero (drain: `.drained` marker + exit `85`, flattened to `1` by `accelerate
+launch`; crash: whatever it raised) → Slurm requeues the job (subject to
 `--requeue` and the wrapper's budget/no-progress checks above) → the new attempt's `Trainer` scans
 `train.output_dir` for the newest committed checkpoint and resumes from it (model, optimizers,
 schedulers, RNG, step counters) → the same W&B run continues (the persisted run id) rather than
