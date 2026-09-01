@@ -172,7 +172,18 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         f"  --container-mounts={mounts} \\",
         '  --container-workdir="$JOB_WORK_DIR" \\',
         "  --no-container-mount-home \\",
-        f"  bash -c '{slurm.install} && \\",
+        # `trap "" USR1` shields the launch plumbing from the drain signal. Slurm delivers
+        # `--signal=USR1@600` to EVERY process in the step's cgroup -- not just the trainer
+        # ranks, but also this task-leader bash and the `accelerate launch` parent between
+        # them, neither of which handles USR1, so both would die instantly (default
+        # disposition; verified: bash and python both exit 138 on unhandled USR1) and
+        # slurmstepd would tear the step down -- SIGKILLing the ranks mid-drain-checkpoint.
+        # SIG_IGN is inherited across exec, so `accelerate launch` survives too, while the
+        # trainer ranks still drain: signal.signal() overrides an inherited ignore (see
+        # oplm.training.signals.DrainSignal.install). SIGTERM is deliberately NOT ignored
+        # here -- torchelastic installs its own TERM handler regardless (an inherited ignore
+        # would be overridden), and scancel's TERM->KILL teardown semantics should stay.
+        f'  bash -c \'trap "" USR1; {slurm.install} && \\',
         f"    {spec.command}'",
     ]
     lines += _requeue_wrapper(spec, slurm)
@@ -183,16 +194,30 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
 def _requeue_wrapper(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
     """Budget- and progress-aware requeue logic run after the training `srun` exits.
 
-    Exit 0 is a clean finish. Exit ``DRAIN_EXIT_CODE`` (85, see ``oplm.training.signals``)
-    requeues unconditionally as long as the requeue budget (``slurm.max_requeues``) is not
-    exhausted -- it bypasses the no-progress guard below entirely (it neither reads nor
-    writes the guard's step file), but not the budget cap. Any other nonzero exit requeues
-    only if budget remains *and* checkpoint progress was made since the previous *non-drain*
-    failure; two consecutive non-drain failures with no step advance between them is a crash
-    loop, and the job exits without requeueing.
+    Exit 0 is a clean finish. A *drain* requeues unconditionally as long as the requeue
+    budget (``slurm.max_requeues``) is not exhausted -- it bypasses the no-progress guard
+    below entirely (it neither reads nor writes the guard's step file), but not the budget
+    cap. Any other nonzero exit requeues only if budget remains *and* checkpoint progress
+    was made since the previous *non-drain* failure; two consecutive non-drain failures
+    with no step advance between them is a crash loop, and the job exits without
+    requeueing.
 
-    When ``spec.progress_dir`` is ``None`` (a non-training job), the no-progress guard and its
-    step-tracking file are omitted entirely -- the wrapper requeues on budget alone.
+    A drain is recognized by EITHER of two signals, because the primary one does not
+    survive the production launch stack: the trainer's rank processes exit
+    ``DRAIN_EXIT_CODE`` (85, see ``oplm.training.signals``), but ``accelerate launch
+    --multi_gpu`` reports any worker failure as its own exit 1 (torchelastic's
+    ``ChildFailedError`` is re-raised in the launcher), so the sbatch script's ``$STATUS``
+    never sees the 85 on a real multi-GPU job. The trainer therefore also writes a
+    ``.drained`` marker file (``oplm.training.signals.DRAIN_MARKER_NAME``) into its output
+    dir immediately after the drain checkpoint commits; the wrapper treats marker-present
+    OR ``$STATUS -eq 85`` as a drain, and *consumes* (deletes) the marker so it can never
+    leak into a later, genuinely crashed attempt. The bare exit-code check is kept for
+    launch shapes with no exit-code-flattening launcher in between (e.g. a single-process
+    ``python -m oplm.train``).
+
+    When ``spec.progress_dir`` is ``None`` (a non-training job), the no-progress guard, the
+    drain marker check, and the step-tracking file are omitted entirely -- the wrapper
+    requeues on budget alone.
     """
     lines = [
         "STATUS=$?",
@@ -210,6 +235,19 @@ def _requeue_wrapper(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
     if spec.progress_dir is not None:
         lines += [
             f'STEP_FILE="{spec.progress_dir}/.last_requeue_step"',
+            # Drain detection: marker file OR exit 85 (see the docstring above for why the
+            # exit code alone is not enough -- `accelerate launch` flattens a rank's 85 to
+            # its own 1). The marker is consumed here, on the batch node, so a later
+            # attempt's genuine crash can never inherit it. Name kept in lockstep with
+            # oplm.training.signals.DRAIN_MARKER_NAME (not imported: rendering must stay
+            # importable without torch).
+            f'DRAIN_MARKER="{spec.progress_dir}/.drained"',
+            "DRAINED=0",
+            'if [ "$STATUS" -eq 85 ]; then DRAINED=1; fi',
+            'if [ -f "$DRAIN_MARKER" ]; then',
+            "  DRAINED=1",
+            '  rm -f "$DRAIN_MARKER"',
+            "fi",
             # `|| true` guards the whole pipeline, not just `grep`: under the script's
             # top-level `set -o pipefail`, `ls` finding no `checkpoint-*` match (the common
             # case on a job's first restart, before any checkpoint is committed) and `grep`
@@ -222,13 +260,13 @@ def _requeue_wrapper(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
             "  | sed 's/.*checkpoint-//' | grep -E '^[0-9]+$' | sort -n | tail -1 || true)",
             "CURRENT_STEP=${CURRENT_STEP:-0}",
             # The guard reads AND writes STEP_FILE only on non-drain exits. Writing it on
-            # the drain (85) path too would arm the guard against the very next crash:
+            # the drain path too would arm the guard against the very next crash:
             # drain -> requeue -> crash before the next checkpoint commits leaves
             # CURRENT_STEP == PREV_STEP, so a single non-drain failure after a drain would
             # end the requeue loop. The guard's contract is two consecutive *non-drain*
             # failures with no progress between them, so the drain leg is fail-open: it
             # neither consults nor updates the recorded step.
-            'if [ "$STATUS" -ne 85 ]; then',
+            'if [ "$DRAINED" -ne 1 ]; then',
             '  if [ "$RESTARTS" -ge 1 ]; then',
             '    PREV_STEP=$(cat "$STEP_FILE" 2>/dev/null || echo -1)',
             '    if [ "$CURRENT_STEP" -le "$PREV_STEP" ]; then',
@@ -241,7 +279,10 @@ def _requeue_wrapper(spec: JobSpec, slurm: SlurmConfig) -> list[str]:
             "  fi",
             '  echo "$CURRENT_STEP" > "$STEP_FILE"',
             "fi",
-            'echo "requeueing (exit=$STATUS, restarts=$RESTARTS, step=$CURRENT_STEP)"',
+            (
+                'echo "requeueing (exit=$STATUS, drained=$DRAINED, restarts=$RESTARTS, '
+                'step=$CURRENT_STEP)"'
+            ),
         ]
     else:
         lines.append('echo "requeueing (exit=$STATUS, restarts=$RESTARTS)"')

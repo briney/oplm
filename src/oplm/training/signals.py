@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+    from pathlib import Path
     from types import FrameType
     from typing import TypeAlias
 
@@ -36,7 +37,53 @@ logger = logging.getLogger(__name__)
 #: max_steps) and any other nonzero exit (crash).
 DRAIN_EXIT_CODE = 85
 
+#: Marker file the trainer writes into ``train.output_dir`` right before a clean drain
+#: exit, and that the rendered requeue wrapper consumes (deletes) to recognize the drain.
+#: The wrapper cannot rely on :data:`DRAIN_EXIT_CODE` alone: the trainer's rank processes
+#: do exit 85, but ``accelerate launch --multi_gpu`` routes any worker failure through
+#: torchelastic's ``ChildFailedError``, which the launcher re-raises -- so the launcher
+#: process itself exits 1 and the 85 never reaches the sbatch script's ``$?``. The file
+#: is the drain signal that survives that flattening. Kept in lockstep with the literal
+#: ``.drained`` in ``oplm.slurm.render._requeue_wrapper`` (which deliberately does not
+#: import this module -- ``oplm.training`` pulls in torch, and script rendering must stay
+#: importable on nodes without it).
+DRAIN_MARKER_NAME = ".drained"
+
 _DRAIN_SIGNALS = (signal.SIGUSR1, signal.SIGTERM)
+
+
+def write_drain_marker(output_dir: Path, global_step: int) -> None:
+    """Write the drain marker the requeue wrapper checks for (main process only).
+
+    Called on the drain exit path, strictly *after* the drain checkpoint has committed --
+    the marker means "drained cleanly with a committed checkpoint; requeue unconditionally,"
+    so writing it before the commit would let a kill mid-checkpoint masquerade as a clean
+    drain. The content (the drained step) is diagnostic only; the wrapper tests existence,
+    never parses.
+
+    Args:
+        output_dir: The training output directory (``cfg.train.output_dir``) -- the same
+            directory the wrapper's ``progress_dir`` points at.
+        global_step: The step the drain checkpoint was saved at, recorded for debugging.
+    """
+    (output_dir / DRAIN_MARKER_NAME).write_text(f"{global_step}\n")
+
+
+def clear_stale_drain_marker(output_dir: Path) -> None:
+    """Remove a leftover drain marker at trainer start (main process only).
+
+    The wrapper consumes (deletes) the marker on every requeue it performs, so under
+    normal operation nothing survives to the next attempt. A marker can go stale only
+    when the wrapper never ran at all after a drain -- e.g. the batch node died between
+    the trainer's drain exit and the wrapper's check, with Slurm itself requeueing the
+    job. Left in place, it would misclassify the *next* genuine crash as a drain and
+    bypass the no-progress guard once; clearing it here bounds any staleness to a single
+    attempt.
+    """
+    marker = output_dir / DRAIN_MARKER_NAME
+    if marker.is_file():
+        logger.info("Removing stale drain marker: %s", marker)
+        marker.unlink()
 
 
 def seconds_until_job_end(env: Mapping[str, str] | None = None) -> float | None:

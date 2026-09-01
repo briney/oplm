@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from oplm.config import serialize_config
-from oplm.training.signals import DRAIN_EXIT_CODE
+from oplm.training.signals import DRAIN_EXIT_CODE, DRAIN_MARKER_NAME
 from tests.training.conftest import tiny_train_cfg
 
 if TYPE_CHECKING:
@@ -125,6 +125,14 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     # A drain warning was logged (docs/DRAIN.md-style observability contract).
     assert "Drain requested" in stderr_path.read_text()
 
+    # The drain marker was written alongside the exit-85 (the signal the sbatch requeue
+    # wrapper actually keys on: `accelerate launch` flattens a rank's exit 85 to its own
+    # exit 1 on a real multi-GPU job, so the exit code alone never reaches the wrapper
+    # there). Its content is the drained step, recorded for debugging.
+    drain_marker = run_dir / DRAIN_MARKER_NAME
+    assert drain_marker.is_file()
+    assert drain_marker.read_text().strip() == str(drained_step)
+
     # The key regression this test guards against (fix commit 69e70f3): the drain
     # branch must sit AFTER this step's tokens_seen/throughput bookkeeping, so the
     # checkpoint it writes carries a tokens_seen that actually covers the drained
@@ -182,6 +190,10 @@ def test_sigusr1_drains_to_checkpoint_and_exits_85_then_auto_resume_continues(
     resumed = Trainer(resume_cfg, callbacks=[])
     assert resumed.global_step == drained_step
     assert resumed.tokens_seen == checkpoint_tokens_seen
+
+    # Trainer start cleared the (here never-consumed -- no requeue wrapper ran) drain
+    # marker, so it cannot misclassify a later genuine crash as a drain.
+    assert not drain_marker.exists()
 
     resumed.train()
     assert resumed.global_step == resume_max_steps

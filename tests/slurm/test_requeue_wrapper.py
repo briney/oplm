@@ -150,6 +150,60 @@ def test_drain_exit_requeues_even_with_stale_step(
     assert log.read_text().strip() == "requeue 555"
 
 
+# --- case 2b: the production drain shape -- exit flattened to 1, marker present ---------
+
+
+def test_drain_marker_requeues_despite_flattened_exit_and_stale_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `.drained` marker makes exit 1 a drain: guard bypassed, marker consumed.
+
+    This is what a real multi-GPU drain looks like to the wrapper: the trainer ranks
+    exit 85, but `accelerate launch` reports the worker failure as its own exit 1
+    (torchelastic ChildFailedError), so `$STATUS` carries no drain information at all.
+    The marker the trainer writes after the drain checkpoint commits must (a) requeue
+    unconditionally even with a stale recorded step (the crash-loop guard must not fire),
+    (b) leave the step file unwritten (the drain leg is fail-open, same as exit 85), and
+    (c) be deleted, so a *later* genuine crash is not misread as a drain.
+    """
+    progress_dir = tmp_path / "output"
+    progress_dir.mkdir()
+    _make_checkpoint(progress_dir, 100)
+    (progress_dir / ".last_requeue_step").write_text("100")
+    (progress_dir / ".drained").write_text("100\n")
+    log = tmp_path / "scontrol.log"
+
+    drained = _run_wrapper(
+        tmp_path,
+        monkeypatch,
+        preamble="false",
+        progress_dir=str(progress_dir),
+        restarts=1,
+        scontrol_log=log,
+    )
+    assert "crash loop" not in drained.stderr
+    assert "requeueing" in drained.stdout
+    assert "drained=1" in drained.stdout
+    assert log.read_text().strip() == "requeue 424242"
+    # (b) the drain leg records nothing...
+    assert (progress_dir / ".last_requeue_step").read_text().strip() == "100"
+    # (c) ...and the marker is consumed.
+    assert not (progress_dir / ".drained").exists()
+
+    # With the marker gone, the same exit 1 at the same step is a genuine crash again:
+    # the pre-seeded step file (100) now applies, so the no-progress guard trips.
+    crashed = _run_wrapper(
+        tmp_path,
+        monkeypatch,
+        preamble="false",
+        progress_dir=str(progress_dir),
+        restarts=2,
+        scontrol_log=log,
+    )
+    assert "crash loop" in crashed.stderr
+    assert log.read_text().splitlines() == ["requeue 424242"]
+
+
 # --- case 3: exit 1 twice at the same step -> second invocation does NOT requeue --------
 
 
