@@ -342,15 +342,18 @@ class OplmBlock(nn.Module):
 
 
 class OplmStack(nn.Module):
-    """Encoder backbone: token embedding, N × OplmBlock, final norm.
+    """Encoder backbone: embedding, shared-block execution schedule, final norm.
 
     Forward returns `(last_hidden, hidden_states_or_None, attentions_or_None)`:
 
+    D is executed depth; physical blocks remain registered exactly once.
+    `layer_execution_order` maps each execution to its physical block index.
+
     * `last_hidden`: `(B, T, D)` post-final-norm activations.
-    * `hidden_states`: `(L + 1)`-tuple of `(B, T, D)` tensors (the
+    * `hidden_states`: `(D + 1)`-tuple of `(B, T, D)` tensors (the
       post-embedding state, then the output of each block, pre-final-norm).
       `None` when `output_hidden_states=False`.
-    * `attentions`: `L`-tuple of `(B, H, T, T)` tensors (each entry is `None`
+    * `attentions`: `D`-tuple of `(B, H, T, T)` tensors (each entry is `None`
       when a block returned no weights). `None` when `output_attentions=False`.
     """
 
@@ -430,10 +433,12 @@ class OplmStack(nn.Module):
         hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
         attentions: tuple[torch.Tensor | None, ...] | None = () if output_attentions else None
 
-        # ResFormer value residual: layer 0 returns its values v1, which are fed
-        # to every later block. Stays None (and unused) when disabled.
+        # ResFormer: retain the first execution of layer 0 as the global value
+        # reference, including when that physical block is revisited.
+        # Stays None (and unused) when disabled.
         v1: torch.Tensor | None = None
-        for block in self.layers:
+        for layer_index in self.layer_execution_order:
+            block = self.layers[layer_index]
             result = block(x, attention_mask, output_attentions, value_residual=v1)
             if self.value_residual_enabled:
                 x, attn, v = result

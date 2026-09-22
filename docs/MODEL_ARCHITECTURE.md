@@ -102,3 +102,34 @@ relu2:  hidden = relu(up + CanonD(up)) ** 2
 ```
 
 It must not be applied to the hidden-size FFN input before the FFN projections.
+
+## Shared-layer looping
+
+`num_hidden_layers` is physical depth L. `num_loops` (default 1) selects the total
+number of invocations of each block in `[loop_start, loop_end)`, a zero-based,
+half-open range whose default is the whole stack. Blocks outside that range run
+once. For eight physical layers and the range `[2, 6)`, two loops execute:
+
+- `stack`: `1 2 → 3 4 5 6 → 3 4 5 6 → 7 8` (one-based labels).
+- `interleave`: `1 2 → 3 3 4 4 5 5 6 6 → 7 8`.
+
+Each physical block is registered once; all its attention, FFN, norm, gate, and
+Canon parameters are reused. Canon kernels retain their physical indices.
+Embeddings run once before the schedule, and final normalization/task prediction
+runs once after it. Residue positions and padding masks stay the same. Training
+uses the existing final-output loss and differentiates through every occurrence.
+Dropout samples normally per invocation, with checkpoint recomputation preserving
+that invocation's RNG state.
+
+The effective depth is `D = L + (num_loops - 1) * (loop_end - loop_start)` after
+resolving a null end to L. Requested hidden states contain D+1 tensors (embedding
+plus each pre-final-norm block output); attentions contain D tensors.
+`model.oplm.backbone.layer_execution_order` maps occurrences to physical blocks
+(`model.backbone` for `OplmModel`). One loop reproduces the ordinary traversal.
+
+Residual alpha and projection initialization continue to scale with physical
+L, not D. Converting a checkpoint does not alter its weights or alpha buffers.
+When value residuals are enabled, the first execution of physical block zero
+provides the global reference for all later physical blocks. Every invocation of
+block zero bypasses mixing; revisiting it never replaces or detaches the reference.
+Changing loop settings requires constructing/loading a model with the new config.

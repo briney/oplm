@@ -380,8 +380,9 @@ class OplmAttention(nn.Module):
         # blend toward) the conv'd values.
         if self.canon_b_enabled:
             q, k, v = self._apply_canon_b(q, k, v, attention_mask)
-        # ResFormer value residual: blend this layer's values toward layer 0's.
-        if value_residual is not None:
+        # ResFormer: physical layer 0 always bypasses mixing, including revisits.
+        # Other layers blend toward its first execution's values.
+        if self.layer_idx > 0 and value_residual is not None:
             lam = self.value_residual_lambda
             v = lam * v + (1.0 - lam) * value_residual
         q, k = self._apply_rope(q, k)
