@@ -805,3 +805,11 @@ For interleaving, set `model.loop_strategy=interleave`. To loop a subset, also s
 `model.loop_start` and `model.loop_end` (zero-based, end exclusive). Unselected
 layers run once. Omitting `init_from` trains the configured looped model from
 scratch with shared parameters from the first step.
+
+Full-state resume checks physical depth and all loop settings before loading
+model or optimizer state. `loop_end=null` and an explicit end equal to physical
+depth are equivalent; other changes, including strategy changes at `num_loops=1`,
+require a new stage with `init_from`. Older checkpoints missing loop fields use
+ordinary defaults. If both saved model-config artifacts are absent, only an
+ordinary default target may resume, with a warning that compatibility cannot be
+verified.

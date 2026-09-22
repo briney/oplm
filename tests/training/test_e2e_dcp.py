@@ -260,7 +260,7 @@ def test_scaler_sidecar_round_trips_fp16_gradscaler_state(tmp_path: Path) -> Non
         "growth_interval": 2000,
         "_growth_tracker": 7,
     }
-    scaler = torch.amp.GradScaler()
+    scaler = torch.amp.GradScaler("cpu")
     scaler.load_state_dict(non_default_scaler_state)
     accelerator.scaler = scaler
 
@@ -281,7 +281,7 @@ def test_scaler_sidecar_round_trips_fp16_gradscaler_state(tmp_path: Path) -> Non
     assert (committed / "scaler.pt").exists()
 
     fresh_accelerator, fresh_model, fresh_optimizer, fresh_scheduler = _prepared_model(cfg)
-    fresh_accelerator.scaler = torch.amp.GradScaler()  # starts from defaults
+    fresh_accelerator.scaler = torch.amp.GradScaler("cpu")  # starts from defaults
 
     load_checkpoint(
         fresh_accelerator,

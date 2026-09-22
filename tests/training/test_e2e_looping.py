@@ -218,3 +218,36 @@ def test_new_stage_does_not_reuse_parent_tracker_id(
     )
     assert "id" not in captured[0] and "resume" not in captured[0]
     assert trainer._wandb_run_id == "new-stage"
+
+
+@pytest.mark.parametrize("auto", [False, True])
+def test_resume_loop_drift_fails_before_state_load_or_initialization(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auto: bool,
+) -> None:
+    configure_accelerator_device("cpu", monkeypatch)
+    Trainer(
+        tiny_train_cfg(tmp_path, training_parquet, max_steps=2, save_every=1, num_loops=2)
+    ).train()
+    import torch.distributed.checkpoint as dcp
+
+    import oplm.training.initialization as initialization
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("incompatible resume must fail before state load or init")
+
+    monkeypatch.setattr(dcp, "load", forbidden)
+    monkeypatch.setattr(initialization, "resolve_initialization_source", forbidden)
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=3,
+        num_loops=3,
+        auto_resume=auto,
+        init_from="missing-parent",
+        resume_from=None if auto else str(tmp_path / "checkpoint-2"),
+    )
+    with pytest.raises((ValueError, RuntimeError), match="num_loops"):
+        Trainer(cfg)
