@@ -813,3 +813,11 @@ require a new stage with `init_from`. Older checkpoints missing loop fields use
 ordinary defaults. If both saved model-config artifacts are absent, only an
 ordinary default target may resume, with a warning that compatibility cannot be
 verified.
+
+Startup logs show physical depth, effective depth, loop range/strategy, and unique
+parameter count. FLOPs and throughput-derived compute metrics count every block
+execution, with the MLM head counted once. The estimator still omits attention
+scores, normalization, and embedding lookups. Compare looping experiments at both
+equal token budgets and equal estimated compute; shared weights leave parameter
+and optimizer-state budgets unchanged, while additional executions increase
+compute and saved activations (mitigated by activation checkpointing).

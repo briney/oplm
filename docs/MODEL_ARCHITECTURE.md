@@ -133,3 +133,8 @@ When value residuals are enabled, the first execution of physical block zero
 provides the global reference for all later physical blocks. Every invocation of
 block zero bypasses mixing; revisiting it never replaces or detaches the reference.
 Changing loop settings requires constructing/loading a model with the new config.
+
+Training compute estimates use effective depth `D` for the block projections and
+count the MLM head once. Unique parameter counts use physical blocks and remain
+unchanged by looping. Activation memory grows with executed depth unless reduced
+through activation checkpointing; parameter sharing alone does not reduce it.

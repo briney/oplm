@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from oplm.model.looping import resolve_layer_execution_order
+
 if TYPE_CHECKING:
     from oplm.model import OplmConfig as OplmModelConfig
 
@@ -15,7 +17,15 @@ def estimate_flops_per_token(config: OplmModelConfig) -> int:
     attention-score FLOPs, normalization, and embedding lookups by design.
     """
     h = config.hidden_size
-    num_hidden_layers = config.num_hidden_layers
+    effective_depth = len(
+        resolve_layer_execution_order(
+            config.num_hidden_layers,
+            num_loops=config.num_loops,
+            loop_strategy=config.loop_strategy,
+            loop_start=config.loop_start,
+            loop_end=config.loop_end,
+        )
+    )
     vocab_size = config.vocab_size
     intermediate = config.intermediate_size  # always resolved post-__init__
     assert intermediate is not None, "intermediate_size is resolved in OplmConfig.__init__"
@@ -28,7 +38,7 @@ def estimate_flops_per_token(config: OplmModelConfig) -> int:
     ffn_flops = num_ffn_proj * 2 * h * intermediate
 
     per_layer = attn_proj_flops + ffn_flops
-    backbone_flops = num_hidden_layers * per_layer
+    backbone_flops = effective_depth * per_layer
 
     # MLM head: dense projection + vocab projection
     head_flops = 2 * h * h + 2 * h * vocab_size

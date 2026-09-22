@@ -509,6 +509,19 @@ class Trainer:
         if gradient_checkpointing:
             model.gradient_checkpointing_enable()  # propagates to every OplmBlock
 
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Model: physical_depth=%d effective_depth=%d unique_parameters=%d "
+                "loops=%d strategy=%s range=[%d, %d)",
+                cfg.model.num_hidden_layers,
+                len(model.oplm.backbone.layer_execution_order),
+                sum(parameter.numel() for parameter in model.parameters()),
+                cfg.model.num_loops,
+                cfg.model.loop_strategy,
+                cfg.model.loop_start,
+                cfg.model.num_hidden_layers if cfg.model.loop_end is None else cfg.model.loop_end,
+            )
+
         # FSDP2/HSDP sharding (Task 5.1), when train.parallelism == "hsdp". Applied HERE,
         # before build_optimizers, because fully_shard swaps the module's parameters for
         # DTensor ones -- an optimizer built beforehand would keep references to tensors
