@@ -422,12 +422,14 @@ class Trainer:
             initialization_source = resolve_initialization_source(cfg.train.init_from)
             protected = {initialization_source}
             checkpoint = initialization_source.parent
-            if initialization_source.name == "hf" and checkpoint.name.startswith("checkpoint-"):
-                protected.add(checkpoint.parent)
+            if initialization_source.name == "hf":
+                protected.add(checkpoint)
+                if checkpoint.name.startswith("checkpoint-"):
+                    protected.add(checkpoint.parent)
             if Path(cfg.train.output_dir).expanduser().resolve() in protected:
                 raise ValueError(
                     "train.output_dir must differ from the initialization export "
-                    "and its parent run directory; use a new stage directory."
+                    "and its checkpoint or parent run directory; use a new stage directory."
                 )
             logger.info("Initializing new stage from pretrained weights: %s", initialization_source)
 

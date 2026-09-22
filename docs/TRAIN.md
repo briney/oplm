@@ -794,7 +794,8 @@ an `hf/` export. It loads all model parameters and persistent buffers strictly;
 non-loop model semantics must match. It starts fresh optimizers, LR schedules,
 random state, data position, counters, and tracking identity. Set the new stage's
 LR, warmup, and duration independently. Use a distinct output directory; the
-export itself and its identifiable parent run directory are rejected as outputs.
+export, its containing checkpoint, and its identifiable parent run directory
+are rejected as outputs.
 
 A resolved `train.resume_from` or `train.auto_resume` checkpoint takes precedence
 and restores the current stage's complete state without accessing `init_from`.

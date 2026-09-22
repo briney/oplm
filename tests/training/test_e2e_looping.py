@@ -251,3 +251,38 @@ def test_resume_loop_drift_fails_before_state_load_or_initialization(
     )
     with pytest.raises((ValueError, RuntimeError), match="num_loops"):
         Trainer(cfg)
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+@pytest.mark.parametrize("source_is_root", [False, True])
+def test_initialization_checkpoint_root_cannot_be_reused_as_output(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symlink: bool,
+    source_is_root: bool,
+) -> None:
+    configure_accelerator_device("cpu", monkeypatch)
+    checkpoint = tmp_path / "parent" / "checkpoint-2"
+    export = checkpoint / "hf"
+    cfg = tiny_train_cfg(tmp_path / "parent", training_parquet)
+    OplmForMaskedLM(cfg.model).save_pretrained(export)
+    saved_config = checkpoint / "config.yaml"
+    saved_config.write_text("parent checkpoint metadata")
+    output = tmp_path / "alias" if symlink else checkpoint
+    if symlink:
+        output.symlink_to(checkpoint, target_is_directory=True)
+    from accelerate import Accelerator
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("source checkpoint must be protected before tracker startup")
+
+    monkeypatch.setattr(Accelerator, "init_trackers", forbidden)
+    source = checkpoint if source_is_root else export
+    with pytest.raises(ValueError, match="output_dir"):
+        Trainer(
+            tiny_train_cfg(
+                output, training_parquet, init_from=str(source), num_loops=2, wandb_enabled=True
+            )
+        )
+    assert saved_config.read_text() == "parent checkpoint metadata"
