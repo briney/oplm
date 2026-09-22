@@ -874,6 +874,83 @@ def _validate_rng_sidecar_count(checkpoint_dir: Path, world_size: int) -> None:
     )
 
 
+def validate_loop_resume_compat(checkpoint_dir: Path, cfg: OplmConfig) -> None:
+    """Reject changes to physical depth or loop settings before restoring state.
+
+    Args:
+        checkpoint_dir: Committed checkpoint with saved YAML or an HF export.
+        cfg: Live run configuration.
+
+    Raises:
+        ValueError: Loop metadata is malformed, incompatible, or unavailable for
+            a target with nondefault looping settings. Use ``train.init_from``
+            in a new stage to intentionally change execution.
+    """
+    from omegaconf import OmegaConf
+
+    from oplm.model import OplmConfig as ModelConfig
+    from oplm.model.looping import resolve_layer_execution_order
+
+    def signature(model: ModelConfig) -> dict[str, Any]:
+        settings = {
+            "num_hidden_layers": model.num_hidden_layers,
+            "num_loops": model.num_loops,
+            "loop_strategy": model.loop_strategy,
+            "loop_start": model.loop_start,
+            "loop_end": model.num_hidden_layers if model.loop_end is None else model.loop_end,
+        }
+        resolve_layer_execution_order(**settings)
+        return settings
+
+    live = signature(cfg.model)
+    saved_model = None
+    yaml_path = checkpoint_dir / "config.yaml"
+    if yaml_path.is_file():
+        raw = OmegaConf.to_container(OmegaConf.load(yaml_path), resolve=True)
+        if not isinstance(raw, dict):
+            raise ValueError(f"Malformed checkpoint config: {yaml_path}")
+        if "model" in raw:
+            saved_model = raw["model"]
+            if not isinstance(saved_model, dict):
+                raise ValueError(f"Malformed model mapping in {yaml_path}")
+    hf_path = checkpoint_dir / "hf" / "config.json"
+    if saved_model is None and hf_path.is_file():
+        saved_model = json.loads(hf_path.read_text())
+        if not isinstance(saved_model, dict):
+            raise ValueError(f"Malformed model mapping in {hf_path}")
+    if saved_model is None:
+        ordinary = {
+            "num_hidden_layers": live["num_hidden_layers"],
+            "num_loops": 1,
+            "loop_strategy": "stack",
+            "loop_start": 0,
+            "loop_end": live["num_hidden_layers"],
+        }
+        if live != ordinary:
+            raise ValueError(
+                f"Checkpoint {checkpoint_dir} lacks model metadata; cannot verify "
+                "loop settings. Use train.init_from in a new stage."
+            )
+        logger.warning(
+            "Checkpoint %s lacks model metadata; cannot verify loop settings; "
+            "allowing ordinary legacy resume.",
+            checkpoint_dir,
+        )
+        return
+    saved = signature(ModelConfig(**saved_model))
+    differences = [
+        f"{name} (checkpoint={saved[name]!r}, live={live[name]!r})"
+        for name in saved
+        if saved[name] != live[name]
+    ]
+    if differences:
+        raise ValueError(
+            "Incompatible loop settings on resume: "
+            + "; ".join(differences)
+            + ". Use train.init_from in a new stage to change execution."
+        )
+
+
 def validate_checkpoint_for_resume(
     checkpoint_dir: Path, cfg: OplmConfig, *, world_size: int | None = None
 ) -> None:
@@ -932,6 +1009,7 @@ def validate_checkpoint_for_resume(
     if world_size is not None:
         _validate_rng_sidecar_count(checkpoint_dir, world_size)
 
+    validate_loop_resume_compat(checkpoint_dir, cfg)
     validate_schedule_compat(checkpoint_dir, cfg, checkpoint_global_step=state.get("global_step"))
 
 
@@ -1004,6 +1082,7 @@ def load_checkpoint(
         raise FileNotFoundError(f"trainer_state.json not found in {checkpoint_dir}")
     state: dict[str, Any] = json.loads(state_path.read_text())
 
+    validate_loop_resume_compat(ckpt_path, cfg)
     validate_schedule_compat(ckpt_path, cfg, checkpoint_global_step=state.get("global_step"))
 
     unwrapped_schedulers = [_unwrap_scheduler(s) for s in schedulers]

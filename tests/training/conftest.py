@@ -106,6 +106,7 @@ def tiny_train_cfg(
     keep_every_n_hours: float | None = None,
     eval: dict[str, object] | None = None,
     eval_every: object = None,
+    init_from: str | None = None,
     resume_from: str | None = None,
     auto_resume: bool = False,
     resume_data_position: bool = True,
@@ -127,6 +128,11 @@ def tiny_train_cfg(
     hidden_size: int = 32,
     num_attention_heads: int = 4,
     num_hidden_layers: int = 2,
+    num_loops: int = 1,
+    loop_strategy: str = "stack",
+    loop_start: int = 0,
+    loop_end: int | None = None,
+    value_residual: str = "none",
     max_position_embeddings: int = 64,
     gradient_checkpointing: bool = False,
     gradient_checkpointing_mode: str = "full",
@@ -147,6 +153,11 @@ def tiny_train_cfg(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_hidden_layers=num_hidden_layers,
+            num_loops=num_loops,
+            loop_strategy=loop_strategy,
+            loop_start=loop_start,
+            loop_end=loop_end,
+            value_residual=value_residual,
             max_position_embeddings=max_position_embeddings,
             gradient_checkpointing=gradient_checkpointing,
             gradient_checkpointing_mode=gradient_checkpointing_mode,
@@ -172,6 +183,7 @@ def tiny_train_cfg(
             save_every_minutes=save_every_minutes,
             keep_every_n_steps=keep_every_n_steps,
             keep_every_n_hours=keep_every_n_hours,
+            init_from=init_from,
             resume_from=resume_from,
             auto_resume=auto_resume,
             resume_data_position=resume_data_position,
@@ -244,6 +256,7 @@ def reset_dynamo() -> Generator[None, None, None]:
     """
     from torch import _dynamo
 
+    original_specialize_float = _dynamo.config.specialize_float
     original_cache_size_limit = _dynamo.config.cache_size_limit
     _dynamo.reset()
     try:
@@ -251,6 +264,7 @@ def reset_dynamo() -> Generator[None, None, None]:
     finally:
         _dynamo.reset()
         _dynamo.config.cache_size_limit = original_cache_size_limit
+        _dynamo.config.specialize_float = original_specialize_float
 
 
 @pytest.fixture

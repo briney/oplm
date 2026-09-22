@@ -778,3 +778,55 @@ about before relying on it in production:
 - [DATA_TOOLING.md](DATA_TOOLING.md) — data formats and masking.
 - [OVERVIEW.md](OVERVIEW.md) — Part IV: trainer internals and design rationale.
 - [README](../README.md) — installation and inference.
+
+## Training a separate looped stage
+
+Keep the physical architecture and data settings in `parent.yaml`. Train the ordinary
+model, then start a new run from its exported weights:
+
+```bash
+oplm train --config parent.yaml train.output_dir=outputs/parent train.max_steps=1000000
+oplm train --config parent.yaml train.init_from=outputs/parent/checkpoint-1000000/hf train.output_dir=outputs/looped train.max_steps=500000 model.num_loops=2 model.loop_strategy=stack
+```
+
+`train.init_from` accepts a local Hugging Face export or a checkpoint directory with
+an `hf/` export. It loads all model parameters and persistent buffers strictly;
+non-loop model semantics must match. It starts fresh optimizers, LR schedules,
+random state, data position, counters, and tracking identity. Set the new stage's
+LR, warmup, and duration independently. Use a distinct output directory; the
+export, its containing checkpoint, and its identifiable parent run directory
+are rejected as outputs.
+
+A resolved `train.resume_from` or `train.auto_resume` checkpoint takes precedence
+and restores the current stage's complete state without accessing `init_from`.
+An empty auto-resume directory starts from `init_from`; an invalid explicit resume
+or unusable set of auto-resume checkpoints fails instead of starting over.
+
+For interleaving, set `model.loop_strategy=interleave`. To loop a subset, also set
+`model.loop_start` and `model.loop_end` (zero-based, end exclusive). Unselected
+layers run once. Omitting `init_from` trains the configured looped model from
+scratch with shared parameters from the first step.
+
+Full-state resume checks physical depth and all loop settings before loading
+model or optimizer state. `loop_end=null` and an explicit end equal to physical
+depth are equivalent; other changes, including strategy changes at `num_loops=1`,
+require a new stage with `init_from`. Older checkpoints missing loop fields use
+ordinary defaults. If both saved model-config artifacts are absent, only an
+ordinary default target may resume, with a warning that compatibility cannot be
+verified.
+
+Startup logs show physical depth, effective depth, loop range/strategy, and unique
+parameter count. FLOPs and throughput-derived compute metrics count every block
+execution, with the MLM head counted once. The estimator still omits attention
+scores, normalization, and embedding lookups. Compare looping experiments at both
+equal token budgets and equal estimated compute; shared weights leave parameter
+and optimizer-state budgets unchanged, while additional executions increase
+compute and saved activations (mitigated by activation checkpointing).
+
+When compiling looped models with activation checkpointing, the trainer specializes
+Python configuration floats (such as normalization epsilon) to avoid a PyTorch
+2.10 tracing failure across repeated checkpoint calls. Tensor shapes remain dynamic
+according to `train.compile_dynamic`. Direct library users combining these features
+with `torch.compile` should set `torch._dynamo.config.specialize_float = True`
+before the first compiled forward. This is a process-wide compiler setting;
+changing configuration floats can cause recompilation.

@@ -14,6 +14,12 @@ model:
   intermediate_size: null # null -> round_up(8/3 * hidden_size, 256) (4x for relu2)
   max_position_embeddings: 1024
 
+  # Shared transformer recurrence (physical layers are stored only once)
+  num_loops: 1 # total executions of each selected layer, including the first
+  loop_strategy: stack # stack | interleave
+  loop_start: 0 # zero-based, inclusive
+  loop_end: null # zero-based, exclusive; null -> num_hidden_layers
+
   # Positional encoding (full RoPE by default: rope_dim resolves to head_dim)
   rope_theta: 10000.0
   rope_dim: null # null -> head_dim (and forces nope_dim to 0); rope_dim + nope_dim must equal head_dim

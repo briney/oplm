@@ -107,6 +107,23 @@ from `configs/model/base.yaml`.
 | `model.intermediate_size` | `int \| null` | derived | FFN inner width. Defaults to `round_up_to(8/3 · hidden_size, 256)`. |
 | `model.max_position_embeddings` | `int` | `1024` | Context length used by train, eval, and inference. |
 
+### Shared-layer looping
+
+`num_hidden_layers` counts unique blocks. The selected contiguous range repeats
+while its prefix and suffix run once. One loop reproduces ordinary execution.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `model.num_loops` | `int` | `1` | Total executions of each selected layer, not extra repeats. |
+| `model.loop_strategy` | `str` | `stack` | Repeat the complete region (`stack`) or each layer (`interleave`). |
+| `model.loop_start` | `int` | `0` | Inclusive zero-based start. |
+| `model.loop_end` | `int \| null` | `null` | Exclusive end; null means `num_hidden_layers`. |
+
+Require positive integer loop counts and `0 <= loop_start < loop_end <=
+num_hidden_layers` after resolving null. Booleans and fractional indices/counts
+are rejected, including for one loop. Effective depth is
+`L + (num_loops - 1) * (loop_end - loop_start)`.
+
 ### Positional encoding
 
 | Override | Type | Default | Notes |
@@ -485,3 +502,9 @@ out.embeddings        # (1, T, hidden_size)
 ```
 
 See the [README](../README.md#quick-start) for more inference examples.
+
+`train.init_from` (default `null`) initializes a fresh training stage from a local
+HF export or a checkpoint directory containing `hf/`. Only weights and persistent
+model buffers transfer. Configure a new output directory and stage-local LR,
+warmup, and step budget. A resolved full-state resume always takes precedence and
+never reads the initialization source. See [the staged training example](TRAIN.md#training-a-separate-looped-stage).

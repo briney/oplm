@@ -100,3 +100,23 @@ specific contract. The `G#` labels appear in the test-module docstrings.
 | **G11** | `tests/test_train_entrypoint.py` | Training entrypoint. The distributed entrypoint bootstraps the environment and runs end-to-end (unit-level bootstrap coverage in `tests/training/test_train_bootstrap.py`). |
 | **G12** | `tests/test_e2e_lifecycle.py` | Train → serve roundtrip. Train a few steps, save, reload via `OplmForMaskedLM.from_pretrained` and `AutoModelForMaskedLM` (`trust_remote_code`), and run inference — embeddings and logits are finite and correctly shaped. |
 | **G13** | `tests/training/test_e2e_wandb.py` | W&B tracker path (optional). With `WANDB_MODE=offline`, `init_trackers` + `log` complete; the flat config dict is correctly `/`-namespaced. |
+
+## Shared-layer looping
+
+`test_e2e_looping.py` exercises ordinary-to-looped weights-only stage transitions,
+AdamW/Muon changes, fresh warmup/counters/data/tracker identity, source-free child
+resume, and rejection of output aliases or loop drift before state loading.
+`test_loop_resume.py` checks legacy metadata defaults and semantic comparisons.
+
+`test_e2e_looping_distributed.py` launches bounded two-rank CPU/gloo workers for
+DDP and native HSDP. Full-stack and interleaved-subset schedules are compared to
+unwrapped loss gradients and optimizer updates with learnable value residuals,
+full/selective checkpointing, and accumulation. Separate launches exercise parent
+initialization, resume after removing the parent, HF/DCP tensor equality, loop
+mismatch on every rank, and guarded two-to-one-rank recovery. Per-rank JSON,
+stdout/stderr logs, and initial full state are retained in pytest temporary dirs.
+
+The compile suite compares AOT-eager loss and all gradients through the real
+Trainer compile setup. CUDA Inductor/bf16 single- and two-rank cases are guarded
+by device availability; CPU checks do not validate GPU kernels or throughput.
+Recomputation tests include dropout-seeded parity in `tests/model/test_looping.py`.

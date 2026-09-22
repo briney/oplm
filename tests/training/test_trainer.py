@@ -604,3 +604,34 @@ def test_save_deferral_resets_after_firing_so_a_later_trigger_gets_its_own_budge
         last_step=4,
     )
     assert fired == [2, 4]
+
+
+@pytest.mark.parametrize("strategy", ["stack", "interleave"])
+def test_loop_startup_reports_physical_effective_depth_and_unique_parameters(
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    strategy: str,
+) -> None:
+    from oplm.model import OplmForMaskedLM
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        num_hidden_layers=3,
+        num_loops=2,
+        loop_start=1,
+        loop_strategy=strategy,
+    )
+    cfg.model.tie_word_embeddings = True
+    unique = sum(p.numel() for p in OplmForMaskedLM(cfg.model).parameters())
+    with caplog.at_level(logging.INFO, logger="oplm.training.trainer"):
+        Trainer(cfg)
+    assert "physical_depth=3" in caplog.text
+    assert "effective_depth=5" in caplog.text
+    assert f"unique_parameters={unique}" in caplog.text
+    assert f"strategy={strategy}" in caplog.text
+    assert "range=[1, 3)" in caplog.text

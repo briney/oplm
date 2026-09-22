@@ -415,6 +415,24 @@ class Trainer:
         )
         self._resolved_resume_target = resume_target  # exposed for tests/observability
 
+        initialization_source = None
+        if resume_target is None and cfg.train.init_from is not None:
+            from oplm.training.initialization import resolve_initialization_source
+
+            initialization_source = resolve_initialization_source(cfg.train.init_from)
+            protected = {initialization_source}
+            checkpoint = initialization_source.parent
+            if initialization_source.name == "hf":
+                protected.add(checkpoint)
+                if checkpoint.name.startswith("checkpoint-"):
+                    protected.add(checkpoint.parent)
+            if Path(cfg.train.output_dir).expanduser().resolve() in protected:
+                raise ValueError(
+                    "train.output_dir must differ from the initialization export "
+                    "and its checkpoint or parent run directory; use a new stage directory."
+                )
+            logger.info("Initializing new stage from pretrained weights: %s", initialization_source)
+
         # Run id persisted right after init_trackers below; reused as the wandb_run_id
         # extra_state key on every checkpoint save. Stays None when wandb is disabled or
         # (main-process-only) on non-main ranks, so save_checkpoint's extra_state omits it.
@@ -483,9 +501,28 @@ class Trainer:
         # AttributeError. Re-enabling here is idempotent and keeps the wiring
         # explicit across transformers versions.
         gradient_checkpointing = getattr(cfg.model, "gradient_checkpointing", False)
-        model = OplmForMaskedLM(cfg.model)  # cfg.model is the HF OplmConfig
+        if initialization_source is None:
+            model = OplmForMaskedLM(cfg.model)  # cfg.model is the HF OplmConfig
+        else:
+            from oplm.training.initialization import load_initial_model
+
+            model = load_initial_model(initialization_source, cfg.model)
+            model.train()  # HF pretrained loading returns an evaluation-mode model.
         if gradient_checkpointing:
             model.gradient_checkpointing_enable()  # propagates to every OplmBlock
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Model: physical_depth=%d effective_depth=%d unique_parameters=%d "
+                "loops=%d strategy=%s range=[%d, %d)",
+                cfg.model.num_hidden_layers,
+                len(model.oplm.backbone.layer_execution_order),
+                sum(parameter.numel() for parameter in model.parameters()),
+                cfg.model.num_loops,
+                cfg.model.loop_strategy,
+                cfg.model.loop_start,
+                cfg.model.num_hidden_layers if cfg.model.loop_end is None else cfg.model.loop_end,
+            )
 
         # FSDP2/HSDP sharding (Task 5.1), when train.parallelism == "hsdp". Applied HERE,
         # before build_optimizers, because fully_shard swaps the module's parameters for
@@ -562,6 +599,16 @@ class Trainer:
         # traces the FSDP-hooked forward rather than having its own wrapper sharded
         # underneath it.
         if cfg.train.compile:
+            if gradient_checkpointing and cfg.model.num_loops > 1:
+                from torch import _dynamo
+
+                # PyTorch 2.10 caches dynamic Python-float proxies across repeated
+                # checkpoint subgraphs, then tries to lift a proxy from a sibling
+                # tracer ("lift_tracked_freevar_to_input ... root SubgraphTracer").
+                # Specialize configuration floats such as norm epsilon and attention
+                # scale; sequence/batch shapes remain dynamic. No tensor is detached.
+                # PyTorch annotates this mutable config default as Literal[False].
+                _dynamo.config.specialize_float = True  # ty: ignore[invalid-assignment]
             # Selective activation checkpointing (SAC) is incompatible with the
             # default DDPOptimizer: it splits the compiled graph at gradient-bucket
             # boundaries to overlap allreduce with backward, which fragments each
