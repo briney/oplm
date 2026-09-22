@@ -93,3 +93,49 @@ def test_from_pretrained_auto_attaches_tokenizer(tmp_path: Path) -> None:
     reloaded = OplmForMaskedLM.from_pretrained(tmp_path)
     assert reloaded.tokenizer is not None
     assert type(reloaded.tokenizer).__name__ == "OplmTokenizerFast"
+
+
+def test_loading_info_preserves_tuple_and_tokenizer(tmp_path: Path) -> None:
+    model = OplmForMaskedLM(_tiny_config(num_loops=2))
+    model.save_pretrained(tmp_path)
+    OplmTokenizerFast().save_pretrained(tmp_path)
+    loaded, info = OplmForMaskedLM.from_pretrained(tmp_path, output_loading_info=True)
+    assert isinstance(loaded, OplmForMaskedLM)
+    assert loaded.tokenizer is not None
+    assert not info["missing_keys"]
+    assert not info["unexpected_keys"]
+
+
+@pytest.mark.parametrize("cls", _TASK_CLASSES, ids=[c.__name__ for c in _TASK_CLASSES])
+@pytest.mark.parametrize("strategy", ["stack", "interleave"])
+def test_looped_round_trip_preserves_outputs(cls: type, strategy: str, tmp_path: Path) -> None:
+    config = _tiny_config(
+        num_loops=2, loop_strategy=strategy, loop_start=1, loop_end=2, tie_word_embeddings=True
+    )
+    model = cls(config).eval()
+    model.save_pretrained(tmp_path)
+    loaded = cls.from_pretrained(tmp_path).eval()
+    batch = OplmTokenizerFast()(["MEEPQ", "MKVL"], padding=True, return_tensors="pt")
+    with torch.no_grad():
+        a = _last_hidden_or_logits(model(**batch))
+        b = _last_hidden_or_logits(loaded(**batch))
+    assert torch.equal(a, b)
+    assert loaded.config.loop_end == 2
+    assert loaded.config.num_loops == 2
+    assert model.state_dict().keys() == loaded.state_dict().keys()
+
+
+def test_legacy_checkpoint_defaults_to_one_loop(tmp_path: Path) -> None:
+    import json
+
+    model = OplmForMaskedLM(_tiny_config()).eval()
+    model.save_pretrained(tmp_path)
+    path = tmp_path / "config.json"
+    data = json.loads(path.read_text())
+    for key in ("num_loops", "loop_strategy", "loop_start", "loop_end"):
+        data.pop(key, None)
+    path.write_text(json.dumps(data))
+    loaded = OplmForMaskedLM.from_pretrained(tmp_path).eval()
+    assert loaded.oplm.backbone.layer_execution_order == (0, 1)
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, loaded.state_dict()[name])

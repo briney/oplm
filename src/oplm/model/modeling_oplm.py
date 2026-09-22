@@ -8,7 +8,7 @@ files. Internal building blocks live in their own modules and are imported here.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -51,6 +51,8 @@ _REMOTE_CODE_DEPS = (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 
 __all__ = [
@@ -77,6 +79,19 @@ class OplmPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["OplmBlock"]
     _supports_sdpa = True
     _supports_flash_attn_2 = False
+
+    def mark_tied_weights_as_initialized(self, loading_info: Any) -> None:
+        """Preserve absent tied aliases until Transformers resolves their source.
+
+        Transformers 5.3's remote-code module-sharing heuristic removes explicitly
+        tied parameters from missing keys after marking them initialized. OPLM
+        shares parameters, not modules, so those keys must survive for tie_weights
+        to load the saved alias (and report a checkpoint missing both aliases).
+        """
+        tied_names = self.all_tied_weights_keys.keys() | self.all_tied_weights_keys.values()
+        missing_tied = loading_info.missing_keys & tied_names
+        super().mark_tied_weights_as_initialized(loading_info)
+        loading_info.missing_keys.update(missing_tied)
 
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights per §15.1 of the architecture doc.
@@ -167,24 +182,29 @@ class OplmPreTrainedModel(PreTrainedModel):
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str | Path | None, *args: Any, **kwargs: Any
+    ) -> Any:
         """Load the model and best-effort attach the saved tokenizer.
 
         If no tokenizer files sit next to the weights (scratch models, offline
         workflows, tests), `model.tokenizer` stays `None` and any call to
         `tokenize`/`encode`/`logits` raises with an actionable message.
+        With `output_loading_info=True`, preserve the framework's `(model, info)` return.
         """
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        result = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        model = result[0] if isinstance(result, tuple) else result
         try:
             from transformers import AutoTokenizer
 
             model.tokenizer = AutoTokenizer.from_pretrained(
                 pretrained_model_name_or_path,
                 trust_remote_code=kwargs.get("trust_remote_code", False),
+                local_files_only=kwargs.get("local_files_only", False),
             )
         except (OSError, ValueError):
             model.tokenizer = None
-        return model
+        return result
 
 
 class EsmcCompatMixin:
