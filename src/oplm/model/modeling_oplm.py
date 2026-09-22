@@ -33,6 +33,7 @@ from .configuration_oplm import _VALID_GRADIENT_CHECKPOINTING_MODES, OplmConfig
 from .conv import CanonConv
 from .embedding import cls_pool, mean_pool
 from .ffn import GEGLU, SwiGLU
+from .looping import resolve_layer_execution_order
 from .masking import prepare_attention_mask
 from .norm import OplmLayerNorm, OplmRMSNorm, make_norm
 from .outputs import LogitsConfig, LogitsOutput
@@ -40,6 +41,7 @@ from .rope import RotaryEmbedding
 from .transformer import OplmBlock, OplmStack
 
 _REMOTE_CODE_DEPS = (
+    resolve_layer_execution_order,
     OplmAttention,
     CanonConv,
     SwiGLU,

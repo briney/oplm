@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 
 from .conv import resolve_canon_kernel_sizes
 from .ffn import round_up_to
+from .looping import resolve_layer_execution_order
 
 # When loading custom code from a local directory with trust_remote_code=True,
 # HuggingFace copies only a module's *direct* relative imports (depth-1; see
@@ -56,6 +57,10 @@ class OplmConfig(PretrainedConfig):
         vocab_size: int = _DEFAULT_VOCAB_SIZE,
         hidden_size: int = 768,
         num_hidden_layers: int = 12,
+        num_loops: int = 1,
+        loop_strategy: str = "stack",
+        loop_start: int = 0,
+        loop_end: int | None = None,
         num_attention_heads: int = 12,
         head_dim: int | None = None,
         intermediate_size: int | None = None,
@@ -113,6 +118,10 @@ class OplmConfig(PretrainedConfig):
         self.vocab_size = int(vocab_size)
         self.hidden_size = int(hidden_size)
         self.num_hidden_layers = int(num_hidden_layers)
+        self.num_loops = num_loops
+        self.loop_strategy = loop_strategy
+        self.loop_start = loop_start
+        self.loop_end = loop_end
         self.num_attention_heads = int(num_attention_heads)
         self.head_dim = head_dim if head_dim is None else int(head_dim)
         self.intermediate_size = (
@@ -221,6 +230,13 @@ class OplmConfig(PretrainedConfig):
 
     def _validate(self) -> None:
         """Raise `ValueError` on any field combination the model cannot handle."""
+        resolve_layer_execution_order(
+            self.num_hidden_layers,
+            num_loops=self.num_loops,
+            loop_strategy=self.loop_strategy,
+            loop_start=self.loop_start,
+            loop_end=self.loop_end,
+        )
         if self.num_attention_heads <= 0:
             raise ValueError(f"num_attention_heads must be > 0; got {self.num_attention_heads}.")
         if self.hidden_size % self.num_attention_heads != 0:

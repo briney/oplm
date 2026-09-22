@@ -14,6 +14,7 @@ from .attention import OplmAttention
 from .conv import CanonConv
 from .embedding import OplmEmbedding
 from .ffn import make_ffn
+from .looping import resolve_layer_execution_order
 from .masking import prepare_attention_mask
 from .norm import make_norm
 
@@ -356,6 +357,13 @@ class OplmStack(nn.Module):
     def __init__(self, config: OplmConfig) -> None:
         super().__init__()
         self.config = config
+        self.layer_execution_order = resolve_layer_execution_order(
+            config.num_hidden_layers,
+            num_loops=getattr(config, "num_loops", 1),
+            loop_strategy=getattr(config, "loop_strategy", "stack"),
+            loop_start=getattr(config, "loop_start", 0),
+            loop_end=getattr(config, "loop_end", None),
+        )
         self.num_hidden_layers = config.num_hidden_layers
         self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
         self.gradient_checkpointing_mode = str(
