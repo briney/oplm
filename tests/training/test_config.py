@@ -481,16 +481,14 @@ def test_peak_tflops_rejects_negative() -> None:
 # --- Phase-1 cross-config divisibility (load_config) ----------------------------
 
 
-def test_pad_divisibility_raises_on_non_divisible(tmp_path: "Path") -> None:
+def test_pad_divisibility_raises_on_non_divisible(tmp_path: Path) -> None:
     """pad_to_multiple_of=128 with max_position_embeddings=1000 (non-divisible) raises."""
     config_path = _write_yaml(tmp_path, "data:\n  pad_to_multiple_of: 128\n")
     with pytest.raises(ValueError, match="pad_to_multiple_of"):
-        load_config(
-            ["--config", config_path, "model.max_position_embeddings=1000"]
-        )
+        load_config(["--config", config_path, "model.max_position_embeddings=1000"])
 
 
-def test_pad_divisibility_passes_on_divisible(tmp_path: "Path") -> None:
+def test_pad_divisibility_passes_on_divisible(tmp_path: Path) -> None:
     """pad_to_multiple_of=128 with max_position_embeddings=1024 (divisible) loads cleanly."""
     config_path = _write_yaml(tmp_path, "data:\n  pad_to_multiple_of: 128\n")
     cfg = load_config(["--config", config_path, "model.max_position_embeddings=1024"])
@@ -677,3 +675,14 @@ def test_cadence_retention_knobs_roundtrip_through_load_config(tmp_path: Path) -
     assert restored.train.resume_data_position is False
     assert restored.train.dist_timeout_minutes == 45
     assert restored.train.remote_checkpoint_uri == "s3://bucket/prefix"
+
+
+def test_init_from_cli_yaml_roundtrip(tmp_path: Path) -> None:
+    cfg = load_config(["train.init_from=outputs/parent/checkpoint-2", "model.num_loops=2"])
+    assert TrainConfig().init_from is None
+    assert cfg.train.init_from == "outputs/parent/checkpoint-2"
+    path = tmp_path / "stage.yaml"
+    path.write_text(serialize_config(cfg))
+    restored = load_config(["--config", str(path)])
+    assert restored.train.init_from == cfg.train.init_from
+    assert restored.model.num_loops == 2

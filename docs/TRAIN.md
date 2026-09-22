@@ -778,3 +778,30 @@ about before relying on it in production:
 - [DATA_TOOLING.md](DATA_TOOLING.md) — data formats and masking.
 - [OVERVIEW.md](OVERVIEW.md) — Part IV: trainer internals and design rationale.
 - [README](../README.md) — installation and inference.
+
+## Training a separate looped stage
+
+Keep the physical architecture and data settings in `parent.yaml`. Train the ordinary
+model, then start a new run from its exported weights:
+
+```bash
+oplm train --config parent.yaml train.output_dir=outputs/parent train.max_steps=1000000
+oplm train --config parent.yaml train.init_from=outputs/parent/checkpoint-1000000/hf train.output_dir=outputs/looped train.max_steps=500000 model.num_loops=2 model.loop_strategy=stack
+```
+
+`train.init_from` accepts a local Hugging Face export or a checkpoint directory with
+an `hf/` export. It loads all model parameters and persistent buffers strictly;
+non-loop model semantics must match. It starts fresh optimizers, LR schedules,
+random state, data position, counters, and tracking identity. Set the new stage's
+LR, warmup, and duration independently. Use a distinct output directory; the
+export itself and its identifiable parent run directory are rejected as outputs.
+
+A resolved `train.resume_from` or `train.auto_resume` checkpoint takes precedence
+and restores the current stage's complete state without accessing `init_from`.
+An empty auto-resume directory starts from `init_from`; an invalid explicit resume
+or unusable set of auto-resume checkpoints fails instead of starting over.
+
+For interleaving, set `model.loop_strategy=interleave`. To loop a subset, also set
+`model.loop_start` and `model.loop_end` (zero-based, end exclusive). Unselected
+layers run once. Omitting `init_from` trains the configured looped model from
+scratch with shared parameters from the first step.

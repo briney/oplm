@@ -72,6 +72,7 @@ train:
   # Retain a checkpoint at least every N wall-clock hours after the previous
   # permanent one; null disables the exemption, > 0 if set.
   keep_every_n_hours: null
+  init_from: null             # local HF export or checkpoint root; weights only, fresh stage
   resume_from: null           # path to a checkpoint to resume from
   # Automatically resume from the newest committed checkpoint under output_dir at
   # trainer start, without an explicit resume_from (long Slurm runs set this true).

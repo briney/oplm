@@ -415,6 +415,22 @@ class Trainer:
         )
         self._resolved_resume_target = resume_target  # exposed for tests/observability
 
+        initialization_source = None
+        if resume_target is None and cfg.train.init_from is not None:
+            from oplm.training.initialization import resolve_initialization_source
+
+            initialization_source = resolve_initialization_source(cfg.train.init_from)
+            protected = {initialization_source}
+            checkpoint = initialization_source.parent
+            if initialization_source.name == "hf" and checkpoint.name.startswith("checkpoint-"):
+                protected.add(checkpoint.parent)
+            if Path(cfg.train.output_dir).expanduser().resolve() in protected:
+                raise ValueError(
+                    "train.output_dir must differ from the initialization export "
+                    "and its parent run directory; use a new stage directory."
+                )
+            logger.info("Initializing new stage from pretrained weights: %s", initialization_source)
+
         # Run id persisted right after init_trackers below; reused as the wandb_run_id
         # extra_state key on every checkpoint save. Stays None when wandb is disabled or
         # (main-process-only) on non-main ranks, so save_checkpoint's extra_state omits it.
@@ -483,7 +499,13 @@ class Trainer:
         # AttributeError. Re-enabling here is idempotent and keeps the wiring
         # explicit across transformers versions.
         gradient_checkpointing = getattr(cfg.model, "gradient_checkpointing", False)
-        model = OplmForMaskedLM(cfg.model)  # cfg.model is the HF OplmConfig
+        if initialization_source is None:
+            model = OplmForMaskedLM(cfg.model)  # cfg.model is the HF OplmConfig
+        else:
+            from oplm.training.initialization import load_initial_model
+
+            model = load_initial_model(initialization_source, cfg.model)
+            model.train()  # HF pretrained loading returns an evaluation-mode model.
         if gradient_checkpointing:
             model.gradient_checkpointing_enable()  # propagates to every OplmBlock
 

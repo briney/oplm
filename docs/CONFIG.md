@@ -502,3 +502,9 @@ out.embeddings        # (1, T, hidden_size)
 ```
 
 See the [README](../README.md#quick-start) for more inference examples.
+
+`train.init_from` (default `null`) initializes a fresh training stage from a local
+HF export or a checkpoint directory containing `hf/`. Only weights and persistent
+model buffers transfer. Configure a new output directory and stage-local LR,
+warmup, and step budget. A resolved full-state resume always takes precedence and
+never reads the initialization source. See [the staged training example](TRAIN.md#training-a-separate-looped-stage).

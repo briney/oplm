@@ -87,6 +87,8 @@ class TrainConfig:
     # is not a multiple of save_every. The save is skipped only when the final
     # step already triggered a periodic save (avoids a redundant re-write).
     save_final: bool = True
+    # Local HF weights for a fresh stage; a resolved resume takes precedence.
+    init_from: str | None = None
     resume_from: str | None = None
     # Time-based checkpoint cadence: also save every N wall-clock minutes, in
     # addition to (not instead of) the step-based save_every cadence. None
