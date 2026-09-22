@@ -1,7 +1,7 @@
 # Looped OPLM — Design
 
 **Date:** 2026-09-21
-**Status:** Draft for written-spec review; implementation has not started.
+**Status:** Approved by the user on 2026-09-22; implementation has not started.
 **Scope:** Fixed-count, fully shared transformer recurrence and weights-only
 initialization of a separate training stage.
 
