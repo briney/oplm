@@ -6,6 +6,8 @@ import inspect
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from oplm.model import OplmConfig, OplmForMaskedLM
 
 # These fields change execution order, runtime reporting, or initial values that
@@ -130,4 +132,14 @@ def load_initial_model(source: Path, target: OplmConfig) -> OplmForMaskedLM:
     }
     if problems:
         raise ValueError(f"Incomplete pretrained initialization from {source}: {problems}")
+    if target.tie_word_embeddings:
+        input_weight = model.get_input_embeddings().weight
+        output_weight = model.get_output_embeddings().weight
+        if input_weight is not output_weight:
+            # Some exports store both aliases. Transformers interprets this as
+            # untied, even when the config requires tying. Preserve the declared
+            # architecture only when both saved values agree; never discard data.
+            if not torch.equal(input_weight, output_weight):
+                raise ValueError(f"Conflicting tied embedding/head weights in {source}.")
+            model.tie_weights()
     return model

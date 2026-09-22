@@ -597,6 +597,16 @@ class Trainer:
         # traces the FSDP-hooked forward rather than having its own wrapper sharded
         # underneath it.
         if cfg.train.compile:
+            if gradient_checkpointing and cfg.model.num_loops > 1:
+                from torch import _dynamo
+
+                # PyTorch 2.10 caches dynamic Python-float proxies across repeated
+                # checkpoint subgraphs, then tries to lift a proxy from a sibling
+                # tracer ("lift_tracked_freevar_to_input ... root SubgraphTracer").
+                # Specialize configuration floats such as norm epsilon and attention
+                # scale; sequence/batch shapes remain dynamic. No tensor is detached.
+                # PyTorch annotates this mutable config default as Literal[False].
+                _dynamo.config.specialize_float = True  # ty: ignore[invalid-assignment]
             # Selective activation checkpointing (SAC) is incompatible with the
             # default DDPOptimizer: it splits the compiled graph at gradient-bucket
             # boundaries to overlap allreduce with backward, which fragments each

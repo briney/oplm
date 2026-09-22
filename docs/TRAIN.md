@@ -821,3 +821,11 @@ scores, normalization, and embedding lookups. Compare looping experiments at bot
 equal token budgets and equal estimated compute; shared weights leave parameter
 and optimizer-state budgets unchanged, while additional executions increase
 compute and saved activations (mitigated by activation checkpointing).
+
+When compiling looped models with activation checkpointing, the trainer specializes
+Python configuration floats (such as normalization epsilon) to avoid a PyTorch
+2.10 tracing failure across repeated checkpoint calls. Tensor shapes remain dynamic
+according to `train.compile_dynamic`. Direct library users combining these features
+with `torch.compile` should set `torch._dynamo.config.specialize_float = True`
+before the first compiled forward. This is a process-wide compiler setting;
+changing configuration floats can cause recompilation.

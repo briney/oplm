@@ -164,3 +164,24 @@ def test_source_resolves_export_or_checkpoint_root(tmp_path: Path) -> None:
 def test_missing_local_source_does_not_fall_back_to_hub(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         resolve_initialization_source(str(tmp_path / "organization" / "model"))
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_explicit_tied_aliases_preserve_tying_or_reject_conflicting_weights(
+    tmp_path: Path,
+    conflicting: bool,
+) -> None:
+    cfg = _config(tie_word_embeddings=True)
+    OplmForMaskedLM(cfg).save_pretrained(tmp_path)
+    path = tmp_path / "model.safetensors"
+    tensors = load_file(path)
+    embedding = tensors["oplm.backbone.embed_tokens.embed_tokens.weight"]
+    tensors["lm_head.decoder.weight"] = embedding.clone() + (1 if conflicting else 0)
+    save_file(tensors, path, metadata={"format": "pt"})
+    if conflicting:
+        with pytest.raises(ValueError, match="tied"):
+            load_initial_model(tmp_path, cfg)
+    else:
+        model = load_initial_model(tmp_path, cfg)
+        assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+        torch.testing.assert_close(model.get_input_embeddings().weight, embedding, rtol=0, atol=0)

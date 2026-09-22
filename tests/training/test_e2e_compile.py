@@ -213,3 +213,92 @@ def test_compile_dynamic_false_pad_to_multiple_runs(
     assert len(cb.train_logs) == 3
     for _, metrics in cb.train_logs:
         assert torch.isfinite(torch.tensor(metrics["train/loss"]))
+
+
+@pytest.mark.parametrize("strategy", ["stack", "interleave"])
+@pytest.mark.parametrize("mode", ["off", "full", "selective"])
+def test_looped_aot_eager_loss_and_gradient_parity(
+    strategy: str,
+    mode: str,
+    reset_dynamo: None,
+    restore_optimize_ddp: None,
+    tmp_path: Path,
+    training_parquet: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import copy
+
+    from oplm.model import OplmTokenizerFast
+    from oplm.training.trainer import Trainer
+    from tests.training.conftest import configure_accelerator_device
+
+    configure_accelerator_device("cpu", monkeypatch)
+    original_compile = torch.compile
+
+    def compile_aot(model: torch.nn.Module, **kwargs: object) -> object:
+        kwargs.pop("mode", None)
+        return original_compile(model, backend="aot_eager", **kwargs)
+
+    monkeypatch.setattr(torch, "compile", compile_aot)
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        num_hidden_layers=3,
+        num_loops=2,
+        loop_strategy=strategy,
+        compile=True,
+        loop_start=1 if strategy == "interleave" else 0,
+        value_residual="learnable",
+        gradient_checkpointing=mode != "off",
+        gradient_checkpointing_mode="full" if mode == "off" else mode,
+    )
+    trainer = Trainer(cfg)
+    compiled = trainer.model
+    candidate = compiled._orig_mod
+    eager = copy.deepcopy(candidate)
+    eager.gradient_checkpointing_disable()
+    batch = OplmTokenizerFast()(["MEEPQ", "LAGVS"], return_tensors="pt", padding=True)
+    batch["labels"] = batch["input_ids"].clone()
+    expected = eager(**batch)
+    actual = compiled(**batch)
+    expected.loss.backward()
+    actual.loss.backward()
+    torch.testing.assert_close(actual.loss, expected.loss, rtol=1e-4, atol=1e-5)
+    for name, param in eager.named_parameters():
+        grad = candidate.get_parameter(name).grad
+        assert (grad is None) == (param.grad is None), name
+        if grad is not None:
+            torch.testing.assert_close(grad, param.grad, rtol=1e-4, atol=1e-5, msg=name)
+
+
+@_REQUIRES_CUDA
+@pytest.mark.parametrize("strategy", ["stack", "interleave"])
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_looped_inductor_trainer(
+    tmp_path: Path,
+    training_parquet: Path,
+    reset_dynamo: None,
+    restore_optimize_ddp: None,
+    strategy: str,
+    mode: str,
+) -> None:
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=2,
+        compile=True,
+        mixed_precision="bf16",
+        num_loops=2,
+        num_hidden_layers=3,
+        loop_strategy=strategy,
+        loop_start=1 if strategy == "interleave" else 0,
+        value_residual="learnable",
+        gradient_checkpointing=True,
+        gradient_checkpointing_mode=mode,
+    )
+    callback = FullRecordingCallback()
+    Trainer(cfg, callbacks=[callback]).train()
+    assert len(callback.train_logs) == 2
+    assert all(math.isfinite(m["train/loss"]) for _, m in callback.train_logs)

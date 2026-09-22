@@ -256,6 +256,7 @@ def reset_dynamo() -> Generator[None, None, None]:
     """
     from torch import _dynamo
 
+    original_specialize_float = _dynamo.config.specialize_float
     original_cache_size_limit = _dynamo.config.cache_size_limit
     _dynamo.reset()
     try:
@@ -263,6 +264,7 @@ def reset_dynamo() -> Generator[None, None, None]:
     finally:
         _dynamo.reset()
         _dynamo.config.cache_size_limit = original_cache_size_limit
+        _dynamo.config.specialize_float = original_specialize_float
 
 
 @pytest.fixture

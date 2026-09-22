@@ -34,8 +34,9 @@ def _run_losses(cfg, callback) -> dict[int, float]:
     return {step: m["train/loss"] for step, m in callback.train_logs}
 
 
+@pytest.mark.parametrize("strategy", ["stack", "interleave"])
 def test_gradient_checkpointing_matches_plain_run(
-    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
 ) -> None:
     """Checkpointed and non-checkpointed runs produce the same loss trajectory."""
     configure_accelerator_device("cpu", monkeypatch)
@@ -47,6 +48,9 @@ def test_gradient_checkpointing_matches_plain_run(
             training_parquet,
             max_steps=5,
             batch_size=4,
+            num_loops=2,
+            loop_strategy=strategy,
+            value_residual="learnable",
             log_every=1,
             gradient_checkpointing=True,
         ),
@@ -60,6 +64,9 @@ def test_gradient_checkpointing_matches_plain_run(
             training_parquet,
             max_steps=5,
             batch_size=4,
+            num_loops=2,
+            loop_strategy=strategy,
+            value_residual="learnable",
             log_every=1,
             gradient_checkpointing=False,
         ),
@@ -75,8 +82,9 @@ def test_gradient_checkpointing_matches_plain_run(
         assert on_losses[step] == pytest.approx(off_losses[step], rel=1e-4, abs=1e-4)
 
 
+@pytest.mark.parametrize("strategy", ["stack", "interleave"])
 def test_selective_gradient_checkpointing_matches_plain_run(
-    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
 ) -> None:
     """Selective (SAC) checkpointing matches the non-checkpointed loss trajectory."""
     configure_accelerator_device("cpu", monkeypatch)
@@ -88,6 +96,9 @@ def test_selective_gradient_checkpointing_matches_plain_run(
             training_parquet,
             max_steps=5,
             batch_size=4,
+            num_loops=2,
+            loop_strategy=strategy,
+            value_residual="learnable",
             log_every=1,
             gradient_checkpointing=True,
             gradient_checkpointing_mode="selective",
@@ -102,6 +113,9 @@ def test_selective_gradient_checkpointing_matches_plain_run(
             training_parquet,
             max_steps=5,
             batch_size=4,
+            num_loops=2,
+            loop_strategy=strategy,
+            value_residual="learnable",
             log_every=1,
             gradient_checkpointing=False,
         ),
