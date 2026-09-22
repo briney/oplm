@@ -83,11 +83,24 @@ class OplmPreTrainedModel(PreTrainedModel):
     def mark_tied_weights_as_initialized(self, loading_info: Any) -> None:
         """Preserve absent tied aliases until Transformers resolves their source.
 
-        Transformers 5.3's remote-code module-sharing heuristic removes explicitly
-        tied parameters from missing keys after marking them initialized. OPLM
-        shares parameters, not modules, so those keys must survive for tie_weights
-        to load the saved alias (and report a checkpoint missing both aliases).
+        This handles input-embedding/MLM-head sharing (tie_word_embeddings=True);
+        looped blocks reuse their module directly and do not need this workaround.
+
+        Reproduced with Transformers 5.3.0: a checkpoint may store only one name
+        for the shared parameter. The parent hook marks the absent alias initialized,
+        then its remote-code module-sharing heuristic removes that alias from
+        missing_keys. The later tie_weights call consequently treats both names as
+        loaded and skips tying, potentially leaving the head on the meta device or
+        with uninitialized values. Preserve the missing names across that hook so
+        normal tying can resolve the saved alias and still report both aliases absent.
         """
+        # Upgrade note: this depends on Transformers internals: the hook running
+        # before tie_weights, all_tied_weights_keys being a target-to-source mapping,
+        # and loading_info.missing_keys being a mutable set. Future loader changes
+        # may break this workaround or make it redundant. Before adapting/removing
+        # it, check the upstream loading/initialization order and rerun
+        # tests/model/test_save_load.py, tests/model/test_push_to_hub.py, and
+        # tests/training/test_initialization.py (including missing tied aliases).
         tied_names = self.all_tied_weights_keys.keys() | self.all_tied_weights_keys.values()
         missing_tied = loading_info.missing_keys & tied_names
         super().mark_tied_weights_as_initialized(loading_info)
