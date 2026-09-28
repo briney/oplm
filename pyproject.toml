@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "oplm"
-version = "0.2.0"
+dynamic = ["version"]
 description = "open protein language model"
 readme = "README.md"
 license = "MIT"
@@ -79,6 +79,9 @@ oplm = "oplm.cli:app"
 Homepage = "https://github.com/briney/oplm"
 Repository = "https://github.com/briney/oplm"
 Issues = "https://github.com/briney/oplm/issues"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.ruff]
 line-length = 100

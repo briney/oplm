@@ -408,7 +408,7 @@ class _StubTrainer:
 
 
 def test_result_json_records_installed_version(tmp_path: Path) -> None:
-    """oplm.__version__ is stale (0.0.1); result.json must carry the installed dist version."""
+    """result.json must carry the installed distribution version."""
     from importlib.metadata import version
 
     callback = SweepMetricsCallback(tmp_path / "result.json")

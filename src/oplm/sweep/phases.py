@@ -488,8 +488,7 @@ def _generate_phase(
         runs=runs,
         ranking=[],
         selected=[],
-        # importlib.metadata, not oplm.__version__: the latter is a hand-maintained stub
-        # ("0.0.1") that has drifted from pyproject's real version.
+        # Record the installed distribution version for sweep provenance.
         oplm_version=version("oplm"),
         generated_at=datetime.now(tz=UTC).isoformat(),
     )
