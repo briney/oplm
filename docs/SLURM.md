@@ -11,6 +11,8 @@ This is the *how-to* for the general layer. Related references:
 - [CONFIG.md](CONFIG.md) — every `model.*` / `train.*` / `data.*` field.
 - [LR_SWEEP.md](LR_SWEEP.md) — the μP learning-rate sweep, a higher-level tool built on top of
   this layer (per-phase job arrays, ranking, resubmission). Nothing on this page requires it.
+- [RECOVERY_TESTS.md](RECOVERY_TESTS.md) — six opt-in failure-injection scripts for testing
+  checkpoint rollback, W&B continuity, automatic requeue, and replacement of failed nodes.
 
 ---
 
