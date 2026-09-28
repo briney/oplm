@@ -271,6 +271,19 @@ ty check src/           # type check (Astral's `ty`, not mypy)
 
 Contributor and agent instructions live in [AGENTS.md](AGENTS.md).
 
+### Releases and versions
+
+Git tags are the version source: `hatch-vcs` builds a clean checkout tagged `v0.3.0`
+as package version `0.3.0`. To release, publish a GitHub release with a new `vX.Y.Z`
+tag on the desired commit; the publishing workflow builds and uploads it to PyPI.
+There is no version constant to update in `pyproject.toml` or Python source.
+
+`oplm.__version__` reads the installed distribution metadata. Untagged development
+commits receive a development version; after changing commits or tags, reinstall
+an editable checkout to refresh its version. Build from a Git checkout with tags
+available, or from a published source distribution (sdist), which preserves the
+version without Git. GitHub's auto-generated source archives are not PyPI sdists.
+
 ---
 
 ## License

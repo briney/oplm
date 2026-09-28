@@ -11,6 +11,7 @@ from transformers import (
     AutoTokenizer,
 )
 
+from ._version import __version__
 from .model import (
     LogitsConfig,
     LogitsOutput,
@@ -21,8 +22,6 @@ from .model import (
     OplmModel,
     OplmTokenizerFast,
 )
-
-__version__ = "0.0.1"
 
 # (1) In-process registration so `import oplm` plus AutoModel*.from_pretrained
 # works without trust_remote_code. HF's `register` raises on a duplicate

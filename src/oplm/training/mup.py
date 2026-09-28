@@ -286,8 +286,7 @@ class SweepMetricsCallback(TrainerCallback):
             * trainer.cfg.train.gradient_accumulation_steps
             * trainer.accelerator.num_processes
         )
-        # oplm.__version__ is a stale hand-set constant; the installed distribution
-        # version is what actually ran. Generated sweep scripts install oplm
+        # Record the installed distribution version. Generated sweep scripts install oplm
         # unpinned, so this is what makes version drift across a multi-week sweep
         # detectable after the fact instead of invisible.
         try:
