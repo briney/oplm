@@ -1,0 +1,55 @@
+# Short recovery drills based on the 400M scaling job, not a production run config.
+# Use --preset 400M and --nodes 2 with oplm.slurm.recovery.<mode>.
+# See docs/RECOVERY_TESTS.md for preparation, installation, and submission.
+model:
+  max_position_embeddings: 512
+  gradient_checkpointing: false
+
+train:
+  batch_size: 128
+  gradient_accumulation_steps: 4  # 2 nodes * 8 GPUs * 128 * 4 = 8192 sequences/step
+  parallelism: ddp
+  mixed_precision: bf16
+  compile: true
+  scheduler: wsd_linear
+  # Compress the schedule for recovery checks, including LR restoration.
+  # Production source: 1M steps = 5000 warmup + 995000 stable (no decay).
+  max_steps: 64
+  warmup_steps: 6
+  stable_steps: 32
+  save_every: 16
+  save_total_limit: 4
+  auto_resume: true
+  wandb_project: oplm-recovery-tests
+
+data:
+  train:
+    uniref70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/train
+      fraction: 0.25
+    deepclust70:
+      path: /mnt/data/datasets/plm-training-data/deepclust70/train
+      fraction: 0.75
+  # Recovery drills disable evaluation; the production eval suite is unchanged.
+  eval: null
+
+slurm:
+  partition: hpc-mid
+  time_limit: "01:00:00"
+  nodes: {400M: 2}
+  max_batch_size: {400M: 128}
+  gpus_per_node: 8
+  cpus_per_task: 128
+  mem: "0"
+  exclusive: true
+  nccl_debug: INFO
+  log_dir: /mnt/home/briney/logs
+  env_file: /mnt/home/briney/.env
+  container_image: /mnt/data/containers/deeplearning_v2026-05-26.sqsh
+  container_mounts:
+    - /mnt/data:/mnt/data
+    - /tmp:/tmp
+  # Place this checkout (including the recovery modules) at this shared path first.
+  # Keep it unchanged for the whole drill; override with --install if located elsewhere.
+  install: pip install /mnt/home/briney/oplm-recovery-code[train]
+  max_requeues: 3
