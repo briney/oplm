@@ -29,7 +29,14 @@ import sys
 from pathlib import Path
 
 
-def main(run_dir: str, train_data: str, out_dir: str, max_steps: int, auto_resume: bool) -> None:
+def main(
+    run_dir: str,
+    train_data: str,
+    out_dir: str,
+    max_steps: int,
+    auto_resume: bool,
+    compiled: bool = False,
+) -> None:
     """Train ``max_steps`` steps on 2 ranks at ``save_every=1``, one checkpoint per step.
 
     Args:
@@ -40,9 +47,17 @@ def main(run_dir: str, train_data: str, out_dir: str, max_steps: int, auto_resum
             every step's checkpoint survives rotation within this launch).
         auto_resume: ``cfg.train.auto_resume`` -- ``True`` for the second launch, which
             must pick up the first launch's newest committed checkpoint.
+        compiled: Exercise compile(DDP) and four-step gradient accumulation on CPU.
     """
     from oplm.training.trainer import Trainer
     from tests.training.conftest import tiny_train_cfg
+
+    class CheckedTrainer(Trainer):
+        def _save_checkpoint(self, *, blocking: bool = True) -> None:
+            wrapped = self.model._orig_mod if compiled else self.model
+            super()._save_checkpoint(blocking=blocking)
+            if compiled:
+                assert self.model._orig_mod is wrapped, "checkpoint export removed live DDP wrapper"
 
     cfg = tiny_train_cfg(
         Path(run_dir),
@@ -52,8 +67,14 @@ def main(run_dir: str, train_data: str, out_dir: str, max_steps: int, auto_resum
         save_total_limit=max_steps,
         auto_resume=auto_resume,
         log_every=1,
+        gradient_accumulation_steps=4 if compiled else 1,
     )
-    trainer = Trainer(cfg, callbacks=[])
+    trainer = CheckedTrainer(cfg, callbacks=[])
+    if compiled:
+        import torch
+
+        # Real OptimizedModule(DDP), without depending on CUDA/Inductor compilation.
+        trainer.model = torch.compile(trainer.model, backend="eager")
     resumed_from_step = trainer.global_step
     trainer.train()
 
@@ -69,4 +90,11 @@ def main(run_dir: str, train_data: str, out_dir: str, max_steps: int, auto_resum
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5] == "true")
+    main(
+        sys.argv[1],
+        sys.argv[2],
+        sys.argv[3],
+        int(sys.argv[4]),
+        sys.argv[5] == "true",
+        len(sys.argv) > 6 and sys.argv[6] == "true",
+    )

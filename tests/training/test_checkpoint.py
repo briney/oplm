@@ -83,6 +83,27 @@ def test_hf_export_round_trips(tmp_path: Path) -> None:
     assert torch.allclose(reloaded.lm_head.decoder.bias.detach(), original_bias)
 
 
+def test_hf_export_preserves_compiled_parallel_wrapper(tmp_path: Path) -> None:
+    """Export must not mutate compile(parallel(model)); DDP exercises this on two ranks."""
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    parallel = torch.nn.DataParallel(model)
+    compiled = torch.compile(parallel, backend="eager")
+    save_checkpoint(
+        accelerator=accelerator,
+        model=compiled,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=1,
+        epoch=0,
+        samples_seen=4,
+        tokens_seen=32,
+    )
+    assert compiled._orig_mod is parallel
+
+
 def test_config_yaml_is_reloadable(tmp_path: Path) -> None:
     """The written ``config.yaml`` carries model/train/data and re-loads via load_config."""
     from oplm.config import load_config
