@@ -57,7 +57,13 @@ def _child_env() -> dict[str, str]:
 
 
 def _run_pilot(
-    run_dir: Path, training_parquet: Path, out_dir: Path, *, max_steps: int, auto_resume: bool
+    run_dir: Path,
+    training_parquet: Path,
+    out_dir: Path,
+    *,
+    max_steps: int,
+    auto_resume: bool,
+    compiled: bool = False,
 ) -> list[dict[str, object]]:
     """Launch the 2-rank worker and return both ranks' recorded payloads."""
     worker = Path(__file__).with_name("_checkpoint_pg_worker.py")
@@ -75,6 +81,7 @@ def _run_pilot(
             str(out_dir),
             str(max_steps),
             "true" if auto_resume else "false",
+            "true" if compiled else "false",
         ],
         check=True,
         timeout=300,
@@ -83,8 +90,9 @@ def _run_pilot(
     return [json.loads((out_dir / f"rank{rank}.json").read_text()) for rank in (0, 1)]
 
 
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled-accumulation"])
 def test_aggressive_async_save_cadence_survives_and_resumes(
-    training_parquet: Path, tmp_path: Path
+    training_parquet: Path, tmp_path: Path, compiled: bool
 ) -> None:
     """``save_every=1`` on 2 DDP ranks completes, commits every checkpoint, and resumes.
 
@@ -108,7 +116,12 @@ def test_aggressive_async_save_cadence_survives_and_resumes(
     out_dir.mkdir()
 
     first_results = _run_pilot(
-        run_dir, training_parquet, out_dir, max_steps=_FIRST_LAUNCH_STEPS, auto_resume=False
+        run_dir,
+        training_parquet,
+        out_dir,
+        max_steps=_FIRST_LAUNCH_STEPS,
+        auto_resume=False,
+        compiled=compiled,
     )
     for result in first_results:
         assert result["resumed_from_step"] == 0
@@ -125,7 +138,12 @@ def test_aggressive_async_save_cadence_survives_and_resumes(
     assert list(run_dir.glob("checkpoint-*.tmp")) == []
 
     second_results = _run_pilot(
-        run_dir, training_parquet, out_dir, max_steps=_SECOND_LAUNCH_STEPS, auto_resume=True
+        run_dir,
+        training_parquet,
+        out_dir,
+        max_steps=_SECOND_LAUNCH_STEPS,
+        auto_resume=True,
+        compiled=compiled,
     )
     for result in second_results:
         assert result["resumed_from_step"] == _FIRST_LAUNCH_STEPS

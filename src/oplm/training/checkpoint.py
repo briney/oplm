@@ -683,11 +683,10 @@ def save_checkpoint(
 
         # HuggingFace export for from_pretrained-style downstream loading
         hf_dir = tmp_dir / "hf"
-        unwrapped = accelerator.unwrap_model(model)
-        # torch.compile wraps the model in OptimizedModule; peel it off to reach
-        # the underlying PreTrainedModel for save_pretrained.
-        if hasattr(unwrapped, "_orig_mod"):
-            unwrapped = unwrapped._orig_mod
+        # Keeping the compile wrapper makes Accelerate replace its live _orig_mod
+        # with the unwrapped model. On rank zero that removes DDP mid-training and
+        # desynchronizes the next backward/accumulation collectives from other ranks.
+        unwrapped = accelerator.unwrap_model(model, keep_torch_compile=False)
         # config.json + model.safetensors. hf_state_dict is None unless the model is
         # FSDP2-sharded, in which case it carries the gathered full tensors (the module's
         # own state_dict would hand safetensors DTensors, which it cannot serialize).

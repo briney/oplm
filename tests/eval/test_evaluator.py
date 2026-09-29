@@ -40,7 +40,7 @@ class _StubModel:
 class _FakeAccelerator:
     """Minimal accelerator: ``unwrap_model`` is the identity."""
 
-    def unwrap_model(self, model: Any) -> Any:
+    def unwrap_model(self, model: Any, *, keep_torch_compile: bool = True) -> Any:
         return model
 
 

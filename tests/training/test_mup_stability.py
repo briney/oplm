@@ -60,7 +60,9 @@ class _StubAccelerator:
         self.is_main_process = is_main_process
         self.logged: list[tuple[int, dict[str, float]]] = []
 
-    def unwrap_model(self, model: OplmForMaskedLM) -> OplmForMaskedLM:
+    def unwrap_model(
+        self, model: OplmForMaskedLM, *, keep_torch_compile: bool = True
+    ) -> OplmForMaskedLM:
         return model
 
     def log(self, metrics: dict[str, float], step: int) -> None:

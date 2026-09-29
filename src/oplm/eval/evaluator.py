@@ -80,7 +80,8 @@ class Evaluator:
         due = [t for t in self.tasks if t.schedule.is_due(ctx)]
         if not due:
             return {}
-        unwrapped = accelerator.unwrap_model(model)
+        # Return the eager model without stripping DDP from the live compile wrapper.
+        unwrapped = accelerator.unwrap_model(model, keep_torch_compile=False)
         unwrapped.eval()
         metrics: dict[str, float] = {}
         try:

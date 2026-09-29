@@ -22,9 +22,9 @@ the signal to a training process; testing Slurm's wall-time signal delivery is a
 
 ## Prepare and review
 
-Install this checkout on the controller with `pip install -e '.[train]'`. The compute
-container must also install a version containing these modules. Pin the checkout/commit or
-package version for the entire drill: the installation command runs again on every restart.
+Install `oplm[train]==0.3.1` on the controller and in the compute containers; that PyPI
+release includes the compiled distributed checkpoint fix. A source install is also supported.
+Pin the package version or checkout for the entire drill: installation runs again on every restart.
 Keep credentials in the existing environment setup, not in these scripts or the manifest.
 
 Start from a **working training YAML with a `slurm:` block** (see [SLURM.md](SLURM.md)).
@@ -33,19 +33,24 @@ container, and storage. `--out` must be a new absolute directory on storage avai
 same path to the controller and every compute container. Paths with shell metacharacters or
 whitespace are rejected because the existing renderer cannot quote them in every context.
 
-Example; replace the shared paths and install command with those used on your cluster:
+Example; replace the shared paths with those used on your cluster:
 
 ```bash
 python -m oplm.slurm.recovery.rank_kill \
   --config configs/scaling.yaml --preset 170M \
   --out /mnt/home/briney/recovery/rank-kill-001 \
   --nodes 2 --save-every 16 --fail-step 24 --max-steps 64 \
-  --install 'pip install -e /mnt/home/briney/projects/oplm[train]'
+  --install 'pip install "oplm[train]==0.3.1"'
 ```
 
 Preparation writes `train.yaml`, `job.sbatch`, and `drill.json`, and creates `events/`,
 `logs/`, and `training/`. Inspect the YAML and job script before submitting. Other modules
 accept the same arguments; use a fresh `--out` for each drill.
+
+`--install` is a preparation-time setting. Changing the source YAML or supplying
+`--install` with `--submit` does not rewrite an already prepared `job.sbatch`. To change
+the install command after a submitted drill fails, prepare a fresh output directory
+(for example, replace `-001` with `-002`) with the desired `--install`, then submit it.
 
 Defaults are two nodes, 64 training steps, checkpoints every 16 steps, injection at step 24,
 and rank 1 as the SIGKILL target. `checkpoint_write` instead injects on the second periodic
@@ -73,21 +78,21 @@ wall-time limit would trigger an unintended drain before the planned injection.
 job: `hpc-mid`, eight GPUs and 128 CPUs per node, the same container and mounts, bf16,
 compilation, sequence length 512, no gradient checkpointing, and per-GPU batch 128.
 Training data is **25% UniRef70 and 75% DeepClust70**, using the supplied `/mnt/data` paths.
-Other model/optimizer defaults come from this checkout, just as omitted settings in the
+Other model/optimizer defaults come from the installed package, just as omitted settings in the
 original command come from the installed package. Use the same code version for both if
 you need an exact production comparison.
 
-First place this checkout, including the new recovery modules, at
-`/mnt/home/briney/oplm-recovery-code` on shared storage and install it on the controller:
+Install the published release on the controller:
 
 ```bash
-cd /mnt/home/briney/oplm-recovery-code
-pip install -e '.[train]'
+pip install 'oplm[train]==0.3.1'
 ```
 
-The config's container install command uses that same source directory. Keep it unchanged
-through all attempts, or supply `--install` with the actual shared checkout/package path.
-The original `pip install oplm[train]` may fetch a release without these new modules.
+The config's container install command pins that same PyPI release. No shared source
+checkout is needed inside the containers. Run preparation from a repository checkout
+containing `configs/recovery_400M.yaml`, or copy that YAML and pass its path to `--config`;
+the example YAML and this guide are not installed by the wheel. For testing unpublished
+changes, use `--install` to select a shared checkout and keep it unchanged between attempts.
 
 Prepare all six drills on two nodes (this loop does **not** submit them):
 

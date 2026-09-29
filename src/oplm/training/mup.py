@@ -419,7 +419,8 @@ class StabilityDiagnosticsCallback(TrainerCallback):
             return
         if self._probe_batch is None or "input_ids" not in self._probe_batch:
             return
-        model = trainer.accelerator.unwrap_model(trainer.model)
+        # Preserve the live compile(DDP) wrapper on this main-process-only path.
+        model = trainer.accelerator.unwrap_model(trainer.model, keep_torch_compile=False)
         was_training = model.training
         model.eval()
         try:
