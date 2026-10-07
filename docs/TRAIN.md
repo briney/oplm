@@ -370,7 +370,10 @@ Rules:
   layout) must match the checkpoint, exactly as for a resume.
 
 The branch gets its own W&B run; `train/lr` (Muon) and `train/lr_adamw` show the live
-schedule from the first logged step.
+schedule from the first logged step. The worked set of branch experiments for the
+late-loss investigation (decay, AdamW-LR, all-LR, and weight-decay branches, plus the
+WSD branch-point comparison) lives in
+[LATE_LOSS_INVESTIGATION.md](LATE_LOSS_INVESTIGATION.md).
 
 ---
 
