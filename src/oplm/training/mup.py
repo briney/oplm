@@ -390,7 +390,7 @@ class StabilityDiagnosticsCallback(TrainerCallback):
             self._run_probe(trainer, diag)
 
         if diag:
-            trainer.accelerator.log(diag, step=step)
+            trainer.accelerator.log(diag | {"train/global_step": step})
 
     # -- probe --------------------------------------------------------------
 

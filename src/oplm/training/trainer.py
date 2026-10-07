@@ -474,6 +474,8 @@ class Trainer:
 
                 active_run = wandb.run
                 if active_run is not None:
+                    active_run.define_metric("train/global_step", hidden=True)
+                    active_run.define_metric("*", step_metric="train/global_step")
                     self._wandb_run_id = active_run.id
                     (Path(cfg.train.output_dir) / "wandb_run_id").write_text(
                         f"{self._wandb_run_id}\n"
@@ -1693,7 +1695,9 @@ class Trainer:
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         """Log metrics and notify callbacks."""
-        self.accelerator.log(metrics, step=self.global_step)
+        # Training can roll back to a checkpoint; W&B's history step cannot.
+        # Append history rows and use the actual training step as the chart axis.
+        self.accelerator.log(metrics | {"train/global_step": self.global_step})
         if not self.accelerator.is_main_process:
             return
 

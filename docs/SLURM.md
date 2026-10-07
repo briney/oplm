@@ -337,6 +337,11 @@ Two more delivery details make the drain actually reach the trainer intact:
 
 ### The wrapper side: budget-capped, progress-aware requeue
 
+The training `srun` uses `--kill-on-bad-exit=1`: if one node's launcher exits nonzero,
+Slurm terminates the remaining tasks in that step so the batch shell can reach its
+requeue wrapper. This overrides the cluster's `KillOnBadExit` default; otherwise a
+surviving node stuck in NCCL can keep `srun` waiting after a rank failure.
+
 After the training `srun` exits, every generated job script runs a requeue wrapper
 (`oplm.slurm.render._requeue_wrapper`) that decides what happens next from the exit status and
 the `.drained` marker:

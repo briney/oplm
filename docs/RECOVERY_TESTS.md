@@ -176,6 +176,19 @@ The checks require:
   resumed attempt's logged steps. `recovery/attempt` and `recovery/step` distinguish replayed
   metrics from stale metrics left by the abandoned attempt.
 
+W&B's internal history counter keeps increasing across attempts. Metrics use
+`train/global_step` as their chart axis, so replayed training steps are retained instead
+of being dropped as writes to past history. The abandoned attempt's metrics remain;
+use `recovery/attempt` to distinguish them. Existing custom charts using W&B's default
+`Step` axis should be switched to `train/global_step`.
+
+After updating recovery or logging code, prepare fresh drill directories and ensure the
+controller and container install the fixed version. For unpublished fixes, install the
+updated checkout on the controller and use `--install` with a shared checkout path during
+preparation. An already submitted script is not rewritten by changing the local file.
+Rerun `rank_kill` and `checkpoint_write` first with `train.compile=true`, then the other
+drills; a passing W&B chart alone does not replace a passing `--check` result.
+
 The report includes before/after node lists and time from injection to the first restored
 rank's startup observation and first resumed training-step log (assuming synchronized node
 clocks). It is not a throughput benchmark. These checks do not compare
