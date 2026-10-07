@@ -58,14 +58,14 @@ class _StubAccelerator:
     def __init__(self, *, is_main_process: bool = True) -> None:
         self.device = torch.device("cpu")
         self.is_main_process = is_main_process
-        self.logged: list[tuple[int, dict[str, float]]] = []
+        self.logged: list[tuple[int | None, dict[str, float]]] = []
 
     def unwrap_model(
         self, model: OplmForMaskedLM, *, keep_torch_compile: bool = True
     ) -> OplmForMaskedLM:
         return model
 
-    def log(self, metrics: dict[str, float], step: int) -> None:
+    def log(self, metrics: dict[str, float], step: int | None = None) -> None:
         self.logged.append((step, dict(metrics)))
 
 
@@ -92,7 +92,8 @@ def test_grad_norm_logged_every_train_log() -> None:
     cb.on_log(trainer, {"train/loss": 2.0}, step=10)
 
     step, metrics = trainer.accelerator.logged[-1]
-    assert step == 10
+    assert step is None
+    assert metrics["train/global_step"] == 10
     assert metrics["diag/grad_norm"] == torch.tensor(1.23).item()
     assert not any(key in metrics for key in _PROBE_KEYS)
 

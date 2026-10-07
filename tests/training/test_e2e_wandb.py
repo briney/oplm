@@ -156,6 +156,50 @@ def test_resume_continues_the_same_wandb_run(
     assert captured_init_kwargs[1]["resume"] == "allow"
 
 
+def test_checkpoint_rollback_keeps_replayed_wandb_metrics(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A W&B history ahead of the checkpoint must accept every replayed training step."""
+    wandb = pytest.importorskip("wandb")
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_SILENT", "true")
+
+    import torch
+
+    from oplm.training.mup import StabilityDiagnosticsCallback
+    from oplm.training.trainer import Trainer
+
+    callback = FullRecordingCallback()
+    trainer = Trainer(
+        tiny_train_cfg(tmp_path, training_parquet, wandb_enabled=True),
+        callbacks=[callback, StabilityDiagnosticsCallback(probe_every=0)],
+    )
+    run = wandb.run
+    assert run is not None
+    try:
+        # Offline W&B cannot resume server history. Seed the real SDK's history counter
+        # at the failed checkpoint instead, reproducing its state after an online resume.
+        run.log({"train/loss": 99.0}, step=32, commit=True)
+        for step in range(17, 33):
+            trainer.global_step = step
+            trainer._last_grad_norm = torch.tensor(float(step))
+            previous_history_step = run.step
+            trainer._log_metrics(
+                {"train/loss": step / 100, "recovery/attempt": 1, "recovery/step": step}
+            )
+            assert run.step > previous_history_step, f"replayed step {step} was not committed"
+        trainer._log_metrics({"eval/heldout/loss": 0.5})
+        summary = dict(run.summary)
+        assert summary["train/global_step"] == 32
+        assert summary["recovery/step"] == 32
+        assert summary["train/loss"] == pytest.approx(0.32)
+        assert summary["diag/grad_norm"] == 32
+        assert summary["eval/heldout/loss"] == 0.5
+        assert callback.train_log_steps == list(range(17, 33))
+    finally:
+        trainer.accelerator.end_training()
+
+
 def test_wandb_run_none_after_init_trackers_is_skipped_gracefully(
     training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
