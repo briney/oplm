@@ -14,8 +14,11 @@ from typing import TYPE_CHECKING
 from typer.testing import CliRunner
 
 from oplm.cli import app
+from tests.cli_output import plain
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import pytest
 
     from oplm.config import OplmConfig
@@ -91,3 +94,22 @@ def test_train_positional_override_reaches_config(monkeypatch: pytest.MonkeyPatc
     result = runner.invoke(app, ["train", "--preset", "50M", "train.max_steps=123"])
     assert result.exit_code == 0, result.output
     assert captured["cfg"].train.max_steps == 123
+
+
+def test_weight_rms_tabulates_a_checkpoint_export(tmp_path: Path) -> None:
+    """``oplm weight-rms`` reads ``<ckpt>/hf/*.safetensors``, one column per checkpoint."""
+    from oplm.model import OplmConfig as OplmModelConfig
+    from oplm.model import OplmForMaskedLM
+
+    model = OplmForMaskedLM(
+        OplmModelConfig(hidden_size=32, num_attention_heads=4, num_hidden_layers=2)
+    )
+    ckpt = tmp_path / "checkpoint-7"
+    model.save_pretrained(ckpt / "hf")
+
+    result = runner.invoke(app, ["weight-rms", str(ckpt)])
+    assert result.exit_code == 0, result.output
+    out = plain(result.stdout)
+    assert "checkpoint-7" in out
+    for group in ("embed", "attn", "mlp", "norm_gain", "head_decoder"):
+        assert group in out

@@ -1019,11 +1019,15 @@ def load_checkpoint(
     schedulers: Sequence[Any],
     checkpoint_dir: str,
     cfg: OplmConfig,
+    *,
+    validate_schedule: bool = True,
 ) -> dict[str, Any]:
     """Load a training checkpoint and return trainer state metadata.
 
     Validates that the checkpoint is schedule-compatible with ``cfg`` (see
-    :func:`validate_schedule_compat`) before touching any state, then restores model and
+    :func:`validate_schedule_compat`; skipped for a ``branch_from`` load, which
+    deliberately changes the schedule -- only the "nothing left to train" check
+    remains) before touching any state, then restores model and
     optimizer state via ``torch.distributed.checkpoint`` (DCP; see :class:`_ModelOptState`),
     restores each scheduler's state, restores this rank's RNG state from its sidecar (a
     missing sidecar is a hard error -- see :func:`_restore_rng_sidecar`), and restores the
@@ -1055,6 +1059,8 @@ def load_checkpoint(
         checkpoint_dir: Path to the checkpoint directory.
         cfg: The live, resolved config being resumed with; compared against the
             checkpoint's own ``config.yaml`` for schedule compatibility.
+        validate_schedule: Run :func:`validate_schedule_compat`. ``False`` for a branch,
+            whose LR/schedule intentionally differ from the checkpoint's.
 
     Returns:
         Dict with keys ``global_step``, ``epoch``, ``tokens_seen``, and
@@ -1082,7 +1088,13 @@ def load_checkpoint(
     state: dict[str, Any] = json.loads(state_path.read_text())
 
     validate_loop_resume_compat(ckpt_path, cfg)
-    validate_schedule_compat(ckpt_path, cfg, checkpoint_global_step=state.get("global_step"))
+    if validate_schedule:
+        validate_schedule_compat(ckpt_path, cfg, checkpoint_global_step=state.get("global_step"))
+    elif cfg.train.max_steps <= int(state.get("global_step", 0)):
+        raise ValueError(
+            f"max_steps ({cfg.train.max_steps}) <= the checkpoint's own global_step "
+            f"({state.get('global_step')}) -- the branch would have nothing left to train"
+        )
 
     unwrapped_schedulers = [_unwrap_scheduler(s) for s in schedulers]
     dcp_state: dict[str, Any] = {

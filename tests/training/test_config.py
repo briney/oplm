@@ -686,3 +686,28 @@ def test_init_from_cli_yaml_roundtrip(tmp_path: Path) -> None:
     restored = load_config(["--config", str(path)])
     assert restored.train.init_from == cfg.train.init_from
     assert restored.model.num_loops == 2
+
+
+# --- late-loss diagnostics / branching knobs -----------------------------------
+
+
+def test_branch_from_is_exclusive_with_resume_and_init() -> None:
+    with pytest.raises(ValueError, match="branch_from"):
+        TrainConfig(branch_from="ckpt", resume_from="ckpt")
+    with pytest.raises(ValueError, match="branch_from"):
+        TrainConfig(branch_from="ckpt", init_from="ckpt/hf")
+    assert TrainConfig(branch_from="ckpt").branch_from == "ckpt"
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.inf])
+def test_adamw_lr_mult_must_be_positive_and_finite(value: float) -> None:
+    with pytest.raises(ValueError, match="adamw_lr_mult"):
+        TrainConfig(adamw_lr_mult=value)
+
+
+def test_weight_diag_every_validation() -> None:
+    with pytest.raises(ValueError, match="weight_diag_every"):
+        TrainConfig(weight_diag_every=-1)
+    with pytest.raises(ValueError, match="weight_diag_every"):
+        TrainConfig(parallelism="hsdp", weight_diag_every=100)
+    assert TrainConfig(weight_diag_every=100).weight_diag_every == 100

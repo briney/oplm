@@ -402,10 +402,22 @@ is specific to that runner, not this general layer.)
 
 ```text
 oplm slurm generate --config FILE --out DIRECTORY [--preset TEXT] [--nodes INT]
-                     [--name TEXT] [--time-limit TEXT]
+                     [--name TEXT] [--time-limit TEXT] [KEY=VALUE]...
 ```
 
 Writes one `<name>.sbatch` into `--out`, plus a `jobs.json` manifest `submit`/`status` read.
+Positional `KEY=VALUE` tokens are appended verbatim to the rendered training command (after
+the injected `train.auto_resume=true`), so one YAML can back many jobs — e.g. the branch
+experiments in [TRAIN.md](TRAIN.md#branching-a-run-wsd-decays-and-lr-experiments):
+
+```bash
+oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/170M-decay-250k \
+  --name 170M-decay-250k train.branch_from=/runs/170M/checkpoint-250000 \
+  train.output_dir=/runs/170M-decay-250k train.stable_steps=245000 train.max_steps=300000
+```
+
+A `train.output_dir=` override also steers the requeue wrapper's no-progress guard, which
+scans that directory for committed checkpoints.
 `--config` is resolved to an absolute path before rendering (the job runs from a job-scoped
 working directory on a compute node, not wherever `generate` was invoked from, so a relative path
 would silently resolve to the wrong file there). `--nodes`/`--time-limit` override whatever the

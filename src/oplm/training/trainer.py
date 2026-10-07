@@ -274,6 +274,10 @@ class Trainer:
             self.callbacks.append(
                 StabilityDiagnosticsCallback(probe_every=cfg.train.stability_probe_every)
             )
+        if cfg.train.weight_diag_every > 0:
+            from oplm.training.diagnostics import WeightDiagnosticsCallback
+
+            self.callbacks.append(WeightDiagnosticsCallback(every=cfg.train.weight_diag_every))
 
         # Seed everything
         set_seed(cfg.train.seed)
@@ -432,6 +436,26 @@ class Trainer:
                     "and its checkpoint or parent run directory; use a new stage directory."
                 )
             logger.info("Initializing new stage from pretrained weights: %s", initialization_source)
+
+        # Branch (same precedence as init_from): only when nothing in output_dir resumes.
+        # Requeues of the branch then auto_resume from the branch's own checkpoints.
+        branch_source: Path | None = None
+        if resume_target is None and cfg.train.branch_from is not None:
+            branch_source = Path(cfg.train.branch_from).expanduser().resolve()
+            if not (branch_source / "trainer_state.json").is_file():
+                raise FileNotFoundError(
+                    f"train.branch_from must be a checkpoint directory (with trainer_state.json), "
+                    f"got {branch_source}"
+                )
+            if Path(cfg.train.output_dir).expanduser().resolve() in (
+                branch_source,
+                branch_source.parent,
+            ):
+                raise ValueError(
+                    "train.output_dir must differ from the branch_from checkpoint and its run "
+                    "directory; branches write into a fresh output_dir."
+                )
+            logger.info("Branching from checkpoint: %s", branch_source)
 
         # Run id persisted right after init_trackers below; reused as the wandb_run_id
         # extra_state key on every checkpoint save. Stays None when wandb is disabled or
@@ -756,6 +780,16 @@ class Trainer:
         self._tput_window_seconds = 0.0
         self._tput_window_steps = 0
 
+        # Per-log-window diagnostics (reset on every train log, never persisted):
+        # mean loss, pre-clip grad norm (mean/max) and clip fraction, mean sequence length.
+        self._window_loss_sum = 0.0
+        self._window_steps = 0
+        self._window_grad_norm_sum = 0.0
+        self._window_grad_norm_max = 0.0
+        self._window_clipped = 0
+        self._window_tokens_start = 0
+        self._window_samples_start = 0
+
         # Dataset size for fractional epoch computation
         self._dataset_size = raw_dataset_size
 
@@ -764,6 +798,10 @@ class Trainer:
         # happens here, now that the model/optimizer/dataloader exist.
         if resume_target is not None:
             self._resume_from_checkpoint(resume_target)
+        elif branch_source is not None:
+            self._branch_from_checkpoint(branch_source)
+        self._window_tokens_start = self.tokens_seen
+        self._window_samples_start = self._samples_seen
 
     def train(self) -> None:
         """Run the training loop."""
@@ -837,6 +875,12 @@ class Trainer:
                             self.model.parameters(),
                             cfg.max_grad_norm,
                         )
+                        # Window stats for _log_step. float() syncs, but the per-step
+                        # loss.item() below already does; no extra cost.
+                        grad_norm = float(self._last_grad_norm)
+                        self._window_grad_norm_sum += grad_norm
+                        self._window_grad_norm_max = max(self._window_grad_norm_max, grad_norm)
+                        self._window_clipped += int(grad_norm > cfg.max_grad_norm)
 
                     for optimizer in self.optimizers:
                         optimizer.step()
@@ -863,6 +907,8 @@ class Trainer:
                 self.global_step += 1
                 current_loss = step_loss_sum / cfg.gradient_accumulation_steps
                 step_loss_sum = 0.0
+                self._window_loss_sum += current_loss
+                self._window_steps += 1
 
                 # Rank-sync the control bundle for this optimizer step in a single
                 # reduce: tokens (so tokens_seen / tokens_delta are rank-identical —
@@ -1270,6 +1316,29 @@ class Trainer:
             "train/flops": cumulative_flops,
             "train/lr": self.scheduler.get_last_lr()[0],
         }
+        if len(self.schedulers) > 1:
+            # Muon mode: the auxiliary AdamW optimizer's first group (embeddings & co.).
+            metrics["train/lr_adamw"] = self.schedulers[-1].get_last_lr()[0]
+
+        # Per-window diagnostics: window-mean loss, pre-clip grad norm, clip fraction,
+        # and mean sequence length (tokens / samples over the window).
+        if self._window_steps > 0:
+            metrics["train/loss_mean"] = self._window_loss_sum / self._window_steps
+            if self.cfg.train.max_grad_norm > 0:
+                metrics["train/grad_norm"] = self._window_grad_norm_sum / self._window_steps
+                metrics["train/grad_norm_max"] = self._window_grad_norm_max
+                metrics["train/clip_frac"] = self._window_clipped / self._window_steps
+        samples_delta = self._samples_seen - self._window_samples_start
+        if samples_delta > 0:
+            tokens_delta = self.tokens_seen - self._window_tokens_start
+            metrics["train/mean_seq_len"] = tokens_delta / samples_delta
+        self._window_loss_sum = 0.0
+        self._window_steps = 0
+        self._window_grad_norm_sum = 0.0
+        self._window_grad_norm_max = 0.0
+        self._window_clipped = 0
+        self._window_tokens_start = self.tokens_seen
+        self._window_samples_start = self._samples_seen
 
         # Steady-state throughput (window resets after each log emission).
         # Note: flops_per_token omits attention-score FLOPs, so achieved_tflops/mfu
@@ -1575,6 +1644,85 @@ class Trainer:
             self.epoch,
             self._samples_seen,
             self.tokens_seen,
+        )
+
+    def _branch_from_checkpoint(self, checkpoint_dir: Path) -> None:
+        """Branch: restore full state like a resume, but keep THIS config's LR/WD/schedule.
+
+        ``load_checkpoint`` restores every optimizer hyperparameter (``lr``,
+        ``initial_lr``, ``weight_decay``, betas, ...) and each LambdaLR's ``base_lrs``
+        from the checkpoint. A branch wants the checkpoint's *state* (weights, momentum,
+        counters, data position) under the *live* hyperparameters, so those are captured
+        from the freshly built optimizers before the load and written back afterwards;
+        the live schedule's λ is then evaluated at the restored step so the very first
+        branch step already uses the right LR (LambdaLR only sets it on ``step()``).
+
+        The data cursor is restored only when ``data.train`` matches the checkpoint's
+        config (a different mix invalidates the cursor; the stream then restarts at row 0).
+        """
+        from oplm.config import load_config
+        from oplm.training.checkpoint import (
+            _unwrap_optimizer,
+            _unwrap_scheduler,
+            load_checkpoint,
+        )
+
+        live_hparams = [
+            [{k: v for k, v in group.items() if k != "params"} for group in opt.param_groups]
+            for opt in (_unwrap_optimizer(o) for o in self.optimizers)
+        ]
+        state = load_checkpoint(
+            self.accelerator,
+            self.model,
+            self.optimizers,
+            self.schedulers,
+            str(checkpoint_dir),
+            self.cfg,
+            validate_schedule=False,
+        )
+        for opt, sched, hparams in zip(self.optimizers, self.schedulers, live_hparams, strict=True):
+            inner, scheduler = _unwrap_optimizer(opt), _unwrap_scheduler(sched)
+            scheduler.base_lrs = [h["initial_lr"] for h in hparams]
+            for group, live, lr_lambda in zip(
+                inner.param_groups, hparams, scheduler.lr_lambdas, strict=True
+            ):
+                group.update(live)
+                group["lr"] = live["initial_lr"] * lr_lambda(scheduler.last_epoch)
+
+        self.global_step = state["global_step"]
+        self.epoch = state["epoch"]
+        self.tokens_seen = state["tokens_seen"]
+        self._samples_seen = int(
+            state.get("samples_seen", self.global_step * self._global_effective_batch_size())
+        )
+        self._set_dataset_epoch(self.epoch)
+        self._epoch_at_last_opt_step = self.epoch
+        self._step_local_tokens = 0
+
+        config_path = checkpoint_dir / "config.yaml"
+        if config_path.is_file():
+            checkpoint_train = load_config(["--config", str(config_path)]).data.train
+            if checkpoint_train != self.cfg.data.train:
+                logger.warning(
+                    "branch_from: data.train differs from the checkpoint's; dropping its data "
+                    "cursor and starting the stream from row 0 of epoch %d.",
+                    self.epoch,
+                )
+                state.pop("cursor", None)
+        self._resume_data_cursor(state, str(checkpoint_dir))
+
+        logger.info(
+            "Branched from checkpoint %s (step=%d, epoch=%d, tokens=%d); lr=%s "
+            "adamw_lr_mult=%s weight_decay=%s scheduler=%s max_steps=%d",
+            checkpoint_dir,
+            self.global_step,
+            self.epoch,
+            self.tokens_seen,
+            self.cfg.train.lr,
+            self.cfg.train.adamw_lr_mult,
+            self.cfg.train.weight_decay,
+            self.cfg.train.scheduler,
+            self.cfg.train.max_steps,
         )
 
     def _resume_data_cursor(self, state: dict[str, Any], checkpoint_dir: str) -> None:

@@ -44,12 +44,23 @@ def _require_manifest(directory: Path) -> dict[str, Any]:
 def generate(
     config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
     out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    overrides: Annotated[
+        list[str] | None,
+        typer.Argument(
+            metavar="[KEY=VALUE]...",
+            help="Config overrides appended to the training command, e.g. train.lr=0.001",
+        ),
+    ] = None,
     preset: Annotated[str | None, typer.Option("--preset")] = None,
     nodes: Annotated[int | None, typer.Option("--nodes")] = None,
     name: Annotated[str | None, typer.Option("--name")] = None,
     time_limit: Annotated[str | None, typer.Option("--time-limit")] = None,
 ) -> None:
     """Write one sbatch script, plus a job manifest, for a training config."""
+    overrides = overrides or []
+    for token in overrides:
+        if "=" not in token or "'" in token:
+            raise typer.BadParameter(f"override must be KEY=VALUE without quotes, got: {token!r}")
     # The rendered command runs on a compute node with a job-scoped $JOB_WORK_DIR as its
     # container working directory, not the directory `generate` was invoked from -- a relative
     # --config would silently resolve to the wrong (likely nonexistent) file there.
@@ -64,10 +75,11 @@ def generate(
         resolved_time = time_limit or slurm.time_limit.resolve(phase=None, preset=preset)
         # The requeue wrapper's no-progress guard needs this run's own output_dir to scan for
         # committed checkpoints -- resolve it the same way the training command itself will
-        # (--config, then --preset), not just the raw YAML default.
+        # (--config, then --preset, then overrides), not just the raw YAML default.
         train_argv = ["--config", str(config)]
         if preset is not None:
             train_argv += ["--preset", preset]
+        train_argv += overrides
         progress_dir = str(load_config(train_argv).train.output_dir)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -81,6 +93,8 @@ def generate(
     # Requeued jobs (Slurm --requeue) must resume from the newest committed checkpoint under
     # output_dir instead of restarting at step 0 -- see Trainer's auto_resume handling.
     args += " train.auto_resume=true"
+    for token in overrides:
+        args += f" {token}"
     spec = JobSpec(
         name=job_name,
         nodes=resolved_nodes,

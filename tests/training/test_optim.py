@@ -186,3 +186,19 @@ def test_residual_gates_land_in_no_decay_group() -> None:
         muon = _names_of(_muon_params(groups), id_to_name)
         assert gate_names <= no_decay, f"gates missing from no-decay under {optimizer}"
         assert not (gate_names & muon), f"gates leaked into Muon under {optimizer}"
+
+
+def test_adamw_lr_mult_scales_only_the_adamw_groups() -> None:
+    """``adamw_lr_mult`` rescales every AdamW group's LR; Muon groups are untouched."""
+    from oplm.training.optim import build_optimizers
+
+    model = _model()
+    base = TrainConfig(optimizer="muon", muon_adjust_lr_fn="original", lr=1e-2)
+    scaled = TrainConfig(optimizer="muon", muon_adjust_lr_fn="original", lr=1e-2, adamw_lr_mult=0.1)
+    muon_base, adamw_base = build_optimizers(model, base)
+    muon_scaled, adamw_scaled = build_optimizers(model, scaled)
+
+    assert [g["lr"] for g in muon_scaled.param_groups] == [g["lr"] for g in muon_base.param_groups]
+    for g_scaled, g_base in zip(adamw_scaled.param_groups, adamw_base.param_groups, strict=True):
+        assert g_scaled["lr"] == pytest.approx(0.1 * g_base["lr"])
+        assert g_scaled["weight_decay"] == g_base["weight_decay"]
