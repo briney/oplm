@@ -92,6 +92,57 @@ def _make_checkpoint(progress_dir: Path, step: int, *, suffix: str = "") -> None
     (progress_dir / f"checkpoint-{step}{suffix}").mkdir(parents=True)
 
 
+def test_training_step_requests_peer_termination_before_requeue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pass Slurm's fail-fast option at launch and requeue after the failed step returns."""
+    progress_dir = tmp_path / "output"
+    _make_checkpoint(progress_dir, 16)
+    arguments = tmp_path / "srun.args"
+    requeues = tmp_path / "scontrol.log"
+    _install_stub(
+        tmp_path,
+        monkeypatch,
+        "srun",
+        f'#!/bin/bash\nprintf "%s\\n" "$@" > "{arguments}"\nexit 1\n',
+    )
+    _install_stub(
+        tmp_path,
+        monkeypatch,
+        "scontrol",
+        f'#!/bin/bash\necho "$@" >> "{requeues}"\n',
+    )
+    for key, value in {
+        "SLURM_JOB_ID": "424242",
+        "SLURM_JOB_USER": "test",
+        "SLURM_NNODES": "2",
+        "SLURM_RESTART_COUNT": "0",
+        "SLURM_KILL_BAD_EXIT": "0",
+        "JOB_WORK_DIR": str(tmp_path),
+    }.items():
+        monkeypatch.setenv(key, value)
+    spec = JobSpec(
+        name="rank-kill",
+        nodes=2,
+        time_limit="01:00:00",
+        command="python -m oplm.train --config cfg.yaml",
+        progress_dir=str(progress_dir),
+    )
+    text = render_job(spec, SLURM)
+    # Execute the training launch and wrapper, skipping cluster-specific setup.
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", text[text.index("set +e\n") :]],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert "--kill-on-bad-exit=1" in arguments.read_text().splitlines()
+    assert result.returncode == 0, result.stderr
+    assert requeues.read_text().strip() == "requeue 424242"
+    assert (progress_dir / ".last_requeue_step").read_text().strip() == "16"
+
+
 # --- case 1: exit 0 -> no requeue --------------------------------------------------------
 
 

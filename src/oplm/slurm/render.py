@@ -167,6 +167,9 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         # requeue wrapper below needs to inspect $STATUS first.
         "set +e",
         "srun --nodes=$SLURM_NNODES --ntasks-per-node=1 \\",
+        # Tear down peer tasks when one launcher fails, even with KillOnBadExit=0.
+        # Otherwise srun can wait on hung ranks forever and never reach the requeue wrapper.
+        "  --kill-on-bad-exit=1 \\",
         "  --export=ALL \\",
         f"  --container-image={slurm.container_image} \\",
         f"  --container-mounts={mounts} \\",
