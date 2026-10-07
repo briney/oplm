@@ -155,19 +155,20 @@ def _build_adamw_optimizer(
 ) -> torch.optim.AdamW:
     """Build AdamW with groups keyed by weight decay and composed width/depth LR mult.
 
-    Each group's base LR is ``cfg.lr * lr_mult``; with μP off and depth exponent
-    zero every multiplier is ``1.0``, so this reduces to the original two-group
-    (decay/no-decay) optimizer at ``cfg.lr``. LambdaLR captures each group's
-    ``initial_lr`` and scales them all by the same schedule λ, so the heterogeneous
-    base LRs compose correctly.
+    Each group's base LR is ``cfg.lr * cfg.adamw_lr_mult * lr_mult``; with μP off,
+    depth exponent zero, and ``adamw_lr_mult=1`` every multiplier is ``1.0``, so this
+    reduces to the original two-group (decay/no-decay) optimizer at ``cfg.lr``.
+    LambdaLR captures each group's ``initial_lr`` and scales them all by the same
+    schedule λ, so the heterogeneous base LRs compose correctly.
     """
+    base_lr = cfg.lr * cfg.adamw_lr_mult
     param_groups = [
-        {"params": list(g.params), "weight_decay": g.weight_decay, "lr": cfg.lr * g.lr_mult}
+        {"params": list(g.params), "weight_decay": g.weight_decay, "lr": base_lr * g.lr_mult}
         for g in adamw_groups
     ]
     return torch.optim.AdamW(
         param_groups,
-        lr=cfg.lr,
+        lr=base_lr,
         betas=(cfg.adam_beta1, cfg.adam_beta2),
         eps=cfg.adam_eps,
     )

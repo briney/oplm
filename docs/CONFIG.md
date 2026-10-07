@@ -272,6 +272,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.muon_ns_steps` | `int` | `5` | Newton–Schulz steps; must be `≥ 1`. |
 | `train.mup_depth_lr_exponent` | `float` | `0.5` | Repeated-block LR exponent; finite and `>= 0`. Zero is a no-op; the run default `0.5` is the sweep-verified correction (no-op at the 24-layer reference depth). Dataclass fallback `0.0`. |
 | `train.mup_depth_reference_layers` | `int` | `24` | Reference layer count in `(reference/L)^exponent`; must be `>= 1`. |
+| `train.adamw_lr_mult` | `float` | `1.0` | Multiplier on the AdamW-side LR only (under Muon: embeddings, head, norms, biases, residual gates, Canon kernels; under `adamw`: every group). Muon matrices are untouched. Must be finite and `> 0`. |
 | `train.max_grad_norm` | `float` | `1.0` | Set `0` to disable clipping. |
 | `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, or `wsd_cosine`. |
 | `train.warmup_steps` | `int` | `5_000` | Must be `≥ 0`. |
@@ -284,6 +285,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.save_every` | `int` | `10_000` | Checkpoint cadence (optimizer steps). |
 | `train.save_total_limit` | `int` | `3` | Rolling checkpoints to keep. Permanent checkpoints (see `keep_every_n_steps` / `keep_every_n_hours`) are exempt from both the count and rotation. |
 | `train.resume_from` | `str \| null` | `null` | Path to an Accelerate checkpoint directory. Explicit; always wins over `auto_resume` when both are set. |
+| `train.branch_from` | `str \| null` | `null` | Branch a new run off a checkpoint directory: restores model, optimizer state, step counters, and (if `data.train` is unchanged) the data position like `resume_from`, but the LR, `adamw_lr_mult`, weight decay, and schedule come from **this** config. Needs a fresh `output_dir`; mutually exclusive with `resume_from`/`init_from`; a resolved `auto_resume` checkpoint in `output_dir` takes precedence (requeued branches resume themselves). See [TRAIN.md "Branching a run"](TRAIN.md#branching-a-run-wsd-decays-and-lr-experiments). |
 | `train.save_every_minutes` | `int \| null` | `null` | Also checkpoint every N wall-clock minutes, in addition to (not instead of) the `save_every` step cadence. `null` disables the timer. Must be `> 0` when set. |
 | `train.keep_every_n_steps` | `int \| null` | `null` | Checkpoints whose step is a multiple of this value are permanent — excluded from `save_total_limit` rotation. `null` disables the exemption. Must be `> 0` when set. |
 | `train.keep_every_n_hours` | `float \| null` | `null` | Marks a checkpoint permanent at least this many wall-clock hours after the previous permanent one. Independent of `keep_every_n_steps`. `null` disables the exemption. Must be `> 0` when set. |
@@ -298,6 +300,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.compile` | `bool` | `false` | Enable `torch.compile` (opt-in; adds first-step latency). |
 | `train.compile_mode` | `str` | `default` | Compile mode: `default` \| `reduce-overhead` \| `max-autotune`. |
 | `train.compile_dynamic` | `bool \| null` | `true` | `torch.compile(dynamic=...)`: `true` = one dynamic graph (default), `false` = static graph per shape (best with `data.pad_to_multiple_of` to bound shapes), `null` = Dynamo auto. When `false`, the trainer raises `torch._dynamo.config.cache_size_limit` to accommodate the expected number of shape buckets. |
+| `train.weight_diag_every` | `int` | `0` | Every N optimizer steps, log per-group weight RMS (`diag/weight_rms/<group>`) and update-RMS / weight-RMS (`diag/update_ratio/<group>`); groups are `embed`, `head_dense`, `head_decoder`, `attn`, `mlp`, `norm_gain`, `residual_gate`, `canon`, `bias`, `other`. `0` disables. Use a multiple of `log_every`. `ddp` only (refused under `hsdp`). Backfill from checkpoints offline with `oplm weight-rms <ckpt>...`. See [TRAIN.md §10](TRAIN.md#10-logging-and-monitoring). |
 | `train.throughput_warmup_steps` | `int` | `50` | Exclude the first N optimizer steps from throughput accounting (covers compile/warmup latency). Set to `0` to include all steps. Must be `≥ 0`. |
 | `train.peak_tflops` | `float \| null` | `null` | Device peak throughput in TFLOPs (e.g. `1979.0` for H100 BF16). When set, the trainer also logs `train/mfu` (achieved TFLOPs / peak). `null` → log only `train/achieved_tflops`. Must be `> 0` when set. |
 | `train.config_path` | `str \| null` | `null` | Auto-populated with the source path passed to `--config`. |

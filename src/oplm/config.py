@@ -61,6 +61,10 @@ class TrainConfig:
     muon_ns_steps: int = 5
     mup_depth_lr_exponent: float = 0.0
     mup_depth_reference_layers: int = 24
+    # Multiplier on the AdamW-side LR only (embeddings, head, norms, biases, gates,
+    # Canon kernels under Muon; every group under optimizer=adamw). Muon groups are
+    # untouched. 1.0 keeps today's behavior, where the AdamW groups inherit `lr`.
+    adamw_lr_mult: float = 1.0
     max_grad_norm: float = 1.0
 
     # Scheduler
@@ -90,6 +94,14 @@ class TrainConfig:
     # Local HF weights for a fresh stage; a resolved resume takes precedence.
     init_from: str | None = None
     resume_from: str | None = None
+    # Branch a new run off a checkpoint: restores model + optimizer state, step
+    # counters, and the data position exactly like resume_from, but takes the LR,
+    # weight decay, and schedule from THIS config instead of the checkpoint's (the
+    # WSD decay branch / LR-experiment workflow). Must point at a checkpoint dir
+    # (not its hf/ export) and use a fresh output_dir; a resolved resume_from /
+    # auto_resume checkpoint in output_dir takes precedence, so a requeued branch
+    # continues as a normal resume of itself.
+    branch_from: str | None = None
     # Time-based checkpoint cadence: also save every N wall-clock minutes, in
     # addition to (not instead of) the step-based save_every cadence. None
     # disables it (checkpoints only happen on the save_every step cadence).
@@ -172,6 +184,11 @@ class TrainConfig:
     # so `torch.compile` stays on (there are no forward hooks). 0 logs only the
     # grad norm. Consulted only when stability_diagnostics is True.
     stability_probe_every: int = 25
+    # Weight-norm diagnostics cadence (optimizer steps): every N steps log per-group
+    # weight RMS and update-RMS / weight-RMS under diag/* (see
+    # oplm.training.diagnostics). 0 disables. Should be a multiple of log_every.
+    # DDP only (main process reads replicated weights; no collectives).
+    weight_diag_every: int = 0
 
     def __post_init__(self) -> None:
         """Validate training configuration."""
@@ -231,6 +248,14 @@ class TrainConfig:
             raise ValueError(
                 f"stability_probe_every must be >= 0, got {self.stability_probe_every}"
             )
+        if self.weight_diag_every < 0:
+            raise ValueError(f"weight_diag_every must be >= 0, got {self.weight_diag_every}")
+        if not math.isfinite(self.adamw_lr_mult) or self.adamw_lr_mult <= 0:
+            raise ValueError(f"adamw_lr_mult must be finite and > 0, got {self.adamw_lr_mult}")
+        if self.branch_from is not None and (
+            self.resume_from is not None or self.init_from is not None
+        ):
+            raise ValueError("branch_from is mutually exclusive with resume_from and init_from")
         if self.save_every_minutes is not None and self.save_every_minutes <= 0:
             raise ValueError(
                 f"save_every_minutes must be > 0 when set, got {self.save_every_minutes}"
@@ -260,6 +285,13 @@ class TrainConfig:
                 "parallelism='hsdp' does not support mixed_precision='fp16': the fp16 "
                 "GradScaler's inf-check is not shard-aware and would let ranks diverge. "
                 "Use mixed_precision='bf16' (default) or 'no'."
+            )
+        if self.parallelism == "hsdp" and self.weight_diag_every:
+            # The weight diagnostics read full parameters on the main process only; under
+            # FSDP2 they are DTensor shards and any full-tensor reduction is a collective.
+            raise ValueError(
+                "parallelism='hsdp' is incompatible with weight_diag_every > 0: the weight "
+                "diagnostics run on the main process over replicated (DDP) parameters."
             )
         if self.parallelism == "hsdp" and self.stability_diagnostics and self.stability_probe_every:
             # StabilityDiagnosticsCallback's probe forward is deliberately main-process

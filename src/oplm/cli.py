@@ -139,6 +139,44 @@ def encode(
     console.print(f"[green]Saved embeddings[/green] {tuple(embeddings.shape)} → {out_path}")
 
 
+def _safetensors_tensors(files: list[Path]):  # noqa: ANN202 — generator of (name, tensor)
+    from safetensors import safe_open
+
+    for file in files:
+        with safe_open(str(file), framework="pt") as handle:
+            for key in handle.keys():  # noqa: SIM118 — safe_open handles are not mappings
+                yield key, handle.get_tensor(key)
+
+
+@app.command(name="weight-rms")
+def weight_rms(
+    checkpoints: Annotated[
+        list[Path], typer.Argument(help="Checkpoint directories (or their hf/ exports)")
+    ],
+) -> None:
+    """Per-group weight RMS of each checkpoint's hf/ export (offline diag/weight_rms/*)."""
+    from oplm.training.diagnostics import GROUPS, weight_rms_by_group
+
+    columns: dict[str, dict[str, float]] = {}
+    for checkpoint in checkpoints:
+        hf_dir = checkpoint / "hf" if (checkpoint / "hf").is_dir() else checkpoint
+        files = sorted(hf_dir.glob("*.safetensors"))
+        if not files:
+            raise typer.BadParameter(f"no *.safetensors under {hf_dir}")
+        columns[checkpoint.name] = weight_rms_by_group(_safetensors_tensors(files))
+
+    table = Table(title="weight RMS by parameter group")
+    table.add_column("group")
+    for label in columns:
+        table.add_column(label, justify="right")
+    for group in GROUPS:
+        if any(group in column for column in columns.values()):
+            table.add_row(
+                group, *(f"{c[group]:.4g}" if group in c else "-" for c in columns.values())
+            )
+    console.print(table)
+
+
 @app.command()
 def info(
     overrides: OverridesArg = None,

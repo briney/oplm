@@ -294,3 +294,52 @@ def test_status_distinguishes_active_from_finished_jobs(
     output = plain(result.stdout)
     assert "JOB_0 (812345): active" in output
     assert "JOB_1 (812346): finished or unknown" in output
+
+
+def test_generate_appends_positional_overrides_to_the_training_command(tmp_path: Path) -> None:
+    """``KEY=VALUE`` tokens ride along after ``train.auto_resume=true`` and steer progress_dir."""
+    config = _write_config(tmp_path / "scaling.yaml")
+    result = runner.invoke(
+        app,
+        [
+            "slurm",
+            "generate",
+            "--config",
+            str(config),
+            "--preset",
+            "170M",
+            "--out",
+            str(tmp_path / "jobs"),
+            "train.branch_from=/runs/main/checkpoint-250000",
+            "train.output_dir=/runs/branch",
+            "train.lr=0.00117",
+        ],
+    )
+    assert result.exit_code == 0, plain(result.stdout)
+    script = (tmp_path / "jobs" / "oplm-170M.sbatch").read_text()
+    assert (
+        "train.auto_resume=true train.branch_from=/runs/main/checkpoint-250000 "
+        "train.output_dir=/runs/branch train.lr=0.00117"
+    ) in script
+    # The requeue wrapper's no-progress guard scans the overridden output_dir.
+    assert 'STEP_FILE="/runs/branch/.last_requeue_step"' in script
+
+
+def test_generate_rejects_non_keyvalue_override(tmp_path: Path) -> None:
+    config = _write_config(tmp_path / "scaling.yaml")
+    result = runner.invoke(
+        app,
+        [
+            "slurm",
+            "generate",
+            "--config",
+            str(config),
+            "--preset",
+            "170M",
+            "--out",
+            str(tmp_path),
+            "oops",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "KEY=VALUE" in plain(result.output)

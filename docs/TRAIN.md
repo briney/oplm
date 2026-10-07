@@ -335,6 +335,46 @@ oplm train --config my_run.yaml \
 
 Raise `train.max_steps` first if the original budget was already reached.
 
+### Branching a run (WSD decays and LR experiments)
+
+`train.resume_from` refuses a changed `lr` / `min_lr` / `scheduler` / `warmup_steps` /
+`stable_steps` (and a shrunk `max_steps`) because a resume must continue the *same*
+schedule. A **branch** is the opposite intent: start a new run from a checkpoint's full
+state (weights, Muon/AdamW moments, step counters, data position) but under *this*
+config's LR, `adamw_lr_mult`, weight decay, and schedule — the WSD "decay from the stable
+phase" step, or an LR experiment forked mid-run.
+
+```bash
+# Decay branch: 250k -> 300k, linear to 0, everything else as in the main run.
+oplm train --config configs/scaling.yaml --preset 170M \
+  train.branch_from=/runs/170M/checkpoint-250000 train.output_dir=/runs/170M-decay-250k \
+  train.scheduler=wsd_linear train.warmup_steps=5000 train.stable_steps=245000 train.max_steps=300000
+```
+
+Rules:
+
+- `branch_from` points at the checkpoint **directory** (not its `hf/` export); the
+  optimizer state is what distinguishes a branch from `init_from`.
+- `output_dir` must be fresh. If it already holds a committed checkpoint and
+  `auto_resume`/`resume_from` resolve it, that resume wins and `branch_from` is ignored —
+  this is what lets a requeued branch job continue as a plain resume of itself.
+- The live schedule is evaluated at the checkpoint's step: with `warmup 5000 / stable
+  245000 / max 300000` a branch from step 250 000 starts at peak LR and decays to
+  `min_lr` over the next 50k steps. For a constant-LR branch set
+  `stable_steps = max_steps - warmup_steps` (the one trailing decay step is harmless).
+- The data cursor is restored only when `data.train` is unchanged; a different mix (the
+  production decay-phase case) restarts the stream at row 0 of the current epoch with a
+  warning. The cursor's layout guard still applies (same world size, workers, per-rank
+  batch, seed), so branch with the same node count or set `resume_data_position=false`.
+- `max_steps` must exceed the checkpoint's step. All other config (model geometry, data
+  layout) must match the checkpoint, exactly as for a resume.
+
+The branch gets its own W&B run; `train/lr` (Muon) and `train/lr_adamw` show the live
+schedule from the first logged step. The worked set of branch experiments for the
+late-loss investigation (decay, AdamW-LR, all-LR, and weight-decay branches, plus the
+WSD branch-point comparison) lives in
+[LATE_LOSS_INVESTIGATION.md](LATE_LOSS_INVESTIGATION.md).
+
 ---
 
 ## 10. Logging and monitoring
@@ -349,6 +389,26 @@ full flattened config is logged under `model/*`, `train/*`, `data/*`. Every
 estimate); eval passes add `eval/<dataset>/<metric>`. Set `train.wandb_project`
 and `train.wandb_run_name` (or `--name`) to organize runs. Disable W&B entirely
 with `train.wandb_enabled=false`.
+
+Each train log also carries per-window diagnostics (the window is the steps since
+the previous log): `train/loss_mean` (mean loss over the window, versus the
+single-step `train/loss`), `train/grad_norm` / `train/grad_norm_max` (pre-clip
+global gradient norm, mean and max) and `train/clip_frac` (fraction of steps where
+clipping fired; all three only when `max_grad_norm > 0`), `train/mean_seq_len`
+(tokens per sample), and under Muon `train/lr_adamw` (the auxiliary AdamW
+optimizer's first group — `train/lr` is the Muon LR).
+
+**Weight-norm diagnostics** (`train.weight_diag_every=N`, off by default): every N
+optimizer steps, `diag/weight_rms/<group>` (pooled RMS of the group's weights) and
+`diag/update_ratio/<group>` (that step's update RMS divided by the weight RMS — the
+effective relative step size) for the groups `embed`, `head_dense`, `head_decoder`,
+`attn`, `mlp`, `norm_gain`, `residual_gate`, `canon`, `bias`, `other`. Main process
+only, DDP only, one full parameter snapshot on the diagnostic step. The same numbers
+can be backfilled from existing checkpoints' `hf/` exports:
+
+```bash
+oplm weight-rms /runs/170M/checkpoint-100000 /runs/170M/checkpoint-400000
+```
 
 ---
 
