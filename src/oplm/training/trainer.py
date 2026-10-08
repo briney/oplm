@@ -32,9 +32,11 @@ if TYPE_CHECKING:
     from oplm.config import OplmConfig
     from oplm.eval.context import EvalContext
     from oplm.eval.evaluator import Evaluator
+    from oplm.model import OplmForMaskedLM
     from oplm.training.callbacks import TrainerCallback
     from oplm.training.checkpoint import PendingSave
     from oplm.training.remote import UploadManager
+    from oplm.training.task import TrainTask
 
 logger = logging.getLogger(__name__)
 
@@ -233,20 +235,23 @@ class Trainer:
         self,
         cfg: OplmConfig,
         callbacks: Sequence[TrainerCallback] | None = None,
+        task: TrainTask | None = None,
     ) -> None:
         from accelerate import Accelerator
         from accelerate.utils import DataLoaderConfiguration, InitProcessGroupKwargs, set_seed
         from rich.console import Console
 
         from oplm.config import validate_parallelism_compat
-        from oplm.data import DeviceDataLoader, build_train_dataloader
-        from oplm.model import OplmForMaskedLM
-        from oplm.training.flops import estimate_flops_per_token
+        from oplm.data import DeviceDataLoader
         from oplm.training.optim import build_optimizers, build_schedulers
         from oplm.training.preflight import run_preflight
+        from oplm.training.task import MLMTask
 
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
+        # Objective-specific model/data/step (docs/TRAIN.md §17). The default
+        # reproduces MLM training exactly; fold stages pass FoldTask (milestone 2).
+        self.task: TrainTask = task if task is not None else MLMTask()
 
         # Cross-section config guard (Task 5.1), first thing and before any process-group
         # work: a config built directly (tests, sweeps, notebooks) never went through
@@ -521,34 +526,30 @@ class Trainer:
 
         # Model
         _status("[dim]Building model...[/dim]")
-        # Read the flag before constructing the model: transformers strips
-        # ``config.gradient_checkpointing`` during ``PreTrainedModel.__init__`` (and
-        # auto-enables checkpointing on the model), so reading it afterward raises
-        # AttributeError. Re-enabling here is idempotent and keeps the wiring
-        # explicit across transformers versions.
+        # Read before build_model: transformers strips the flag off the HF config during
+        # PreTrainedModel.__init__; the compile block below still needs it.
         gradient_checkpointing = getattr(cfg.model, "gradient_checkpointing", False)
-        if initialization_source is None:
-            model = OplmForMaskedLM(cfg.model)  # cfg.model is the HF OplmConfig
-        else:
-            from oplm.training.initialization import load_initial_model
-
-            model = load_initial_model(initialization_source, cfg.model)
-            model.train()  # HF pretrained loading returns an evaluation-mode model.
-        if gradient_checkpointing:
-            model.gradient_checkpointing_enable()  # propagates to every OplmBlock
+        model = self.task.build_model(cfg, initialization_source)
 
         if self.accelerator.is_main_process:
             logger.info(
-                "Model: physical_depth=%d effective_depth=%d unique_parameters=%d "
-                "loops=%d strategy=%s range=[%d, %d)",
-                cfg.model.num_hidden_layers,
-                len(model.oplm.backbone.layer_execution_order),
+                "Model: task=%s unique_parameters=%d",
+                type(self.task).__name__,
                 sum(parameter.numel() for parameter in model.parameters()),
-                cfg.model.num_loops,
-                cfg.model.loop_strategy,
-                cfg.model.loop_start,
-                cfg.model.num_hidden_layers if cfg.model.loop_end is None else cfg.model.loop_end,
             )
+            if isinstance(self.task, MLMTask):
+                logger.info(
+                    "MLM backbone: physical_depth=%d effective_depth=%d loops=%d strategy=%s "
+                    "range=[%d, %d)",
+                    cfg.model.num_hidden_layers,
+                    len(cast("OplmForMaskedLM", model).oplm.backbone.layer_execution_order),
+                    cfg.model.num_loops,
+                    cfg.model.loop_strategy,
+                    cfg.model.loop_start,
+                    cfg.model.num_hidden_layers
+                    if cfg.model.loop_end is None
+                    else cfg.model.loop_end,
+                )
 
         # FSDP2/HSDP sharding (Task 5.1), when train.parallelism == "hsdp". Applied HERE,
         # before build_optimizers, because fully_shard swaps the module's parameters for
@@ -565,7 +566,7 @@ class Trainer:
         # Optimizer and dataloader
         optimizers = build_optimizers(model, cfg.train)
         _status("[dim]Loading training data...[/dim]")
-        dataloader = build_train_dataloader(cfg)
+        dataloader = self.task.build_dataloader(cfg)
         raw_dataset_size = self._get_dataset_size_from_dataloader(dataloader)
 
         # Compute total_steps
@@ -771,8 +772,9 @@ class Trainer:
         # clean_stale_checkpoint_dirs), never a resume candidate.
         self._pending_save: _PendingAsyncSave | None = None
 
-        # FLOP estimation
-        self.flops_per_token = estimate_flops_per_token(cfg.model)
+        # FLOP estimation; None when the task has no honest per-token formula (spec §6.4),
+        # in which case train/flops, train/achieved_tflops and train/mfu are omitted.
+        self.flops_per_token: int | None = self.task.flops_per_token(cfg)
 
         # Throughput timing state (steady-state window; warmup steps excluded)
         self._step_timer_start: float | None = None
@@ -789,6 +791,9 @@ class Trainer:
         self._window_clipped = 0
         self._window_tokens_start = 0
         self._window_samples_start = 0
+        # Task-reported per-micro-batch metrics, window-averaged in _log_step.
+        self._window_metric_sums: dict[str, float] = {}
+        self._window_metric_counts: dict[str, int] = {}
 
         # Dataset size for fractional epoch computation
         self._dataset_size = raw_dataset_size
@@ -860,12 +865,8 @@ class Trainer:
 
                 # Forward + backward inside accumulation context
                 with self.accelerator.accumulate(self.model):
-                    outputs = self.model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        labels=batch["labels"],
-                    )
-                    loss = outputs["loss"]
+                    result = self.task.step(self.model, batch)
+                    loss = result.loss
                     self.accelerator.backward(loss)
 
                     if cfg.max_grad_norm > 0 and self.accelerator.sync_gradients:
@@ -894,9 +895,12 @@ class Trainer:
                 # below), samples, and the data cursor's micro-batch count (Task 3.3 --
                 # every rank pulls exactly one DataLoader batch per micro-step, so this
                 # stays rank-identical without a reduce).
-                self._step_local_tokens += int(batch["attention_mask"].sum().item())
-                self._samples_seen += len(batch["input_ids"]) * self.accelerator.num_processes
+                self._step_local_tokens += result.tokens
+                self._samples_seen += result.samples * self.accelerator.num_processes
                 self._batches_in_epoch += 1
+                for key, value in result.metrics.items():
+                    self._window_metric_sums[key] = self._window_metric_sums.get(key, 0.0) + value
+                    self._window_metric_counts[key] = self._window_metric_counts.get(key, 0) + 1
 
                 # Only act on optimizer steps (accumulation boundary)
                 if not self.accelerator.sync_gradients:
@@ -1306,16 +1310,20 @@ class Trainer:
     def _log_step(self, loss: float) -> None:
         """Log training metrics to wandb."""
         fractional_epoch = self._fractional_epoch()
-        cumulative_flops = self.flops_per_token * self.tokens_seen
 
         metrics = {
             "train/loss": loss,
             "train/epoch": fractional_epoch,
             "train/samples": self._samples_seen,
             "train/tokens": self.tokens_seen,
-            "train/flops": cumulative_flops,
             "train/lr": self.scheduler.get_last_lr()[0],
         }
+        if self.flops_per_token is not None:
+            metrics["train/flops"] = self.flops_per_token * self.tokens_seen
+        for key, total in self._window_metric_sums.items():
+            metrics[f"train/{key}"] = total / self._window_metric_counts[key]
+        self._window_metric_sums.clear()
+        self._window_metric_counts.clear()
         if len(self.schedulers) > 1:
             # Muon mode: the auxiliary AdamW optimizer's first group (embeddings & co.).
             metrics["train/lr_adamw"] = self.schedulers[-1].get_last_lr()[0]
@@ -1346,14 +1354,18 @@ class Trainer:
         if self._tput_window_steps > 0 and self._tput_window_seconds > 0:
             tokens_per_sec = self._tput_window_tokens / self._tput_window_seconds
             step_time_s = self._tput_window_seconds / self._tput_window_steps
-            achieved_tflops = (
-                self.flops_per_token * self._tput_window_tokens / self._tput_window_seconds / 1e12
-            )
             metrics["train/tokens_per_sec"] = tokens_per_sec
             metrics["train/step_time_s"] = step_time_s
-            metrics["train/achieved_tflops"] = achieved_tflops
-            if self.cfg.train.peak_tflops:
-                metrics["train/mfu"] = achieved_tflops / self.cfg.train.peak_tflops
+            if self.flops_per_token is not None:
+                achieved_tflops = (
+                    self.flops_per_token
+                    * self._tput_window_tokens
+                    / self._tput_window_seconds
+                    / 1e12
+                )
+                metrics["train/achieved_tflops"] = achieved_tflops
+                if self.cfg.train.peak_tflops:
+                    metrics["train/mfu"] = achieved_tflops / self.cfg.train.peak_tflops
             # Reset window accumulators
             self._tput_window_tokens = 0
             self._tput_window_seconds = 0.0

@@ -830,6 +830,28 @@ about before relying on it in production:
 
 ---
 
+## 17. Training tasks (`TrainTask`)
+
+The Trainer owns acceleration, optimization, accumulation, eval cadence, fault
+tolerance and checkpointing. The objective-specific third — building the model,
+building the training dataloader, turning one micro-batch into a loss, and the
+FLOP estimate — lives behind `oplm.training.task.TrainTask`:
+
+| Method | Returns |
+| --- | --- |
+| `build_model(cfg, initialization_source)` | the trainable `nn.Module` (weights loaded from `train.init_from` when given) |
+| `build_dataloader(cfg)` | the rank/worker-striped training `DataLoader` |
+| `step(model, batch)` | `StepResult(loss, tokens, samples, metrics)` |
+| `flops_per_token(cfg)` | an `int`, or `None` to omit `train/flops`, `train/achieved_tflops` and `train/mfu` |
+
+`MLMTask` is the default (`Trainer(cfg)`), and reproduces the pre-seam behaviour
+exactly. `StepResult.metrics` are logged as `train/<key>`, averaged over the log
+window; the keys the trainer emits itself (`loss`, `lr`, `epoch`, `samples`,
+`tokens`, `flops`, ...) are reserved. The folding head's `FoldTask`
+(docs/FOLD.md) is the second implementation.
+
+---
+
 ## See also
 
 - [CONFIG.md](CONFIG.md) — full configuration reference.
