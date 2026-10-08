@@ -20,20 +20,28 @@ straight pass-through: ``p_in_weight = proj_bundle.weight[:2D]``,
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch import Tensor
 
 __all__ = [
     "TRIMUL_EPS",
+    "Backend",
     "Direction",
+    "TriMulPath",
     "TriangleMultiplication",
+    "cueq_available",
+    "fused_trimul",
+    "resolve_trimul_path",
     "trimul_contract",
+    "trimul_mixed",
     "trimul_post",
     "trimul_pre",
     "trimul_reference",
@@ -42,6 +50,150 @@ __all__ = [
 Direction = Literal["outgoing", "incoming"]
 TRIMUL_EPS = 1e-5
 _EINSUM: dict[str, str] = {"outgoing": "bikd,bjkd->bijd", "incoming": "bkid,bkjd->bijd"}
+
+Backend = Literal["auto", "fused", "fused_forward_reference_backward", "reference"]
+TriMulPath = Literal["fused_autograd", "fused_forward_reference_backward", "reference"]
+_VALID_BACKENDS: tuple[str, ...] = (
+    "auto",
+    "fused",
+    "fused_forward_reference_backward",
+    "reference",
+)
+_FUSED_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+
+try:
+    from cuequivariance_torch import (  # ty: ignore[unresolved-import]  # optional `fold` extra
+        triangle_multiplicative_update as _cueq_trimul,
+    )
+except ImportError:  # the `fold` extra is optional; CPU/test environments never have it
+    _cueq_trimul = None
+
+
+def cueq_available() -> bool:
+    """Whether ``cuequivariance_torch.triangle_multiplicative_update`` is importable."""
+    return _cueq_trimul is not None
+
+
+def resolve_trimul_path(z: Tensor, *, needs_grad: bool, backend: Backend) -> TriMulPath:
+    """Pick the execution path for one call (design §5.2).
+
+    ``"reference"`` whenever cuEquivariance is absent, ``z`` is not on CUDA, the width is
+    not a multiple of 32, the dtype is unsupported, or the backend says so. Otherwise a
+    call with no gradient requirement uses the fused forward directly; a gradient call
+    uses the library's autograd unless ``backend`` selects the mixed path. ``"auto"``
+    trusts the library's autograd until ``oplm fold bench-kernels`` says otherwise --
+    the recorded choice then goes into the stage config.
+    """
+    if backend == "reference" or not cueq_available() or not z.is_cuda:
+        return "reference"
+    if z.shape[-1] % 32 or z.dtype not in _FUSED_DTYPES:
+        return "reference"
+    if not needs_grad or backend == "fused":
+        return "fused_autograd"
+    if backend == "fused_forward_reference_backward":
+        return "fused_forward_reference_backward"
+    return "fused_autograd"
+
+
+def fused_trimul(
+    z: Tensor, direction: Direction, mask: Tensor | None, *weights: Tensor, eps: float = TRIMUL_EPS
+) -> Tensor:
+    """cuEquivariance ``triangle_multiplicative_update`` with the port's weight mapping."""
+    if _cueq_trimul is None:
+        raise RuntimeError("cuequivariance_torch is not installed; pip install 'oplm[fold]'")
+    (
+        norm_in_weight,
+        norm_in_bias,
+        p_in_weight,
+        g_in_weight,
+        norm_out_weight,
+        norm_out_bias,
+        p_out_weight,
+        g_out_weight,
+    ) = weights
+    return _cueq_trimul(
+        z,
+        direction=direction,
+        mask=None if mask is None else mask.to(z.dtype),
+        norm_in_weight=norm_in_weight,
+        norm_in_bias=norm_in_bias,
+        p_in_weight=p_in_weight,
+        g_in_weight=g_in_weight,
+        norm_out_weight=norm_out_weight,
+        norm_out_bias=norm_out_bias,
+        p_out_weight=p_out_weight,
+        g_out_weight=g_out_weight,
+        eps=eps,
+    )
+
+
+class _FusedForwardReferenceBackward(torch.autograd.Function):
+    """Fused inference kernel forward; the staged reference recomputed in backward.
+
+    One recomputation boundary: the forward saves only its inputs (pair block, mask,
+    weights -- what an activation checkpoint saves anyway); the backward rebuilds the
+    staged reference graph under ``enable_grad`` and backpropagates through it, so
+    reference activations exist only inside the backward call. Composes with
+    ``torch.utils.checkpoint``: the outer checkpoint re-runs the cheap fused forward,
+    then this backward runs the reference exactly once.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        z: Tensor,
+        mask: Tensor | None,
+        direction: Direction,
+        eps: float,
+        chunk_size: int | None,
+        fused_fn: Callable[..., Tensor],
+        *weights: Tensor,
+    ) -> Tensor:
+        ctx.direction, ctx.eps, ctx.chunk_size = direction, eps, chunk_size
+        ctx.mask = mask  # not differentiated; may be None
+        ctx.save_for_backward(z, *weights)
+        with torch.no_grad():
+            return fused_fn(z, direction, mask, *weights, eps=eps)
+
+    @staticmethod
+    def backward(  # ty: ignore[invalid-method-override]  # Function.backward is *grad_outputs: Any
+        ctx: Any, grad_out: Tensor
+    ) -> tuple[Tensor | None, ...]:
+        z, *weights = ctx.saved_tensors
+        needs = ctx.needs_input_grad
+        with torch.enable_grad():
+            z_live = z.detach().requires_grad_(needs[0])
+            weights_live = [
+                w.detach().requires_grad_(need) for w, need in zip(weights, needs[6:], strict=True)
+            ]
+            out = trimul_reference(
+                z_live,
+                ctx.direction,
+                ctx.mask,
+                *weights_live,
+                eps=ctx.eps,
+                chunk_size=ctx.chunk_size,
+            )
+            inputs = [t for t in (z_live, *weights_live) if t.requires_grad]
+            grads = iter(torch.autograd.grad(out, inputs, grad_out, allow_unused=True))
+        dz = next(grads) if z_live.requires_grad else None
+        dweights = [next(grads) if w.requires_grad else None for w in weights_live]
+        return (dz, None, None, None, None, None, *dweights)
+
+
+def trimul_mixed(
+    z: Tensor,
+    direction: Direction,
+    mask: Tensor | None,
+    *weights: Tensor,
+    eps: float = TRIMUL_EPS,
+    chunk_size: int | None = 64,
+    fused_fn: Callable[..., Tensor] = fused_trimul,
+) -> Tensor:
+    """Fused forward, reference backward. ``fused_fn`` is injectable so CPU tests can drive it."""
+    return _FusedForwardReferenceBackward.apply(
+        z, mask, direction, eps, chunk_size, fused_fn, *weights
+    )
 
 
 def _layer_norm_fp32(x: Tensor, weight: Tensor, bias: Tensor, eps: float) -> Tensor:
@@ -97,8 +249,8 @@ def trimul_contract(
     equation = _EINSUM[direction]
     right32 = right.float()
     n = left.shape[1]
-    # Disable autocast to keep the fp32 accumulation (einsum lowers to bmm which autocast
-    # would re-cast to dtype, violating spec §5.4; see THIRD_PARTY_NOTICES.md design notes).
+    # Spec §5.4: accumulate in fp32. einsum lowers to bmm, which autocast would re-cast to
+    # the low-precision dtype, so autocast is disabled locally around the contraction.
     with torch.autocast(device_type=left.device.type, enabled=False):
         if chunk_size is None or n <= chunk_size:
             return torch.einsum(equation, left.float(), right32)
@@ -166,14 +318,18 @@ class TriangleMultiplication(nn.Module):
         *,
         eps: float = TRIMUL_EPS,
         chunk_size: int | None = 64,
+        backend: Backend = "auto",
     ) -> None:
         super().__init__()
         if direction not in _EINSUM:
             raise ValueError(f"direction must be 'outgoing' or 'incoming', got {direction!r}")
+        if backend not in _VALID_BACKENDS:
+            raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {backend!r}")
         self.width = width
         self.direction: Direction = direction
         self.eps = eps
         self.chunk_size = chunk_size
+        self.backend: Backend = backend
         # Plain nn.LayerNorm holders keep the upstream state-dict exactly; the fp32
         # math lives in _layer_norm_fp32, which is OplmLayerNorm's contract.
         self.norm_start = nn.LayerNorm(width, eps=eps)
@@ -197,11 +353,17 @@ class TriangleMultiplication(nn.Module):
         )
 
     def forward(self, z: Tensor, mask: Tensor | None = None) -> Tensor:
-        return trimul_reference(
-            z,
-            self.direction,
-            mask,
-            *self.kernel_weights(),
-            eps=self.eps,
-            chunk_size=self.chunk_size,
+        weights = self.kernel_weights()
+        needs_grad = torch.is_grad_enabled() and (
+            z.requires_grad or any(w.requires_grad for w in weights)
+        )
+        path = resolve_trimul_path(z, needs_grad=needs_grad, backend=self.backend)
+        if path == "reference":
+            return trimul_reference(
+                z, self.direction, mask, *weights, eps=self.eps, chunk_size=self.chunk_size
+            )
+        if path == "fused_autograd":
+            return fused_trimul(z, self.direction, mask, *weights, eps=self.eps)
+        return trimul_mixed(
+            z, self.direction, mask, *weights, eps=self.eps, chunk_size=self.chunk_size
         )
