@@ -91,6 +91,11 @@ oplm fold bench-kernels --paths reference --compile-reference --out bench-refere
 oplm fold bench-kernels --device cpu --dtype fp32 --widths 32 --lengths 16 --paths reference
 ```
 
+On the SUNK cluster, [`docs/fold/b200-task7.sbatch`](fold/b200-task7.sbatch) runs the whole
+milestone-0 acceptance checklist (GPU parity tests, both benchmarks, the cuda-bf16 MLM/EMA
+regression files) on one B200 inside the standard Pyxis container, installing the branch
+editable from a clone or a mounted checkout; its header lists the environment overrides.
+
 Per (width, length, direction, path) the report records forward, forward+backward
 and checkpointed forward+backward ms/iter, peak allocated/reserved GiB, the path
 that actually ran (`"unavailable"` when the request cannot resolve on the machine),
