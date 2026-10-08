@@ -97,14 +97,17 @@ def trimul_contract(
     equation = _EINSUM[direction]
     right32 = right.float()
     n = left.shape[1]
-    if chunk_size is None or n <= chunk_size:
-        return torch.einsum(equation, left.float(), right32)
-    chunks = []
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-        left_chunk = left[:, start:end] if direction == "outgoing" else left[:, :, start:end]
-        chunks.append(torch.einsum(equation, left_chunk.float(), right32))
-    return torch.cat(chunks, dim=1)
+    # Disable autocast to keep the fp32 accumulation (einsum lowers to bmm which autocast
+    # would re-cast to dtype, violating spec §5.4; see THIRD_PARTY_NOTICES.md design notes).
+    with torch.autocast(device_type=left.device.type, enabled=False):
+        if chunk_size is None or n <= chunk_size:
+            return torch.einsum(equation, left.float(), right32)
+        chunks = []
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            left_chunk = left[:, start:end] if direction == "outgoing" else left[:, :, start:end]
+            chunks.append(torch.einsum(equation, left_chunk.float(), right32))
+        return torch.cat(chunks, dim=1)
 
 
 def trimul_post(

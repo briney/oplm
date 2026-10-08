@@ -3,6 +3,8 @@ masks, gradients, stage locality, and state-dict parity (docs/FOLD.md "Triangle 
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -151,3 +153,18 @@ def test_state_dict_matches_upstream_names_and_shapes() -> None:
 def test_rejects_unknown_direction() -> None:
     with pytest.raises(ValueError, match="direction"):
         TriangleMultiplication(32, "sideways")  # type: ignore[arg-type]
+
+
+def test_contraction_stays_fp32_under_autocast() -> None:
+    """Autocast must not demote the fp32 contraction (spec §5.4); the module output keeps the pair dtype."""
+    m = _module("outgoing")
+    z, mask = _inputs(n=5)
+    left, right, _zn = trimul_pre(z, mask, *m.kernel_weights()[:4], eps=m.eps)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert trimul_contract(left, right, "outgoing", chunk_size=None).dtype == torch.float32
+        assert trimul_contract(left, right, "outgoing", chunk_size=2).dtype == torch.float32
+        out = m(z, mask)
+    assert torch.isfinite(out).all()
+    m_bf16 = copy.deepcopy(m).bfloat16()
+    out_bf16 = m_bf16(z.bfloat16(), mask)
+    assert out_bf16.dtype == torch.bfloat16 and torch.isfinite(out_bf16).all()
