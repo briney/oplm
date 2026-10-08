@@ -5,6 +5,7 @@ Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import platform
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 
     import torch
 
-    from oplm.fold.trimul import Backend, Direction
+    from oplm.fold.trimul import Backend, Direction, TriangleMultiplication
 
 app = typer.Typer(name="fold", help="Structure prediction head", add_completion=False)
 console = Console()
@@ -112,6 +113,17 @@ def _phases(
     }
 
 
+def _error_vs_fp32(module: TriangleMultiplication, z: torch.Tensor, mask: torch.Tensor) -> float:
+    """Max abs difference between ``module`` and an fp32 reference-path copy on the same input."""
+    import torch
+
+    with torch.no_grad():
+        reference = copy.deepcopy(module).float()
+        reference.backend = "reference"
+        expected = reference(z.detach().float(), mask)
+        return float((module(z, mask).float() - expected).abs().max())
+
+
 def run_kernel_benchmark(
     *,
     widths: list[int],
@@ -132,11 +144,12 @@ def run_kernel_benchmark(
     resolve on this machine (no CUDA, no cuEquivariance, unsupported width) is reported as
     ``"unavailable"`` with the path that would actually run. ``compile_reference`` wraps the
     ``reference`` path's module in ``torch.compile`` (design §5.2 path 3: the compiled
-    reference). Numerical error against an fp32 reference is recorded for lengths up to
-    ``error_max_length``.
+    reference); ``torch.compiler.reset()`` runs before each compile so every compiled case
+    starts from a fresh cache instead of hitting dynamo's recompile limit and silently
+    running eager. Numerical error against an fp32 reference is recorded for lengths up to
+    ``error_max_length``; a failure there is recorded as ``{"status": "error", ...}`` instead
+    of aborting the run.
     """
-    import copy
-
     import torch
 
     from oplm.fold.trimul import TriangleMultiplication, resolve_trimul_path
@@ -178,18 +191,22 @@ def run_kernel_benchmark(
         case["compiled"] = compile_reference and path == "reference"
         runner: Callable[..., torch.Tensor] = module
         if case["compiled"]:
+            # Each case adds shape/direction/grad-mode guards to the same code object; past
+            # dynamo's recompile limit it silently falls back to eager. Start every compiled
+            # case from an empty cache so ``compiled: True`` always means compiled timings.
+            torch.compiler.reset()
             runner = torch.compile(module, dynamic=False)
 
         for name, fn in _phases(runner, z, mask).items():
             case[name] = _time(fn, dev, iters, warmup)
         if length <= error_max_length:
-            with torch.no_grad():
-                reference = copy.deepcopy(module).float()
-                reference.backend = "reference"
-                expected = reference(z.detach().float(), mask)
-                case["max_abs_error_vs_fp32_reference"] = float(
-                    (module(z, mask).float() - expected).abs().max()
-                )
+            try:
+                case["max_abs_error_vs_fp32_reference"] = _error_vs_fp32(module, z, mask)
+            except Exception as exc:  # keep the timings already measured for this case
+                case["max_abs_error_vs_fp32_reference"] = {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
         report["cases"].append(case)
     return report
 
@@ -206,6 +223,12 @@ def _ms(entry: dict[str, Any] | None) -> str:
     if not entry:
         return "-"
     return f"{entry['ms_per_iter']:.1f}" if entry["status"] == "ok" else "err"
+
+
+def _err(value: float | dict[str, Any] | None) -> str:
+    if value is None:
+        return "-"
+    return "err" if isinstance(value, dict) else f"{value:.2e}"
 
 
 @app.command("bench-kernels")
@@ -237,6 +260,13 @@ def bench_kernels(
         )
     if dtype not in _DTYPES:
         raise typer.BadParameter(f"dtype must be one of {sorted(_DTYPES)}")
+    if device.startswith("cuda"):
+        import torch
+
+        if not torch.cuda.is_available():
+            raise typer.BadParameter(
+                "--device cuda requested but CUDA is not available; use --device cpu"
+            )
     report = run_kernel_benchmark(
         widths=_ints(widths),
         lengths=_ints(lengths),
@@ -280,9 +310,10 @@ def bench_kernels(
             _ms(case.get("forward_backward")),
             _ms(case.get("checkpointed")),
             f"{peak:.2f}" if peak is not None else "-",
-            f"{case['max_abs_error_vs_fp32_reference']:.2e}"
-            if "max_abs_error_vs_fp32_reference" in case
-            else "-",
+            _err(case.get("max_abs_error_vs_fp32_reference")),
         )
-    console.print(table)
+    # Non-tty output (Slurm logs, CI) defaults to 80 columns, which ellipsizes the path and
+    # status cells into ambiguity; widen it. A real terminal keeps its own width.
+    table_console = console if console.is_terminal else Console(width=max(console.width, 160))
+    table_console.print(table)
     console.print(f"Wrote {out}")
