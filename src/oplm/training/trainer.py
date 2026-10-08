@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.nn as nn
 
-from oplm.training.ema import EMA_HF_DIRNAME, EMA_SIDECAR_NAME
+from oplm.training.ema import EMA_HF_DIRNAME, EMA_SIDECAR_NAME, build_ema
 from oplm.training.signals import (
     DRAIN_EXIT_CODE,
     DrainSignal,
@@ -729,8 +729,6 @@ class Trainer:
         # right device, and before the resume below so a checkpoint's ema.pt lands in it.
         self._ema: AveragedModel | None = None
         if cfg.train.ema_decay is not None:
-            from oplm.training.ema import build_ema
-
             self._ema = build_ema(self._unwrapped_model, cfg.train.ema_decay)
 
         # Training state

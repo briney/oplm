@@ -136,7 +136,10 @@ def test_sliding_window_dense_matches_upstream_and_zeroes_invalid() -> None:
 
 
 def test_sliding_window_counts_in_valid_atom_rank_not_padded_index() -> None:
-    """Invalid atoms between two valid ones do not consume window budget (reference-space window)."""
+    """Invalid atoms between two valid ones do not consume window budget.
+
+    The window is measured in reference (valid-atom rank) space, not padded index space.
+    """
     q, k, v = _qkv(n=16)
     valid = torch.zeros(2, 16, dtype=torch.bool)
     valid[:, 0] = True

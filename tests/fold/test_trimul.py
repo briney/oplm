@@ -162,7 +162,10 @@ def test_rejects_unknown_direction() -> None:
 
 
 def test_contraction_stays_fp32_under_autocast() -> None:
-    """Autocast must not demote the fp32 contraction (spec §5.4); the module output keeps the pair dtype."""
+    """Autocast must not demote the fp32 contraction (spec §5.4).
+
+    The module output keeps the pair dtype.
+    """
     m = _module("outgoing")
     z, mask = _inputs(n=5)
     left, right, _zn = trimul_pre(z, mask, *m.kernel_weights()[:4], eps=m.eps)

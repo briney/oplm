@@ -50,7 +50,9 @@ def resolve_attention_backend(x: Tensor, backend: AttentionBackend) -> Literal["
 def _compiled_flex() -> Callable[..., Tensor]:
     # Uncompiled flex_attention materializes the full score matrix (it warns about it);
     # the fused kernel only exists through torch.compile. Compiled once per process.
-    return torch.compile(flex_attention, dynamic=False)  # ty: ignore[invalid-return-type]
+    return torch.compile(  # ty: ignore[invalid-return-type]  # typed Tensor | tuple; no return_lse
+        flex_attention, dynamic=False
+    )
 
 
 def _flex(
@@ -61,7 +63,9 @@ def _flex(
     block_mask: BlockMask | None,
 ) -> Tensor:
     fn = _compiled_flex() if q.is_cuda else flex_attention  # CPU: eager, forward-only use
-    return fn(q, k, v, score_mod=score_mod, block_mask=block_mask)  # ty: ignore[invalid-return-type]
+    return fn(  # ty: ignore[invalid-return-type]  # typed Tensor | tuple; return_lse never requested
+        q, k, v, score_mod=score_mod, block_mask=block_mask
+    )
 
 
 def pair_biased_attention(
@@ -89,9 +93,9 @@ def pair_biased_attention(
     """
     if resolve_attention_backend(q, backend) == "dense":
         scale = q.shape[-1] ** -0.5
-        logits = torch.matmul(q, k.transpose(-1, -2)).float() * scale + bias.float()
+        logits = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale + bias.float()
         if key_mask is not None:
-            logits = logits.masked_fill(~key_mask[:, None, None, :], float("-inf"))
+            logits = logits.masked_fill(~key_mask[:, None, None, :], torch.finfo(logits.dtype).min)
         attn = torch.softmax(logits, dim=-1)
         if key_mask is not None:  # all -inf rows softmax to NaN: define them as zero
             any_valid = key_mask.any(dim=-1)[:, None, None, None]

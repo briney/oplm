@@ -315,6 +315,8 @@ outputs/medium-uniref50/
     ├── trainer_state.json     # global_step, epoch, samples_seen, tokens_seen
     ├── config.yaml            # the full resolved run config (re-loadable)
     ├── hf/                    # HuggingFace export: config.json + model.safetensors + tokenizer
+    ├── ema.pt                 # EMA tracker (averaged tensors + count); when `train.ema_decay` is set
+    ├── hf_ema/                # HuggingFace export of the EMA weights; when `train.ema_decay` is set
     └── <accelerate state>     # model, optimizer(s), scheduler(s), RNG — for resuming
 ```
 
@@ -385,8 +387,9 @@ step, training loss, and the most recent eval loss.
 **Weights & Biases** — enabled by default (`train.wandb_enabled`). At startup the
 full flattened config is logged under `model/*`, `train/*`, `data/*`. Every
 `train.log_every` optimizer steps the trainer logs `train/loss`, `train/lr`,
-`train/epoch`, `train/samples`, `train/tokens`, and `train/flops` (a cumulative
-estimate); eval passes add `eval/<dataset>/<metric>`. Set `train.wandb_project`
+`train/epoch`, `train/samples`, `train/tokens`, and, when the task provides a FLOP
+estimate ([§17](#17-training-tasks-traintask)), `train/flops` (a cumulative estimate);
+eval passes add `eval/<dataset>/<metric>`. Set `train.wandb_project`
 and `train.wandb_run_name` (or `--name`) to organize runs. Disable W&B entirely
 with `train.wandb_enabled=false`.
 
@@ -579,7 +582,7 @@ latency. Eval and checkpoint steps are also excluded from wall-time accounting.
 |--------|:-------------:|-------|
 | `train/tokens_per_sec` | yes | Tokens processed per second (headline metric). |
 | `train/step_time_s` | yes | Average optimizer-step wall time (seconds). |
-| `train/achieved_tflops` | yes | Estimated TFLOPs/s based on `estimate_flops_per_token`. Note: omits attention-score FLOPs; use `tokens_per_sec` for throughput comparison. |
+| `train/achieved_tflops` | only when the task provides a FLOP estimate ([§17](#17-training-tasks-traintask)) | Estimated TFLOPs/s based on `estimate_flops_per_token`. Note: omits attention-score FLOPs; use `tokens_per_sec` for throughput comparison. |
 | `train/mfu` | only when `peak_tflops` set | `achieved_tflops / peak_tflops`. Set `train.peak_tflops` to your device peak (e.g. `312.0` for an A100 SXM BF16, `989.5` for an H100 SXM BF16). |
 
 ```yaml

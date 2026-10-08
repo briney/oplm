@@ -46,7 +46,11 @@ def _environment(device: torch.device) -> dict[str, Any]:
         cueq_version = None
     try:
         git_rev: str | None = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=Path(__file__).resolve().parent,  # this package's repo, not the caller's cwd
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         git_rev = None

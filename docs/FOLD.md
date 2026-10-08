@@ -32,7 +32,10 @@ The forward is three explicit stages:
    sigmoid gate, pair mask → `left`, `right`, `zn`.
 2. `trimul_contract` (the only cross-row/column op): outgoing
    `out[i,j] = Σ_k left[i,k]·right[j,k]`, incoming `out[i,j] = Σ_k left[k,i]·right[k,j]`,
-   fp32 accumulation, chunked over output rows (`chunk_size`, default 64).
+   fp32 accumulation, chunked over output rows (`chunk_size`, default 64). Chunking
+   bounds forward/no-grad memory only; under autograd the reference saves both fp32
+   operands, which the `bench-kernels` reference-path peak numbers will show. The
+   pair block must be square (`I == J`).
 3. `trimul_post` (pointwise): fp32-internal LayerNorm, `proj_emit`, output gate.
 
 Stages 1 and 3 are block-local by construction (tested on random sub-blocks), which
@@ -63,6 +66,13 @@ block (milestone 1), as upstream.
 `backend="auto"` is FlexAttention (compiled, block masks) on CUDA and the dense
 formulation on CPU; FlexAttention has no CPU backward. Q/K/V dtypes are never
 changed by these functions. Gradient parity (incl. the bias) is a slow GPU test.
+
+**M1 entry criterion.** `_compiled_flex` uses `torch.compile(..., dynamic=False)` and both
+functions rebuild their `BlockMask` per call. Every new `(B, N, dtype)` recompiles, and past
+dynamo's recompile limit flex silently falls back to eager, which materializes the full
+score matrix. Before `AttentionPairBias`/atom attention call these in a training loop, M1
+must bucket shapes (crops are multiples of 128), accept a precomputed `BlockMask`, and raise
+`torch._dynamo.config.recompile_limit` as needed.
 
 ## 4. Training seam and EMA
 

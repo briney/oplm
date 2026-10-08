@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from torch import nn
+from torch.autograd.function import once_differentiable
 from torch.nn import functional as F
 
 if TYPE_CHECKING:
@@ -64,7 +65,7 @@ _FUSED_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 try:
     _cueq_trimul = import_module("cuequivariance_torch").triangle_multiplicative_update
-except ImportError:  # the `fold` extra is optional; CPU/test environments never have it
+except (ImportError, AttributeError):  # optional `fold` extra: absent, or lacking the symbol
     _cueq_trimul = None
 
 
@@ -160,9 +161,8 @@ class _FusedForwardReferenceBackward(torch.autograd.Function):
             return fused_fn(z, direction, mask, *weights, eps=eps)
 
     @staticmethod
-    def backward(  # ty: ignore[invalid-method-override]  # Function.backward is *grad_outputs: Any
-        ctx: Any, grad_out: Tensor
-    ) -> tuple[Tensor | None, ...]:
+    @once_differentiable
+    def backward(ctx: Any, grad_out: Tensor) -> tuple[Tensor | None, ...]:
         z, *weights = ctx.saved_tensors
         needs = ctx.needs_input_grad
         with (
@@ -223,7 +223,8 @@ def trimul_pre(
     """Stage 1 (pointwise): normalize, project, gate, mask.
 
     Args:
-        z: Pair block ``(B, I, J, D)``.
+        z: Pair block ``(B, I, J, D)``; must be square (``I == J``), as the contraction
+            and the output gate broadcast require.
         mask: Pair validity ``(B, I, J)`` (bool or float); ``None`` means all valid.
         norm_in_weight: ``norm_start`` affine weight ``(D,)``.
         norm_in_bias: ``norm_start`` affine bias ``(D,)``.
@@ -250,11 +251,15 @@ def trimul_contract(
 
     ``outgoing``: ``out[b,i,j] = sum_k left[b,i,k] * right[b,j,k]``;
     ``incoming``: ``out[b,i,j] = sum_k left[b,k,i] * right[b,k,j]``.
-    Output rows are chunked so one fp32 chunk of ``left`` at a time is live next to
-    the fp32 copy of ``right``. The result is fp32.
+    The operands ``(B, I, J, D)`` must come from a square pair block (``I == J``).
+    Output rows are chunked, which bounds the memory of the forward under ``no_grad``
+    (one fp32 chunk of ``left`` next to the fp32 copy of ``right``). Under autograd each
+    chunk's ``.float()`` copy is saved for backward, so peak memory is the full fp32
+    ``left`` plus fp32 ``right`` plus einsum's permute copies. The result is fp32.
     """
-    # ponytail: keeps one full fp32 copy of `right` (4 GiB at L=2048, D=256); the fused
-    # cuEquivariance path is the production kernel, this is the oracle/fallback.
+    # ponytail: chunking only bounds the no-grad forward; with grad this holds full fp32
+    # `left` and `right` (4 GiB each at L=2048, D=256) plus einsum permute copies. The
+    # fused cuEquivariance path is the production kernel, this is the oracle/fallback.
     equation = _EINSUM[direction]
     right32 = right.float()
     n = left.shape[1]
@@ -317,7 +322,9 @@ class TriangleMultiplication(nn.Module):
     """One triangle multiplicative update, returning the delta.
 
     The residual add and row-shared dropout live in the pair-update block that
-    owns this module (milestone 1), exactly as upstream's ``PairUpdateBlock``.
+    owns this module (milestone 1), exactly as upstream's ``PairUpdateBlock``. The pair
+    block passed to ``forward`` must be square (``I == J``): the contraction and the
+    output gate broadcast require it.
     """
 
     def __init__(
