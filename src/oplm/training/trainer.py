@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.nn as nn
 
+from oplm.training.ema import EMA_HF_DIRNAME, EMA_SIDECAR_NAME
 from oplm.training.signals import (
     DRAIN_EXIT_CODE,
     DrainSignal,
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 
     from accelerate import Accelerator
     from torch.distributed import ProcessGroup
+    from torch.optim.swa_utils import AveragedModel
     from torch.utils.data import DataLoader
 
     from oplm.config import OplmConfig
@@ -720,6 +722,17 @@ class Trainer:
         self.schedulers = list(prepared[1 + num_optimizers :])
         self.scheduler = self.schedulers[0]
 
+        # Unwrapped live model (no DDP/compile wrapper): the EMA source and hf/ export
+        # target. keep_torch_compile=False for the reason given in checkpoint.save_checkpoint.
+        self._unwrapped_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        # EMA (train.ema_decay). Built after prepare/compile so the copy sits on the
+        # right device, and before the resume below so a checkpoint's ema.pt lands in it.
+        self._ema: AveragedModel | None = None
+        if cfg.train.ema_decay is not None:
+            from oplm.training.ema import build_ema
+
+            self._ema = build_ema(self._unwrapped_model, cfg.train.ema_decay)
+
         # Training state
         self.global_step = 0
         self.epoch = 0
@@ -909,6 +922,11 @@ class Trainer:
                 for scheduler in self.schedulers:
                     scheduler.step()
                 self.global_step += 1
+                # EMA: once per real optimizer step (never on accumulation micro-steps --
+                # we are past the sync_gradients gate -- and never on a step the fp16
+                # scaler skipped).
+                if self._ema is not None and not self.accelerator.optimizer_step_was_skipped:
+                    self._ema.update_parameters(self._unwrapped_model)
                 current_loss = step_loss_sum / cfg.gradient_accumulation_steps
                 step_loss_sum = 0.0
                 self._window_loss_sum += current_loss
@@ -1497,6 +1515,7 @@ class Trainer:
             cursor=cursor,
             blocking=blocking,
             process_group=self._checkpoint_process_group,
+            ema=self._ema,
         )
         self._last_save_at = time.monotonic()
 
@@ -1612,6 +1631,13 @@ class Trainer:
         }
         if self._wandb_run_id is not None:
             extra_state["wandb_run_id"] = self._wandb_run_id
+        if self._ema is not None:
+            extra_state["ema"] = {
+                "decay": self.cfg.train.ema_decay,
+                "sidecar": EMA_SIDECAR_NAME,
+                "hf_dir": EMA_HF_DIRNAME,
+                "n_averaged": int(self._ema.n_averaged),
+            }
         return extra_state
 
     def _resume_from_checkpoint(self, checkpoint_dir: str) -> None:
@@ -1629,6 +1655,7 @@ class Trainer:
             self.schedulers,
             checkpoint_dir,
             self.cfg,
+            ema=self._ema,
         )
         self.global_step = state["global_step"]
         self.epoch = state["epoch"]
@@ -1691,6 +1718,7 @@ class Trainer:
             str(checkpoint_dir),
             self.cfg,
             validate_schedule=False,
+            ema=self._ema,
         )
         for opt, sched, hparams in zip(self.optimizers, self.schedulers, live_hparams, strict=True):
             inner, scheduler = _unwrap_optimizer(opt), _unwrap_scheduler(sched)

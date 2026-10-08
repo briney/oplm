@@ -85,6 +85,9 @@ def main(remote_uri: str, checkpoint_dir_str: str, out_dir: str) -> None:
     if rank == 0:
         (checkpoint_dir / "trainer_state.json").write_text("{}")
         (checkpoint_dir / "config.yaml").write_text("cfg")
+        (checkpoint_dir / "ema.pt").write_text("ema")
+        (checkpoint_dir / "hf_ema").mkdir()
+        (checkpoint_dir / "hf_ema" / "model.safetensors").write_text("averaged")
 
     dist.barrier()  # every rank's files must exist before either partitions/uploads
 
@@ -96,6 +99,7 @@ def main(remote_uri: str, checkpoint_dir_str: str, out_dir: str) -> None:
         save_total_limit=3,
         keep_every_n_steps=None,
     )
+    assert (job.shared_files is not None) == (rank == 0)  # shared artifacts: global leader only
     manager.submit(job)
     manager.drain(timeout=30.0)
 

@@ -610,6 +610,7 @@ no-progress guard), see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget
 | `resume_data_position` | `true` | **Data-exact resume (Phase 3 — live).** When a checkpoint carries a data cursor and this is `true` (the default), a resume replays the exact row-level position the run was at when the checkpoint was taken — no row re-seen or skipped, same order as an uninterrupted run — instead of restarting the epoch's data stream from row 0. The cursor's layout (`world_size`, `num_workers`, per-rank batch size, seed) is validated against the live run; a mismatch raises, naming the escape hatch. Set `false` to opt back into the pre-Phase-3 behavior (restart the current epoch from row 0) — the escape hatch for resuming into a different world size/worker count, or a pre-Task-3.3 checkpoint with no cursor at all. See "What a resume restores" below. |
 | `dist_timeout_minutes` | `15` | Timeout passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. A genuine hang raises within this window instead of wedging until the Slurm time limit; a no-op on a single process. |
 | `remote_checkpoint_uri` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background (Task 4.2) — durability beyond local/shared storage. `null` (default) disables it entirely: zero behavior change, no import of `oplm.training.remote`, no fsspec call. See "Remote checkpoint mirror" below. |
+| `ema_decay` | `null` | EMA of the trainable weights (fold stages use `0.999`). One update per optimizer step. Each checkpoint adds `ema.pt` + `hf_ema/`; resume restores the tracker; a pre-EMA checkpoint resumed with this set logs a warning and restarts the average from the live weights. `ddp` only. |
 | `parallelism` | `ddp` | `ddp` (one full replica per rank, gradients all-reduced) or `hsdp` (FSDP2 `fully_shard` over a 2-D mesh: shard within a node, replicate across nodes). Checkpoints are parallelism-agnostic, so the same checkpoint resumes under either setting at any world size. `hsdp` requires world size > 1 and currently refuses three combinations, each of which would otherwise hang or silently diverge: **configured `data.eval`** (in-loop eval all-gathers on rank-striped forward counts and deadlocks — evaluate an HSDP run's checkpoints with a separate `ddp` job), `mixed_precision=fp16` (the GradScaler's inf-check is not shard-aware), and `stability_diagnostics` with `stability_probe_every > 0` (the probe's main-process-only forward all-gathers). See `oplm.training.parallel` for the full limitation list; deeper HSDP docs land with Task 5.3. |
 
 `save_every`, `save_total_limit`, and `resume_from` are the pre-existing checkpointing knobs —
@@ -627,7 +628,7 @@ one is still uploading is queued (at most one slot — a further commit before i
 queued one, since the newer checkpoint always supersedes an older, not-yet-started upload). On
 multi-node runs, each node's `local_process_index == 0` process uploads only the DCP shard files
 its own node's ranks wrote; the global main process additionally uploads the shared artifacts
-(`.metadata`, `trainer_state.json`, `config.yaml`, `hf/`) — all of this over a dedicated GLOO
+(`.metadata`, `trainer_state.json`, `config.yaml`, `ema.pt` and `hf_ema/` when EMA is on, `hf/`) — all of this over a dedicated GLOO
 process group, never the trainer's own (typically NCCL) default group.
 
 Finalizing the remote manifest is not a bare barrier: every node leader that just finished its
@@ -716,6 +717,7 @@ model/optimizer state) plus per-rank sidecars (RNG, and the fp16 `GradScaler` wh
 - model weights,
 - **all** optimizer state — including Muon's, not just AdamW's,
 - LR scheduler state,
+- the EMA tracker (`ema.pt`: averaged tensors and update count) when `train.ema_decay` is set,
 - RNG state (Python, NumPy, CPU and CUDA generators), and
 - the trainer's own step counters (`global_step`, `epoch`, `samples_seen`, `tokens_seen`, plus the
   `keep_every_n_hours` bookkeeping and the persisted W&B run id — see below).

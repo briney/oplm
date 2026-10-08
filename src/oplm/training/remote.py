@@ -22,7 +22,7 @@ integration stays thin (per-checkpoint calls, no threading/collective details):
   into the files *this node's* ranks wrote (DCP shard files are named
   ``__<rank>_<n>.distcp``; each rank also has its own ``rng_state_<rank>.pt``) plus,
   on global rank 0 only, the shared artifacts (``.metadata``, ``trainer_state.json``,
-  ``config.yaml``, ``scaler.pt``, ``KEEP``, ``hf/``).
+  ``config.yaml``, ``scaler.pt``, ``ema.pt``, ``KEEP``, ``hf/``, ``hf_ema/``).
 - :class:`UploadManager` -- serializes uploads to a single background daemon
   thread (one in flight; a new commit while uploading replaces at most one queued
   job, dropping the superseded one), cross-checks every node leader's job identity
@@ -67,7 +67,14 @@ _RNG_SIDECAR_PREFIX = "rng_state_"
 # shard files (see build_upload_job). "KEEP" is included so a downloaded checkpoint
 # that was locally marked permanent (checkpoint.mark_permanent) stays exempt from
 # local rotation after a remote-recovered resume, too.
-_SHARED_ARTIFACT_NAMES = (".metadata", "trainer_state.json", "config.yaml", "scaler.pt", "KEEP")
+_SHARED_ARTIFACT_NAMES = (
+    ".metadata",
+    "trainer_state.json",
+    "config.yaml",
+    "scaler.pt",
+    "ema.pt",
+    "KEEP",
+)
 
 
 def _is_permanent(manifest: dict[str, Any], step: int, keep_every_n_steps: int | None) -> bool:
@@ -423,7 +430,8 @@ class UploadJob:
             shard files + RNG sidecars). Every node's leader uploads this list.
         shared_files: Paths relative to ``local_dir`` for the artifacts written once,
             by the main process, regardless of which node it lives on (``.metadata``,
-            ``trainer_state.json``, ``config.yaml``, ``scaler.pt``, ``KEEP``, ``hf/``).
+            ``trainer_state.json``, ``config.yaml``, ``scaler.pt``, ``ema.pt``, ``KEEP``,
+            ``hf/``, ``hf_ema/``).
             ``None`` on every rank except the global leader, which alone uploads them.
         permanent: Whether this checkpoint is exempt from ``save_total_limit``
             rotation (mirrors the local ``keep_every_n_steps``/``keep_every_n_hours``
@@ -487,8 +495,9 @@ def build_upload_job(
 
     The global leader (``accelerator.is_main_process``) additionally collects the
     shared, once-only artifacts: ``.metadata``, ``trainer_state.json``,
-    ``config.yaml``, ``scaler.pt``, ``KEEP`` (whichever of these exist -- ``scaler.pt``
-    and ``KEEP`` are conditional even locally), and every file under ``hf/``.
+    ``config.yaml``, ``scaler.pt``, ``ema.pt``, ``KEEP`` (whichever of these exist --
+    ``scaler.pt``, ``ema.pt`` and ``KEEP`` are conditional even locally), and every file
+    under ``hf/`` and ``hf_ema/``.
 
     Args:
         checkpoint_dir: The committed local checkpoint directory.
@@ -535,11 +544,14 @@ def build_upload_job(
             candidate = checkpoint_dir / name
             if candidate.is_file():
                 shared_files.append(Path(name))
-        hf_dir = checkpoint_dir / "hf"
-        if hf_dir.is_dir():
-            shared_files.extend(
-                sorted(p.relative_to(checkpoint_dir) for p in hf_dir.rglob("*") if p.is_file())
-            )
+        for export_name in ("hf", "hf_ema"):
+            export_dir = checkpoint_dir / export_name
+            if export_dir.is_dir():
+                shared_files.extend(
+                    sorted(
+                        p.relative_to(checkpoint_dir) for p in export_dir.rglob("*") if p.is_file()
+                    )
+                )
 
     return UploadJob(
         local_dir=checkpoint_dir,
