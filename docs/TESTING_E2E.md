@@ -16,6 +16,7 @@ Tests mirror the source layout under `tests/`:
 | `tests/training/` | The real `Trainer`: logging, checkpoint rotation/resume, gradient accumulation, epochs, mixed precision, `torch.compile`, optimizers/schedulers, grad clipping, eval scheduling, W&B. |
 | `tests/eval/` | Eval harness: scheduling cadences, sequence/structure tasks, the registry, token accounting, the categorical Jacobian, trainer integration. |
 | `tests/data/` | Data pipeline: dataloaders, collation, MLM masking, determinism, weighted-masking invariants, import hygiene. |
+| `tests/fold/` | Structure-head kernels: triangle-multiplication reference vs the upstream equation, dispatch and the mixed fused/reference path, attention primitives, `bench-kernels`. GPU parity tests are `slow` and skip without CUDA (+ cuEquivariance). |
 | `tests/` (root) | Cross-module: CLI, training entrypoint, train→serve lifecycle. |
 | `tests/fixtures/` | Real data: `training/test_sequences.parquet` (real protein sequences) and `eval/structures/` (PDB fixtures). |
 
