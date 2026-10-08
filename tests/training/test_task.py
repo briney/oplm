@@ -19,9 +19,10 @@ if TYPE_CHECKING:
     from torch import nn
 
 
-def test_step_result_rejects_reserved_metric_keys() -> None:
+@pytest.mark.parametrize("key", ["loss", "mfu", "tokens_per_sec", "grad_norm"])
+def test_step_result_rejects_reserved_metric_keys(key: str) -> None:
     with pytest.raises(ValueError, match="reserved"):
-        StepResult(loss=torch.tensor(0.0), tokens=1, samples=1, metrics={"loss": 1.0})
+        StepResult(loss=torch.tensor(0.0), tokens=1, samples=1, metrics={key: 1.0})
 
 
 def test_mlm_task_step_matches_direct_model_call(tmp_path: Path, training_parquet: Path) -> None:
@@ -64,13 +65,25 @@ def test_custom_task_metrics_and_flop_policy_flow_through_trainer(
 ) -> None:
     from oplm.training.trainer import Trainer
 
-    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=4, log_every=2, batch_size=4)
+    # Zero warmup and a peak so the throughput window fires and, given a FLOP estimate,
+    # would emit achieved_tflops and mfu: their absence below is then the task's doing.
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=4,
+        log_every=2,
+        batch_size=4,
+        throughput_warmup_steps=0,
+        peak_tflops=1.0,
+    )
     callback = FullRecordingCallback()
     Trainer(cfg, callbacks=[callback], task=_AuxMetricTask()).train()
 
     assert callback.train_log_steps == [2, 4]
     for _step, metrics in callback.train_logs:
         assert math.isfinite(metrics["train/aux"])
+        assert "train/tokens_per_sec" in metrics
+        assert "train/step_time_s" in metrics
         assert "train/flops" not in metrics
         assert "train/achieved_tflops" not in metrics
         assert "train/mfu" not in metrics

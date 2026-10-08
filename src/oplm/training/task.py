@@ -25,7 +25,25 @@ __all__ = ["MLMTask", "StepResult", "TrainTask"]
 
 # Metric keys the Trainer itself emits under ``train/``; a task may not reuse them.
 _RESERVED_METRIC_KEYS = frozenset(
-    {"loss", "loss_mean", "lr", "epoch", "samples", "tokens", "flops", "global_step"}
+    {
+        "loss",
+        "loss_mean",
+        "lr",
+        "lr_adamw",
+        "epoch",
+        "samples",
+        "tokens",
+        "flops",
+        "global_step",
+        "grad_norm",
+        "grad_norm_max",
+        "clip_frac",
+        "mean_seq_len",
+        "tokens_per_sec",
+        "step_time_s",
+        "achieved_tflops",
+        "mfu",
+    }
 )
 
 
