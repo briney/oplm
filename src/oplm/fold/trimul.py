@@ -20,6 +20,7 @@ straight pass-through: ``p_in_weight = proj_bundle.weight[:2D]``,
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -62,9 +63,7 @@ _VALID_BACKENDS: tuple[str, ...] = (
 _FUSED_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 try:
-    from cuequivariance_torch import (  # ty: ignore[unresolved-import]  # optional `fold` extra
-        triangle_multiplicative_update as _cueq_trimul,
-    )
+    _cueq_trimul = import_module("cuequivariance_torch").triangle_multiplicative_update
 except ImportError:  # the `fold` extra is optional; CPU/test environments never have it
     _cueq_trimul = None
 
@@ -135,7 +134,9 @@ class _FusedForwardReferenceBackward(torch.autograd.Function):
     staged reference graph under ``enable_grad`` and backpropagates through it, so
     reference activations exist only inside the backward call. Composes with
     ``torch.utils.checkpoint``: the outer checkpoint re-runs the cheap fused forward,
-    then this backward runs the reference exactly once.
+    then this backward runs the reference exactly once. Autograd runs ``backward`` outside
+    the forward's autocast context, so the forward's autocast state is recorded and
+    replayed around the recompute (same as ``torch.utils.checkpoint``).
     """
 
     @staticmethod
@@ -151,6 +152,9 @@ class _FusedForwardReferenceBackward(torch.autograd.Function):
     ) -> Tensor:
         ctx.direction, ctx.eps, ctx.chunk_size = direction, eps, chunk_size
         ctx.mask = mask  # not differentiated; may be None
+        ctx.device_type = z.device.type
+        ctx.autocast_enabled = torch.is_autocast_enabled(ctx.device_type)
+        ctx.autocast_dtype = torch.get_autocast_dtype(ctx.device_type)
         ctx.save_for_backward(z, *weights)
         with torch.no_grad():
             return fused_fn(z, direction, mask, *weights, eps=eps)
@@ -161,7 +165,12 @@ class _FusedForwardReferenceBackward(torch.autograd.Function):
     ) -> tuple[Tensor | None, ...]:
         z, *weights = ctx.saved_tensors
         needs = ctx.needs_input_grad
-        with torch.enable_grad():
+        with (
+            torch.enable_grad(),
+            torch.autocast(
+                device_type=ctx.device_type, dtype=ctx.autocast_dtype, enabled=ctx.autocast_enabled
+            ),
+        ):
             z_live = z.detach().requires_grad_(needs[0])
             weights_live = [
                 w.detach().requires_grad_(need) for w, need in zip(weights, needs[6:], strict=True)

@@ -273,6 +273,41 @@ def test_module_backend_knob_validates() -> None:
     assert TriangleMultiplication(32, "outgoing", backend="reference").backend == "reference"
 
 
+def test_mixed_path_replays_autocast_in_backward() -> None:
+    """bf16 pair tensor, fp32 params, autocast on: the recompute must replay the autocast state."""
+    m = _module("outgoing")
+    z, mask = _inputs(n=6)
+    z16 = z.bfloat16().requires_grad_(True)
+
+    def fake_fused(
+        z_: torch.Tensor,
+        direction_: str,
+        mask_: torch.Tensor | None,
+        *weights: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        return trimul_reference(z_, direction_, mask_, *weights, eps=eps, chunk_size=None)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = trimul_mixed(
+            z16, "outgoing", mask, *m.kernel_weights(), eps=m.eps, chunk_size=2, fused_fn=fake_fused
+        )
+        loss = out.float().square().sum()
+    loss.backward()  # outside the autocast block, as in a training step
+    mixed = _grads(m, z16)
+
+    z16_ref = z.bfloat16().requires_grad_(True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        ref_loss = m(z16_ref, mask).float().square().sum()
+    ref_loss.backward()
+    reference = _grads(m, z16_ref)
+    assert mixed.keys() == reference.keys()
+    for name in reference:
+        # bf16 accumulation-order noise: measured worst error is 6e-3 of each tensor's max.
+        atol = 2e-2 * reference[name].abs().max().item()
+        torch.testing.assert_close(mixed[name], reference[name], rtol=2e-2, atol=atol)
+
+
 # --- GPU parity (slow; skipped without CUDA + cuEquivariance) ---------------------------
 
 _requires_cueq = pytest.mark.skipif(
@@ -280,7 +315,9 @@ _requires_cueq = pytest.mark.skipif(
     reason="needs CUDA and the `fold` extra (cuequivariance-torch)",
 )
 # Tolerance policy (spec §9): the fused bf16 error against the fp32 reference may be at
-# most 4x the bf16 *reference* error against the same fp32 oracle, plus a small floor.
+# most 4x the bf16 *reference* error against the same fp32 oracle, plus a small floor. The
+# floor is relative to the fp32 reference's max magnitude for that tensor (not absolute):
+# mean-reduced losses make gradients tiny, and an absolute floor would pass zero gradients.
 _ERR_MULT = 4.0
 _ERR_FLOOR = 1e-2
 
@@ -315,9 +352,13 @@ def test_fused_paths_match_fp32_reference_within_bf16_tolerance(
     assert resolve_trimul_path(z32.bfloat16(), needs_grad=True, backend=backend) != "reference"
     fused_out, fused = run(backend)
 
+    floor = _ERR_FLOOR * expected_out.abs().max().item()
     baseline = (ref_bf16_out - expected_out).abs().max().item()
-    assert (fused_out - expected_out).abs().max().item() <= _ERR_MULT * baseline + _ERR_FLOOR
+    assert (fused_out - expected_out).abs().max().item() <= _ERR_MULT * baseline + floor
     for name in expected:
+        assert expected[name].abs().max() > 0, name
+        assert fused[name].abs().max() > 0, name
+        floor = _ERR_FLOOR * expected[name].abs().max().item()
         baseline = (ref_bf16[name] - expected[name]).abs().max().item()
         err = (fused[name] - expected[name]).abs().max().item()
-        assert err <= _ERR_MULT * baseline + _ERR_FLOOR, (name, err, baseline)
+        assert err <= _ERR_MULT * baseline + floor, (name, err, baseline)
