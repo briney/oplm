@@ -13,6 +13,9 @@
 #   OPLM_CONTAINER=/mnt/data/containers/deeplearning_v2026-05-26.sqsh
 #   OPLM_RESULTS=/mnt/home/<you>/fold-m0-b200/<jobid>   where reports and logs land
 #   OPLM_CUEQ_OPS=cuequivariance-ops-torch-cu13  swap for -cu12 if the container's torch is CUDA 12
+#   OPLM_STEPS="install env-torch mlm-regression"  run only these steps (default: all six, in
+#                                                 order: install env-torch gpu-tests bench
+#                                                 bench-compiled mlm-regression)
 # If the B200 nodes live on another partition: sbatch --partition=<name> docs/fold/b200-task7.sbatch
 #
 #SBATCH --job-name=fold-m0-b200
@@ -34,8 +37,9 @@ RESULTS="${OPLM_RESULTS:-/mnt/home/${SLURM_JOB_USER}/fold-m0-b200/${SLURM_JOB_ID
 GIT_REF="${OPLM_GIT_REF:-feat/fold-m0}"
 REPO="${OPLM_REPO:-}"
 CUEQ_OPS="${OPLM_CUEQ_OPS:-cuequivariance-ops-torch-cu13}"
+STEPS="${OPLM_STEPS:-install env-torch gpu-tests bench bench-compiled mlm-regression}"
 # The in-container script reads these; srun --export=ALL only forwards exported variables.
-export RESULTS GIT_REF REPO CUEQ_OPS
+export RESULTS GIT_REF REPO CUEQ_OPS STEPS
 
 # Creates JOB_WORK_DIR (node-local /tmp) and exports object-storage / W&B credentials.
 source "$ENV_FILE"
@@ -52,6 +56,10 @@ set -uo pipefail
 log() { echo "=== $(date -Is) $*"; }
 run() {  # run <name> <command...>: never abort the job on one failing step; record its status.
   local name=$1; shift
+  case " $STEPS " in
+    *" $name "*) ;;
+    *) log "step $name skipped (OPLM_STEPS)"; echo "$name skipped" >> "$RESULTS/status.txt"; return 0 ;;
+  esac
   log "step $name: $*"
   "$@" > "$RESULTS/$name.log" 2>&1
   local status=$?
