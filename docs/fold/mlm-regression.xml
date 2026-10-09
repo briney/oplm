@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="8" time="7.452" timestamp="2026-10-09T07:43:17.893674+00:00" hostname="slurm-b200-193-055"><testcase classname="tests.training.test_e2e_logging" name="test_logging_cadence_and_metric_contract[cpu-no]" time="2.346" /><testcase classname="tests.training.test_e2e_logging" name="test_logging_cadence_and_metric_contract[cuda-no]" time="0.490" /><testcase classname="tests.training.test_e2e_logging" name="test_logging_cadence_and_metric_contract[cuda-bf16]" time="0.958" /><testcase classname="tests.training.test_e2e_precision" name="test_mixed_precision_run_learns_and_checkpoints[bf16]" time="1.059" /><testcase classname="tests.training.test_e2e_precision" name="test_mixed_precision_run_learns_and_checkpoints[fp16]" time="1.690" /><testcase classname="tests.training.test_e2e_ema" name="test_ema_sidecar_and_hf_ema_round_trip" time="0.189" /><testcase classname="tests.training.test_e2e_ema" name="test_ema_counts_optimizer_steps_and_survives_resume" time="0.263"><failure message="RuntimeError: Expected all tensors to be on the same device, but got other is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA__equal)">tmp_path = PosixPath('/tmp/pytest-of-briney/pytest-0/test_ema_counts_optimizer_step0')
+training_parquet = PosixPath('/tmp/pytest-of-briney/pytest-0/fixtures0/test_sequences_fast.parquet')
+
+    def test_ema_counts_optimizer_steps_and_survives_resume(
+        tmp_path: Path, training_parquet: Path
+    ) -&gt; None:
+        from oplm.training.trainer import Trainer
+
+        common = dict(
+            batch_size=4, gradient_accumulation_steps=2, log_every=1, warmup_steps=0, ema_decay=0.5
+        )
+        cfg1 = tiny_train_cfg(tmp_path, training_parquet, max_steps=4, save_every=4, **common)
+        first = Trainer(cfg1)
+        first.train()
+        assert first._ema is not None
+        assert int(first._ema.n_averaged) == 4  # optimizer steps, not the 8 micro-batches
+
+        ckpt = tmp_path / "checkpoint-4"
+        state = json.loads((ckpt / "trainer_state.json").read_text())
+        assert state["ema"] == {"decay": 0.5, "sidecar": "ema.pt", "hf_dir": "hf_ema", "n_averaged": 4}
+        assert (ckpt / "ema.pt").is_file()
+        assert (ckpt / "hf_ema" / "model.safetensors").is_file()
+        saved = torch.load(ckpt / "ema.pt", map_location="cpu", weights_only=True)
+
+        cfg2 = tiny_train_cfg(
+            tmp_path, training_parquet, max_steps=8, save_every=8, resume_from=str(ckpt), **common
+        )
+        resumed = Trainer(cfg2)
+        assert resumed._ema is not None
+        assert int(resumed._ema.n_averaged) == 4  # restored, not restarted
+        for name, tensor in resumed._ema.state_dict().items():
+&gt;           assert torch.equal(tensor, saved[name]), name
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           RuntimeError: Expected all tensors to be on the same device, but got other is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA__equal)
+
+tests/training/test_e2e_ema.py:136: RuntimeError</failure></testcase><testcase classname="tests.training.test_e2e_ema" name="test_resume_into_ema_from_checkpoint_without_ema_warns" time="0.282" /></testsuite></testsuites>

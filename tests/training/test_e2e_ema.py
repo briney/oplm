@@ -133,7 +133,9 @@ def test_ema_counts_optimizer_steps_and_survives_resume(
     assert resumed._ema is not None
     assert int(resumed._ema.n_averaged) == 4  # restored, not restarted
     for name, tensor in resumed._ema.state_dict().items():
-        assert torch.equal(tensor, saved[name]), name
+        # The tracker lives on the training device (cuda:0 on a GPU box); the sidecar
+        # was loaded to CPU above, and torch.equal refuses mixed devices.
+        assert torch.equal(tensor.detach().cpu(), saved[name]), name
 
     resumed.train()
     assert int(resumed._ema.n_averaged) == 8 == resumed.global_step

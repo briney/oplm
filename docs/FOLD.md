@@ -121,6 +121,22 @@ and [`docs/fold/bench-kernels-b200-compiled-reference.json`](fold/bench-kernels-
 paths, including the library's own backward (`fused_autograd`) at width 256, so
 the width-aware fallback the plan held in reserve is not needed.
 
+**Parity and regression tests** ([`docs/fold/status.txt`](fold/status.txt)):
+
+- `tests/fold -m slow`: 28 passed ([`gpu-tests.log`](fold/gpu-tests.log),
+  [`fold-gpu-tests.xml`](fold/fold-gpu-tests.xml)): both fused trimul paths
+  against the fp32 reference at widths 128 and 256, lengths 128/512/1024, both
+  directions (24 cases), and compiled FlexAttention against the dense oracle for
+  pair-biased and sliding-window attention in fp32 and bf16 at 256 and 512 tokens,
+  including gradients into Q, K, V, and the pair bias (4 cases).
+- `tests/training/test_e2e_logging.py`, `test_e2e_precision.py`, `test_e2e_ema.py`
+  on cuda-bf16: 7 passed, 1 failed ([`mlm-regression.log`](fold/mlm-regression.log)).
+  The failure was in the test, not the trainer: `test_ema_counts_optimizer_steps_and_survives_resume`
+  compared the resumed EMA tensors (on `cuda:0`) with a sidecar loaded to CPU, and
+  `torch.equal` refuses mixed devices. The restore had already passed its
+  `n_averaged == 4` check; the comparison now moves the tensor to CPU first. The
+  file should be re-run on the GPU to confirm the assertions after that line.
+
 Outgoing direction (incoming is within 5% everywhere); ms per iteration, peak
 *allocated* GiB during forward+backward (peak *reserved* in the JSON is cumulative
 across cases and is not a per-case number):
