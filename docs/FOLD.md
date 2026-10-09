@@ -50,9 +50,11 @@ Dispatch (`resolve_trimul_path`) is explicit, per call, from device/dtype/width/
 | `fused_forward_reference_backward` | `backend="fused_forward_reference_backward"` | fused forward saved as a single recomputation boundary; the reference graph is rebuilt inside `backward` and freed after it |
 
 `TriangleMultiplication.backend` is the knob; `"auto"` trusts the library's
-autograd. Choose per width from the benchmark below and record the choice in the
-stage config. Residual add and row-shared dropout belong to the owning pair
-block (milestone 1), as upstream.
+autograd, and the B200 run in §6 confirmed that trust for both widths with
+cuEquivariance 0.12: `auto` is the setting for widths 128 and 256, and the mixed
+path stays as the measured fallback (same forward, reference-cost backward).
+Record the choice in each stage config. Residual add and row-shared dropout
+belong to the owning pair block (milestone 1), as upstream.
 
 ## 3. Attention primitives (`oplm.fold.attention`)
 
@@ -106,4 +108,65 @@ are recorded in §6 once measured.
 
 ## 6. Measured results
 
-_Pending: filled by the milestone-0 acceptance run (plan Task 7)._
+Milestone-0 acceptance run on one NVIDIA B200 (`slurm-b200-193-055`, 2026-10-09,
+branch at `918a094`, via [`docs/fold/b200-task7.sbatch`](fold/b200-task7.sbatch)):
+torch 2.11.0+cu130, CUDA 13.0, cuequivariance / cuequivariance-torch /
+cuequivariance-ops-torch-cu13 0.12.0, triton 3.6.0, transformers 5.3.0,
+accelerate 1.13.0 ([`docs/fold/pip-freeze.txt`](fold/pip-freeze.txt)). Bench
+settings: bf16, 5 timed iterations after 2 warm-ups, reference chunk size 64,
+batch 1. Full reports: [`docs/fold/bench-kernels-b200.json`](fold/bench-kernels-b200.json)
+and [`docs/fold/bench-kernels-b200-compiled-reference.json`](fold/bench-kernels-b200-compiled-reference.json).
+
+**Every case ran** (`status: ok`) at both widths, both directions, and all three
+paths, including the library's own backward (`fused_autograd`) at width 256, so
+the width-aware fallback the plan held in reserve is not needed.
+
+Outgoing direction (incoming is within 5% everywhere); ms per iteration, peak
+*allocated* GiB during forward+backward (peak *reserved* in the JSON is cumulative
+across cases and is not a per-case number):
+
+| Width | Tokens | Path | Forward | Fwd+bwd | Checkpointed | Peak GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| 128 | 1024 | `reference` | 53.4 | 123.1 | 176.5 | 5.6 |
+| 128 | 1024 | `reference` (compiled) | 48.4 | 106.5 | 154.8 | 7.7 |
+| 128 | 1024 | `fused_forward_reference_backward` | 1.1 | 124.2 | 125.3 | 6.1 |
+| 128 | 1024 | `fused_autograd` | 1.1 | 7.7 | 8.7 | 3.0 |
+| 128 | 2048 | `reference` | 424.9 | 944.7 | 1374.7 | 22.1 |
+| 128 | 2048 | `reference` (compiled) | 407.8 | 852.5 | 1259.2 | 63.7 |
+| 128 | 2048 | `fused_forward_reference_backward` | 4.9 | 949.7 | 954.4 | 24.1 |
+| 128 | 2048 | `fused_autograd` | 4.9 | 32.4 | 37.3 | 12.1 |
+| 256 | 1024 | `reference` | 107.2 | 251.2 | 358.1 | 11.1 |
+| 256 | 1024 | `reference` (compiled) | 99.8 | 223.2 | 323.1 | 15.3 |
+| 256 | 1024 | `fused_forward_reference_backward` | 4.4 | 255.5 | 259.8 | 12.1 |
+| 256 | 1024 | `fused_autograd` | 4.2 | 19.6 | 23.9 | 6.0 |
+| 256 | 2048 | `reference` | 864.8 | 1961.1 | 2821.0 | 44.2 |
+| 256 | 2048 | `reference` (compiled) | 842.4 | 1820.6 | 2661.5 | 127.3 |
+| 256 | 2048 | `fused_forward_reference_backward` | 20.5 | 1980.6 | 2000.0 | 48.2 |
+| 256 | 2048 | `fused_autograd` | 20.9 | 75.7 | 99.8 | 24.1 |
+
+Numerical error, max |bf16 path − fp32 reference| at 384 tokens (the bench measures
+it up to 512; outgoing / incoming):
+
+| Width | bf16 `reference` | fused forward (both fused paths) |
+| --- | --- | --- |
+| 128 | 1.60e-2 / 1.55e-2 | 1.03e-2 / 1.00e-2 |
+| 256 | 1.73e-2 / 1.77e-2 | 1.10e-2 / 1.06e-2 |
+
+The fused kernel is closer to the fp32 reference than the bf16 reference is, so
+the parity tolerance in `tests/fold/test_trimul.py` (4× the bf16-reference error
+plus a relative floor) holds with margin.
+
+Decisions recorded from this run:
+
+- **`backend="auto"` for both widths.** Library autograd is 25× faster than the
+  reference for forward+backward at 2048/256 (76 ms vs 1961 ms) at 55% of its
+  allocated peak (24 GiB vs 44 GiB), and 125× faster at 2048/128.
+- **The mixed path is a fallback only.** Its forward matches `fused_autograd`;
+  its backward costs the full reference recompute plus roughly 10% more memory
+  than eager reference.
+- **The compiled reference is not used.** `torch.compile` buys about 10% on time
+  but allocates 1.4–2.9× more than the eager reference (127 GiB vs 44 GiB at
+  2048/256), which is the wrong trade for the memory-bound regime.
+- **Reference cost at 2048 tokens.** 44 GiB allocated and 2.8 s per checkpointed
+  step for one width-256 block: the pure-PyTorch path is an oracle, not a training
+  path, at this length.
