@@ -33,7 +33,7 @@ from oplm.fold.attention import (
     resolve_attention_backend,
     sliding_window_block_mask,
 )
-from oplm.fold.trunk import GatedMLP, Transition, cuda_bf16_autocast
+from oplm.fold.trunk import GatedMLP, Transition, cuda_bf16_autocast, fp32_autocast_off
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -241,11 +241,6 @@ class DenoiserInputs:
     atom_block_mask: BlockMask | None = None
 
 
-def _fp32(device: torch.device) -> torch.autocast:
-    """Context that disables any outer autocast on ``device`` (coordinates stay fp32, spec §5.4)."""
-    return torch.autocast(device_type=device.type, enabled=False)
-
-
 def random_rotations(
     n: int, *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None = None
 ) -> Tensor:
@@ -276,7 +271,7 @@ def center_random_augmentation(
     x: Tensor, atom_mask: Tensor, *, generator: torch.Generator | None = None
 ) -> Tensor:
     """Masked centering, a random rotation per sample, then a ``N(0, I)`` translation (Å)."""
-    with _fp32(x.device):
+    with fp32_autocast_off(x.device):
         mask = atom_mask[..., None].to(x.dtype)
         x = x - (x * mask).sum(dim=1, keepdim=True) / mask.sum(dim=1, keepdim=True).clamp(min=1)
         rot = random_rotations(x.shape[0], device=x.device, dtype=x.dtype, generator=generator)
@@ -287,7 +282,7 @@ def center_random_augmentation(
 
 def weighted_rigid_align(x: Tensor, x_gt: Tensor, weights: Tensor) -> Tensor:
     """Weighted Kabsch in fp32: ``x`` superposed onto ``x_gt`` (upstream)."""
-    with _fp32(x.device):
+    with fp32_autocast_off(x.device):
         w = weights[..., None].float()
         denom = w.sum(dim=1, keepdim=True).clamp(min=1e-8)
         mu = (x.float() * w).sum(dim=1, keepdim=True) / denom
@@ -348,7 +343,7 @@ class StructureHead(nn.Module):
         def rep(t: Tensor) -> Tensor:
             return t.repeat_interleave(num_samples, dim=0)
 
-        with _fp32(s_inputs.device):
+        with fp32_autocast_off(s_inputs.device):
             z = self.conditioning.pair(z_trunk, relpos)
             c = self.atom_encoder.embed(atom_features)
             atom_mask_s, token_mask_s = rep(atom_mask), rep(token_mask)
@@ -371,7 +366,7 @@ class StructureHead(nn.Module):
 
     def denoise(self, x_noisy: Tensor, t_hat: Tensor, inp: DenoiserInputs) -> Tensor:
         """EDM-preconditioned denoiser: ``c_skip · x + c_out · F(c_in · x, c_noise)`` (fp32)."""
-        with _fp32(x_noisy.device):
+        with fp32_autocast_off(x_noisy.device):
             sigma = self.sigma_data
             t = t_hat.float().reshape(-1)
             if t.numel() == 1:
@@ -447,7 +442,7 @@ class StructureHead(nn.Module):
         lam = cfg.noise_scale if noise_scale is None else noise_scale
         eta = cfg.step_scale if step_scale is None else step_scale
         device = inp.z.device
-        with _fp32(device):
+        with fp32_autocast_off(device):
             schedule = self.noise_schedule(steps, device)
             schedule = F.pad(schedule[schedule <= cap], (1, 0), value=cap)
             sigmas = schedule.tolist()

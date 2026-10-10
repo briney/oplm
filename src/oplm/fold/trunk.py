@@ -40,6 +40,7 @@ __all__ = [
     "RowSharedDropout",
     "Transition",
     "cuda_bf16_autocast",
+    "fp32_autocast_off",
     "pair_stack_kwargs",
     "unloaded",
 ]
@@ -50,6 +51,11 @@ def cuda_bf16_autocast(enabled: bool) -> contextlib.AbstractContextManager[Any]:
     if enabled:
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return contextlib.nullcontext()
+
+
+def fp32_autocast_off(device: torch.device) -> contextlib.AbstractContextManager[Any]:
+    """Disable any outer autocast for fp32-only math (coordinates, alignment, logits; spec §5.4)."""
+    return torch.autocast(device_type=device.type, enabled=False)
 
 
 def unloaded(p: Tensor) -> bool:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,6 +12,7 @@ from torch.nn import functional as F
 from oplm.fold.atoms import gather_token_to_atom, intra_token_index
 from oplm.fold.confidence import (
     ConfidenceHead,
+    ConfidenceOutput,
     categorical_mean,
     symmetrized_distogram,
     tm_scores,
@@ -210,3 +212,21 @@ def test_symmetrized_distogram() -> None:
     out = symmetrized_distogram(head, z)
     torch.testing.assert_close(out, head(z + z.transpose(1, 2)))
     torch.testing.assert_close(out, out.transpose(1, 2))
+
+
+def test_outputs_stay_fp32_under_outer_autocast() -> None:
+    """Spec §5.4: logits and scores stay fp32 even when the caller runs under autocast."""
+    cfg = _cfg()
+    torch.manual_seed(0)
+    head = ConfidenceHead(cfg).eval()
+    with torch.no_grad():  # non-zero so a zero-init cannot hide a downcast
+        head.plddt_weight.normal_()
+        head.resolved_weight.normal_()
+    chains = [ChainSpec("MKV", "A"), ChainSpec("GG", "B")]
+    _, _, plain = _run(head, cfg, chains, 2)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        _, _, autocast = _run(head, cfg, chains, 2)
+    for field in fields(ConfidenceOutput):
+        got, want = getattr(autocast, field.name), getattr(plain, field.name)
+        assert got.dtype == torch.float32, field.name
+        torch.testing.assert_close(got, want, atol=1e-6, rtol=0), field.name
