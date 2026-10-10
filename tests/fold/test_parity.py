@@ -7,8 +7,9 @@ tightens them to <= 10x observed.
 
 from __future__ import annotations
 
+import functools
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
@@ -29,7 +30,21 @@ if TYPE_CHECKING:
 
     from torch import Tensor
 
+    from oplm.fold.fixtures import FixtureCase
+
 _CASES = [pytest.param(c, id=c.name) for c in FIXTURE_CASES]
+
+
+@functools.cache
+def _manifest(fixtures_dir: Path) -> dict[str, Any]:
+    return json.loads((fixtures_dir / "manifest.json").read_text())
+
+
+def _case_fixture(fixtures_dir: Path, case: FixtureCase) -> dict[str, Tensor]:
+    """Load ``case``'s recorded tensors; skip it when an ``OPLM_CASES`` subset left it out."""
+    if case.name not in _manifest(fixtures_dir)["cases"]:
+        pytest.skip(f"case {case.name} not in the fixture manifest")
+    return load_fixture(fixtures_dir, case.name)
 
 
 @pytest.fixture(scope="module")
@@ -70,7 +85,7 @@ def test_head_weights_load_strictly_and_config_matches(released: OplmForFolding)
 def test_featurizer_matches_upstream(
     fixtures_dir: Path, conformers: ReferenceConformers, case
 ) -> None:
-    fx = load_fixture(fixtures_dir, case.name)
+    fx = _case_fixture(fixtures_dir, case)
     f = featurize(case.chains, conformers=conformers)
     for ours, theirs in [
         ("token_index", "token_index"),
@@ -99,7 +114,7 @@ def test_featurizer_matches_upstream(
 
 @pytest.mark.parametrize("case", _CASES)
 def test_shim_matches(fixtures_dir: Path, released: OplmForFolding, case) -> None:
-    fx = load_fixture(fixtures_dir, case.name)
+    fx = _case_fixture(fixtures_dir, case)
     with torch.no_grad():
         lm_z = released.language_model(fx["lm_hidden_states"].float())
     _close(lm_z, fx["language_model.out.0"], atol=1e-4, rtol=1e-4, what="lm_z")
@@ -109,7 +124,7 @@ def test_shim_matches(fixtures_dir: Path, released: OplmForFolding, case) -> Non
 def test_inputs_embedder_matches(
     fixtures_dir: Path, released: OplmForFolding, conformers, case
 ) -> None:
-    fx = load_fixture(fixtures_dir, case.name)
+    fx = _case_fixture(fixtures_dir, case)
     f = featurize(case.chains, conformers=conformers)
     with torch.no_grad():
         emb = released.input_embedder(f)
@@ -129,7 +144,7 @@ def test_inputs_embedder_matches(
 def test_recurrence_readout_and_distogram_match(
     fixtures_dir: Path, released: OplmForFolding, conformers, case
 ) -> None:
-    fx = load_fixture(fixtures_dir, case.name)
+    fx = _case_fixture(fixtures_dir, case)
     f = featurize(case.chains, conformers=conformers)
     pair_mask = f.token_mask[:, :, None].float() * f.token_mask[:, None, :].float()
     z_init, lm_z, z0 = (
@@ -151,6 +166,7 @@ def test_recurrence_readout_and_distogram_match(
             num_loops=case.num_loops + 1,
             return_states=True,
         )
+        assert len(states) == case.num_loops + 1
         for i, state in enumerate(states):
             _close(state, fx[f"folding_trunk.out.{i}"], atol=2e-3, rtol=2e-3, what=f"state {i + 1}")
         readout = released.parcae.readout(z, pair_mask)
@@ -168,7 +184,7 @@ def test_recurrence_readout_and_distogram_match(
 
 @pytest.mark.parametrize("case", _CASES)
 def test_denoiser_matches(fixtures_dir: Path, released: OplmForFolding, conformers, case) -> None:
-    fx = load_fixture(fixtures_dir, case.name)
+    fx = _case_fixture(fixtures_dir, case)
     f = featurize(case.chains, conformers=conformers)
     with torch.no_grad():
         emb = released.input_embedder(f)
@@ -193,10 +209,8 @@ def test_denoiser_matches(fixtures_dir: Path, released: OplmForFolding, conforme
 def test_sampler_schedule_matches_recorded_t_hat(
     fixtures_dir: Path, released: OplmForFolding, case
 ) -> None:
-    fx = load_fixture(fixtures_dir, case.name)
-    calls = json.loads((fixtures_dir / "manifest.json").read_text())["cases"][case.name][
-        "denoiser_calls"
-    ]
+    fx = _case_fixture(fixtures_dir, case)
+    calls = _manifest(fixtures_dir)["cases"][case.name]["denoiser_calls"]
     sched = released.structure_head.noise_schedule(case.num_steps, torch.device("cpu"))
     cap = released.config.inference_sigma_cap
     sched = torch.nn.functional.pad(sched[sched <= cap], (1, 0), value=cap).tolist()
@@ -209,7 +223,7 @@ def test_sampler_schedule_matches_recorded_t_hat(
 
 @pytest.mark.parametrize("case", _CASES)
 def test_confidence_matches(fixtures_dir: Path, released: OplmForFolding, conformers, case) -> None:
-    fx = load_fixture(fixtures_dir, case.name)
+    fx = _case_fixture(fixtures_dir, case)
     f = featurize(case.chains, conformers=conformers)
     with torch.no_grad():
         out = released.confidence_head(
@@ -238,10 +252,10 @@ def test_confidence_matches(fixtures_dir: Path, released: OplmForFolding, confor
 @pytest.mark.parametrize("case", _CASES[:1])
 def test_gpu_pipeline_tracks_the_cpu_oracle(fixtures_dir: Path, conformers, case) -> None:
     """bf16 autocast + FlexAttention + fused trimul: finite end to end, pair within bf16 drift."""
+    fx = _case_fixture(fixtures_dir, case)
     cfg = fold_config_from_upstream(json.loads((fixtures_dir / "config.json").read_text()))
     model = OplmForFolding(cfg).eval().cuda()
     model.load_state_dict(load_file(str(fixtures_dir / "head.safetensors")), strict=True)
-    fx = load_fixture(fixtures_dir, case.name)
     f = featurize(case.chains, conformers=conformers, pad_tokens_to=128)
     hs = torch.zeros(1, 128, cfg.lm_num_hidden_states, cfg.lm_hidden_size)
     L = fx["lm_hidden_states"].shape[1]

@@ -83,8 +83,11 @@ git rev-parse HEAD > "$RESULTS/git-rev.txt"
 
 # Pinned upstream environment: esm 3.4.1.post1 needs Python >=3.12 and transformers <5; this
 # repo accepts transformers >=4.45, so one venv serves both (and exercises OPLM under 4.x).
-run venv bash -c "pip install --quiet uv && ([ -x '$ESM_VENV/bin/python' ] || uv venv --python 3.12 '$ESM_VENV')"
-run install bash -c "source '$ESM_VENV/bin/activate' && pip install --quiet 'esm==3.4.1.post1' rdkit && pip install --quiet -e '$REPO[dev]' && pip freeze | grep -i -E '^(esm|torch|transformers|rdkit|safetensors|huggingface)' > '$RESULTS/pip-freeze.txt'"
+# Every install targets the venv's interpreter explicitly (`uv pip --python`): a bare `pip`
+# after `source activate` would fall through to the container Python. `python -m uv` avoids
+# depending on where pip put the uv entry point.
+run venv bash -c "python -m pip install --quiet uv && ([ -x '$ESM_VENV/bin/python' ] || python -m uv venv --seed --python 3.12 '$ESM_VENV')"
+run install bash -c "python -m uv pip install --python '$ESM_VENV/bin/python' --quiet 'esm==3.4.1.post1' rdkit && python -m uv pip install --python '$ESM_VENV/bin/python' --quiet -e '$REPO[dev]' && python -m uv pip freeze --python '$ESM_VENV/bin/python' | grep -i -E '^(esm|torch|transformers|rdkit|safetensors|huggingface)' > '$RESULTS/pip-freeze.txt'"
 run env bash -c "source '$ESM_VENV/bin/activate' && python -c 'import esm, torch, transformers; print(esm.__version__, torch.__version__, transformers.__version__)'"
 run make-fixtures bash -c "source '$ESM_VENV/bin/activate' && oplm fold make-fixtures --out '$FIXTURES' --cases '$CASES'"
 cp "$FIXTURES/manifest.json" "$RESULTS/manifest.json" 2>/dev/null || true

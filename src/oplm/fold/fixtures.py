@@ -235,8 +235,12 @@ class _Recorder:
         self.handles.append(module.register_forward_hook(hook, with_kwargs=kwargs))
 
 
-def _dump_reference_conformers(out: Path, base: ReferenceConformers) -> None:
-    """Our residue/atom tables with positions from upstream's ``get_idealized_atom_pos``."""
+def _dump_reference_conformers(out: Path, base: ReferenceConformers, ccd_source: str) -> None:
+    """Our residue/atom tables with positions from upstream's ``get_idealized_atom_pos``.
+
+    ``ccd_source`` names the ``ccd.pkl`` upstream already loaded (``load_ccd`` caches it
+    process-wide on first use, so the caller must load the pinned file before this runs).
+    """
     from esm.models.esmfold2.conformers import get_idealized_atom_pos  # ty: ignore[unresolved-import]  # esm venv only
 
     residues = {}
@@ -255,8 +259,8 @@ def _dump_reference_conformers(out: Path, base: ReferenceConformers) -> None:
     out.write_text(
         json.dumps(
             {
-                "source": f"esm {version('esm')} get_idealized_atom_pos over ccd.pkl of "
-                f"{UPSTREAM_REPO}@{UPSTREAM_REVISION} (Computed conformer, raw)",
+                "source": f"esm {version('esm')} get_idealized_atom_pos over {ccd_source} "
+                "(Computed conformer, raw)",
                 "charge_table": base.source,
                 "residues": residues,
             },
@@ -277,8 +281,12 @@ def generate_fixtures(
     """Run upstream ESMFold2 on CPU in fp32 for each case and record the parity oracle.
 
     Requires the ``esm`` package (``esm==3.4.1.post1``) and network/cache access to ``repo``.
-    Determinism: ``set_kernel_backend(None)``, ``set_chunk_size(None)``, LM dropout off
-    (``_lm_dropout_context(model, None)``), ``lm_mask_pct=0``, ``torch.manual_seed(seed)``
+    Determinism and precision: ``set_kernel_backend(None)``, ``set_chunk_size(None)``, ESMC in
+    fp32 (``esmc_precision="fp32"``; the bf16 default would round its weights for good),
+    per-loop LM dropout off (``config.lm_encoder.lm_dropout = 0``, ``per_loop_lm_dropout =
+    False``; upstream applies it with ``training=True`` even in eval, and its
+    ``_lm_dropout_context(model, None)`` is a no-op), ``lm_mask_pct=0``, the CCD read from the
+    pinned snapshot's ``ccd.pkl`` (not ``biohub/ESMFold2@main``), and ``torch.manual_seed(seed)``
     before every forward; the initial pair state is captured by wrapping ``_init_pair_state``.
     """
     from esm.models.esmfold2 import (  # ty: ignore[unresolved-import]  # esm venv only
@@ -287,7 +295,6 @@ def generate_fixtures(
         ProteinInput,
         StructurePredictionInput,
     )
-    from esm.models.esmfold2.processor import _lm_dropout_context  # ty: ignore[unresolved-import]  # esm venv only
     from huggingface_hub import snapshot_download
 
     out_dir = Path(out_dir)
@@ -304,16 +311,28 @@ def generate_fixtures(
 
     torch.set_default_dtype(torch.float32)
     # If this signature rejects `revision`, pass the `snapshot` path instead (same files).
-    model = EsmFold2Model.from_pretrained(repo, revision=revision, device="cpu").eval().float()
+    model = (
+        EsmFold2Model.from_pretrained(repo, revision=revision, esmc_precision="fp32", device="cpu")
+        .eval()
+        .float()
+    )
     model.set_kernel_backend(None)
     model.set_chunk_size(None)
-    builder = ESMFold2InputBuilder()
-    _dump_reference_conformers(out_dir / "reference_conformers.json", ReferenceConformers.load())
+    model.config.lm_encoder.lm_dropout = 0.0  # released 0.25, applied per loop even in eval
+    model.config.lm_encoder.per_loop_lm_dropout = False
+    builder = ESMFold2InputBuilder(ccd_cache=snapshot)  # loads snapshot/ccd.pkl process-wide
+    ccd_source = f"{snapshot / 'ccd.pkl'} ({repo}@{revision})"
+    _dump_reference_conformers(
+        out_dir / "reference_conformers.json", ReferenceConformers.load(), ccd_source
+    )
 
     manifest: dict[str, Any] = {
         "repo": repo,
         "revision": revision,
         "seed": seed,
+        "esmc_precision": "fp32",
+        "lm_dropout": 0.0,
+        "ccd": ccd_source,
         "python": sys.version,
         "platform": platform.platform(),
         "esm": version("esm"),
@@ -357,7 +376,7 @@ def generate_fixtures(
         )
         features, _chain_infos = builder.prepare_input(spi, seed=seed, device="cpu")
         torch.manual_seed(seed)
-        with torch.no_grad(), _lm_dropout_context(model, None):
+        with torch.no_grad():
             output = model(
                 **features,
                 num_loops=case.num_loops,
