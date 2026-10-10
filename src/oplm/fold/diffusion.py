@@ -11,8 +11,9 @@ Modifications: attention is milestone 0's ``pair_biased_attention`` (FlexAttenti
 oracle) with a precomputed block mask, and padded query rows are zeroed; the denoiser takes the
 conditioned pair and the atom conditioning as arguments so the sampler computes them once; the
 sampler takes a ``torch.Generator``; the sigma cap truncates the schedule exactly as upstream.
-Precision (spec §5.4): coordinates, preconditioning, alignment and the sampler are fp32; the
-pair-conditioning transitions run under bf16 autocast on CUDA as upstream.
+Precision (spec §5.4): coordinates, preconditioning, alignment and the sampler are fp32 whatever
+the caller's autocast (``prepare``, ``denoise``, ``sample``, the augmentation and the alignment
+disable it locally); the pair-conditioning transitions re-enable bf16 autocast on CUDA as upstream.
 """
 
 from __future__ import annotations
@@ -240,6 +241,11 @@ class DenoiserInputs:
     atom_block_mask: BlockMask | None = None
 
 
+def _fp32(device: torch.device) -> torch.autocast:
+    """Context that disables any outer autocast on ``device`` (coordinates stay fp32, spec §5.4)."""
+    return torch.autocast(device_type=device.type, enabled=False)
+
+
 def random_rotations(
     n: int, *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None = None
 ) -> Tensor:
@@ -270,27 +276,30 @@ def center_random_augmentation(
     x: Tensor, atom_mask: Tensor, *, generator: torch.Generator | None = None
 ) -> Tensor:
     """Masked centering, a random rotation per sample, then a ``N(0, I)`` translation (Å)."""
-    mask = atom_mask[..., None].to(x.dtype)
-    x = x - (x * mask).sum(dim=1, keepdim=True) / mask.sum(dim=1, keepdim=True).clamp(min=1)
-    rot = random_rotations(x.shape[0], device=x.device, dtype=x.dtype, generator=generator)
-    x = torch.einsum("bmd,bds->bms", x, rot)
-    return x + torch.randn((x.shape[0], 1, 3), dtype=x.dtype, device=x.device, generator=generator)
+    with _fp32(x.device):
+        mask = atom_mask[..., None].to(x.dtype)
+        x = x - (x * mask).sum(dim=1, keepdim=True) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+        rot = random_rotations(x.shape[0], device=x.device, dtype=x.dtype, generator=generator)
+        x = torch.einsum("bmd,bds->bms", x, rot)
+        shift = torch.randn((x.shape[0], 1, 3), dtype=x.dtype, device=x.device, generator=generator)
+        return x + shift
 
 
 def weighted_rigid_align(x: Tensor, x_gt: Tensor, weights: Tensor) -> Tensor:
     """Weighted Kabsch in fp32: ``x`` superposed onto ``x_gt`` (upstream)."""
-    w = weights[..., None].float()
-    denom = w.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    mu = (x.float() * w).sum(dim=1, keepdim=True) / denom
-    mu_gt = (x_gt.float() * w).sum(dim=1, keepdim=True) / denom
-    x_c, gt_c = x.float() - mu, x_gt.float() - mu_gt
-    h = torch.einsum("bni,bnj->bij", w * gt_c, x_c)
-    u, _, vh = torch.linalg.svd(h, driver="gesvd" if h.is_cuda else None)
-    det = torch.linalg.det(u @ vh)
-    d = torch.ones(h.shape[0], 3, device=h.device, dtype=h.dtype)
-    d[:, 2] = det
-    rot = u @ torch.diag_embed(d) @ vh
-    return x_c @ rot.transpose(-1, -2) + mu_gt
+    with _fp32(x.device):
+        w = weights[..., None].float()
+        denom = w.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        mu = (x.float() * w).sum(dim=1, keepdim=True) / denom
+        mu_gt = (x_gt.float() * w).sum(dim=1, keepdim=True) / denom
+        x_c, gt_c = x.float() - mu, x_gt.float() - mu_gt
+        h = torch.einsum("bni,bnj->bij", w * gt_c, x_c)
+        u, _, vh = torch.linalg.svd(h, driver="gesvd" if h.is_cuda else None)
+        det = torch.linalg.det(u @ vh)
+        d = torch.ones(h.shape[0], 3, device=h.device, dtype=h.dtype)
+        d[:, 2] = det
+        rot = u @ torch.diag_embed(d) @ vh
+        return x_c @ rot.transpose(-1, -2) + mu_gt
 
 
 class StructureHead(nn.Module):
@@ -339,64 +348,66 @@ class StructureHead(nn.Module):
         def rep(t: Tensor) -> Tensor:
             return t.repeat_interleave(num_samples, dim=0)
 
-        z = self.conditioning.pair(z_trunk, relpos)
-        c = self.atom_encoder.embed(atom_features)
-        atom_mask_s, token_mask_s = rep(atom_mask), rep(token_mask)
-        flex = resolve_attention_backend(z, self.config.attention_backend) == "flex"
-        return DenoiserInputs(
-            s_inputs=rep(s_inputs),
-            z=z,
-            c=rep(c),
-            rope=(rep(rope[0]), rep(rope[1])),
-            atom_mask=atom_mask_s,
-            atom_to_token=rep(atom_to_token),
-            token_mask=token_mask_s,
-            token_block_mask=pair_bias_block_mask(token_mask_s) if flex else None,
-            atom_block_mask=(
-                sliding_window_block_mask(atom_mask_s, self.config.atom_window // 2)
-                if flex
-                else None
-            ),
-        )
+        with _fp32(s_inputs.device):
+            z = self.conditioning.pair(z_trunk, relpos)
+            c = self.atom_encoder.embed(atom_features)
+            atom_mask_s, token_mask_s = rep(atom_mask), rep(token_mask)
+            flex = resolve_attention_backend(z, self.config.attention_backend) == "flex"
+            return DenoiserInputs(
+                s_inputs=rep(s_inputs),
+                z=z,
+                c=rep(c),
+                rope=(rep(rope[0]), rep(rope[1])),
+                atom_mask=atom_mask_s,
+                atom_to_token=rep(atom_to_token),
+                token_mask=token_mask_s,
+                token_block_mask=pair_bias_block_mask(token_mask_s) if flex else None,
+                atom_block_mask=(
+                    sliding_window_block_mask(atom_mask_s, self.config.atom_window // 2)
+                    if flex
+                    else None
+                ),
+            )
 
     def denoise(self, x_noisy: Tensor, t_hat: Tensor, inp: DenoiserInputs) -> Tensor:
         """EDM-preconditioned denoiser: ``c_skip · x + c_out · F(c_in · x, c_noise)`` (fp32)."""
-        sigma = self.sigma_data
-        t = t_hat.float().reshape(-1)
-        if t.numel() == 1:
-            t = t.expand(x_noisy.shape[0])
-        x_noisy = x_noisy.float()
-        s = self.conditioning.single(inp.s_inputs, t)
-        r_noisy = x_noisy / torch.sqrt(t * t + sigma * sigma)[:, None, None]
-        coords = torch.cat(
-            [r_noisy, torch.zeros_like(r_noisy)], dim=-1
-        )  # upstream: pred_r1 is always 0
-        q = inp.c + self.coords_linear(coords.to(inp.c.dtype))
-        n_tokens = inp.token_mask.shape[1]
-        a, q_skip = self.atom_encoder(
-            q,
-            inp.c,
-            *inp.rope,
-            inp.atom_mask,
-            inp.atom_to_token,
-            n_tokens,
-            block_mask=inp.atom_block_mask,
-        )
-        a = a + self.single_to_token(self.single_step_norm(s))
-        a = self.token_transformer(a, s, inp.z, inp.token_mask, inp.token_block_mask)
-        a = self.token_norm(a)
-        r_update = self.atom_decoder(
-            a,
-            q_skip,
-            inp.c,
-            *inp.rope,
-            inp.atom_mask,
-            inp.atom_to_token,
-            block_mask=inp.atom_block_mask,
-        )
-        c_skip = (sigma * sigma / (sigma * sigma + t * t))[:, None, None]
-        c_out = (sigma * t / torch.sqrt(sigma * sigma + t * t))[:, None, None]
-        return c_skip * x_noisy + c_out * r_update.float()
+        with _fp32(x_noisy.device):
+            sigma = self.sigma_data
+            t = t_hat.float().reshape(-1)
+            if t.numel() == 1:
+                t = t.expand(x_noisy.shape[0])
+            x_noisy = x_noisy.float()
+            s = self.conditioning.single(inp.s_inputs, t)
+            r_noisy = x_noisy / torch.sqrt(t * t + sigma * sigma)[:, None, None]
+            coords = torch.cat(
+                [r_noisy, torch.zeros_like(r_noisy)], dim=-1
+            )  # upstream: pred_r1 is always 0
+            q = inp.c + self.coords_linear(coords.to(inp.c.dtype))
+            n_tokens = inp.token_mask.shape[1]
+            a, q_skip = self.atom_encoder(
+                q,
+                inp.c,
+                *inp.rope,
+                inp.atom_mask,
+                inp.atom_to_token,
+                n_tokens,
+                block_mask=inp.atom_block_mask,
+            )
+            a = a + self.single_to_token(self.single_step_norm(s))
+            a = self.token_transformer(a, s, inp.z, inp.token_mask, inp.token_block_mask)
+            a = self.token_norm(a)
+            r_update = self.atom_decoder(
+                a,
+                q_skip,
+                inp.c,
+                *inp.rope,
+                inp.atom_mask,
+                inp.atom_to_token,
+                block_mask=inp.atom_block_mask,
+            )
+            c_skip = (sigma * sigma / (sigma * sigma + t * t))[:, None, None]
+            c_out = (sigma * t / torch.sqrt(sigma * sigma + t * t))[:, None, None]
+            return c_skip * x_noisy + c_out * r_update.float()
 
     def noise_schedule(self, num_steps: int, device: torch.device) -> Tensor:
         """Karras ``σ_d · (s_max^(1/ρ) + k/(n-1) (s_min^(1/ρ) − s_max^(1/ρ)))^ρ``, trailing 0."""
@@ -436,19 +447,20 @@ class StructureHead(nn.Module):
         lam = cfg.noise_scale if noise_scale is None else noise_scale
         eta = cfg.step_scale if step_scale is None else step_scale
         device = inp.z.device
-        schedule = self.noise_schedule(steps, device)
-        schedule = F.pad(schedule[schedule <= cap], (1, 0), value=cap)
-        sigmas = schedule.tolist()
-        gammas = [cfg.gamma_0 if s > cfg.gamma_min else 0.0 for s in sigmas]
-        n, n_atoms = inp.atom_mask.shape
-        atom_mask = inp.atom_mask.float()
-        x = sigmas[0] * torch.randn(n, n_atoms, 3, device=device, generator=generator)
-        for sigma_tm, sigma_t, gamma in zip(sigmas[:-1], sigmas[1:], gammas[1:], strict=True):
-            x = center_random_augmentation(x, atom_mask, generator=generator)
-            t_hat = sigma_tm * (1.0 + gamma)
-            eps_std = lam * max(t_hat**2 - sigma_tm**2, 0.0) ** 0.5
-            x_noisy = x + eps_std * torch.randn(x.shape, device=device, generator=generator)
-            x_denoised = self.denoise(x_noisy, torch.full((n,), t_hat, device=device), inp)
-            x_noisy = weighted_rigid_align(x_noisy, x_denoised, atom_mask)
-            x = x_noisy + eta * (sigma_t - t_hat) * (x_noisy - x_denoised) / t_hat
-        return x
+        with _fp32(device):
+            schedule = self.noise_schedule(steps, device)
+            schedule = F.pad(schedule[schedule <= cap], (1, 0), value=cap)
+            sigmas = schedule.tolist()
+            gammas = [cfg.gamma_0 if s > cfg.gamma_min else 0.0 for s in sigmas]
+            n, n_atoms = inp.atom_mask.shape
+            atom_mask = inp.atom_mask.float()
+            x = sigmas[0] * torch.randn(n, n_atoms, 3, device=device, generator=generator)
+            for sigma_tm, sigma_t, gamma in zip(sigmas[:-1], sigmas[1:], gammas[1:], strict=True):
+                x = center_random_augmentation(x, atom_mask, generator=generator)
+                t_hat = sigma_tm * (1.0 + gamma)
+                eps_std = lam * max(t_hat**2 - sigma_tm**2, 0.0) ** 0.5
+                x_noisy = x + eps_std * torch.randn(x.shape, device=device, generator=generator)
+                x_denoised = self.denoise(x_noisy, torch.full((n,), t_hat, device=device), inp)
+                x_noisy = weighted_rigid_align(x_noisy, x_denoised, atom_mask)
+                x = x_noisy + eta * (sigma_t - t_hat) * (x_noisy - x_denoised) / t_hat
+            return x
