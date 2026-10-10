@@ -35,6 +35,8 @@ All E2E training scenarios (and a few heavy model/eval tests) are tagged
 `@pytest.mark.slow`. The fast inner-loop suite is everything else; the slow suite
 is the full-`Trainer` and real-structure-eval coverage.
 
+`OPLM_FOLD_FIXTURES=<dir>` enables `tests/fold/test_parity.py` (skipped with a reason otherwise).
+
 ## 3. How to run
 
 > **Use `python -m pytest`, not bare `pytest`.** In the current environment the

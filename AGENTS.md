@@ -60,7 +60,7 @@ src/oplm/                      # main package (src layout)
 │   ├── configuration_oplm.py  # OplmConfig (PretrainedConfig)
 │   ├── tokenization_oplm.py   # OplmTokenizerFast (33-token ESM-C-compatible)
 │   └── modeling_oplm.py       # all public Oplm* model classes
-├── fold/                       # structure prediction head: kernels + bench CLI now, model/data/training later (docs/FOLD.md)
+├── fold/                       # structure prediction head: kernels, model, data, predict; parity tests need OPLM_FOLD_FIXTURES (docs/FOLD.md §7)
 ├── slurm/                      # general Slurm job generation/submission (docs/SLURM.md)
 │   ├── config.py               # `slurm:` block schema, PhaseTable, resolve_batch_plan
 │   ├── render.py                # JobSpec -> sbatch script text, submit.sh, job arrays

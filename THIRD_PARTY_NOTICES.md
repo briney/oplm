@@ -16,6 +16,16 @@ its module docstring.
 | --- | --- | --- |
 | `src/oplm/fold/trimul.py` | `esm/models/esmfold2/layers.py` (`TriangleMultiplicativeBlock`) | Parameter conventions, forward equations, cuEquivariance weight mapping |
 | `src/oplm/fold/attention.py` | `esm/models/esmfold2/layers.py` (`AttentionPairBias`, `SWA3DRoPEAttention`) | Pair-bias logit and key-mask semantics; rank-based sliding-window mask |
+| `src/oplm/fold/pair.py` | `esm/models/esmfold2/layers.py` (`ResIdxAsymIdSymIdEntityIdEncoding`, `SingleToPair`) | Relative-position one-hot layout; outer product/difference |
+| `src/oplm/fold/trunk.py` | `esm/models/esmfold2/{layers,model}.py` (`PairUpdateBlock`, `FoldingTrunk`, `Transition`, parcae recurrence) | Block composition, SwiGLU order, recurrence dynamics and init |
+| `src/oplm/fold/atoms.py` | `esm/models/esmfold2/layers.py` (`build_3d_rope`, `SWA3DRoPEAttention`, `SWAAtomBlock`, `EsmFold2AtomEncoder/Decoder`, `InputsEmbedder`) | Atom feature layout, 3D RoPE, adaLN atom blocks, token aggregation |
+| `src/oplm/fold/lm_shim.py` | `esm/models/esmfold2/layers.py` (`LanguageModelShim`) | Per-layer norm/projection, softmax layer mix |
+| `src/oplm/fold/diffusion.py` | `esm/models/esmfold2/layers.py` (`DiffusionConditioning`, `AttentionPairBias`, `ConditionedTransitionBlock`, `DiffusionModule`, `DiffusionStructureHead`) | Conditioning, adaLN blocks, EDM preconditioning, Karras schedule, churned sampler, Kabsch |
+| `src/oplm/fold/confidence.py` | `esm/models/esmfold2/model.py` (`ConfidenceHead`, pTM/ipTM) | Pair init, distance bins, pooling, pLDDT/PAE/PDE heads, TM-score formula |
+| `src/oplm/fold/modeling_fold.py` | `esm/models/esmfold2/model.py` (`EsmFold2Model.forward`) | Stage order and precision policy |
+| `src/oplm/fold/data/ccd.py`, `src/oplm/fold/data/reference_conformers.json` | `esm/models/esmfold2/{constants,protein_utils}.py` | Residue vocabulary, heavy-atom order, charged atoms, reference conformers |
+| `src/oplm/fold/data/featurize.py` | `esm/models/esmfold2/prepare_input.py` | Token/atom feature construction, unknown-residue bond quirk |
+| `src/oplm/fold/fixtures.py` | `esm/models/esmfold2/config.py` | Config field correspondence |
 
 The Apache License, Version 2.0 follows.
 

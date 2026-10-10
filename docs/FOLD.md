@@ -186,3 +186,34 @@ Decisions recorded from this run:
 - **Reference cost at 2048 tokens.** 44 GiB allocated and 2.8 s per checkpointed
   step for one width-256 block: the pure-PyTorch path is an oracle, not a training
   path, at this length.
+
+## 7. Milestone 1: ESMFold2 inference port (`oplm.fold.modeling_fold`)
+
+**What exists.** `FoldConfig` (defaults = the released `biohub/ESMFold2-Fast` config; `docs/
+fold/m1/` records the parity run), `featurize()` (protein chains -> `FoldFeatures`; one LM row
+per chain with BOS/EOS; atoms padded to 32; tokens optionally padded to a crop multiple),
+`OplmForFolding` (checkpoint-identical module names; `base_model_prefix` is `oplm_fold`; frozen
+LM held outside the module tree via `attach_lm` / `lm_name_or_path`;
+`forward(features) -> FoldOutput`), `fold()` + `write_mmcif()` and `oplm fold predict`.
+`oplm fold make-fixtures` + `docs/fold/b200-fixtures.sbatch` record the parity oracle;
+`tests/fold/test_parity.py` runs when `OPLM_FOLD_FIXTURES` points at it.
+
+**Deviations from upstream, all deliberate.**
+- Per-loop LM-pair dropout (`pair_dropout`) and LM input masking are training-only; upstream
+  forces dropout on at inference. Inference is deterministic given `generator`.
+- `inference_num_loops` counts iterations executed (upstream `num_loops + 1`); the spec default
+  is 10, the released config maps to 21.
+- The initial pair state and the sampler take a `torch.Generator`; upstream draws from the
+  global RNG. Independently sampled structures are therefore not an oracle (spec §9).
+- Padded query rows of the diffusion token transformer are zeroed (upstream leaves them finite
+  garbage); interface pLDDT (`complex_iplddt`) is deferred to milestone 2.
+- Loading a fold checkpoint needs `oplm` installed; `trust_remote_code` bundling is not
+  provided (the featurizer, tokenizer vocabulary and LM live in this package). A config whose
+  `lm_name_or_path` has the `<repo>#esmc` form (a head trained against the ESMC bundled in that
+  repo) makes `from_pretrained` raise a `ValueError`; such heads run with precomputed
+  `lm_hidden_states`.
+- `fold()` ranks samples by ipTM (complex) / pTM (monomer); upstream's `fold()` does not rank.
+- Coordinates, the sampler and the confidence math disable any outer autocast locally (spec
+  §5.4); the trunk portion of `forward` runs under bf16 autocast on CUDA only.
+
+**Parity (filled in by Task 12).** | stage | atol used | max abs err observed | cases |
