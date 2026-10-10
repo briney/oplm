@@ -52,7 +52,7 @@ class OplmFoldPreTrainedModel(PreTrainedModel):
     """HF plumbing for fold models: config class, init policy, checkpointing hooks."""
 
     config_class = FoldConfig
-    base_model_prefix = "fold"
+    base_model_prefix = "oplm_fold"
     main_input_name = "lm_input_ids"
     supports_gradient_checkpointing = True
     _no_split_modules = ["PairUpdateBlock", "DiffusionBlock", "AtomBlock"]

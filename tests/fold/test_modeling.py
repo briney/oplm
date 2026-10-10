@@ -42,6 +42,8 @@ def test_state_dict_matches_released_checkpoint_patterns() -> None:
         model = OplmForFolding(FoldConfig())
     keys = list(model.state_dict())
     assert len(keys) == 1054
+    # transformers 4.x matches the prefix without a dot; a hit there silently skips loading
+    assert not any(k.startswith(OplmForFolding.base_model_prefix) for k in keys)
     patterns = {re.sub(r"\.\d+\.", ".N.", k) for k in keys}
     assert patterns == expected
     counts = {}
