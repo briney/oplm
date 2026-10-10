@@ -135,7 +135,7 @@ the width-aware fallback the plan held in reserve is not needed.
   compared the resumed EMA tensors (on `cuda:0`) with a sidecar loaded to CPU, and
   `torch.equal` refuses mixed devices. The restore had already passed its
   `n_averaged == 4` check; the comparison now moves the tensor to CPU first. The
-  file should be re-run on the GPU to confirm the assertions after that line.
+  fixed file was re-run on the same container (job 25270, 2026-10-09): 3 passed.
 
 Outgoing direction (incoming is within 5% everywhere); ms per iteration, peak
 *allocated* GiB during forward+backward (peak *reserved* in the JSON is cumulative
