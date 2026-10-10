@@ -321,3 +321,27 @@ def bench_kernels(
     table_console = console if console.is_terminal else Console(width=max(console.width, 160))
     table_console.print(table)
     console.print(f"Wrote {out}")
+
+
+@app.command("make-fixtures")
+def make_fixtures(
+    out: Annotated[Path, typer.Option("--out", help="Fixture directory to create")],
+    repo: Annotated[str, typer.Option(help="Upstream HF repo")] = "biohub/ESMFold2-Fast",
+    revision: Annotated[
+        str, typer.Option(help="Upstream HF revision (sha)")
+    ] = "45fe8656f5b3ef493c17fcf9abe9a2968902e712",
+    cases: Annotated[str, typer.Option(help="Comma-separated case names, or 'all'")] = "all",
+    seed: Annotated[int, typer.Option(help="torch.manual_seed before every upstream forward")] = 0,
+) -> None:
+    """Record ESMFold2 golden fixtures (requires the pinned `esm` venv; CPU, fp32)."""
+    from oplm.fold.fixtures import FIXTURE_CASES, generate_fixtures
+
+    chosen = (
+        FIXTURE_CASES
+        if cases == "all"
+        else tuple(c for c in FIXTURE_CASES if c.name in cases.split(","))
+    )
+    if not chosen:
+        raise typer.BadParameter(f"no fixture case matches {cases!r}")
+    path = generate_fixtures(out, repo=repo, revision=revision, cases=chosen, seed=seed)
+    console.print(f"[green]fixtures written to {path}[/green]")
