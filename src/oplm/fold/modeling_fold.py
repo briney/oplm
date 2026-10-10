@@ -107,7 +107,7 @@ def load_frozen_lm(
             ``fold_config_from_upstream``: the head was trained against the ESMC bundled in
             that repo, which is not an OPLM; pass ``lm_hidden_states`` to ``forward`` instead.
     """
-    if "#" in str(name_or_path):
+    if str(name_or_path).endswith("#esmc"):
         raise ValueError(
             f"{name_or_path!r} names a language model bundled in an upstream checkpoint, not an "
             "OPLM; run the head with precomputed lm_hidden_states (see docs/FOLD.md §7)"
@@ -144,13 +144,17 @@ class OplmForFolding(OplmFoldPreTrainedModel):
 
     @property
     def lm(self) -> nn.Module | None:
-        """The attached frozen language model, or ``None``."""
+        """The attached frozen LM, or ``None``; its device and dtype are the caller's."""
         return self._lm
 
     def attach_lm(
         self, lm: nn.Module, *, name_or_path: str | None = None, revision: str | None = None
     ) -> None:
         """Attach a frozen LM after checking it against the config's shape contract.
+
+        The caller owns the LM's device and dtype: it is frozen and put in eval mode but never
+        moved or cast (``forward`` runs it where it lives). Only the auto-resolution in
+        :meth:`from_pretrained` and ``oplm fold predict`` cast it to bf16 on CUDA.
 
         Raises:
             ValueError: ``lm.config.hidden_size`` or its hidden-state count disagrees with
@@ -203,19 +207,27 @@ class OplmForFolding(OplmFoldPreTrainedModel):
     ) -> Any:
         """Load the head, then attach ``lm`` or resolve the LM from the config (override wins).
 
-        No LM is attached when neither is given and ``config.lm_name_or_path`` is unset; call
-        :meth:`attach_lm` or pass ``lm_hidden_states`` to ``forward``.
+        No LM is attached when neither is given and ``config.lm_name_or_path`` is unset or has
+        the ``<repo>#esmc`` form (a head trained against upstream's bundled ESMC); call
+        :meth:`attach_lm` or pass ``lm_hidden_states`` to ``forward``. An auto-resolved LM goes
+        to the head's device, in bf16 when that is CUDA; an ``lm`` passed in keeps the caller's
+        device and dtype.
         """
         result = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         model = result[0] if isinstance(result, tuple) else result
         source = lm_name_or_path or model.config.lm_name_or_path
+        if lm_name_or_path is None and str(source).endswith("#esmc"):
+            source = None  # not an OPLM: run the head with precomputed lm_hidden_states
         if lm is not None:
             model.attach_lm(lm)
         elif source is not None:
             revision = lm_revision or (
                 model.config.lm_revision if lm_name_or_path is None else None
             )
-            model.attach_lm(load_frozen_lm(source, revision=revision, device=model.device))
+            dtype = torch.bfloat16 if model.device.type == "cuda" else None
+            model.attach_lm(
+                load_frozen_lm(source, revision=revision, device=model.device, dtype=dtype)
+            )
         return result
 
     # --- forward -------------------------------------------------------------------------

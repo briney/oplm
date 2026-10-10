@@ -388,6 +388,8 @@ def predict(
             "no language model: pass --lm or save the checkpoint with lm_name_or_path"
         )
     folder.lm.to(dev)
+    if dev.type == "cuda":
+        folder.lm.to(torch.bfloat16)  # spec §5.4: the frozen LM runs in bf16 on CUDA
     result = fold(folder, specs, num_samples=samples, num_loops=loops, num_steps=steps, seed=seed)
     write_mmcif(result, out)
     console.print(

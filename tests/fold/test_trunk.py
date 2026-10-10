@@ -161,6 +161,20 @@ def test_recurrence_grad_loops_truncate_backpropagation() -> None:
     assert z_init.grad is not None and rec.log_delta.grad is not None
 
 
+def test_recurrence_rejects_negative_grad_loops() -> None:
+    rec = Recurrence(_W, coda_blocks=1, trimul_backend="reference")
+    z0 = _pair(seed=1)
+    with pytest.raises(ValueError, match="grad_loops"):
+        rec.run(
+            PairStack(1, _W, trimul_backend="reference"),
+            lambda _t: z0,
+            z0=z0,
+            pair_mask=None,
+            num_loops=2,
+            grad_loops=-1,
+        )
+
+
 def test_pair_stack_kwargs_come_from_config() -> None:
     cfg = FoldConfig(trunk_dropout=0.1, trimul_backend="reference", trimul_chunk_size=None)
     kw = pair_stack_kwargs(cfg)

@@ -214,10 +214,15 @@ class FoldConfig(PretrainedConfig):
                 "token_width must be even and divisible by diffusion_heads; "
                 f"got {self.token_width!r} / {self.diffusion_heads!r}."
             )
-        if self.atom_width % self.atom_encoder_heads or self.atom_width % self.diffusion_atom_heads:
+        if self.diffusion_atom_heads != self.atom_encoder_heads:
             raise ValueError(
-                "atom_width must be divisible by atom_encoder_heads and diffusion_atom_heads; "
-                f"got {self.atom_width!r}."
+                "diffusion_atom_heads must equal atom_encoder_heads (the diffusion atom "
+                "encoder/decoder reuse the inputs embedder's RoPE tables); got "
+                f"{self.diffusion_atom_heads!r} vs {self.atom_encoder_heads!r}."
+            )
+        if self.atom_width % self.atom_encoder_heads:
+            raise ValueError(
+                f"atom_width must be divisible by atom_encoder_heads; got {self.atom_width!r}."
             )
         head_dim = self.atom_width // self.atom_encoder_heads
         if 3 * self.spatial_rope_pairs_per_axis + self.uid_rope_pairs > head_dim // 2:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
+import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -93,6 +94,23 @@ def _run(
             asym_id=f.asym_id,
         )
     return f, (s_inputs, z, relpos, bonds, coords), out
+
+
+def test_forward_rejects_coords_that_are_not_whole_samples_of_the_batch() -> None:
+    head, t = ConfidenceHead(_cfg()), torch.zeros(1)
+    with pytest.raises(ValueError, match="3 .* 2"):
+        head(
+            s_inputs=t,
+            z=torch.zeros(2, 4, 4, 32),
+            relpos=t,
+            bonds=t,
+            coords=torch.zeros(3, 8, 3),
+            distogram_atom_idx=t,
+            token_mask=t,
+            atom_to_token=t,
+            atom_mask=t,
+            asym_id=t,
+        )
 
 
 def test_forward_matches_transcribed_upstream_confidence_head() -> None:

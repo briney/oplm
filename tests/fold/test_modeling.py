@@ -13,6 +13,7 @@ from transformers import AutoConfig, AutoModel
 
 from oplm.fold import ChainSpec, FoldConfig, OplmForFolding, featurize
 from oplm.fold.lm_shim import lm_state_count
+from oplm.fold.modeling_fold import load_frozen_lm
 from oplm.training.ema import build_ema
 from tests.fold.helpers import tiny_fold_config, tiny_lm
 
@@ -215,6 +216,20 @@ def test_from_pretrained_resolves_the_lm_from_config(tmp_path: Path) -> None:
     bad.save_pretrained(tmp_path / "bad")
     with pytest.raises(ValueError, match="lm_hidden_size"):
         OplmForFolding.from_pretrained(tmp_path / "bad")
+
+
+def test_esmc_heads_reload_without_an_lm(tmp_path: Path) -> None:
+    """A ``<repo>#esmc`` head skips LM auto-resolution; only that suffix is rejected."""
+    OplmForFolding(_tiny_cfg(lm_name_or_path="biohub/ESMFold2-Fast#esmc")).save_pretrained(
+        tmp_path / "fold"
+    )
+    assert OplmForFolding.from_pretrained(tmp_path / "fold").lm is None
+    with pytest.raises(ValueError, match="bundled"):
+        load_frozen_lm("x#esmc")
+    with pytest.raises(ValueError, match="bundled"):  # an explicit #esmc override still fails
+        OplmForFolding.from_pretrained(tmp_path / "fold", lm_name_or_path="x#esmc")
+    tiny_lm().save_pretrained(tmp_path / "dir#1" / "lm")
+    assert lm_state_count(load_frozen_lm(tmp_path / "dir#1" / "lm")) == 3
 
 
 def test_gradient_checkpointing_reaches_every_pair_stack() -> None:

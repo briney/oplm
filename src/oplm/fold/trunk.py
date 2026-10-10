@@ -246,9 +246,14 @@ class Recurrence(nn.Module):
             grad_loops: Only the last ``grad_loops`` iterations build a graph (truncated
                 BPTT, spec §5.6); ``None`` keeps the caller's gradient mode throughout.
             return_states: Also return the state after every loop (parity fixtures).
+
+        Raises:
+            ValueError: ``num_loops < 1`` or ``grad_loops < 0``.
         """
         if num_loops < 1:
             raise ValueError(f"num_loops must be >= 1; got {num_loops!r}")
+        if grad_loops is not None and grad_loops < 0:
+            raise ValueError(f"grad_loops must be >= 0 or None; got {grad_loops!r}")
         a, b_mat = self.dynamics()
         a = a.to(z0.dtype).view(1, 1, 1, -1)
         b_mat = b_mat.to(z0.dtype)

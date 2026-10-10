@@ -191,7 +191,15 @@ class ConfidenceHead(nn.Module):
         atom_mask: Tensor,
         asym_id: Tensor,
     ) -> ConfidenceOutput:
-        """Score ``coords (B·S, A, 3)`` against the base-batch trunk tensors, per sample."""
+        """Score ``coords (B·S, A, 3)`` against the base-batch trunk tensors, per sample.
+
+        Raises:
+            ValueError: ``coords.shape[0]`` is not a multiple of the trunk batch ``z.shape[0]``.
+        """
+        if coords.shape[0] % z.shape[0]:
+            raise ValueError(
+                f"coords batch {coords.shape[0]} is not a multiple of the trunk batch {z.shape[0]}"
+            )
         with fp32_autocast_off(z.device):  # logits and scores stay fp32 (spec §5.4)
             num_samples = coords.shape[0] // z.shape[0]
 

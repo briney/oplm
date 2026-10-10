@@ -34,6 +34,7 @@ def test_defaults_match_the_released_fast_checkpoint() -> None:
         ("pair_width", 100, "multiple of 32"),
         ("token_width", 770, "divisible by diffusion_heads"),
         ("atom_width", 130, "divisible by atom_encoder_heads"),
+        ("diffusion_atom_heads", 2, "diffusion_atom_heads"),
         ("recurrence_grad_loops", 0, "recurrence_grad_loops"),
         ("recurrence_max_loops", 0, "recurrence_max_loops"),
         ("inference_num_loops", 0, "inference_num_loops"),
