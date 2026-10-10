@@ -1,4 +1,4 @@
-"""``oplm fold`` command group. Milestone 0 ships ``bench-kernels`` (design §5.2).
+"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``predict`` (design §5.2).
 
 Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 """
@@ -321,3 +321,78 @@ def bench_kernels(
     table_console = console if console.is_terminal else Console(width=max(console.width, 160))
     table_console.print(table)
     console.print(f"Wrote {out}")
+
+
+@app.command("make-fixtures")
+def make_fixtures(
+    out: Annotated[Path, typer.Option("--out", help="Fixture directory to create")],
+    repo: Annotated[str, typer.Option(help="Upstream HF repo")] = "biohub/ESMFold2-Fast",
+    revision: Annotated[
+        str, typer.Option(help="Upstream HF revision (sha)")
+    ] = "45fe8656f5b3ef493c17fcf9abe9a2968902e712",
+    cases: Annotated[str, typer.Option(help="Comma-separated case names, or 'all'")] = "all",
+    seed: Annotated[int, typer.Option(help="torch.manual_seed before every upstream forward")] = 0,
+) -> None:
+    """Record ESMFold2 golden fixtures (requires the pinned `esm` venv; CPU, fp32)."""
+    from oplm.fold.fixtures import FIXTURE_CASES, generate_fixtures
+
+    chosen = (
+        FIXTURE_CASES
+        if cases == "all"
+        else tuple(c for c in FIXTURE_CASES if c.name in cases.split(","))
+    )
+    if not chosen:
+        raise typer.BadParameter(f"no fixture case matches {cases!r}")
+    path = generate_fixtures(out, repo=repo, revision=revision, cases=chosen, seed=seed)
+    console.print(f"[green]fixtures written to {path}[/green]")
+
+
+@app.command("predict")
+def predict(
+    chains: Annotated[
+        list[str], typer.Argument(help="Chains as SEQ, ID:SEQ or ID:SEQ*N (homo-oligomer copies)")
+    ],
+    model: Annotated[Path, typer.Option("--model", help="Fold checkpoint directory")],
+    out: Annotated[Path, typer.Option("--out", help="Output .cif path")],
+    lm: Annotated[
+        str | None,
+        typer.Option("--lm", help="Frozen LM path or Hub id (overrides the checkpoint's)"),
+    ] = None,
+    samples: Annotated[
+        int, typer.Option(help="Diffusion samples; the best by ipTM (complex) or pTM is written")
+    ] = 1,
+    loops: Annotated[
+        int | None, typer.Option(help="Recurrence iterations (default: config)")
+    ] = None,
+    steps: Annotated[
+        int | None, typer.Option(help="Sampler steps before the sigma cap (default: config)")
+    ] = None,
+    seed: Annotated[
+        int | None, typer.Option(help="Seed for the initial pair state and the sampler")
+    ] = None,
+    device: Annotated[str, typer.Option(help="cuda, cpu or auto")] = "auto",
+) -> None:
+    """Predict a protein (complex) structure and write it as mmCIF."""
+    import torch
+
+    from oplm.fold.modeling_fold import OplmForFolding
+    from oplm.fold.predict import fold, parse_chain_arg, write_mmcif
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = torch.device(device)
+    specs = [parse_chain_arg(text, chr(ord("A") + i)) for i, text in enumerate(chains)]
+    folder = OplmForFolding.from_pretrained(model, lm_name_or_path=lm).to(dev).eval()
+    if folder.lm is None:
+        raise typer.BadParameter(
+            "no language model: pass --lm or save the checkpoint with lm_name_or_path"
+        )
+    folder.lm.to(dev)
+    if dev.type == "cuda":
+        folder.lm.to(torch.bfloat16)  # spec §5.4: the frozen LM runs in bf16 on CUDA
+    result = fold(folder, specs, num_samples=samples, num_loops=loops, num_steps=steps, seed=seed)
+    write_mmcif(result, out)
+    console.print(
+        f"wrote {out}  pTM {result.ptm:.3f}  ipTM {result.iptm:.3f}  "
+        f"mean pLDDT {float(result.plddt.mean()) * 100:.1f}  sample {result.best_sample}/{samples}"
+    )

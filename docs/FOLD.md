@@ -3,8 +3,9 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 0 (foundations and
-kernels).** Model, data, losses, and training land in later milestones.
+this file records what is implemented. **Status: milestone 1 (inference port).**
+Kernels, the model, data featurization, and prediction exist (§7); losses and
+training land in milestone 2.
 
 ## 1. Package layout (implemented so far)
 
@@ -186,3 +187,46 @@ Decisions recorded from this run:
 - **Reference cost at 2048 tokens.** 44 GiB allocated and 2.8 s per checkpointed
   step for one width-256 block: the pure-PyTorch path is an oracle, not a training
   path, at this length.
+
+## 7. Milestone 1: ESMFold2 inference port (`oplm.fold.modeling_fold`)
+
+**What exists.** `FoldConfig` (defaults = the released `biohub/ESMFold2-Fast` config; `docs/fold/m1/`
+records the parity run), `featurize()` (protein chains -> `FoldFeatures`; one LM row per chain
+with BOS/EOS; atoms padded to 32; tokens optionally padded to a crop multiple; duplicate chain
+ids, including `ID_2` copy suffixes, raise `ValueError`),
+`OplmForFolding` (checkpoint-identical module names; `base_model_prefix` is `oplm_fold`; frozen
+LM held outside the module tree via `attach_lm` / `lm_name_or_path`;
+`forward(features) -> FoldOutput`), `fold()` + `write_mmcif()` and `oplm fold predict`.
+`oplm fold make-fixtures` + `docs/fold/b200-fixtures.sbatch` record the parity oracle;
+`tests/fold/test_parity.py` runs when `OPLM_FOLD_FIXTURES` points at it.
+
+**Deviations from upstream and the spec, all deliberate.**
+- Per-loop LM-pair dropout (`pair_dropout`) and LM input masking are training-only; upstream
+  forces dropout on at inference. Inference is deterministic given `generator`.
+- `inference_num_loops` counts iterations executed (upstream `num_loops + 1`); the spec default
+  is 10, the released config maps to 21.
+- The initial pair state and the sampler take a `torch.Generator`; upstream draws from the
+  global RNG. Independently sampled structures are therefore not an oracle (spec §9).
+- Padded query rows of the diffusion token transformer are zeroed (upstream leaves them finite
+  garbage); interface pLDDT (`complex_iplddt`) is deferred to milestone 2.
+- Loading a fold checkpoint needs `oplm` installed; `trust_remote_code` bundling is not
+  provided (the featurizer, tokenizer vocabulary and LM live in this package). A config whose
+  `lm_name_or_path` has the `<repo>#esmc` form (a head trained against the ESMC bundled in that
+  repo) loads through `from_pretrained` with no LM attached (`load_frozen_lm` rejects that form
+  with a `ValueError`); such heads run with precomputed `lm_hidden_states`.
+- `fold()` ranks samples by ipTM (complex) / pTM (monomer); upstream's `fold()` does not rank.
+  It requires an eval-mode model (train mode would apply `pair_dropout`).
+- Coordinates, the sampler and the confidence math disable any outer autocast locally (spec
+  §5.4); the trunk portion of `forward` runs under bf16 autocast on CUDA only.
+- The frozen LM is cast to bf16 only when loaded through `from_pretrained`/the CLI on CUDA; an
+  explicitly attached LM keeps the caller's dtype.
+- Atoms pad to a multiple of 32 (upstream's layout), not spec §4.7's
+  `atoms_per_token_budget × crop`; the budgeted layout arrives with milestone-2 batching.
+- Reference conformers are used raw at inference (no per-token rotation, as upstream); spec
+  §4.3's rotations are a training augmentation for milestone 2.
+
+**Parity.** Task 12 fills this table. Task 12 replaces the packaged conformer table with the
+fixture dump unconditionally.
+
+| stage | atol used | max abs err observed | cases |
+|---|---|---|---|

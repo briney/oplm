@@ -70,6 +70,8 @@ fold = [
     # (docs/FOLD.md §6, docs/fold/pip-freeze.txt).
     "cuequivariance-torch>=0.12.0",
     "cuequivariance-ops-torch-cu13>=0.12.0",
+    # mmCIF output (oplm.fold.predict.write_mmcif).
+    "gemmi>=0.7",
 ]
 dev = [
     "pytest>=8.0",
@@ -80,6 +82,8 @@ dev = [
     # ty that flags code an older ty accepts. Bump deliberately. See
     # [tool.ty.environment] below.
     "ty==0.0.40",
+    # mmCIF round-trip in tests/fold/test_predict.py.
+    "gemmi>=0.7",
 ]
 
 [project.scripts]
