@@ -84,3 +84,23 @@ def test_write_mmcif_round_trips_through_gemmi(tmp_path: Path) -> None:
     assert all(0.0 <= a.b_iso <= 100.0 for a in atoms)
     assert atoms[0].name == "N" and atoms[0].element.name == "N"
     assert chains["A"][0].seqid.num == 1 and chains["B"][1].seqid.num == 2
+    assert atoms[0].b_iso == pytest.approx(100 * float(result.plddt_per_atom[0]), abs=1e-3)
+
+
+def test_fold_unpads_padded_tokens() -> None:
+    model = _model()
+    result = fold(model, [ChainSpec("MKV", "A"), ChainSpec("GG", "B")], pad_to_multiple=8, seed=0)
+    assert result.features.num_tokens == 8
+    assert result.coords.shape == (32, 3) and result.plddt_per_atom.shape == (32,)
+    assert result.plddt.shape == (5,) and result.pae.shape == (5, 5)
+    assert result.residue_names == ["MET", "LYS", "VAL", "GLY", "GLY"]
+
+
+def test_fold_rejects_duplicate_chain_ids() -> None:
+    with pytest.raises(ValueError, match="duplicate chain id"):
+        fold(_model(), [ChainSpec("MKV", "B"), ChainSpec("GG", "B")])
+
+
+def test_fold_requires_eval_mode() -> None:
+    with pytest.raises(ValueError, match="eval-mode"):
+        fold(_model().train(), [ChainSpec("MKV", "A")])

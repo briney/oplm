@@ -3,8 +3,9 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 0 (foundations and
-kernels).** Model, data, losses, and training land in later milestones.
+this file records what is implemented. **Status: milestone 1 (inference port).**
+Kernels, the model, data featurization, and prediction exist (§7); losses and
+training land in milestone 2.
 
 ## 1. Package layout (implemented so far)
 
@@ -189,9 +190,10 @@ Decisions recorded from this run:
 
 ## 7. Milestone 1: ESMFold2 inference port (`oplm.fold.modeling_fold`)
 
-**What exists.** `FoldConfig` (defaults = the released `biohub/ESMFold2-Fast` config; `docs/
-fold/m1/` records the parity run), `featurize()` (protein chains -> `FoldFeatures`; one LM row
-per chain with BOS/EOS; atoms padded to 32; tokens optionally padded to a crop multiple),
+**What exists.** `FoldConfig` (defaults = the released `biohub/ESMFold2-Fast` config; `docs/fold/m1/`
+records the parity run), `featurize()` (protein chains -> `FoldFeatures`; one LM row per chain
+with BOS/EOS; atoms padded to 32; tokens optionally padded to a crop multiple; duplicate chain
+ids, including `ID_2` copy suffixes, raise `ValueError`),
 `OplmForFolding` (checkpoint-identical module names; `base_model_prefix` is `oplm_fold`; frozen
 LM held outside the module tree via `attach_lm` / `lm_name_or_path`;
 `forward(features) -> FoldOutput`), `fold()` + `write_mmcif()` and `oplm fold predict`.
@@ -213,7 +215,11 @@ LM held outside the module tree via `attach_lm` / `lm_name_or_path`;
   repo) makes `from_pretrained` raise a `ValueError`; such heads run with precomputed
   `lm_hidden_states`.
 - `fold()` ranks samples by ipTM (complex) / pTM (monomer); upstream's `fold()` does not rank.
+  It requires an eval-mode model (train mode would apply `pair_dropout`).
 - Coordinates, the sampler and the confidence math disable any outer autocast locally (spec
   §5.4); the trunk portion of `forward` runs under bf16 autocast on CUDA only.
 
-**Parity (filled in by Task 12).** | stage | atol used | max abs err observed | cases |
+**Parity.** Task 12 fills this table.
+
+| stage | atol used | max abs err observed | cases |
+|---|---|---|---|

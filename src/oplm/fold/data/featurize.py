@@ -98,6 +98,7 @@ def _expand_chains(chains: Sequence[ChainSpec]) -> list[tuple[str, str, int, int
     """(chain_id, sequence, entity_id, sym_id) per chain copy; entities by first-seen sequence."""
     entities: dict[str, int] = {}
     copies_seen: dict[int, int] = {}
+    seen_ids: set[str] = set()
     out = []
     for spec in chains:
         if spec.copies < 1:
@@ -107,6 +108,9 @@ def _expand_chains(chains: Sequence[ChainSpec]) -> list[tuple[str, str, int, int
             sym = copies_seen.get(entity, 0)
             copies_seen[entity] = sym + 1
             chain_id = spec.chain_id if k == 0 else f"{spec.chain_id}_{k + 1}"
+            if chain_id in seen_ids:
+                raise ValueError(f"duplicate chain id {chain_id!r}")
+            seen_ids.add(chain_id)
             out.append((chain_id, spec.sequence, entity, sym))
     return out
 
@@ -127,7 +131,8 @@ def featurize(
         atom_pad_multiple: Atom axis padding multiple (upstream: 32).
 
     Raises:
-        ValueError: ``pad_tokens_to`` is smaller than the token count, or a chain is empty.
+        ValueError: ``pad_tokens_to`` is smaller than the token count, a chain is empty, or
+            two chains (after ``copies`` expansion to ``ID``, ``ID_2``, ...) share an id.
     """
     table = conformers or ReferenceConformers.load()
     expanded = _expand_chains(chains)

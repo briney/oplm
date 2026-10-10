@@ -81,3 +81,15 @@ def test_token_padding_and_atom_budget() -> None:
 def test_to_device_and_custom_conformers() -> None:
     f = featurize([ChainSpec("G", "A")], conformers=ReferenceConformers.load()).to("cpu")
     assert f.ref_pos.device.type == "cpu" and f.num_atoms == 32
+
+
+@pytest.mark.parametrize(
+    "chains",
+    [
+        [ChainSpec("MKV", "B"), ChainSpec("GG", "B")],
+        [ChainSpec("GG", "A", copies=2), ChainSpec("MKV", "A_2")],  # copy suffix collides
+    ],
+)
+def test_duplicate_chain_ids_raise(chains: list[ChainSpec]) -> None:
+    with pytest.raises(ValueError, match="duplicate chain id"):
+        featurize(chains)

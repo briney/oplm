@@ -90,7 +90,13 @@ def fold(
     ``pad_to_multiple`` defaults to 128 on CUDA (FlexAttention shape buckets, docs/FOLD.md §3)
     and to no padding on CPU. ``seed`` makes the initial pair state and the sampler
     deterministic for a given device.
+
+    Raises:
+        ValueError: ``model`` is in train mode (``pair_dropout`` would break determinism), or
+            two chains share an id.
     """
+    if model.training:
+        raise ValueError("fold() requires an eval-mode model; call model.eval() first")
     device = model.device
     if pad_to_multiple is None and device.type == "cuda":
         pad_to_multiple = 128
