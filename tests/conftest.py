@@ -18,10 +18,13 @@ def _reset_accelerator_state() -> None:
 
     AcceleratorState is a process-global singleton. Without resetting it,
     a test that creates an Accelerator with mixed_precision="no" prevents
-    a later test from using mixed_precision="bf16" in the same process.
+    a later test from using mixed_precision="bf16" in the same process. A no-op without
+    accelerate (a ``[train]`` extra the fold parity venv does not install).
     """
-    from accelerate.state import AcceleratorState
-
+    try:
+        from accelerate.state import AcceleratorState
+    except ImportError:
+        return
     AcceleratorState._reset_state(reset_partial_state=True)
 
 

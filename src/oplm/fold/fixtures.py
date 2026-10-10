@@ -1,17 +1,18 @@
 """Golden-fixture tooling for the ESMFold2 parity oracle (spec §9).
 
 Two halves. Pure-torch helpers that run anywhere: the released-config -> :class:`FoldConfig`
-map, head-only weight extraction from the HF shards, fixture loading, LM-row splitting. And
-the generator, which imports the upstream ``esm`` package lazily and runs only inside the
-pinned fixture venv (docs/fold/b200-fixtures.sbatch): it featurizes each case with upstream's
-own input builder, runs the upstream model on CPU in fp32 with dropout, masking and kernels
-off and the loop count and sampler pinned, records every stage through forward hooks, and
-writes one safetensors file per case plus a manifest. Fixture tensors keep upstream's dtype.
+map, head-only weight extraction from the HF shards, fixture loading. And the generator,
+which imports the upstream ``esm`` package lazily and runs only inside the pinned fixture venv
+(docs/fold/b200-fixtures.sbatch): it featurizes each case with upstream's own input builder,
+runs the upstream model on CPU in fp32 with dropout, masking and kernels off and the loop count
+and sampler pinned, records every stage through forward hooks, and writes one safetensors file
+per case plus a manifest. Fixture tensors keep upstream's dtype.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -40,7 +41,6 @@ __all__ = [
     "fold_config_from_upstream",
     "generate_fixtures",
     "load_fixture",
-    "upstream_lm_rows",
 ]
 
 UPSTREAM_REPO = "biohub/ESMFold2-Fast"
@@ -177,19 +177,6 @@ def load_fixture(fixtures_dir: Path, case_name: str) -> dict[str, Tensor]:
     return load_file(str(Path(fixtures_dir) / f"{case_name}.safetensors"))
 
 
-def upstream_lm_rows(input_ids: Tensor, *, bos: int, eos: int, pad: int) -> list[list[int]]:
-    """Split upstream's packed ``[BOS c1 EOS BOS c2 EOS PAD...]`` LM row into per-chain rows."""
-    rows: list[list[int]] = []
-    for tok in input_ids[0].tolist():
-        if tok == pad:
-            break
-        if tok == bos:
-            rows.append([tok])
-        else:
-            rows[-1].append(tok)
-    return rows
-
-
 # --- generator (runs only in the esm venv) ---------------------------------------------------
 
 
@@ -286,16 +273,23 @@ def generate_fixtures(
     per-loop LM dropout off (``config.lm_encoder.lm_dropout = 0``, ``per_loop_lm_dropout =
     False``; upstream applies it with ``training=True`` even in eval, and its
     ``_lm_dropout_context(model, None)`` is a no-op), ``lm_mask_pct=0``, the CCD read from the
-    pinned snapshot's ``ccd.pkl`` (not ``biohub/ESMFold2@main``), and ``torch.manual_seed(seed)``
-    before every forward; the initial pair state is captured by wrapping ``_init_pair_state``.
+    pinned snapshot's ``ccd.pkl`` (not ``biohub/ESMFold2@main``, nor an ``ESMCFOLD_CCD_PATH``
+    inherited from the environment), and ``torch.manual_seed(seed)`` before every forward; the
+    initial pair state is captured by wrapping ``_init_pair_state``.
     """
+    # Upstream reads ESMCFOLD_CCD_PATH at import (conformers.CCD_PICKLE_PATH) and prefers it over
+    # ccd_cache; drop it before the import and clear the global in case esm was imported already.
+    os.environ.pop("ESMCFOLD_CCD_PATH", None)
     from esm.models.esmfold2 import (  # ty: ignore[unresolved-import]  # esm venv only
         ESMFold2InputBuilder,
         EsmFold2Model,
         ProteinInput,
         StructurePredictionInput,
+        conformers,
     )
     from huggingface_hub import snapshot_download
+
+    conformers.CCD_PICKLE_PATH = None
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -310,9 +304,9 @@ def generate_fixtures(
     extract_head_weights(snapshot, out_dir / "head.safetensors")
 
     torch.set_default_dtype(torch.float32)
-    # If this signature rejects `revision`, pass the `snapshot` path instead (same files).
+    # Load from the pinned local snapshot (same files as `revision`), never a Hub re-resolve.
     model = (
-        EsmFold2Model.from_pretrained(repo, revision=revision, esmc_precision="fp32", device="cpu")
+        EsmFold2Model.from_pretrained(str(snapshot), device="cpu", esmc_precision="fp32")
         .eval()
         .float()
     )
@@ -329,10 +323,12 @@ def generate_fixtures(
     manifest: dict[str, Any] = {
         "repo": repo,
         "revision": revision,
+        "snapshot": str(snapshot),
         "seed": seed,
         "esmc_precision": "fp32",
         "lm_dropout": 0.0,
         "ccd": ccd_source,
+        "ccd_env_override_removed": True,
         "python": sys.version,
         "platform": platform.platform(),
         "esm": version("esm"),

@@ -17,12 +17,7 @@ from safetensors.torch import load_file
 
 from oplm.fold.data.ccd import ReferenceConformers
 from oplm.fold.data.featurize import featurize
-from oplm.fold.fixtures import (
-    FIXTURE_CASES,
-    fold_config_from_upstream,
-    load_fixture,
-    upstream_lm_rows,
-)
+from oplm.fold.fixtures import FIXTURE_CASES, fold_config_from_upstream, load_fixture
 from oplm.fold.modeling_fold import OplmForFolding
 
 if TYPE_CHECKING:
@@ -81,6 +76,20 @@ def test_head_weights_load_strictly_and_config_matches(released: OplmForFolding)
     assert len(released.state_dict()) == 1054
 
 
+def test_packaged_reference_conformers_match_upstream_dump(fixtures_dir: Path) -> None:
+    """The packaged table must equal the generator's ``get_idealized_atom_pos`` dump."""
+    dump = fixtures_dir / "reference_conformers.json"
+    ours, theirs = ReferenceConformers.load(), ReferenceConformers.load(dump)
+    fix = f"replace src/oplm/fold/data/reference_conformers.json with {dump}"
+    assert ours.codes == theirs.codes, fix
+    for code in ours.codes:
+        a, b = ours[code], theirs[code]
+        assert (a.atoms, a.elements, a.charges) == (b.atoms, b.elements, b.charges), (
+            f"{code}: {fix}"
+        )
+        _close(a.positions, b.positions, atol=1e-6, what=f"{code} positions ({fix})")
+
+
 @pytest.mark.parametrize("case", _CASES)
 def test_featurizer_matches_upstream(
     fixtures_dir: Path, conformers: ReferenceConformers, case
@@ -107,9 +116,11 @@ def test_featurizer_matches_upstream(
     assert torch.equal(f.token_bonds.bool(), fx["features.token_bonds"].bool())
     _close(f.ref_charge, fx["features.ref_charge"], atol=0, what="ref_charge")
     _close(f.ref_pos, fx["features.ref_pos"], atol=1e-6, what="ref_pos")
-    rows = upstream_lm_rows(fx["features.input_ids"], bos=0, eos=2, pad=1)
-    ours_rows = [[t for t in row if t != 1] for row in f.lm_input_ids.tolist()]
-    assert ours_rows == rows
+    # Upstream keeps one ESM id per token (no BOS/EOS/PAD; X -> 24 as ours); compare per chain.
+    ids, asym = fx["features.input_ids"][0], fx["features.asym_id"][0]
+    theirs = [ids[asym == c].tolist() for c in range(int(asym.max()) + 1)]
+    ours = [[t for t in row if t not in (0, 1, 2)] for row in f.lm_input_ids.tolist()]
+    assert ours == theirs
 
 
 @pytest.mark.parametrize("case", _CASES)

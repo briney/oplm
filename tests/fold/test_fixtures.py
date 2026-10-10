@@ -1,4 +1,4 @@
-"""Released-config -> FoldConfig map, head-weight extraction, LM-row splitting, case table."""
+"""Released-config -> FoldConfig map, head-weight extraction, case table."""
 
 from __future__ import annotations
 
@@ -9,12 +9,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from oplm.fold.configuration_fold import FoldConfig
-from oplm.fold.fixtures import (
-    FIXTURE_CASES,
-    extract_head_weights,
-    fold_config_from_upstream,
-    upstream_lm_rows,
-)
+from oplm.fold.fixtures import FIXTURE_CASES, extract_head_weights, fold_config_from_upstream
 
 _CFG = Path(__file__).parent / "data" / "esmfold2_fast_config.json"
 
@@ -68,11 +63,6 @@ def test_extract_head_weights_drops_esmc_and_keeps_shards_order(tmp_path: Path) 
     head = load_file(out)
     assert set(head) == {"distogram_head.bias", "parcae.log_delta"}
     assert torch.equal(head["parcae.log_delta"], torch.full((4,), 2.0))
-
-
-def test_upstream_lm_rows_split_the_packed_sequence() -> None:
-    ids = torch.tensor([[0, 20, 15, 2, 0, 6, 6, 2, 1, 1]])
-    assert upstream_lm_rows(ids, bos=0, eos=2, pad=1) == [[0, 20, 15, 2], [0, 6, 6, 2]]
 
 
 def test_fixture_cases_cover_the_spec_shapes() -> None:
