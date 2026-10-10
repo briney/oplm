@@ -200,7 +200,7 @@ LM held outside the module tree via `attach_lm` / `lm_name_or_path`;
 `oplm fold make-fixtures` + `docs/fold/b200-fixtures.sbatch` record the parity oracle;
 `tests/fold/test_parity.py` runs when `OPLM_FOLD_FIXTURES` points at it.
 
-**Deviations from upstream, all deliberate.**
+**Deviations from upstream and the spec, all deliberate.**
 - Per-loop LM-pair dropout (`pair_dropout`) and LM input masking are training-only; upstream
   forces dropout on at inference. Inference is deterministic given `generator`.
 - `inference_num_loops` counts iterations executed (upstream `num_loops + 1`); the spec default
@@ -212,14 +212,21 @@ LM held outside the module tree via `attach_lm` / `lm_name_or_path`;
 - Loading a fold checkpoint needs `oplm` installed; `trust_remote_code` bundling is not
   provided (the featurizer, tokenizer vocabulary and LM live in this package). A config whose
   `lm_name_or_path` has the `<repo>#esmc` form (a head trained against the ESMC bundled in that
-  repo) makes `from_pretrained` raise a `ValueError`; such heads run with precomputed
-  `lm_hidden_states`.
+  repo) loads through `from_pretrained` with no LM attached (`load_frozen_lm` rejects that form
+  with a `ValueError`); such heads run with precomputed `lm_hidden_states`.
 - `fold()` ranks samples by ipTM (complex) / pTM (monomer); upstream's `fold()` does not rank.
   It requires an eval-mode model (train mode would apply `pair_dropout`).
 - Coordinates, the sampler and the confidence math disable any outer autocast locally (spec
   §5.4); the trunk portion of `forward` runs under bf16 autocast on CUDA only.
+- The frozen LM is cast to bf16 only when loaded through `from_pretrained`/the CLI on CUDA; an
+  explicitly attached LM keeps the caller's dtype.
+- Atoms pad to a multiple of 32 (upstream's layout), not spec §4.7's
+  `atoms_per_token_budget × crop`; the budgeted layout arrives with milestone-2 batching.
+- Reference conformers are used raw at inference (no per-token rotation, as upstream); spec
+  §4.3's rotations are a training augmentation for milestone 2.
 
-**Parity.** Task 12 fills this table.
+**Parity.** Task 12 fills this table. Task 12 replaces the packaged conformer table with the
+fixture dump unconditionally.
 
 | stage | atol used | max abs err observed | cases |
 |---|---|---|---|
