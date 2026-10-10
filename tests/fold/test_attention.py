@@ -8,9 +8,12 @@ import torch
 from torch.nn import functional as F
 
 from oplm.fold.attention import (
+    ensure_flex_recompile_limit,
+    pair_bias_block_mask,
     pair_biased_attention,
     resolve_attention_backend,
     sliding_window_attention,
+    sliding_window_block_mask,
 )
 
 
@@ -195,3 +198,48 @@ def test_flex_matches_dense_forward_and_backward_on_gpu(dtype: torch.dtype, n: i
         base_err = (b - e).abs().max().item()
         err = (f - e).abs().max().item()
         assert err <= _ERR_MULT * base_err + _ERR_FLOOR, (name, err, base_err)
+
+
+# --- precomputed block masks (milestone 1) ----------------------------------------------
+
+
+def test_precomputed_block_masks_match_inline_construction_on_cpu_forward() -> None:
+    q, k, v = _qkv(n=64)
+    bias = torch.randn(2, 2, 64, 64)
+    key_mask = torch.ones(2, 64, dtype=torch.bool)
+    key_mask[0, 50:] = False
+    valid = torch.ones(2, 64, dtype=torch.bool)
+    valid[1, 10:20] = False
+    with torch.no_grad():
+        inline = pair_biased_attention(q, k, v, bias, key_mask, backend="flex")
+        pre = pair_biased_attention(
+            q, k, v, bias, key_mask, backend="flex", block_mask=pair_bias_block_mask(key_mask)
+        )
+        torch.testing.assert_close(pre, inline)
+        inline_sw = sliding_window_attention(q, k, v, valid, 4, backend="flex")
+        pre_sw = sliding_window_attention(
+            q, k, v, valid, 4, backend="flex", block_mask=sliding_window_block_mask(valid, 4)
+        )
+        torch.testing.assert_close(pre_sw, inline_sw)
+
+
+def test_block_mask_is_ignored_on_the_dense_path() -> None:
+    q, k, v = _qkv()
+    bias = torch.randn(2, 2, 48, 48)
+    key_mask = torch.ones(2, 48, dtype=torch.bool)
+    dense = pair_biased_attention(q, k, v, bias, key_mask, backend="dense")
+    with_mask = pair_biased_attention(
+        q, k, v, bias, key_mask, backend="dense", block_mask=pair_bias_block_mask(key_mask)
+    )
+    torch.testing.assert_close(dense, with_mask)
+
+
+def test_ensure_flex_recompile_limit_only_raises() -> None:
+    from torch import _dynamo
+
+    before = _dynamo.config.recompile_limit
+    ensure_flex_recompile_limit(before + 8)
+    assert _dynamo.config.recompile_limit == before + 8
+    ensure_flex_recompile_limit(1)
+    assert _dynamo.config.recompile_limit == before + 8
+    _dynamo.config.recompile_limit = before

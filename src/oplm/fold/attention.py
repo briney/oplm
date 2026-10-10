@@ -31,9 +31,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AttentionBackend",
+    "ensure_flex_recompile_limit",
+    "pair_bias_block_mask",
     "pair_biased_attention",
     "resolve_attention_backend",
     "sliding_window_attention",
+    "sliding_window_block_mask",
 ]
 
 AttentionBackend = Literal["auto", "dense", "flex"]
@@ -68,6 +71,48 @@ def _flex(
     )
 
 
+def pair_bias_block_mask(key_mask: Tensor, n_queries: int | None = None) -> BlockMask:
+    """Block mask for `pair_biased_attention`: keys valid where `key_mask[b, j]`.
+
+    Build it once per forward (one per diffusion-sampling call) and pass it to every
+    block; `create_block_mask` is uncompiled and materialises a `(B, N, N)` mask.
+    """
+    batch, n_keys = key_mask.shape
+
+    def mask_mod(b: Tensor, h: Tensor, qi: Tensor, ki: Tensor) -> Tensor:
+        return key_mask[b, ki]
+
+    return create_block_mask(
+        mask_mod, batch, None, n_queries or n_keys, n_keys, device=key_mask.device
+    )
+
+
+def sliding_window_block_mask(valid: Tensor, half_window: int) -> BlockMask:
+    """Block mask for `sliding_window_attention` (rank-based window, self always visible)."""
+    batch, n = valid.shape
+    rank = torch.cumsum(valid.to(torch.int64), dim=1) - 1
+
+    def mask_mod(b: Tensor, h: Tensor, qi: Tensor, ki: Tensor) -> Tensor:
+        in_window = (rank[b, qi] - rank[b, ki]).abs() <= half_window
+        return (valid[b, qi] & valid[b, ki] & in_window) | (qi == ki)
+
+    return create_block_mask(mask_mod, batch, None, n, n, device=valid.device)
+
+
+def ensure_flex_recompile_limit(limit: int = 64) -> None:
+    """Raise dynamo's recompile limit so bucketed shapes never fall back to eager flex.
+
+    `_compiled_flex` uses `dynamic=False`; each new `(B, N, dtype)` compiles once. Past
+    the limit dynamo silently runs the eager kernel, which materialises the full score
+    matrix (docs/FOLD.md §3). Only ever raises the limit.
+    """
+    from torch import _dynamo
+
+    _dynamo.config.recompile_limit = max(  # ty: ignore[invalid-assignment]  # inferred Literal[8]
+        _dynamo.config.recompile_limit, limit
+    )
+
+
 def pair_biased_attention(
     q: Tensor,
     k: Tensor,
@@ -76,6 +121,7 @@ def pair_biased_attention(
     key_mask: Tensor | None = None,
     *,
     backend: AttentionBackend = "auto",
+    block_mask: BlockMask | None = None,
 ) -> Tensor:
     """``softmax_j(q_i.k_j / sqrt(d) + bias[b,h,i,j]) v_j`` over valid keys.
 
@@ -87,6 +133,9 @@ def pair_biased_attention(
         key_mask: ``(B, N)`` bool, True for valid keys; ``None`` means all valid. A batch
             row with no valid key returns zeros.
         backend: ``"auto"``, ``"dense"`` or ``"flex"``.
+        block_mask: A precomputed mask from ``pair_bias_block_mask`` /
+            ``sliding_window_block_mask``; built inline when ``None``; ignored on the
+            dense path.
 
     Returns:
         ``(B, H, N, d)`` in ``v``'s dtype.
@@ -102,18 +151,13 @@ def pair_biased_attention(
             attn = torch.where(any_valid, attn, torch.zeros_like(attn))
         return torch.matmul(attn.to(v.dtype), v)
 
-    batch, _heads, n_q, _ = q.shape
+    n_q = q.shape[2]
 
     def score_mod(score: Tensor, b: Tensor, h: Tensor, qi: Tensor, ki: Tensor) -> Tensor:
         return score + bias[b, h, qi, ki]
 
-    block_mask: BlockMask | None = None
-    if key_mask is not None:
-
-        def mask_mod(b: Tensor, h: Tensor, qi: Tensor, ki: Tensor) -> Tensor:
-            return key_mask[b, ki]
-
-        block_mask = create_block_mask(mask_mod, batch, None, n_q, k.shape[2], device=q.device)
+    if block_mask is None and key_mask is not None:
+        block_mask = pair_bias_block_mask(key_mask, n_q)
     return _flex(q, k, v, score_mod, block_mask)
 
 
@@ -125,6 +169,7 @@ def sliding_window_attention(
     half_window: int,
     *,
     backend: AttentionBackend = "auto",
+    block_mask: BlockMask | None = None,
 ) -> Tensor:
     """Local attention over the valid-atom rank with window ``[-half_window, half_window]``.
 
@@ -141,20 +186,19 @@ def sliding_window_attention(
         valid: ``(B, N)`` bool atom validity.
         half_window: Window radius in valid-atom rank (upstream default 64 -> window 128).
         backend: ``"auto"``, ``"dense"`` or ``"flex"``.
+        block_mask: A precomputed mask from ``pair_bias_block_mask`` /
+            ``sliding_window_block_mask``; built inline when ``None``; ignored on the
+            dense path.
     """
-    batch, _heads, n, _ = q.shape
-    rank = torch.cumsum(valid.to(torch.int64), dim=1) - 1
     if resolve_attention_backend(q, backend) == "dense":
+        n = q.shape[2]
+        rank = torch.cumsum(valid.to(torch.int64), dim=1) - 1
         within = (rank[:, :, None] - rank[:, None, :]).abs() <= half_window
         allowed = within & valid[:, :, None] & valid[:, None, :]
         allowed = allowed | torch.eye(n, dtype=torch.bool, device=q.device)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed[:, None])
     else:
-
-        def mask_mod(b: Tensor, h: Tensor, qi: Tensor, ki: Tensor) -> Tensor:
-            in_window = (rank[b, qi] - rank[b, ki]).abs() <= half_window
-            return (valid[b, qi] & valid[b, ki] & in_window) | (qi == ki)
-
-        block_mask = create_block_mask(mask_mod, batch, None, n, n, device=q.device)
+        if block_mask is None:
+            block_mask = sliding_window_block_mask(valid, half_window)
         out = _flex(q, k, v, None, block_mask)
     return out * valid[:, None, :, None].to(out.dtype)
