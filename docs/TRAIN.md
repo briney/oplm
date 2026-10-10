@@ -315,6 +315,8 @@ outputs/medium-uniref50/
     ├── trainer_state.json     # global_step, epoch, samples_seen, tokens_seen
     ├── config.yaml            # the full resolved run config (re-loadable)
     ├── hf/                    # HuggingFace export: config.json + model.safetensors + tokenizer
+    ├── ema.pt                 # EMA tracker (averaged tensors + count); when `train.ema_decay` is set
+    ├── hf_ema/                # HuggingFace export of the EMA weights; when `train.ema_decay` is set
     └── <accelerate state>     # model, optimizer(s), scheduler(s), RNG — for resuming
 ```
 
@@ -385,8 +387,9 @@ step, training loss, and the most recent eval loss.
 **Weights & Biases** — enabled by default (`train.wandb_enabled`). At startup the
 full flattened config is logged under `model/*`, `train/*`, `data/*`. Every
 `train.log_every` optimizer steps the trainer logs `train/loss`, `train/lr`,
-`train/epoch`, `train/samples`, `train/tokens`, and `train/flops` (a cumulative
-estimate); eval passes add `eval/<dataset>/<metric>`. Set `train.wandb_project`
+`train/epoch`, `train/samples`, `train/tokens`, and, when the task provides a FLOP
+estimate ([§17](#17-training-tasks-traintask)), `train/flops` (a cumulative estimate);
+eval passes add `eval/<dataset>/<metric>`. Set `train.wandb_project`
 and `train.wandb_run_name` (or `--name`) to organize runs. Disable W&B entirely
 with `train.wandb_enabled=false`.
 
@@ -579,7 +582,7 @@ latency. Eval and checkpoint steps are also excluded from wall-time accounting.
 |--------|:-------------:|-------|
 | `train/tokens_per_sec` | yes | Tokens processed per second (headline metric). |
 | `train/step_time_s` | yes | Average optimizer-step wall time (seconds). |
-| `train/achieved_tflops` | yes | Estimated TFLOPs/s based on `estimate_flops_per_token`. Note: omits attention-score FLOPs; use `tokens_per_sec` for throughput comparison. |
+| `train/achieved_tflops` | only when the task provides a FLOP estimate ([§17](#17-training-tasks-traintask)) | Estimated TFLOPs/s based on `estimate_flops_per_token`. Note: omits attention-score FLOPs; use `tokens_per_sec` for throughput comparison. |
 | `train/mfu` | only when `peak_tflops` set | `achieved_tflops / peak_tflops`. Set `train.peak_tflops` to your device peak (e.g. `312.0` for an A100 SXM BF16, `989.5` for an H100 SXM BF16). |
 
 ```yaml
@@ -610,6 +613,7 @@ no-progress guard), see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget
 | `resume_data_position` | `true` | **Data-exact resume (Phase 3 — live).** When a checkpoint carries a data cursor and this is `true` (the default), a resume replays the exact row-level position the run was at when the checkpoint was taken — no row re-seen or skipped, same order as an uninterrupted run — instead of restarting the epoch's data stream from row 0. The cursor's layout (`world_size`, `num_workers`, per-rank batch size, seed) is validated against the live run; a mismatch raises, naming the escape hatch. Set `false` to opt back into the pre-Phase-3 behavior (restart the current epoch from row 0) — the escape hatch for resuming into a different world size/worker count, or a pre-Task-3.3 checkpoint with no cursor at all. See "What a resume restores" below. |
 | `dist_timeout_minutes` | `15` | Timeout passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. A genuine hang raises within this window instead of wedging until the Slurm time limit; a no-op on a single process. |
 | `remote_checkpoint_uri` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background (Task 4.2) — durability beyond local/shared storage. `null` (default) disables it entirely: zero behavior change, no import of `oplm.training.remote`, no fsspec call. See "Remote checkpoint mirror" below. |
+| `ema_decay` | `null` | EMA of the trainable weights (fold stages use `0.999`). One update per optimizer step. Each checkpoint adds `ema.pt` + `hf_ema/`; resume restores the tracker; a pre-EMA checkpoint resumed with this set logs a warning and restarts the average from the live weights. `ddp` only. |
 | `parallelism` | `ddp` | `ddp` (one full replica per rank, gradients all-reduced) or `hsdp` (FSDP2 `fully_shard` over a 2-D mesh: shard within a node, replicate across nodes). Checkpoints are parallelism-agnostic, so the same checkpoint resumes under either setting at any world size. `hsdp` requires world size > 1 and currently refuses three combinations, each of which would otherwise hang or silently diverge: **configured `data.eval`** (in-loop eval all-gathers on rank-striped forward counts and deadlocks — evaluate an HSDP run's checkpoints with a separate `ddp` job), `mixed_precision=fp16` (the GradScaler's inf-check is not shard-aware), and `stability_diagnostics` with `stability_probe_every > 0` (the probe's main-process-only forward all-gathers). See `oplm.training.parallel` for the full limitation list; deeper HSDP docs land with Task 5.3. |
 
 `save_every`, `save_total_limit`, and `resume_from` are the pre-existing checkpointing knobs —
@@ -627,7 +631,7 @@ one is still uploading is queued (at most one slot — a further commit before i
 queued one, since the newer checkpoint always supersedes an older, not-yet-started upload). On
 multi-node runs, each node's `local_process_index == 0` process uploads only the DCP shard files
 its own node's ranks wrote; the global main process additionally uploads the shared artifacts
-(`.metadata`, `trainer_state.json`, `config.yaml`, `hf/`) — all of this over a dedicated GLOO
+(`.metadata`, `trainer_state.json`, `config.yaml`, `ema.pt` and `hf_ema/` when EMA is on, `hf/`) — all of this over a dedicated GLOO
 process group, never the trainer's own (typically NCCL) default group.
 
 Finalizing the remote manifest is not a bare barrier: every node leader that just finished its
@@ -716,6 +720,7 @@ model/optimizer state) plus per-rank sidecars (RNG, and the fp16 `GradScaler` wh
 - model weights,
 - **all** optimizer state — including Muon's, not just AdamW's,
 - LR scheduler state,
+- the EMA tracker (`ema.pt`: averaged tensors and update count) when `train.ema_decay` is set,
 - RNG state (Python, NumPy, CPU and CUDA generators), and
 - the trainer's own step counters (`global_step`, `epoch`, `samples_seen`, `tokens_seen`, plus the
   `keep_every_n_hours` bookkeeping and the persisted W&B run id — see below).
@@ -827,6 +832,28 @@ about before relying on it in production:
   rotation never touches it because nothing without a manifest is ever counted or deleted. Safe
   (never mistaken for a valid checkpoint) but requires an operator to clean up stale
   manifest-less directories periodically on long-running production buckets.
+
+---
+
+## 17. Training tasks (`TrainTask`)
+
+The Trainer owns acceleration, optimization, accumulation, eval cadence, fault
+tolerance and checkpointing. The objective-specific third — building the model,
+building the training dataloader, turning one micro-batch into a loss, and the
+FLOP estimate — lives behind `oplm.training.task.TrainTask`:
+
+| Method | Returns |
+| --- | --- |
+| `build_model(cfg, initialization_source)` | the trainable `nn.Module` (weights loaded from `train.init_from` when given) |
+| `build_dataloader(cfg)` | the rank/worker-striped training `DataLoader` |
+| `step(model, batch)` | `StepResult(loss, tokens, samples, metrics)` |
+| `flops_per_token(cfg)` | an `int`, or `None` to omit `train/flops`, `train/achieved_tflops` and `train/mfu` |
+
+`MLMTask` is the default (`Trainer(cfg)`), and reproduces the pre-seam behaviour
+exactly. `StepResult.metrics` are logged as `train/<key>`, averaged over the log
+window; the keys the trainer emits itself (`loss`, `lr`, `epoch`, `samples`,
+`tokens`, `flops`, ...) are reserved. The folding head's `FoldTask`
+(docs/FOLD.md) is the second implementation.
 
 ---
 

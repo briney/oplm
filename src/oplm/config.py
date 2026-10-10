@@ -130,6 +130,11 @@ class TrainConfig:
     # None disables remote sync.
     remote_checkpoint_uri: str | None = None
 
+    # Exponential moving average of the trainable weights (fold stages set 0.999).
+    # None = off (MLM runs unchanged). Updated once per successful optimizer step;
+    # every checkpoint then also writes ema.pt + hf_ema/ (docs/TRAIN.md §16).
+    ema_decay: float | None = None
+
     # Parallelism strategy.
     #   "ddp"  — one full model replica per rank, gradients all-reduced (default;
     #            what every run did before Phase 5).
@@ -268,6 +273,8 @@ class TrainConfig:
             raise ValueError(
                 f"keep_every_n_hours must be > 0 when set, got {self.keep_every_n_hours}"
             )
+        if self.ema_decay is not None and not (0.0 < self.ema_decay < 1.0):
+            raise ValueError(f"ema_decay must be in (0, 1) when set, got {self.ema_decay}")
         if self.dist_timeout_minutes <= 0:
             raise ValueError(f"dist_timeout_minutes must be > 0, got {self.dist_timeout_minutes}")
         if self.parallelism not in _VALID_PARALLELISM:
@@ -285,6 +292,13 @@ class TrainConfig:
                 "parallelism='hsdp' does not support mixed_precision='fp16': the fp16 "
                 "GradScaler's inf-check is not shard-aware and would let ranks diverge. "
                 "Use mixed_precision='bf16' (default) or 'no'."
+            )
+        if self.parallelism == "hsdp" and self.ema_decay is not None:
+            # The EMA copy and its ema.pt sidecar are built from full replicated (DDP)
+            # parameters on every rank; under FSDP2 they are DTensor shards.
+            raise ValueError(
+                "parallelism='hsdp' is incompatible with ema_decay: the EMA tracker and its "
+                "ema.pt sidecar are built from replicated (DDP) parameters, not FSDP2 shards."
             )
         if self.parallelism == "hsdp" and self.weight_diag_every:
             # The weight diagnostics read full parameters on the main process only; under

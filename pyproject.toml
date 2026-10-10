@@ -62,6 +62,15 @@ train = [
     "pandas>=2.0",
     "matplotlib>=3.7",
 ]
+fold = [
+    # cuEquivariance fused triangle multiplication (oplm.fold.trimul dispatch). The
+    # staged PyTorch reference runs without it; CPU tests never import it. The cu13
+    # ops wheel matches the torch cu130 builds. Floor 0.12.0: the version whose own
+    # backward was verified at widths 128 and 256 on a B200 with torch 2.11.0+cu130
+    # (docs/FOLD.md §6, docs/fold/pip-freeze.txt).
+    "cuequivariance-torch>=0.12.0",
+    "cuequivariance-ops-torch-cu13>=0.12.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

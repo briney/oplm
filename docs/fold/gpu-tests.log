@@ -1,0 +1,49 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.0.3, pluggy-1.6.0 -- /opt/conda/bin/python
+cachedir: .pytest_cache
+rootdir: /tmp/fold-m0-b200_25080/oplm
+configfile: pyproject.toml
+plugins: anyio-4.13.0, fast-array-utils-1.4.1, jaxtyping-0.3.9, zarr-3.1.6, cov-7.1.0
+collecting ... collected 61 items / 33 deselected / 28 selected
+
+tests/fold/test_attention.py::test_flex_matches_dense_forward_and_backward_on_gpu[256-dtype0] PASSED [  3%]
+tests/fold/test_attention.py::test_flex_matches_dense_forward_and_backward_on_gpu[256-dtype1] PASSED [  7%]
+tests/fold/test_attention.py::test_flex_matches_dense_forward_and_backward_on_gpu[512-dtype0] PASSED [ 10%]
+tests/fold/test_attention.py::test_flex_matches_dense_forward_and_backward_on_gpu[512-dtype1] PASSED [ 14%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-outgoing-128-128] PASSED [ 17%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-outgoing-128-256] PASSED [ 21%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-outgoing-512-128] PASSED [ 25%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-outgoing-512-256] PASSED [ 28%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-outgoing-1024-128] PASSED [ 32%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-outgoing-1024-256] PASSED [ 35%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-incoming-128-128] PASSED [ 39%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-incoming-128-256] PASSED [ 42%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-incoming-512-128] PASSED [ 46%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-incoming-512-256] PASSED [ 50%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-incoming-1024-128] PASSED [ 53%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused-incoming-1024-256] PASSED [ 57%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-outgoing-128-128] PASSED [ 60%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-outgoing-128-256] PASSED [ 64%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-outgoing-512-128] PASSED [ 67%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-outgoing-512-256] PASSED [ 71%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-outgoing-1024-128] PASSED [ 75%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-outgoing-1024-256] PASSED [ 78%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-incoming-128-128] PASSED [ 82%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-incoming-128-256] PASSED [ 85%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-incoming-512-128] PASSED [ 89%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-incoming-512-256] PASSED [ 92%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-incoming-1024-128] PASSED [ 96%]
+tests/fold/test_trimul.py::test_fused_paths_match_fp32_reference_within_bf16_tolerance[fused_forward_reference_backward-incoming-1024-256] PASSED [100%]
+
+=============================== warnings summary ===============================
+../../../opt/conda/lib/python3.12/site-packages/torch/jit/_script.py:1488
+  /opt/conda/lib/python3.12/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/fold/test_attention.py: 14 warnings
+  /opt/conda/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+-- generated xml file: /mnt/home/briney/fold-m0-b200/25080/fold-gpu-tests.xml --
+=============== 28 passed, 33 deselected, 15 warnings in 54.14s ================

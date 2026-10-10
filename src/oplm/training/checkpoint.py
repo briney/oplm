@@ -19,12 +19,15 @@ from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
+from oplm.training.ema import EMA_HF_DIRNAME, EMA_SIDECAR_NAME, sync_ema_buffers
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import timedelta
 
     from accelerate import Accelerator
     from torch.distributed import ProcessGroup
+    from torch.optim.swa_utils import AveragedModel
 
     from oplm.config import OplmConfig
 
@@ -264,6 +267,43 @@ def _restore_scaler_sidecar(checkpoint_dir: Path, accelerator: Accelerator) -> N
         )
 
 
+def _write_ema_artifacts(tmp_dir: Path, ema: AveragedModel, live_model: Any) -> None:
+    """Write ``ema.pt`` (tracker state incl. ``n_averaged``) and ``hf_ema/``, main process only.
+
+    Both land in ``tmp_dir`` before the commit rename, so they are covered by the
+    atomic commit and (via ``remote._SHARED_ARTIFACT_NAMES`` / the ``hf_ema`` glob)
+    by the remote mirror. DDP keeps every rank's tracker identical, so one copy suffices.
+    """
+    from oplm.data import get_tokenizer
+
+    sync_ema_buffers(ema, live_model)
+    torch.save(ema.state_dict(), tmp_dir / EMA_SIDECAR_NAME)
+    ema_dir = tmp_dir / EMA_HF_DIRNAME
+    ema_module: Any = ema.module  # a deep copy of the HF model: has save_pretrained
+    ema_module.save_pretrained(ema_dir)
+    get_tokenizer().save_pretrained(ema_dir)
+
+
+def _restore_ema_sidecar(checkpoint_dir: Path, ema: AveragedModel | None) -> None:
+    """Restore the EMA tracker from ``ema.pt`` on every rank; warn on a run/checkpoint mismatch."""
+    sidecar_path = checkpoint_dir / EMA_SIDECAR_NAME
+    if ema is not None and sidecar_path.is_file():
+        ema.load_state_dict(torch.load(sidecar_path, map_location="cpu", weights_only=True))
+    elif ema is not None:
+        logger.warning(
+            "train.ema_decay is set but checkpoint %s has no %s; the EMA tracker starts "
+            "from the live weights at the next optimizer step.",
+            checkpoint_dir,
+            EMA_SIDECAR_NAME,
+        )
+    elif sidecar_path.is_file():
+        logger.warning(
+            "Checkpoint %s has EMA state (%s) but train.ema_decay is unset; not restored.",
+            checkpoint_dir,
+            EMA_SIDECAR_NAME,
+        )
+
+
 @dataclass
 class PendingSave:
     """Handle for an in-flight async checkpoint save awaiting its deferred commit.
@@ -486,6 +526,7 @@ def save_checkpoint(
     cursor: Any | None = None,
     blocking: bool = True,
     process_group: ProcessGroup | None = None,
+    ema: AveragedModel | None = None,
 ) -> Path | PendingSave:
     """Save a training checkpoint atomically via a tmp-dir + rename commit.
 
@@ -572,6 +613,10 @@ def save_checkpoint(
             collectives can interleave with the training loop's own collectives on the
             default group (Task 5.1b; see :func:`build_checkpoint_process_group`'s
             docstring for the full story).
+        ema: The EMA tracker (``train.ema_decay``), or ``None`` when EMA is off. When
+            set, ``ema.pt`` and ``hf_ema/`` are written on the main process into the
+            staging directory, so the atomic commit covers them (see
+            :func:`_write_ema_artifacts`).
 
     Returns:
         When ``blocking=True`` (default): the path the checkpoint is committed to
@@ -695,6 +740,8 @@ def save_checkpoint(
         else:
             unwrapped.save_pretrained(hf_dir, state_dict=hf_state_dict)
         get_tokenizer().save_pretrained(hf_dir)  # tokenizer files for round-trip
+        if ema is not None:
+            _write_ema_artifacts(tmp_dir, ema, unwrapped)
 
     if blocking:
         return _commit_checkpoint(
@@ -1021,6 +1068,7 @@ def load_checkpoint(
     cfg: OplmConfig,
     *,
     validate_schedule: bool = True,
+    ema: AveragedModel | None = None,
 ) -> dict[str, Any]:
     """Load a training checkpoint and return trainer state metadata.
 
@@ -1061,6 +1109,8 @@ def load_checkpoint(
             checkpoint's own ``config.yaml`` for schedule compatibility.
         validate_schedule: Run :func:`validate_schedule_compat`. ``False`` for a branch,
             whose LR/schedule intentionally differ from the checkpoint's.
+        ema: The EMA tracker to restore from ``ema.pt`` (see
+            :func:`_restore_ema_sidecar`), or ``None`` when EMA is off.
 
     Returns:
         Dict with keys ``global_step``, ``epoch``, ``tokens_seen``, and
@@ -1109,6 +1159,7 @@ def load_checkpoint(
 
     _restore_rng_sidecar(ckpt_path, accelerator.process_index)
     _restore_scaler_sidecar(ckpt_path, accelerator)
+    _restore_ema_sidecar(ckpt_path, ema)
 
     return state
 

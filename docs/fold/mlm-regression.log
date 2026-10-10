@@ -1,0 +1,96 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.0.3, pluggy-1.6.0 -- /opt/conda/bin/python
+cachedir: .pytest_cache
+rootdir: /tmp/fold-m0-b200_25080/oplm
+configfile: pyproject.toml
+plugins: anyio-4.13.0, fast-array-utils-1.4.1, jaxtyping-0.3.9, zarr-3.1.6, cov-7.1.0
+collecting ... collected 8 items
+
+tests/training/test_e2e_logging.py::test_logging_cadence_and_metric_contract[cpu-no] PASSED [ 12%]
+tests/training/test_e2e_logging.py::test_logging_cadence_and_metric_contract[cuda-no] PASSED [ 25%]
+tests/training/test_e2e_logging.py::test_logging_cadence_and_metric_contract[cuda-bf16] PASSED [ 37%]
+tests/training/test_e2e_precision.py::test_mixed_precision_run_learns_and_checkpoints[bf16] PASSED [ 50%]
+tests/training/test_e2e_precision.py::test_mixed_precision_run_learns_and_checkpoints[fp16] PASSED [ 62%]
+tests/training/test_e2e_ema.py::test_ema_sidecar_and_hf_ema_round_trip PASSED [ 75%]
+tests/training/test_e2e_ema.py::test_ema_counts_optimizer_steps_and_survives_resume FAILED [ 87%]
+tests/training/test_e2e_ema.py::test_resume_into_ema_from_checkpoint_without_ema_warns PASSED [100%]
+
+=================================== FAILURES ===================================
+_____________ test_ema_counts_optimizer_steps_and_survives_resume ______________
+
+tmp_path = PosixPath('/tmp/pytest-of-briney/pytest-0/test_ema_counts_optimizer_step0')
+training_parquet = PosixPath('/tmp/pytest-of-briney/pytest-0/fixtures0/test_sequences_fast.parquet')
+
+    def test_ema_counts_optimizer_steps_and_survives_resume(
+        tmp_path: Path, training_parquet: Path
+    ) -> None:
+        from oplm.training.trainer import Trainer
+
+        common = dict(
+            batch_size=4, gradient_accumulation_steps=2, log_every=1, warmup_steps=0, ema_decay=0.5
+        )
+        cfg1 = tiny_train_cfg(tmp_path, training_parquet, max_steps=4, save_every=4, **common)
+        first = Trainer(cfg1)
+        first.train()
+        assert first._ema is not None
+        assert int(first._ema.n_averaged) == 4  # optimizer steps, not the 8 micro-batches
+
+        ckpt = tmp_path / "checkpoint-4"
+        state = json.loads((ckpt / "trainer_state.json").read_text())
+        assert state["ema"] == {"decay": 0.5, "sidecar": "ema.pt", "hf_dir": "hf_ema", "n_averaged": 4}
+        assert (ckpt / "ema.pt").is_file()
+        assert (ckpt / "hf_ema" / "model.safetensors").is_file()
+        saved = torch.load(ckpt / "ema.pt", map_location="cpu", weights_only=True)
+
+        cfg2 = tiny_train_cfg(
+            tmp_path, training_parquet, max_steps=8, save_every=8, resume_from=str(ckpt), **common
+        )
+        resumed = Trainer(cfg2)
+        assert resumed._ema is not None
+        assert int(resumed._ema.n_averaged) == 4  # restored, not restarted
+        for name, tensor in resumed._ema.state_dict().items():
+>           assert torch.equal(tensor, saved[name]), name
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           RuntimeError: Expected all tensors to be on the same device, but got other is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA__equal)
+
+tests/training/test_e2e_ema.py:136: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+Building model...
+Loading training data...
+Preparing for training...
+4/4 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ loss=3.4352 eval=N/A 0:00:00
+Building model...
+Loading training data...
+Preparing for training...
+----------------------------- Captured stderr call -----------------------------
+Writing model shards: 100%|██████████| 1/1 [00:00<00:00, 211.81it/s]
+Writing model shards: 100%|██████████| 1/1 [00:00<00:00, 679.57it/s]
+------------------------------ Captured log call -------------------------------
+WARNING  oplm.training.checkpoint:checkpoint.py:858 Checkpoint /tmp/pytest-of-briney/pytest-0/test_ema_counts_optimizer_step0/checkpoint-4: resuming with a larger max_steps (checkpoint=4, live=8). The decay portion of the LR schedule will differ from an uninterrupted run to the new, longer target -- expected for a deliberate run extension.
+=============================== warnings summary ===============================
+tests/training/test_e2e_logging.py: 14 warnings
+  /opt/conda/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/training/test_e2e_logging.py::test_logging_cadence_and_metric_contract[cpu-no]
+tests/training/test_e2e_logging.py::test_logging_cadence_and_metric_contract[cuda-no]
+tests/training/test_e2e_logging.py::test_logging_cadence_and_metric_contract[cuda-bf16]
+tests/training/test_e2e_precision.py::test_mixed_precision_run_learns_and_checkpoints[bf16]
+tests/training/test_e2e_precision.py::test_mixed_precision_run_learns_and_checkpoints[fp16]
+tests/training/test_e2e_ema.py::test_ema_sidecar_and_hf_ema_round_trip
+tests/training/test_e2e_ema.py::test_ema_counts_optimizer_steps_and_survives_resume
+tests/training/test_e2e_ema.py::test_resume_into_ema_from_checkpoint_without_ema_warns
+  /opt/conda/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:483: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.
+    return func(*args, **kwargs)
+
+tests/training/test_e2e_ema.py::test_ema_sidecar_and_hf_ema_round_trip
+tests/training/test_e2e_ema.py::test_ema_counts_optimizer_steps_and_survives_resume
+tests/training/test_e2e_ema.py::test_resume_into_ema_from_checkpoint_without_ema_warns
+  /opt/conda/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:483: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+    return func(*args, **kwargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+-- generated xml file: /mnt/home/briney/fold-m0-b200/25080/mlm-regression.xml --
+=========================== short test summary info ============================
+FAILED tests/training/test_e2e_ema.py::test_ema_counts_optimizer_steps_and_survives_resume
+=================== 1 failed, 7 passed, 25 warnings in 7.45s ===================

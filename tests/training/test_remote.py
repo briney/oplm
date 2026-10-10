@@ -683,6 +683,52 @@ def test_remote_rotation_via_upload_manager_honors_keep_every_n_steps(tmp_path: 
     assert remote_names == ["checkpoint-4", "checkpoint-6", "checkpoint-8"]
 
 
+def test_build_upload_job_mirrors_ema_artifacts_from_the_main_rank_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ema.pt`` and every ``hf_ema/`` file are shared artifacts: main rank only."""
+    from oplm.training.remote import build_upload_job
+
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")  # two single-rank nodes
+    checkpoint_dir = tmp_path / "checkpoint-7"
+    _write_local_checkpoint(
+        checkpoint_dir,
+        {
+            "__0_0.distcp": "shard",
+            "trainer_state.json": "{}",
+            "ema.pt": "ema",
+            "hf/model.safetensors": "live",
+            "hf_ema/model.safetensors": "averaged",
+            "hf_ema/config.json": "{}",
+        },
+    )
+
+    def job_for(rank: int) -> Any:
+        accelerator = _FakeAccelerator(
+            is_main_process=rank == 0,
+            num_processes=2,
+            process_index=rank,
+            local_process_index=0,
+        )
+        return build_upload_job(
+            checkpoint_dir,
+            accelerator,
+            permanent=False,
+            save_total_limit=3,
+            keep_every_n_steps=None,
+        )
+
+    main_job = job_for(0)
+    assert main_job.shared_files is not None
+    assert {
+        Path("ema.pt"),
+        Path("hf/model.safetensors"),
+        Path("hf_ema/config.json"),
+        Path("hf_ema/model.safetensors"),
+    } <= set(main_job.shared_files)
+    assert job_for(1).shared_files is None
+
+
 @pytest.mark.slow
 def test_two_node_leaders_upload_through_the_real_collective_path(tmp_path: Path) -> None:
     """2 real CPU/gloo processes, real ``build_upload_group``/``UploadManager`` collectives.
@@ -729,6 +775,8 @@ def test_two_node_leaders_upload_through_the_real_collective_path(tmp_path: Path
         "__0_0.distcp",
         "__1_0.distcp",
         "config.yaml",
+        "ema.pt",
+        "hf_ema/model.safetensors",
         "rng_state_0.pt",
         "rng_state_1.pt",
         "trainer_state.json",

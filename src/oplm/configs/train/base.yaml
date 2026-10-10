@@ -91,6 +91,10 @@ train:
   # additionally synced to; null disables remote sync. s3:// needs the `s3` extra.
   remote_checkpoint_uri: null
 
+  # Exponential moving average of the trainable weights, updated once per optimizer
+  # step; null disables it. Fold stages use 0.999. Adds ema.pt + hf_ema/ to checkpoints.
+  ema_decay: null
+
   # Infrastructure
   seed: 42
   output_dir: outputs
