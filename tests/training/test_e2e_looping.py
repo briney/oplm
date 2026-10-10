@@ -208,7 +208,11 @@ def test_new_stage_does_not_reuse_parent_tracker_id(
 
     def track(self: Accelerator, **kwargs: Any) -> None:
         captured.append(kwargs["init_kwargs"]["wandb"])
-        monkeypatch.setattr(wandb, "run", SimpleNamespace(id="new-stage"))
+        # The trainer calls define_metric on the live run right after init (fc1f6d4), so
+        # the stub needs it alongside the id this test is actually about.
+        monkeypatch.setattr(
+            wandb, "run", SimpleNamespace(id="new-stage", define_metric=lambda *a, **k: None)
+        )
 
     monkeypatch.setattr(Accelerator, "init_trackers", track)
     trainer = Trainer(
