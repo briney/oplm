@@ -266,3 +266,11 @@ sampler schedule, seed 0, CPU, 4.6 s): pTM 0.215, mean pLDDT 0.794. Upstream's r
 step counts and RNG). The `write_mmcif` output read back with gemmi: chain A, 20 residues, 153
 atoms. [`parity-local.log`](fold/m1/parity-local.log) is the same parity suite on the workstation
 at the final tolerances (all 37 pass; the GPU test skips without CUDA).
+
+**GPU run** ([`gpu-tests.log`](fold/m1/gpu-tests.log), [`gpu-status.txt`](fold/m1/gpu-status.txt),
+SUNK job 25487, one B200, 2026-10-11): `pytest tests/fold -m slow` against the same fixtures, all 29
+pass: the milestone-0 FlexAttention and fused-trimul parity tests and
+`test_gpu_pipeline_tracks_the_cpu_oracle` (bf16 autocast, FlexAttention and the fused trimul end to
+end on trp-cage: finite coordinates and PAE, final pair within the 5e-2 relative Frobenius bound of
+the CPU oracle). That run predates the test recording its observed value; it now lands in the job's
+JUnit XML as the `pair_rel_fro_err` property.

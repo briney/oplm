@@ -261,7 +261,9 @@ def test_confidence_matches(fixtures_dir: Path, released: OplmForFolding, confor
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("case", _CASES[:1])
-def test_gpu_pipeline_tracks_the_cpu_oracle(fixtures_dir: Path, conformers, case) -> None:
+def test_gpu_pipeline_tracks_the_cpu_oracle(
+    fixtures_dir: Path, conformers, case, record_property
+) -> None:
     """bf16 autocast + FlexAttention + fused trimul: finite end to end, pair within bf16 drift."""
     fx = _case_fixture(fixtures_dir, case)
     cfg = fold_config_from_upstream(json.loads((fixtures_dir / "config.json").read_text()))
@@ -286,4 +288,5 @@ def test_gpu_pipeline_tracks_the_cpu_oracle(fixtures_dir: Path, conformers, case
     ref = fx["parcae_coda.out.0"].float().cuda()
     ours = out.pair[:, :L, :L]
     rel = ((ours - ref).norm() / ref.norm()).item()
+    record_property("pair_rel_fro_err", f"{rel:.3e}")  # lands in the job's --junitxml
     assert rel < 5e-2, f"relative Frobenius error of the final pair: {rel:.3e}"
