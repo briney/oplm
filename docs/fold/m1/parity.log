@@ -1,0 +1,104 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0 -- /mnt/data/briney/fold-fixtures/esm-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /tmp/fold-m1-fixtures_25479/oplm
+configfile: pyproject.toml
+plugins: anyio-4.15.1, platformdirs-4.13.0, cov-7.1.0
+collecting ... collected 38 items
+
+tests/fold/test_parity.py::test_head_weights_load_strictly_and_config_matches PASSED [  2%]
+tests/fold/test_parity.py::test_packaged_reference_conformers_match_upstream_dump FAILED [  5%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[trp_cage] PASSED [  7%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[villin] PASSED [ 10%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[gb1] PASSED  [ 13%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[heterodimer] PASSED [ 15%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[homodimer_x] PASSED [ 18%]
+tests/fold/test_parity.py::test_shim_matches[trp_cage] PASSED            [ 21%]
+tests/fold/test_parity.py::test_shim_matches[villin] PASSED              [ 23%]
+tests/fold/test_parity.py::test_shim_matches[gb1] PASSED                 [ 26%]
+tests/fold/test_parity.py::test_shim_matches[heterodimer] PASSED         [ 28%]
+tests/fold/test_parity.py::test_shim_matches[homodimer_x] PASSED         [ 31%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[trp_cage] PASSED [ 34%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[villin] PASSED   [ 36%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[gb1] PASSED      [ 39%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[heterodimer] PASSED [ 42%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[homodimer_x] PASSED [ 44%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[trp_cage] PASSED [ 47%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[villin] PASSED [ 50%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[gb1] PASSED [ 52%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[heterodimer] PASSED [ 55%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[homodimer_x] PASSED [ 57%]
+tests/fold/test_parity.py::test_denoiser_matches[trp_cage] PASSED        [ 60%]
+tests/fold/test_parity.py::test_denoiser_matches[villin] PASSED          [ 63%]
+tests/fold/test_parity.py::test_denoiser_matches[gb1] PASSED             [ 65%]
+tests/fold/test_parity.py::test_denoiser_matches[heterodimer] PASSED     [ 68%]
+tests/fold/test_parity.py::test_denoiser_matches[homodimer_x] PASSED     [ 71%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[trp_cage] PASSED [ 73%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[villin] PASSED [ 76%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[gb1] PASSED [ 78%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[heterodimer] PASSED [ 81%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[homodimer_x] PASSED [ 84%]
+tests/fold/test_parity.py::test_confidence_matches[trp_cage] PASSED      [ 86%]
+tests/fold/test_parity.py::test_confidence_matches[villin] PASSED        [ 89%]
+tests/fold/test_parity.py::test_confidence_matches[gb1] PASSED           [ 92%]
+tests/fold/test_parity.py::test_confidence_matches[heterodimer] PASSED   [ 94%]
+tests/fold/test_parity.py::test_confidence_matches[homodimer_x] PASSED   [ 97%]
+tests/fold/test_parity.py::test_gpu_pipeline_tracks_the_cpu_oracle[trp_cage] SKIPPED [100%]
+
+=================================== FAILURES ===================================
+____________ test_packaged_reference_conformers_match_upstream_dump ____________
+
+fixtures_dir = PosixPath('/mnt/data/briney/fold-fixtures/25479')
+
+    def test_packaged_reference_conformers_match_upstream_dump(fixtures_dir: Path) -> None:
+        """The packaged table must equal the generator's ``get_idealized_atom_pos`` dump."""
+        dump = fixtures_dir / "reference_conformers.json"
+        ours, theirs = ReferenceConformers.load(), ReferenceConformers.load(dump)
+        fix = f"replace src/oplm/fold/data/reference_conformers.json with {dump}"
+        assert ours.codes == theirs.codes, fix
+        for code in ours.codes:
+            a, b = ours[code], theirs[code]
+            assert (a.atoms, a.elements, a.charges) == (b.atoms, b.elements, b.charges), (
+                f"{code}: {fix}"
+            )
+>           _close(a.positions, b.positions, atol=1e-6, what=f"{code} positions ({fix})")
+
+tests/fold/test_parity.py:90:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+a = tensor([[-0.0100, -1.2073, -1.0555],
+        [-0.0419,  0.1745, -0.5729],
+        [ 1.2128,  0.4738,  0.1952],
+        [ 1.9390,  1.4485, -0.1376],
+        [-1.2769,  0.4288,  0.2994]])
+b = tensor([[-0.9146, -1.3157, -0.0495],
+        [-0.3617, -0.0719, -0.5885],
+        [ 1.1219, -0.2118, -0.7704],
+        [ 1.6425,  0.0034, -1.8977],
+        [-0.6790,  1.1178,  0.3253]])
+atol = 1e-06, rtol = 0.0
+what = 'ALA positions (replace src/oplm/fold/data/reference_conformers.json with /mnt/data/briney/fold-fixtures/25479/reference_conformers.json)'
+
+    def _close(a: Tensor, b: Tensor, *, atol: float, rtol: float = 0.0, what: str = "") -> None:
+        a, b = a.float(), b.float()
+        err = (a - b).abs().max().item()
+>       torch.testing.assert_close(
+            a, b, atol=atol, rtol=rtol, msg=f"{what}: max abs err {err:.3e} (atol {atol})"
+        )
+E       AssertionError: ALA positions (replace src/oplm/fold/data/reference_conformers.json with /mnt/data/briney/fold-fixtures/25479/reference_conformers.json): max abs err 1.760e+00 (atol 1e-06)
+
+tests/fold/test_parity.py:69: AssertionError
+=============================== warnings summary ===============================
+../../../mnt/data/briney/fold-fixtures/esm-venv/lib/python3.12/site-packages/transformers/utils/hub.py:110
+  /mnt/data/briney/fold-fixtures/esm-venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+    warnings.warn(
+
+../../../mnt/data/briney/fold-fixtures/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488
+  /mnt/data/briney/fold-fixtures/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+---- generated xml file: /mnt/home/briney/fold-m1-fixtures/25479/parity.xml ----
+=========================== short test summary info ============================
+SKIPPED [1] tests/fold/test_parity.py:261: CUDA required
+============= 1 failed, 36 passed, 1 skipped, 2 warnings in 24.74s =============

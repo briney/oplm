@@ -256,7 +256,10 @@ def _dump_reference_conformers(out: Path, base: ReferenceConformers, ccd_source:
             {
                 "source": f"esm {version('esm')} get_idealized_atom_pos over {ccd_source} "
                 "(Computed conformer, raw)",
-                "charge_table": base.source,
+                "charge_table": (
+                    "atoms, elements and charges transcribed from Biohub esm 3.4.1 "
+                    "esm/models/esmfold2/{constants,protein_utils}.py"
+                ),
                 "residues": residues,
             },
             indent=1,

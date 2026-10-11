@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="1" tests="38" time="24.739" timestamp="2026-10-11T15:45:51.355046+00:00" hostname="slurm-b200-193-175"><testcase classname="tests.fold.test_parity" name="test_head_weights_load_strictly_and_config_matches" time="9.777" /><testcase classname="tests.fold.test_parity" name="test_packaged_reference_conformers_match_upstream_dump" time="0.029"><failure message="AssertionError: ALA positions (replace src/oplm/fold/data/reference_conformers.json with /mnt/data/briney/fold-fixtures/25479/reference_conformers.json): max abs err 1.760e+00 (atol 1e-06)">fixtures_dir = PosixPath('/mnt/data/briney/fold-fixtures/25479')
+
+    def test_packaged_reference_conformers_match_upstream_dump(fixtures_dir: Path) -&gt; None:
+        """The packaged table must equal the generator's ``get_idealized_atom_pos`` dump."""
+        dump = fixtures_dir / "reference_conformers.json"
+        ours, theirs = ReferenceConformers.load(), ReferenceConformers.load(dump)
+        fix = f"replace src/oplm/fold/data/reference_conformers.json with {dump}"
+        assert ours.codes == theirs.codes, fix
+        for code in ours.codes:
+            a, b = ours[code], theirs[code]
+            assert (a.atoms, a.elements, a.charges) == (b.atoms, b.elements, b.charges), (
+                f"{code}: {fix}"
+            )
+&gt;           _close(a.positions, b.positions, atol=1e-6, what=f"{code} positions ({fix})")
+
+tests/fold/test_parity.py:90:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+a = tensor([[-0.0100, -1.2073, -1.0555],
+        [-0.0419,  0.1745, -0.5729],
+        [ 1.2128,  0.4738,  0.1952],
+        [ 1.9390,  1.4485, -0.1376],
+        [-1.2769,  0.4288,  0.2994]])
+b = tensor([[-0.9146, -1.3157, -0.0495],
+        [-0.3617, -0.0719, -0.5885],
+        [ 1.1219, -0.2118, -0.7704],
+        [ 1.6425,  0.0034, -1.8977],
+        [-0.6790,  1.1178,  0.3253]])
+atol = 1e-06, rtol = 0.0
+what = 'ALA positions (replace src/oplm/fold/data/reference_conformers.json with /mnt/data/briney/fold-fixtures/25479/reference_conformers.json)'
+
+    def _close(a: Tensor, b: Tensor, *, atol: float, rtol: float = 0.0, what: str = "") -&gt; None:
+        a, b = a.float(), b.float()
+        err = (a - b).abs().max().item()
+&gt;       torch.testing.assert_close(
+            a, b, atol=atol, rtol=rtol, msg=f"{what}: max abs err {err:.3e} (atol {atol})"
+        )
+E       AssertionError: ALA positions (replace src/oplm/fold/data/reference_conformers.json with /mnt/data/briney/fold-fixtures/25479/reference_conformers.json): max abs err 1.760e+00 (atol 1e-06)
+
+  tests/fold/test_parity.py:69: AssertionError</failure></testcase><testcase classname="tests.fold.test_parity" name="test_featurizer_matches_upstream[trp_cage]" time="0.091" /><testcase classname="tests.fold.test_parity" name="test_featurizer_matches_upstream[villin]" time="0.106" /><testcase classname="tests.fold.test_parity" name="test_featurizer_matches_upstream[gb1]" time="0.083" /><testcase classname="tests.fold.test_parity" name="test_featurizer_matches_upstream[heterodimer]" time="0.124" /><testcase classname="tests.fold.test_parity" name="test_featurizer_matches_upstream[homodimer_x]" time="0.118" /><testcase classname="tests.fold.test_parity" name="test_shim_matches[trp_cage]" time="0.084" /><testcase classname="tests.fold.test_parity" name="test_shim_matches[villin]" time="0.069" /><testcase classname="tests.fold.test_parity" name="test_shim_matches[gb1]" time="0.203" /><testcase classname="tests.fold.test_parity" name="test_shim_matches[heterodimer]" time="0.062" /><testcase classname="tests.fold.test_parity" name="test_shim_matches[homodimer_x]" time="0.056" /><testcase classname="tests.fold.test_parity" name="test_inputs_embedder_matches[trp_cage]" time="0.026" /><testcase classname="tests.fold.test_parity" name="test_inputs_embedder_matches[villin]" time="0.022" /><testcase classname="tests.fold.test_parity" name="test_inputs_embedder_matches[gb1]" time="0.067" /><testcase classname="tests.fold.test_parity" name="test_inputs_embedder_matches[heterodimer]" time="0.063" /><testcase classname="tests.fold.test_parity" name="test_inputs_embedder_matches[homodimer_x]" time="0.017" /><testcase classname="tests.fold.test_parity" name="test_recurrence_readout_and_distogram_match[trp_cage]" time="0.413" /><testcase classname="tests.fold.test_parity" name="test_recurrence_readout_and_distogram_match[villin]" time="0.826" /><testcase classname="tests.fold.test_parity" name="test_recurrence_readout_and_distogram_match[gb1]" time="2.040" /><testcase classname="tests.fold.test_parity" name="test_recurrence_readout_and_distogram_match[heterodimer]" time="0.554" /><testcase classname="tests.fold.test_parity" name="test_recurrence_readout_and_distogram_match[homodimer_x]" time="0.356" /><testcase classname="tests.fold.test_parity" name="test_denoiser_matches[trp_cage]" time="0.050" /><testcase classname="tests.fold.test_parity" name="test_denoiser_matches[villin]" time="0.047" /><testcase classname="tests.fold.test_parity" name="test_denoiser_matches[gb1]" time="0.057" /><testcase classname="tests.fold.test_parity" name="test_denoiser_matches[heterodimer]" time="0.044" /><testcase classname="tests.fold.test_parity" name="test_denoiser_matches[homodimer_x]" time="0.040" /><testcase classname="tests.fold.test_parity" name="test_sampler_schedule_matches_recorded_t_hat[trp_cage]" time="0.008" /><testcase classname="tests.fold.test_parity" name="test_sampler_schedule_matches_recorded_t_hat[villin]" time="0.008" /><testcase classname="tests.fold.test_parity" name="test_sampler_schedule_matches_recorded_t_hat[gb1]" time="0.008" /><testcase classname="tests.fold.test_parity" name="test_sampler_schedule_matches_recorded_t_hat[heterodimer]" time="0.007" /><testcase classname="tests.fold.test_parity" name="test_sampler_schedule_matches_recorded_t_hat[homodimer_x]" time="0.007" /><testcase classname="tests.fold.test_parity" name="test_confidence_matches[trp_cage]" time="0.035" /><testcase classname="tests.fold.test_parity" name="test_confidence_matches[villin]" time="0.062" /><testcase classname="tests.fold.test_parity" name="test_confidence_matches[gb1]" time="0.114" /><testcase classname="tests.fold.test_parity" name="test_confidence_matches[heterodimer]" time="0.040" /><testcase classname="tests.fold.test_parity" name="test_confidence_matches[homodimer_x]" time="0.037" /><testcase classname="tests.fold.test_parity" name="test_gpu_pipeline_tracks_the_cpu_oracle[trp_cage]" time="0.016"><skipped type="pytest.skip" message="CUDA required">/tmp/fold-m1-fixtures_25479/oplm/tests/fold/test_parity.py:261: CUDA required</skipped></testcase></testsuite></testsuites>
+

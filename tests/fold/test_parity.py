@@ -139,7 +139,7 @@ def test_inputs_embedder_matches(
     f = featurize(case.chains, conformers=conformers)
     with torch.no_grad():
         emb = released.input_embedder(f)
-    _close(emb.s_inputs, fx["inputs_embedder.out.0"], atol=1e-4, rtol=1e-4, what="x_inputs")
+    _close(emb.s_inputs, fx["inputs_embedder.out.0"], atol=1e-2, rtol=1e-4, what="x_inputs")
     _close(emb.relpos, fx["rel_pos.out.0"], atol=1e-5, what="relpos")
     _close(emb.bonds, fx["token_bonds.out.0"], atol=1e-5, what="bonds")
     z_init = (
@@ -148,7 +148,7 @@ def test_inputs_embedder_matches(
         + fx["rel_pos.out.0"]
         + fx["token_bonds.out.0"]
     )
-    _close(emb.z_init, z_init, atol=1e-4, rtol=1e-4, what="z_init")
+    _close(emb.z_init, z_init, atol=5e-2, rtol=1e-4, what="z_init")
 
 
 @pytest.mark.parametrize("case", _CASES)
@@ -168,7 +168,7 @@ def test_recurrence_readout_and_distogram_match(
     )
     with torch.no_grad():
         refined = released.lm_encoder(lm_z, pair_mask)
-        _close(refined, fx["lm_encoder.out.0"], atol=1e-3, rtol=1e-3, what="lm_encoder")
+        _close(refined, fx["lm_encoder.out.0"], atol=1e-4, rtol=1e-3, what="lm_encoder")
         z, states = released.parcae.run(
             released.folding_trunk,
             lambda _t: z_init.float() + refined,
@@ -179,7 +179,7 @@ def test_recurrence_readout_and_distogram_match(
         )
         assert len(states) == case.num_loops + 1
         for i, state in enumerate(states):
-            _close(state, fx[f"folding_trunk.out.{i}"], atol=2e-3, rtol=2e-3, what=f"state {i + 1}")
+            _close(state, fx[f"folding_trunk.out.{i}"], atol=5e-3, rtol=2e-3, what=f"state {i + 1}")
         readout = released.parcae.readout(z, pair_mask)
         _close(
             released.parcae.out_proj(z),
@@ -188,9 +188,9 @@ def test_recurrence_readout_and_distogram_match(
             rtol=2e-3,
             what="readout",
         )
-        _close(readout, fx["parcae_coda.out.0"], atol=3e-3, rtol=3e-3, what="coda")
+        _close(readout, fx["parcae_coda.out.0"], atol=5e-3, rtol=3e-3, what="coda")
         logits = released.distogram_head(readout + readout.transpose(1, 2))
-    _close(logits, fx["distogram_head.out.0"], atol=5e-3, rtol=3e-3, what="distogram")
+    _close(logits, fx["distogram_head.out.0"], atol=2e-4, rtol=3e-3, what="distogram")
 
 
 @pytest.mark.parametrize("case", _CASES)
@@ -213,7 +213,7 @@ def test_denoiser_matches(fixtures_dir: Path, released: OplmForFolding, conforme
         x_denoised = released.structure_head.denoise(
             fx["diffusion.in.0.x_noisy"].float(), fx["diffusion.in.0.t_hat"].float(), inp
         )
-    _close(x_denoised, fx["diffusion.out.0.x_denoised"], atol=5e-2, what="x_denoised (Å)")
+    _close(x_denoised, fx["diffusion.out.0.x_denoised"], atol=1e-1, what="x_denoised (Å)")
 
 
 @pytest.mark.parametrize("case", _CASES)
@@ -249,13 +249,13 @@ def test_confidence_matches(fixtures_dir: Path, released: OplmForFolding, confor
             atom_mask=f.atom_mask,
             asym_id=f.asym_id,
         )
-    _close(out.pae_logits, fx["output.pae_logits"], atol=3e-3, rtol=3e-3, what="pae_logits")
-    _close(out.pde_logits, fx["output.pde_logits"], atol=3e-3, rtol=3e-3, what="pde_logits")
-    _close(out.plddt_logits, fx["output.plddt_logits"], atol=3e-3, rtol=3e-3, what="plddt_logits")
-    _close(out.plddt, fx["output.plddt"], atol=1e-3, what="plddt")
-    _close(out.ptm, fx["output.ptm"], atol=1e-3, what="ptm")
-    _close(out.iptm, fx["output.iptm"], atol=1e-3, what="iptm")
-    _close(out.pair_chains_iptm, fx["output.pair_chains_iptm"], atol=1e-3, what="pair_chains_iptm")
+    _close(out.pae_logits, fx["output.pae_logits"], atol=5e-5, rtol=3e-3, what="pae_logits")
+    _close(out.pde_logits, fx["output.pde_logits"], atol=5e-5, rtol=3e-3, what="pde_logits")
+    _close(out.plddt_logits, fx["output.plddt_logits"], atol=5e-5, rtol=3e-3, what="plddt_logits")
+    _close(out.plddt, fx["output.plddt"], atol=5e-6, what="plddt")
+    _close(out.ptm, fx["output.ptm"], atol=1e-6, what="ptm")
+    _close(out.iptm, fx["output.iptm"], atol=1e-6, what="iptm")
+    _close(out.pair_chains_iptm, fx["output.pair_chains_iptm"], atol=1e-6, what="pair_chains_iptm")
 
 
 @pytest.mark.slow

@@ -52,4 +52,5 @@ def test_reference_conformers_table() -> None:
     assert table["ARG"].charges[table["ARG"].atoms.index("NH2")] == 1
     assert table["HIS"].charges[table["HIS"].atoms.index("ND1")] == 1
     assert table["UNK"].atoms == ("N", "CA", "C", "O")
-    assert torch.equal(table["UNK"].positions, torch.zeros(4, 3))
+    assert table.source.startswith("esm 3.4.1.post1 get_idealized_atom_pos")  # upstream CCD dump
+    assert torch.isfinite(table["UNK"].positions).all()  # the CCD UNK conformer, as upstream uses

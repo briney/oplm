@@ -1,0 +1,49 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.16, pytest-9.1.1, pluggy-1.6.0 -- ~/git/oplm/.venv/bin/python
+rootdir: ~/git/oplm
+configfile: pyproject.toml
+plugins: anyio-4.15.1, cov-7.1.0, platformdirs-4.12.3
+collecting ... collected 38 items
+
+tests/fold/test_parity.py::test_head_weights_load_strictly_and_config_matches PASSED [  2%]
+tests/fold/test_parity.py::test_packaged_reference_conformers_match_upstream_dump PASSED [  5%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[trp_cage] PASSED [  7%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[villin] PASSED [ 10%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[gb1] PASSED  [ 13%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[heterodimer] PASSED [ 15%]
+tests/fold/test_parity.py::test_featurizer_matches_upstream[homodimer_x] PASSED [ 18%]
+tests/fold/test_parity.py::test_shim_matches[trp_cage] PASSED            [ 21%]
+tests/fold/test_parity.py::test_shim_matches[villin] PASSED              [ 23%]
+tests/fold/test_parity.py::test_shim_matches[gb1] PASSED                 [ 26%]
+tests/fold/test_parity.py::test_shim_matches[heterodimer] PASSED         [ 28%]
+tests/fold/test_parity.py::test_shim_matches[homodimer_x] PASSED         [ 31%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[trp_cage] PASSED [ 34%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[villin] PASSED   [ 36%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[gb1] PASSED      [ 39%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[heterodimer] PASSED [ 42%]
+tests/fold/test_parity.py::test_inputs_embedder_matches[homodimer_x] PASSED [ 44%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[trp_cage] PASSED [ 47%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[villin] PASSED [ 50%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[gb1] PASSED [ 52%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[heterodimer] PASSED [ 55%]
+tests/fold/test_parity.py::test_recurrence_readout_and_distogram_match[homodimer_x] PASSED [ 57%]
+tests/fold/test_parity.py::test_denoiser_matches[trp_cage] PASSED        [ 60%]
+tests/fold/test_parity.py::test_denoiser_matches[villin] PASSED          [ 63%]
+tests/fold/test_parity.py::test_denoiser_matches[gb1] PASSED             [ 65%]
+tests/fold/test_parity.py::test_denoiser_matches[heterodimer] PASSED     [ 68%]
+tests/fold/test_parity.py::test_denoiser_matches[homodimer_x] PASSED     [ 71%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[trp_cage] PASSED [ 73%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[villin] PASSED [ 76%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[gb1] PASSED [ 78%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[heterodimer] PASSED [ 81%]
+tests/fold/test_parity.py::test_sampler_schedule_matches_recorded_t_hat[homodimer_x] PASSED [ 84%]
+tests/fold/test_parity.py::test_confidence_matches[trp_cage] PASSED      [ 86%]
+tests/fold/test_parity.py::test_confidence_matches[villin] PASSED        [ 89%]
+tests/fold/test_parity.py::test_confidence_matches[gb1] PASSED           [ 92%]
+tests/fold/test_parity.py::test_confidence_matches[heterodimer] PASSED   [ 94%]
+tests/fold/test_parity.py::test_confidence_matches[homodimer_x] PASSED   [ 97%]
+tests/fold/test_parity.py::test_gpu_pipeline_tracks_the_cpu_oracle[trp_cage] SKIPPED [100%]
+
+=========================== short test summary info ============================
+SKIPPED [1] tests/fold/test_parity.py:261: CUDA required
+======================== 37 passed, 1 skipped in 8.15s =========================

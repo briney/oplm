@@ -4,8 +4,9 @@ Values transcribed from Biohub's ESMFold2 ``constants.py`` / ``protein_utils.py`
 see THIRD_PARTY_NOTICES.md): the 33-class residue-type vocabulary (ids 2..21 are the twenty
 amino acids by alphabetical three-letter code, 22 is UNK), the heavy-atom order per residue,
 the three charged atoms, and the atom-name character encoding. Reference conformers come
-from ``reference_conformers.json`` next to this file (see its ``source`` field); the fixture
-generator can regenerate that file from the ``ccd.pkl`` shipped with the ESMFold2 weights.
+from ``reference_conformers.json`` next to this file: upstream's ``get_idealized_atom_pos``
+dump of the CCD conformers in ``biohub/ESMFold2``'s ``ccd.pkl`` (see its ``source`` field),
+written by ``oplm fold make-fixtures``; ESMFold2-Fast ships no ``ccd.pkl``.
 Milestone 5 widens this module to ligands and nucleic acids via a gemmi-parsed CCD cache.
 """
 
