@@ -3,9 +3,9 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 1 (inference port).**
-Kernels, the model, data featurization, and prediction exist (§7); losses and
-training land in milestone 2.
+this file records what is implemented. **Status: milestone 1 (inference port), accepted
+2026-10-11.** Kernels, the model, data featurization, and prediction exist, with the
+acceptance evidence in §7; losses and training land in milestone 2.
 
 ## 1. Package layout (implemented so far)
 
@@ -225,8 +225,55 @@ LM held outside the module tree via `attach_lm` / `lm_name_or_path`;
 - Reference conformers are used raw at inference (no per-token rotation, as upstream); spec
   §4.3's rotations are a training augmentation for milestone 2.
 
-**Parity.** Task 12 fills this table. Task 12 replaces the packaged conformer table with the
-fixture dump unconditionally.
+**Parity run** ([`docs/fold/m1/`](fold/m1/), SUNK job 25479, 2026-10-11). CPU fp32 oracle from
+`esm==3.4.1.post1` (Python 3.12.13, torch 2.11.0+cu130 on CPU, transformers 4.57.6) against
+`biohub/ESMFold2-Fast@45fe865` with the CCD from `biohub/ESMFold2@69869f7` (ESMFold2-Fast ships no
+`ccd.pkl`); five cases (trp-cage, villin, GB1, a heterodimer, a homodimer with an X residue), two
+recurrence loops and three sampler steps each. Every stage passed at the draft tolerances; the one
+failure in the recorded log, `test_packaged_reference_conformers_match_upstream_dump`, was the
+expected one (resolved below). The per-stage errors were then measured on a workstation (same
+fixtures, fp32 CPU, dense attention, reference trimul) with the assertions replaced by recording.
+Each `atol` is the smallest 1-2-5 round number ≥ 10× the atol the assertion needs after its `rtol`
+term, floored at 1e-6. `x_inputs` and `z_init` exceeded the draft 1e-4 on the workstation but not
+on the cluster: float accumulation order, growing with sequence length.
+[`parity-rerun.log`](fold/m1/parity-rerun.log) / [`parity-rerun-status.txt`](fold/m1/parity-rerun-status.txt)
+is the cluster rerun at the final tolerances (SUNK job 25489, same venv and fixtures, `parity`
+step only): all 37 pass, the GPU test skips without CUDA.
 
-| stage | atol used | max abs err observed | cases |
-|---|---|---|---|
+| stage | atol | rtol | max abs err | atol needed after rtol | worst case |
+|---|---|---|---|---|---|
+| ref_charge, ref_pos, relpos, bonds | 0 / 1e-6 / 1e-5 / 1e-5 | 0 | 0 | 0 | exact on all five |
+| lm_z (shim) | 1e-4 | 1e-4 | 1.7e-5 | 5.4e-6 | gb1 |
+| x_inputs | 1e-2 | 1e-4 | 1.1e-3 | 9.9e-4 | gb1 |
+| z_init | 5e-2 | 1e-4 | 2.9e-3 | 2.6e-3 | gb1 |
+| lm_encoder | 1e-4 | 1e-3 | 6.1e-5 | 5.7e-6 | gb1 |
+| trunk states 1-3 | 5e-3 | 2e-3 | 2.7e-3 | 2.6e-4 | gb1, trp_cage |
+| readout | 2e-3 | 2e-3 | 1.7e-3 | 1.1e-4 | gb1 |
+| coda | 5e-3 | 3e-3 | 1.3e-3 | 2.7e-4 | gb1 |
+| distogram logits | 2e-4 | 3e-3 | 1.2e-4 | 1.5e-5 | gb1 |
+| x_denoised (Å) | 1e-1 | 0 | 7.1e-3 | 7.1e-3 | trp_cage |
+| pae / pde / plddt logits | 5e-5 | 3e-3 | 1.8e-5 | 4.8e-6 | gb1, villin |
+| plddt | 5e-6 | 0 | 4.2e-7 | 4.2e-7 | homodimer_x |
+| ptm, iptm, pair_chains_iptm | 1e-6 | 0 | 4.5e-8 | 4.5e-8 | gb1, heterodimer |
+
+**Reference conformers.** The packaged `reference_conformers.json` is now the generator's dump of
+upstream `get_idealized_atom_pos` (the CCD "Computed" conformers in `biohub/ESMFold2@69869f7`'s
+`ccd.pkl`), which is what upstream's featurizer uses for protein tokens, UNK included (it gets the
+CCD UNK backbone, not zeros). The milestone-1 transcription of `PROTEIN_REF_POS` was a different
+conformer set (up to 6.4 Å per atom after centring, MET worst); atoms, elements and charges were
+already identical. Predictions made before the swap used the wrong atom reference frame.
+
+**End-to-end prediction** (released head, recorded ESMC states for trp-cage, 21 loops, released
+sampler schedule, seed 0, CPU, 4.6 s): pTM 0.215, mean pLDDT 0.794. Upstream's recorded 3-loop /
+3-step run on the same input: pTM 0.052, mean pLDDT 0.276 (not comparable: different loop and
+step counts and RNG). The `write_mmcif` output read back with gemmi: chain A, 20 residues, 153
+atoms. [`parity-local.log`](fold/m1/parity-local.log) is the same parity suite on the workstation
+at the final tolerances (all 37 pass; the GPU test skips without CUDA).
+
+**GPU run** ([`gpu-tests.log`](fold/m1/gpu-tests.log), [`gpu-status.txt`](fold/m1/gpu-status.txt),
+SUNK job 25487, one B200, 2026-10-11): `pytest tests/fold -m slow` against the same fixtures, all 29
+pass: the milestone-0 FlexAttention and fused-trimul parity tests and
+`test_gpu_pipeline_tracks_the_cpu_oracle` (bf16 autocast, FlexAttention and the fused trimul end to
+end on trp-cage: finite coordinates and PAE, final pair within the 5e-2 relative Frobenius bound of
+the CPU oracle). That run predates the test recording its observed value; it now lands in the job's
+JUnit XML as the `pair_rel_fro_err` property.

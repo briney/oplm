@@ -36,6 +36,8 @@ __all__ = [
     "FIXTURE_CASES",
     "UPSTREAM_REPO",
     "UPSTREAM_REVISION",
+    "CCD_REPO",
+    "CCD_REVISION",
     "FixtureCase",
     "extract_head_weights",
     "fold_config_from_upstream",
@@ -45,6 +47,10 @@ __all__ = [
 
 UPSTREAM_REPO = "biohub/ESMFold2-Fast"
 UPSTREAM_REVISION = "45fe8656f5b3ef493c17fcf9abe9a2968902e712"
+# ESMFold2-Fast ships no ccd.pkl; upstream load_ccd() defaults to biohub/ESMFold2 at main.
+# Pin that repo's commit so the oracle is reproducible.
+CCD_REPO = "biohub/ESMFold2"
+CCD_REVISION = "69869f737beffec5294845ede23db5fc0b4f509e"
 
 
 @dataclass(frozen=True)
@@ -228,7 +234,9 @@ def _dump_reference_conformers(out: Path, base: ReferenceConformers, ccd_source:
     ``ccd_source`` names the ``ccd.pkl`` upstream already loaded (``load_ccd`` caches it
     process-wide on first use, so the caller must load the pinned file before this runs).
     """
-    from esm.models.esmfold2.conformers import get_idealized_atom_pos  # ty: ignore[unresolved-import]  # esm venv only
+    from esm.models.esmfold2.conformers import (  # ty: ignore[unresolved-import]  # esm venv
+        get_idealized_atom_pos,
+    )
 
     residues = {}
     for code in base.codes:
@@ -248,7 +256,10 @@ def _dump_reference_conformers(out: Path, base: ReferenceConformers, ccd_source:
             {
                 "source": f"esm {version('esm')} get_idealized_atom_pos over {ccd_source} "
                 "(Computed conformer, raw)",
-                "charge_table": base.source,
+                "charge_table": (
+                    "atoms, elements and charges transcribed from Biohub esm 3.4.1 "
+                    "esm/models/esmfold2/{constants,protein_utils}.py"
+                ),
                 "residues": residues,
             },
             indent=1,
@@ -272,10 +283,11 @@ def generate_fixtures(
     fp32 (``esmc_precision="fp32"``; the bf16 default would round its weights for good),
     per-loop LM dropout off (``config.lm_encoder.lm_dropout = 0``, ``per_loop_lm_dropout =
     False``; upstream applies it with ``training=True`` even in eval, and its
-    ``_lm_dropout_context(model, None)`` is a no-op), ``lm_mask_pct=0``, the CCD read from the
-    pinned snapshot's ``ccd.pkl`` (not ``biohub/ESMFold2@main``, nor an ``ESMCFOLD_CCD_PATH``
-    inherited from the environment), and ``torch.manual_seed(seed)`` before every forward; the
-    initial pair state is captured by wrapping ``_init_pair_state``.
+    ``_lm_dropout_context(model, None)`` is a no-op), ``lm_mask_pct=0``, the CCD read from
+    ``CCD_REPO@CCD_REVISION``'s ``ccd.pkl`` (the Fast repo ships none; upstream's default would
+    resolve the same file unpinned at ``main``; an inherited ``ESMCFOLD_CCD_PATH`` is ignored),
+    and ``torch.manual_seed(seed)`` before every forward; the initial pair state is captured by
+    wrapping ``_init_pair_state``.
     """
     # Upstream reads ESMCFOLD_CCD_PATH at import (conformers.CCD_PICKLE_PATH) and prefers it over
     # ccd_cache; drop it before the import and clear the global in case esm was imported already.
@@ -287,16 +299,14 @@ def generate_fixtures(
         StructurePredictionInput,
         conformers,
     )
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download, snapshot_download
 
     conformers.CCD_PICKLE_PATH = None
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     snapshot = Path(
-        snapshot_download(
-            repo, revision=revision, allow_patterns=["*.json", "*.safetensors", "*.pkl"]
-        )
+        snapshot_download(repo, revision=revision, allow_patterns=["*.json", "*.safetensors"])
     )
     config = json.loads((snapshot / "config.json").read_text())
     config.pop("esmc_config", None)
@@ -314,8 +324,9 @@ def generate_fixtures(
     model.set_chunk_size(None)
     model.config.lm_encoder.lm_dropout = 0.0  # released 0.25, applied per loop even in eval
     model.config.lm_encoder.per_loop_lm_dropout = False
-    builder = ESMFold2InputBuilder(ccd_cache=snapshot)  # loads snapshot/ccd.pkl process-wide
-    ccd_source = f"{snapshot / 'ccd.pkl'} ({repo}@{revision})"
+    ccd_pkl = Path(hf_hub_download(CCD_REPO, "ccd.pkl", revision=CCD_REVISION))
+    builder = ESMFold2InputBuilder(ccd_cache=ccd_pkl.parent)  # load_ccd reads <dir>/ccd.pkl
+    ccd_source = f"{ccd_pkl} ({CCD_REPO}@{CCD_REVISION})"
     _dump_reference_conformers(
         out_dir / "reference_conformers.json", ReferenceConformers.load(), ccd_source
     )

@@ -23,7 +23,7 @@ its module docstring.
 | `src/oplm/fold/diffusion.py` | `esm/models/esmfold2/layers.py` (`DiffusionConditioning`, `AttentionPairBias`, `ConditionedTransitionBlock`, `DiffusionModule`, `DiffusionStructureHead`) | Conditioning, adaLN blocks, EDM preconditioning, Karras schedule, churned sampler, Kabsch |
 | `src/oplm/fold/confidence.py` | `esm/models/esmfold2/model.py` (`ConfidenceHead`, pTM/ipTM) | Pair init, distance bins, pooling, pLDDT/PAE/PDE heads, TM-score formula |
 | `src/oplm/fold/modeling_fold.py` | `esm/models/esmfold2/model.py` (`EsmFold2Model.forward`) | Stage order and precision policy |
-| `src/oplm/fold/data/ccd.py`, `src/oplm/fold/data/reference_conformers.json` | `esm/models/esmfold2/{constants,protein_utils}.py` | Residue vocabulary, heavy-atom order, charged atoms, reference conformers |
+| `src/oplm/fold/data/ccd.py`, `src/oplm/fold/data/reference_conformers.json` | `esm/models/esmfold2/{constants,protein_utils,conformers}.py` | Residue vocabulary, heavy-atom order, charged atoms; conformer positions are the wwPDB Chemical Component Dictionary conformers in `biohub/ESMFold2`'s `ccd.pkl`, dumped through `get_idealized_atom_pos` |
 | `src/oplm/fold/data/featurize.py` | `esm/models/esmfold2/prepare_input.py` | Token/atom feature construction, unknown-residue bond quirk |
 | `src/oplm/fold/fixtures.py` | `esm/models/esmfold2/config.py` | Config field correspondence |
 
