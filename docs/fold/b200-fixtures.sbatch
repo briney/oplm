@@ -10,7 +10,7 @@
 #   sbatch docs/fold/b200-fixtures.sbatch
 # Overrides (environment variables, all optional):
 #   OPLM_REPO=/mnt/home/<you>/git/oplm       mounted checkout instead of cloning
-#   OPLM_GIT_REF=feat/fold-m1                branch/tag/sha to clone when OPLM_REPO is unset
+#   OPLM_GIT_REF=main                        branch/tag/sha to clone when OPLM_REPO is unset
 #   OPLM_ENV_FILE=/mnt/home/<you>/.env       credentials/JOB_WORK_DIR script to source
 #   OPLM_CONTAINER=/mnt/data/containers/deeplearning_v2026-05-26.sqsh
 #   OPLM_FIXTURES=/mnt/data/<you>/fold-fixtures/<jobid>   where the fixtures land (persistent)
@@ -37,7 +37,7 @@ CONTAINER="${OPLM_CONTAINER:-/mnt/data/containers/deeplearning_v2026-05-26.sqsh}
 RESULTS="${OPLM_RESULTS:-/mnt/home/${SLURM_JOB_USER}/fold-m1-fixtures/${SLURM_JOB_ID}}"
 FIXTURES="${OPLM_FIXTURES:-/mnt/data/${SLURM_JOB_USER}/fold-fixtures/${SLURM_JOB_ID}}"
 ESM_VENV="${OPLM_ESM_VENV:-/mnt/data/${SLURM_JOB_USER}/fold-fixtures/esm-venv}"
-GIT_REF="${OPLM_GIT_REF:-feat/fold-m1}"
+GIT_REF="${OPLM_GIT_REF:-main}"
 REPO="${OPLM_REPO:-}"
 CASES="${OPLM_CASES:-all}"
 STEPS="${OPLM_STEPS:-venv install env make-fixtures parity}"

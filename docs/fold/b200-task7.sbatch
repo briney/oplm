@@ -8,7 +8,7 @@
 #   sbatch docs/fold/b200-task7.sbatch
 # Overrides (environment variables, all optional):
 #   OPLM_REPO=/mnt/home/<you>/git/oplm   use a mounted checkout instead of cloning
-#   OPLM_GIT_REF=feat/fold-m0            branch/tag/sha to clone when OPLM_REPO is unset
+#   OPLM_GIT_REF=main                    branch/tag/sha to clone when OPLM_REPO is unset
 #   OPLM_ENV_FILE=/mnt/home/<you>/.env   the credentials/JOB_WORK_DIR script to source
 #   OPLM_CONTAINER=/mnt/data/containers/deeplearning_v2026-05-26.sqsh
 #   OPLM_RESULTS=/mnt/home/<you>/fold-m0-b200/<jobid>   where reports and logs land
@@ -34,7 +34,7 @@ set -euo pipefail
 ENV_FILE="${OPLM_ENV_FILE:-/mnt/home/${SLURM_JOB_USER}/.env}"
 CONTAINER="${OPLM_CONTAINER:-/mnt/data/containers/deeplearning_v2026-05-26.sqsh}"
 RESULTS="${OPLM_RESULTS:-/mnt/home/${SLURM_JOB_USER}/fold-m0-b200/${SLURM_JOB_ID}}"
-GIT_REF="${OPLM_GIT_REF:-feat/fold-m0}"
+GIT_REF="${OPLM_GIT_REF:-main}"
 REPO="${OPLM_REPO:-}"
 CUEQ_OPS="${OPLM_CUEQ_OPS:-cuequivariance-ops-torch-cu13}"
 STEPS="${OPLM_STEPS:-install env-torch gpu-tests bench bench-compiled mlm-regression}"
