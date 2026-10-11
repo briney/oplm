@@ -3,9 +3,9 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 1 (inference port).**
-Kernels, the model, data featurization, and prediction exist (§7); losses and
-training land in milestone 2.
+this file records what is implemented. **Status: milestone 1 (inference port), accepted
+2026-10-11.** Kernels, the model, data featurization, and prediction exist, with the
+acceptance evidence in §7; losses and training land in milestone 2.
 
 ## 1. Package layout (implemented so far)
 
@@ -236,6 +236,9 @@ fixtures, fp32 CPU, dense attention, reference trimul) with the assertions repla
 Each `atol` is the smallest 1-2-5 round number ≥ 10× the atol the assertion needs after its `rtol`
 term, floored at 1e-6. `x_inputs` and `z_init` exceeded the draft 1e-4 on the workstation but not
 on the cluster: float accumulation order, growing with sequence length.
+[`parity-rerun.log`](fold/m1/parity-rerun.log) / [`parity-rerun-status.txt`](fold/m1/parity-rerun-status.txt)
+is the cluster rerun at the final tolerances (SUNK job 25489, same venv and fixtures, `parity`
+step only): all 37 pass, the GPU test skips without CUDA.
 
 | stage | atol | rtol | max abs err | atol needed after rtol | worst case |
 |---|---|---|---|---|---|
