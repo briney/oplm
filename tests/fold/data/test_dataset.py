@@ -296,8 +296,16 @@ def single_process(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(seq_dataset, "_resolve_distributed_context", lambda: (0, 1, 0, 1))
 
 
-def stream(ds: StructureDataset | InterleavedDataset) -> list[tuple[str, list[int]]]:
-    return [(str(r["id"]), r["example"].features.residue_index[0].tolist()) for r in ds]
+def stream(ds: StructureDataset | InterleavedDataset) -> list[tuple[str, list[int], int]]:
+    """(id, crop residue indices, conformer hash) per row, so rotations are compared too."""
+    return [
+        (
+            str(r["id"]),
+            r["example"].features.residue_index[0].tolist(),
+            hash(r["example"].features.ref_pos.numpy().tobytes()),
+        )
+        for r in ds
+    ]
 
 
 def test_eligibility_filters_and_len(fixture_dataset: Path, single_process: None) -> None:
@@ -409,3 +417,5 @@ def test_missing_shard_raises_and_empty_shards_are_skipped(
     victim.unlink()
     with pytest.raises(FileNotFoundError, match=victim.name):
         StructureDataset(broken, split=None)
+    with pytest.raises(FileNotFoundError, match=victim.name):  # even if it holds no eligible rows
+        StructureDataset(broken, split="cameo")

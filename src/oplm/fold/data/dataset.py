@@ -587,16 +587,15 @@ class StructureDataset(ShardedProteinDataset):
             columns=["shard", "row", "chain_index", "split", "length", "resolved_count"],
         ).to_pylist()
         shard_pos = {p.name: i for i, p in enumerate(self._shards)}
+        missing = sorted({r["shard"] for r in index} - shard_pos.keys())
+        if missing:
+            raise FileNotFoundError(f"index names shards missing under {root}: {missing}")
         chains_by_shard: list[dict[int, list[int]]] = [{} for _ in self._shards]
         for r in index:
             if split is not None and r["split"] != split:
                 continue
             if r["length"] > max_chain_length or r["resolved_count"] < min_resolved_residues:
                 continue
-            if r["shard"] not in shard_pos:
-                raise FileNotFoundError(
-                    f"index names shard {r['shard']} which is missing under {root}"
-                )
             chains_by_shard[shard_pos[r["shard"]]].setdefault(int(r["row"]), []).append(
                 int(r["chain_index"])
             )
