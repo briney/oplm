@@ -23,8 +23,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
+from oplm.data.sequence.dataset import ShardedProteinDataset
 from oplm.fold.data.ccd import ChemCompTable, ReferenceConformers
-from oplm.fold.data.complex import complex_to_row, rows_to_table
+from oplm.fold.data.complex import complex_to_row, row_to_complex, rows_to_table
+from oplm.fold.data.crop import crop_chain
+from oplm.fold.data.featurize import featurize_complex
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "PreprocessConfig",
+    "StructureDataset",
     "assign_splits",
     "discover_entries",
     "preprocess",
@@ -501,3 +505,142 @@ def rows_to_index_table(index_rows: list[dict[str, Any]]) -> pa.Table:
     """The per-chain index as a pyarrow table with explicit nullable types."""
     columns = [pa.array([r[f.name] for r in index_rows], type=f.type) for f in _INDEX_SCHEMA]
     return pa.Table.from_arrays(columns, schema=_INDEX_SCHEMA)
+
+
+# ----------------------------------------------------------------------------- runtime
+
+_MASK32 = 0xFFFF_FFFF
+
+
+def _example_seed(seed: int, epoch: int, shard: int, row: int) -> int:
+    """Seed for one example's chain choice, crop and conformer rotations."""
+    mixed = (
+        (seed * 0x9E37_79B1) ^ (epoch * 0x85EB_CA77) ^ (shard * 0xC2B2_AE3D) ^ (row * 0x27D4_EB2F)
+    )
+    return (mixed + 0x1656_67B1) & _MASK32
+
+
+class StructureDataset(ShardedProteinDataset):
+    """Single-chain training examples from a preprocessed structure dataset directory.
+
+    Subclasses :class:`ShardedProteinDataset` so rank/worker striping, per-epoch shuffling,
+    :class:`InterleavedDataset` mixing and the data-exact resume contract are inherited. Only
+    the row reader differs: this dataset strides over the *eligible* rows of each shard (entries
+    with at least one chain in ``split`` that is at most ``max_chain_length`` long and has at
+    least ``min_resolved_residues`` resolved residues), and every eligible row yields exactly one
+    example, so the base class's skip arithmetic holds. Per row, a generator seeded from
+    ``(seed, epoch, shard, row)`` picks one eligible chain uniformly, crops it and featurizes it
+    with fresh conformer rotations; a resumed run therefore restores the same example.
+
+    Rows are ``{"id": "<entry>_<chain>", "example": FoldExample}``; collate with
+    :func:`oplm.fold.data.collate.collate_rows`.
+
+    Args:
+        path: Dataset directory written by ``oplm fold preprocess``.
+        split: Index ``split`` value to train on; ``None`` means every chain.
+        crop_size: Tokens per example (a multiple of 128 in training configs).
+        contiguous_prob: Probability of a contiguous crop; otherwise spatial.
+        max_chain_length: Chains longer than this are never sampled (addendum §3).
+        min_resolved_residues: Chains with fewer resolved residues are never sampled.
+        seed: Base seed (shared with the inherited shuffling).
+        shuffle_shards: Shuffle shard order each epoch.
+        shuffle_rows: Shuffle eligible-row order within a shard each epoch.
+        conformers: Reference conformer table; the packaged one when ``None``.
+        atom_pad_multiple: Per-example atom padding multiple (the collator re-pads to the budget).
+
+    Raises:
+        FileNotFoundError: ``path`` lacks ``shards/``, ``index.parquet`` or ``manifest.json``, or
+            the index names a shard file that is not on disk.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        split: str | None = "train",
+        crop_size: int = 384,
+        contiguous_prob: float = 0.5,
+        max_chain_length: int = 1024,
+        min_resolved_residues: int = 4,
+        seed: int = 0,
+        shuffle_shards: bool = True,
+        shuffle_rows: bool = True,
+        conformers: ReferenceConformers | None = None,
+        atom_pad_multiple: int = 32,
+    ) -> None:
+        root = Path(path)
+        for required in ("shards", "index.parquet", "manifest.json"):
+            if not (root / required).exists():
+                raise FileNotFoundError(f"{root} has no {required}; run `oplm fold preprocess`")
+        super().__init__(
+            root / "shards", shuffle_shards=shuffle_shards, shuffle_rows=shuffle_rows, seed=seed
+        )
+        manifest = json.loads((root / "manifest.json").read_text())
+        self._row_group_size = int(manifest["row_group_size"])
+        self._crop_size = crop_size
+        self._contiguous_prob = contiguous_prob
+        self._conformers = conformers
+        self._atom_pad_multiple = atom_pad_multiple
+
+        index = pq.read_table(
+            root / "index.parquet",
+            columns=["shard", "row", "chain_index", "split", "length", "resolved_count"],
+        ).to_pylist()
+        shard_pos = {p.name: i for i, p in enumerate(self._shards)}
+        chains_by_shard: list[dict[int, list[int]]] = [{} for _ in self._shards]
+        for r in index:
+            if split is not None and r["split"] != split:
+                continue
+            if r["length"] > max_chain_length or r["resolved_count"] < min_resolved_residues:
+                continue
+            if r["shard"] not in shard_pos:
+                raise FileNotFoundError(
+                    f"index names shard {r['shard']} which is missing under {root}"
+                )
+            chains_by_shard[shard_pos[r["shard"]]].setdefault(int(r["row"]), []).append(
+                int(r["chain_index"])
+            )
+        self._eligible_chains = chains_by_shard
+        self._eligible_rows = [sorted(d) for d in chains_by_shard]
+        # The base class strides over these counts; positions map to real rows in _read_rows.
+        self._rows_per_shard = [len(rows) for rows in self._eligible_rows]
+        self._total_rows = sum(self._rows_per_shard)
+
+    def _read_rows(self, shard_idx: int, row_indices: list[int]) -> Iterator[dict[str, object]]:
+        """Yield one example per eligible-row position, reading one row group at a time.
+
+        ponytail: random access with a one-group cache; small row groups (manifest
+        ``row_group_size``, default 16) bound the read amplification. Group-blocked row
+        orders would cut it further if I/O ever dominates.
+        """
+        real_rows = [self._eligible_rows[shard_idx][i] for i in row_indices]
+        pf = pq.ParquetFile(self._shards[shard_idx])
+        size = self._row_group_size
+        cached: tuple[int, Any] | None = None
+        table = self._conformers or ReferenceConformers.load()
+        self._conformers = table
+        for real in real_rows:
+            group = real // size
+            if cached is None or cached[0] != group:
+                cached = (group, pf.read_row_group(group))
+            row = cached[1].slice(real - group * size, 1).to_pylist()[0]
+            complex = row_to_complex(row)
+            generator = torch.Generator().manual_seed(
+                _example_seed(self._seed, self._epoch, shard_idx, real)
+            )
+            chains = self._eligible_chains[shard_idx][real]
+            chain = chains[int(torch.randint(0, len(chains), (1,), generator=generator))]
+            cropped = crop_chain(
+                complex,
+                chain,
+                self._crop_size,
+                contiguous_prob=self._contiguous_prob,
+                generator=generator,
+            )
+            example = featurize_complex(
+                cropped,
+                conformers=table,
+                atom_pad_multiple=self._atom_pad_multiple,
+                generator=generator,
+            )
+            yield {"id": example.id, "example": example}

@@ -16,13 +16,13 @@ from oplm.fold.data.featurize import FoldFeatures, FoldTargets
 from oplm.model.tokenization_oplm import VOCAB
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from torch import Tensor
 
     from oplm.fold.data.featurize import FoldExample
 
-__all__ = ["FoldBatch", "atom_budget", "collate_examples"]
+__all__ = ["FoldBatch", "atom_budget", "collate_examples", "collate_rows"]
 
 _PAD = VOCAB["<pad>"]
 _TOKEN_FIELDS = (
@@ -136,3 +136,20 @@ def collate_examples(
         }
     )
     return FoldBatch(ids=[ex.id for ex in examples], features=features, targets=targets)
+
+
+def collate_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    crop_size: int,
+    atoms_per_token_budget: int = 24,
+    atom_pad_multiple: int = 32,
+) -> FoldBatch:
+    """``collate_examples`` over ``StructureDataset`` rows (``{"id", "example"}`` dicts)."""
+    examples = [row["example"] for row in rows]
+    return collate_examples(
+        examples,  # ty: ignore[invalid-argument-type]  # rows are untyped dicts by the dataset contract
+        crop_size=crop_size,
+        atoms_per_token_budget=atoms_per_token_budget,
+        atom_pad_multiple=atom_pad_multiple,
+    )

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from oplm.fold.data.collate import FoldBatch, atom_budget, collate_examples
+from oplm.fold.data.collate import FoldBatch, atom_budget, collate_examples, collate_rows
 from oplm.fold.data.featurize import featurize_complex
 from oplm.model.tokenization_oplm import VOCAB
 
@@ -84,3 +84,9 @@ def test_over_budget_and_over_crop_examples_are_rejected(
         collate_examples([ex], crop_size=64, atoms_per_token_budget=1)
     with pytest.raises(ValueError, match="crop_size"):
         collate_examples([ex], crop_size=32)
+
+
+def test_collate_rows_unwraps_dataset_rows(parsed: Callable[[str], MolecularComplex]) -> None:
+    ex = featurize_complex(parsed("1l2y"))
+    batch = collate_rows([{"id": ex.id, "example": ex}], crop_size=32)
+    assert batch.ids == ["1l2y_A"] and batch.features.num_tokens == 32

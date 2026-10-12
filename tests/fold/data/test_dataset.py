@@ -5,15 +5,22 @@ from __future__ import annotations
 import gzip
 import json
 import shutil
+from functools import partial
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 import pytest
+import torch
 import yaml
+from torch.utils.data import DataLoader
 
+import oplm.data.sequence.dataset as seq_dataset
+from oplm.data.sequence.dataset import InterleavedDataset
+from oplm.fold.data.collate import collate_rows
 from oplm.fold.data.complex import COMPLEX_SCHEMA, row_to_complex
 from oplm.fold.data.dataset import (
     PreprocessConfig,
+    StructureDataset,
     assign_splits,
     discover_entries,
     preprocess,
@@ -282,3 +289,123 @@ def test_rerun_into_an_existing_output_raises(tmp_path: Path) -> None:
     preprocess(cfg)
     with pytest.raises(FileExistsError, match="shards"):
         preprocess(cfg)
+
+
+@pytest.fixture
+def single_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(seq_dataset, "_resolve_distributed_context", lambda: (0, 1, 0, 1))
+
+
+def stream(ds: StructureDataset | InterleavedDataset) -> list[tuple[str, list[int]]]:
+    return [(str(r["id"]), r["example"].features.residue_index[0].tolist()) for r in ds]
+
+
+def test_eligibility_filters_and_len(fixture_dataset: Path, single_process: None) -> None:
+    train = StructureDataset(fixture_dataset, split="train", crop_size=16)
+    assert len(train) == 4 and train.total_length == 4  # 1ejg, 4hhb, 2ds7, 1l2y
+    assert len(StructureDataset(fixture_dataset, split="train", max_chain_length=50)) == 2
+    assert len(StructureDataset(fixture_dataset, split="train", min_resolved_residues=45)) == 2
+    assert len(StructureDataset(fixture_dataset, split="casp14")) == 1
+    assert len(StructureDataset(fixture_dataset, split="cameo")) == 1
+    assert len(StructureDataset(fixture_dataset, split=None)) == 6
+    assert len(StructureDataset(fixture_dataset, split="nope")) == 0
+
+
+def test_examples_are_seeded_single_chain_crops(
+    fixture_dataset: Path, single_process: None
+) -> None:
+    ds = StructureDataset(fixture_dataset, split="train", crop_size=16, seed=0)
+    ds.set_epoch(0)
+    rows = list(ds)
+    assert len(rows) == 4
+    assert sorted(str(r["id"]).split("_")[0] for r in rows) == ["1ejg", "1l2y", "2ds7", "4hhb"]
+    by_id = index_by_id(fixture_dataset)
+    for r in rows:
+        ex = r["example"]
+        f = ex.features
+        entry, chain_id = ex.id.split("_")
+        sequence = next(c["sequence"] for c in by_id[entry] if c["chain_id"] == chain_id)
+        assert f.num_tokens <= 16 and f.num_chains == 1 and f.asym_id.eq(0).all()
+        assert f.lm_input_ids.shape[1] == len(sequence) + 2  # the LM row is the full chain
+        assert ex.targets.coords.shape[1] == f.num_atoms
+        starts = f.atom_to_token[0, f.atom_mask[0]]
+        for token in range(f.num_tokens):  # rotated, centered conformers (spec §4.3)
+            atoms = f.ref_pos[0, f.atom_mask[0]][starts == token]
+            assert torch.allclose(atoms.mean(0), torch.zeros(3), atol=1e-4)
+    hhb = next(r for r in rows if str(r["id"]).startswith("4hhb"))
+    assert hhb["example"].features.lm_input_ids.shape[1] in (143, 148)  # a full alpha/beta chain
+    again = StructureDataset(fixture_dataset, split="train", crop_size=16, seed=0)
+    again.set_epoch(0)
+    assert stream(again) == stream(ds)
+    ds.set_epoch(1)
+    assert stream(ds) != stream(again)  # a new epoch gives new chains/crops
+    other = StructureDataset(fixture_dataset, split="train", crop_size=16, seed=1)
+    other.set_epoch(0)
+    assert stream(other) != stream(again)
+
+
+@pytest.mark.parametrize("skip", [0, 1, 2, 5])
+def test_resumed_stream_is_baseline_suffix(
+    fixture_dataset: Path, single_process: None, skip: int
+) -> None:
+    baseline = StructureDataset(fixture_dataset, split=None, crop_size=16, seed=3)
+    baseline.set_epoch(2)
+    expected = stream(baseline)
+    assert len(expected) == 6
+    resumed = StructureDataset(fixture_dataset, split=None, crop_size=16, seed=3)
+    resumed.set_epoch(2)
+    resumed.set_resume_skip(batches_in_epoch=skip, per_rank_batch=1, num_workers=1)
+    assert stream(resumed) == expected[skip:]
+    resumed.clear_resume_skip()
+    assert stream(resumed) == expected
+
+
+def test_resume_with_two_dataloader_workers_matches_batch_suffix(fixture_dataset: Path) -> None:
+    collate = partial(collate_rows, crop_size=16)
+
+    def loader(ds: StructureDataset) -> DataLoader:
+        return DataLoader(
+            ds, batch_size=1, collate_fn=collate, num_workers=2, persistent_workers=False
+        )
+
+    def batches(ds: StructureDataset) -> list[tuple[list[str], list[int]]]:
+        return [(b.ids, b.features.residue_index[0].tolist()) for b in loader(ds)]
+
+    baseline = StructureDataset(fixture_dataset, split=None, crop_size=16, seed=0)
+    baseline.set_epoch(0)
+    expected = batches(baseline)
+    assert len(expected) == 6
+    k = 2  # a full worker-cycle boundary (k % num_workers == 0)
+    resumed = StructureDataset(fixture_dataset, split=None, crop_size=16, seed=0)
+    resumed.set_epoch(0)
+    resumed.set_resume_skip(batches_in_epoch=k, per_rank_batch=1, num_workers=2)
+    assert batches(resumed) == expected[k:]
+
+
+def test_interleaved_sources_resume(fixture_dataset: Path, single_process: None) -> None:
+    def mix() -> InterleavedDataset:
+        a = StructureDataset(fixture_dataset, split="train", crop_size=16, seed=0)
+        b = StructureDataset(fixture_dataset, split="casp14", crop_size=16, seed=0)
+        return InterleavedDataset([a, b], [0.7, 0.3], num_samples=8, seed=0)
+
+    baseline = mix()
+    baseline.set_epoch(0)
+    expected = stream(baseline)
+    assert len(expected) == 8
+    resumed = mix()
+    resumed.set_epoch(0)
+    resumed.set_resume_skip(batches_in_epoch=3, per_rank_batch=1, num_workers=1)
+    assert stream(resumed) == expected[3:]
+
+
+def test_missing_shard_raises_and_empty_shards_are_skipped(
+    fixture_dataset: Path, tmp_path: Path, single_process: None
+) -> None:
+    cameo = StructureDataset(fixture_dataset, split="cameo", crop_size=16)
+    assert len(cameo) == 1 and [r["id"] for r in cameo] == ["1crn_A"]  # other shards have no rows
+    broken = tmp_path / "broken"
+    shutil.copytree(fixture_dataset, broken)
+    victim = sorted((broken / "shards").glob("shard-*.parquet"))[-1]
+    victim.unlink()
+    with pytest.raises(FileNotFoundError, match=victim.name):
+        StructureDataset(broken, split=None)
