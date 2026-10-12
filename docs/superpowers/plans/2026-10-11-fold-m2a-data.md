@@ -843,7 +843,7 @@ are pinned in `docs/superpowers/plans/2026-10-11-fold-m2a-data.md` Task 3.
 | File | Why it is here |
 | --- | --- |
 | `mmcif/1crn.cif.gz` | Crambin, 46-residue X-ray monomer at 1.5 Å, every residue resolved. |
-| `mmcif/1ejg.cif.gz` | Crambin at 0.54 Å: altlocs (381 atoms), hydrogens, microheterogeneity (`PRO,SER` at 22, `LEU,ILE` at 25). Same sequence as 1crn (exact-sequence exclusion). |
+| `mmcif/1ejg.cif.gz` | Crambin at 0.54 Å: altlocs (381 atoms), hydrogens, microheterogeneity (`PRO,SER` at 22, `LEU,ILE` at 25; the parsed sequence therefore has L at 25 where 1crn has I). |
 | `mmcif/4hhb.cif.gz` | Hemoglobin: two entities × two copies (symmetry ids), hemes and phosphate (ligands dropped), waters dropped. |
 | `mmcif/2ds7.cif.gz` | Se-Met monomer with residues 1–11 unmodeled (tokens with masked coordinates); `MSE` → `MET` with `SE` → `SD`. |
 | `mmcif/1jb6.cif.gz` | Homodimer with `MSE` and `NLE` (norleucine → `LEU`, two atoms unmatched); chain B unmodeled at 1–2 and 31–33. |
@@ -2421,7 +2421,7 @@ def _preprocess_fixtures(out: Path, cutoff: str) -> Path:
 
 @pytest.fixture(scope="session")
 def fixture_dataset(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """The six fixtures preprocessed with the real cutoff: train = 4hhb, 2ds7, 1l2y."""
+    """The six fixtures preprocessed with the real cutoff: train = 1ejg, 4hhb, 2ds7, 1l2y."""
     return _preprocess_fixtures(tmp_path_factory.mktemp("fold_ds"), cutoff="2021-09-30")
 
 
@@ -2441,6 +2441,7 @@ import gzip
 import json
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 import pytest
@@ -2453,7 +2454,12 @@ from oplm.fold.data.dataset import (
     preprocess,
     read_target_list,
 )
-from tests.fold.data.conftest import FOLD_FIXTURES, MMCIF_DIR
+from tests.fold.data.conftest import FIXTURE_IDS, FOLD_FIXTURES, MMCIF_DIR
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from oplm.fold.data.complex import MolecularComplex
 
 
 def index_by_id(dataset: Path) -> dict[str, list[dict[str, object]]]:
@@ -2464,11 +2470,17 @@ def index_by_id(dataset: Path) -> dict[str, list[dict[str, object]]]:
     return out
 
 
-def test_preprocess_layout_counts_and_schema(fixture_dataset: Path) -> None:
+def test_preprocess_layout_counts_and_schema(
+    fixture_dataset: Path, parsed: Callable[[str], MolecularComplex]
+) -> None:
     manifest = json.loads((fixture_dataset / "manifest.json").read_text())
     assert manifest["schema_version"] == 1 and manifest["parse_version"] == 1
     assert manifest["accepted"] == 6 and manifest["rejected"] == {}
-    assert manifest["dropped"] == {"ligand": 2, "water": 1}
+    expected_dropped: dict[str, int] = {}
+    for eid in FIXTURE_IDS:  # 4hhb: 2 ligand entities + water; 2ds7: 1 + water; 1jb6: water
+        for kind, n in parsed(eid).metadata.dropped.items():
+            expected_dropped[kind] = expected_dropped.get(kind, 0) + n
+    assert manifest["dropped"] == expected_dropped == {"ligand": 3, "water": 3}
     assert manifest["row_group_size"] == 2 and manifest["config"]["cutoff"] == "2021-09-30"
     assert manifest["licenses"] == {"wwPDB": "CC0 1.0", "CCD": "CC0 1.0"}
     assert manifest["ccd"]["components"] == 45 and len(manifest["ccd"]["sha256"]) == 64
@@ -2507,7 +2519,7 @@ def test_splits_with_the_real_cutoff(fixture_dataset: Path) -> None:
     assert split == {
         "1crn": {"cameo"},
         "1jb6": {"casp14"},
-        "1ejg": {"excluded_heldout_sequence"},  # crambin again
+        "1ejg": {"train"},  # crambin too, but L at residue 25 (vs I in 1crn): no exact match
         "4hhb": {"train"},
         "2ds7": {"train"},
         "1l2y": {"train"},
@@ -3216,9 +3228,9 @@ def stream(ds: StructureDataset | InterleavedDataset) -> list[tuple[str, list[in
 
 def test_eligibility_filters_and_len(fixture_dataset: Path, single_process: None) -> None:
     train = StructureDataset(fixture_dataset, split="train", crop_size=16)
-    assert len(train) == 3 and train.total_length == 3  # 4hhb, 2ds7, 1l2y
-    assert len(StructureDataset(fixture_dataset, split="train", max_chain_length=50)) == 1  # 1l2y
-    assert len(StructureDataset(fixture_dataset, split="train", min_resolved_residues=45)) == 1  # 4hhb
+    assert len(train) == 4 and train.total_length == 4  # 1ejg, 4hhb, 2ds7, 1l2y
+    assert len(StructureDataset(fixture_dataset, split="train", max_chain_length=50)) == 2  # 1ejg, 1l2y
+    assert len(StructureDataset(fixture_dataset, split="train", min_resolved_residues=45)) == 2  # 1ejg, 4hhb
     assert len(StructureDataset(fixture_dataset, split="casp14")) == 1
     assert len(StructureDataset(fixture_dataset, split="cameo")) == 1
     assert len(StructureDataset(fixture_dataset, split=None)) == 6
@@ -3229,7 +3241,8 @@ def test_examples_are_seeded_single_chain_crops(fixture_dataset: Path, single_pr
     ds = StructureDataset(fixture_dataset, split="train", crop_size=16, seed=0)
     ds.set_epoch(0)
     rows = list(ds)
-    assert len(rows) == 3 and sorted(str(r["id"]).split("_")[0] for r in rows) == ["1l2y", "2ds7", "4hhb"]
+    assert len(rows) == 4
+    assert sorted(str(r["id"]).split("_")[0] for r in rows) == ["1ejg", "1l2y", "2ds7", "4hhb"]
     by_id = index_by_id(fixture_dataset)
     for r in rows:
         ex = r["example"]
