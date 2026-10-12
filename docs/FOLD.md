@@ -314,19 +314,20 @@ atoms of a token are contiguous and in the packaged template order, so training 
 line up with the `ref_*` features by construction (`featurize_complex` verifies the names).
 
 `parse_mmcif` (`data/mmcif.py`, gemmi) applies §4.4 at parse time and records why an entry
-was rejected (`parse_error`, `resolution`, `no_protein_chains`, `no_resolved_chain`,
-`internal_error`) or what was dropped (`water`, `ligand`, `nucleic_acid`, `other_polymer`,
-`short_chain`, `empty_sequence`, `unknown`): L-peptide polymer entities of the asymmetric unit
-only; the token sequence is the entity polymer sequence (unmodeled residues are tokens with
-`atom_resolved` false); first model; highest-occupancy altloc per atom name; hydrogens dropped;
-microheterogeneity keeps the sequence's first alternative; resolution ≤ 9 Å (NMR has none);
-chains with fewer than 4 resolved residues dropped. Non-standard residues collapse to their
-CCD parent (`ChemCompTable.protein_parent`, from `_chem_comp.mon_nstd_parent_comp_id`) only
-when the component type contains "PEPTIDE" and is not D-handed (`D-` prefix); D-peptides,
-non-polymer components, multi-parent and parent-less components become `UNK`. Atoms match the
-parent template by name, with AlphaFold's `MSE` `SE → SD` convention, and parent atoms the
-modified residue lacks are unresolved (norleucine loses `CD1`/`CD2`). Release date is the first
-`_pdbx_audit_revision_history.revision_date`.
+was rejected (`parse_error`, `resolution`, `no_protein_chains`, `no_resolved_chain`) or what
+was dropped (`water`, `ligand`, `nucleic_acid`, `other_polymer`, `short_chain`,
+`empty_sequence`, `unknown`): L-peptide polymer entities of the asymmetric unit only; the token
+sequence is the entity polymer sequence (unmodeled residues are tokens with `atom_resolved`
+false); first model; highest-occupancy altloc per atom name; hydrogens dropped; microheterogeneity
+keeps the sequence's first alternative; resolution ≤ 9 Å (NMR has none); chains with fewer than 4
+resolved residues dropped. Non-standard residues collapse to their CCD parent
+(`ChemCompTable.protein_parent`, from `_chem_comp.mon_nstd_parent_comp_id`) only when the
+component type contains "PEPTIDE" and is not D-handed (`D-` prefix); D-peptides, non-polymer
+components, multi-parent and parent-less components become `UNK`. Atoms match the parent template
+by name, with AlphaFold's `MSE` `SE → SD` convention, and parent atoms the modified residue lacks
+are unresolved (norleucine loses `CD1`/`CD2`). Release date is the first
+`_pdbx_audit_revision_history.revision_date`. `oplm fold preprocess` records `internal_error` for
+unexpected worker exceptions (with the exception message as `detail`).
 
 ### Shards, index and splits (`oplm fold preprocess`)
 
@@ -340,7 +341,7 @@ oplm fold preprocess --archive <mmCIF root> --ccd components.cif.gz --out <datas
 | `shards/shard-NNNNN.parquet` | one row per entry (`COMPLEX_SCHEMA`), ~1 GB each, row groups of 16 rows for random access |
 | `index.parquet` | one row per chain: id, chain ids, chain index, entity/sym, sequence, length, resolved count, chain count, resolution, release date, method, shard, row, `split` |
 | `targets/<name>.json` | the held-out target lists as `[{"id", "chain"}]` |
-| `ccd_table.json`, `checksums.txt`, `manifest.json`, `README.md` | the parsed CCD table, sha256 of every input, provenance/config/counts, dataset card |
+| `ccd_table.json`, `checksums.txt`, `manifest.json`, `README.md` | parsed CCD table; sha256 of every archive entry file (accepted or rejected; CCD's sha256 in `manifest.json` under `ccd.sha256`); provenance/config/counts; dataset card |
 
 Splits are entry-level: `cameo`/`casp14` (from the target lists, ids case-insensitive),
 `excluded_heldout_sequence` (pre-cutoff entries sharing a chain sequence with a held-out
@@ -348,15 +349,15 @@ entry), `train` (release date ≤ 2021-09-30), `valid` (64 seeded post-cutoff mo
 one protein chain, resolution ≤ 2.5 Å, length 50–400), `post_cutoff`, `undated`. Clustering
 and homology exclusions are milestone 3 (a dataset revision).
 
-The tool refuses an empty archive and requires `out/` to be empty or absent (reruns need a
-fresh directory); `--cutoff` is normalized to an ISO date, and `checksums.txt` is written
-with paths relative to the archive root (so `sha256sum -c checksums.txt` works from the
-archive root).
+The tool refuses an empty archive and requires `out/shards` and `out/targets` to be empty or
+absent (a rerun needs a fresh directory; other files in `out/` are overwritten); `--cutoff` is
+normalized to an ISO date, and `checksums.txt` is written with paths relative to the archive root
+(so `sha256sum -c checksums.txt` works from the archive root).
 
 ### Runtime
 
 `StructureDataset(path, split="train", crop_size=384, contiguous_prob=0.5,
-max_chain_length=1024)` subclasses `ShardedProteinDataset`: rank/worker striping, per-epoch
+max_chain_length=1024, ...)` subclasses `ShardedProteinDataset`: rank/worker striping, per-epoch
 shuffling, `InterleavedDataset` mixing and the data-exact resume contract (`set_resume_skip`,
 `_arm_sample_skip`) are inherited. It strides over the index-eligible rows of each shard and
 yields exactly one example per row: a generator seeded from `(seed, epoch, shard, row)` picks

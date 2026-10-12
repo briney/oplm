@@ -18,7 +18,7 @@ Tests mirror the source layout under `tests/`:
 | `tests/data/` | Data pipeline: dataloaders, collation, MLM masking, determinism, weighted-masking invariants, import hygiene. |
 | `tests/fold/` | Structure head: kernels, the ESMFold2 port, prediction, and the data pipeline (`tests/fold/data/`: CCD table, `MolecularComplex`, mmCIF parsing on the real entries under `tests/fixtures/fold/`, crops, featurization with targets, collation, preprocessing and `StructureDataset` resume). GPU parity tests are `slow` and skip without CUDA. |
 | `tests/` (root) | Cross-module: CLI, training entrypoint, train→serve lifecycle. |
-| `tests/fixtures/` | Real data: `training/test_sequences.parquet` (real protein sequences) and `eval/structures/` (PDB fixtures). |
+| `tests/fixtures/` | Real data: `training/test_sequences.parquet` (real protein sequences), `eval/structures/` (PDB fixtures), and `fold/` (real wwPDB mmCIF entries and a CCD subset for the structure head's data pipeline). |
 
 ## 2. Markers & selection
 
