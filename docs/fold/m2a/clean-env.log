@@ -1,0 +1,4 @@
+# clean-environment load, 2026-10-12: /home/bryanbriney/data/tmp/oplm-clean (uv venv, Python 3.11) with oplm[fold] @ git+https://github.com/briney/oplm@e0ea2fd4837a45b7733c1e7dd3360c70d6489d1c
+# data: hf download brineylab/oplmfold-training-data --repo-type dataset --revision wwpdb-2026-10-12 --include 'wwpdb/2026-10-12/*' (revision 0fad20d41cbf7f7e1a8ddea0ab098443bbec3172)
+# output of: len(ds), batch.ids, batch.features.res_type.shape, batch.targets.resolved.sum()
+175065 ['2ki4_A', '2ewc_D', '2evi_C', '2jd3_B'] torch.Size([4, 384]) 5067

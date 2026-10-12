@@ -3,7 +3,7 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 2a (data) implemented; milestone 1 (inference port) accepted 2026-10-11.**
+this file records what is implemented. **Status: milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
 Kernels, the model, prediction and the training data pipeline exist (§7 holds the M1 acceptance
 evidence, §8 the data contract); losses and training land in milestone 2b.
 
@@ -374,15 +374,28 @@ each token for M2b's frame-based losses.
 ### Acquisition, publishing, download
 
 ```bash
-# wwPDB mmCIF archive (about 60 GB gzipped; read in place, never decompressed)
+# wwPDB mmCIF archive (about 90 GB gzipped, 260k entries; read in place, never decompressed)
 rsync -rlpt -v -z --delete --port=33444 rsync.rcsb.org::ftp_data/structures/divided/mmCIF/ $OPLM_DATA/pdb/mmCIF/
 # Chemical Component Dictionary
 curl -o $OPLM_DATA/pdb/components.cif.gz https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz
-# publish (resumable) and pull on a cluster node
-hf upload-large-folder <namespace>/<dataset> <dataset dir> --repo-type dataset
-hf download <namespace>/<dataset> --repo-type dataset --local-dir $OPLM_DATA/fold/<dataset>
+# preprocess straight into the repository layout, then publish (resumable) and tag
+oplm fold preprocess ... --out $OPLM_DATA/hf/wwpdb/<snapshot>
+hf upload-large-folder brineylab/oplmfold-training-data $OPLM_DATA/hf --repo-type dataset
+hf repo tag create brineylab/oplmfold-training-data wwpdb-<snapshot> --repo-type dataset
+# pull one source on a cluster node
+hf download brineylab/oplmfold-training-data --repo-type dataset --revision wwpdb-<snapshot> \
+    --include "wwpdb/<snapshot>/*" --local-dir $OPLM_DATA/hf
 ```
 
-The manifest's `snapshot_date`, `checksums.txt` and the CCD checksum pin the inputs; the
-repo revision pins the artifact a run trained on. Acceptance evidence lives in
-[`docs/fold/m2a/`](fold/m2a/).
+Published data lives in the Hugging Face dataset repository
+[`brineylab/oplmfold-training-data`](https://huggingface.co/datasets/brineylab/oplmfold-training-data):
+one immutable folder per source and version (`wwpdb/2026-10-12/`; later `afdb-distill/`,
+`afdb-dimers/`, `antibody-antigen/`), one tag per publish (`<source>-<version>`), and a root
+card with the inventory and download recipes. `hf upload-large-folder` has no target-path
+option, so the local folder mirrors the repository layout. The manifest's `snapshot_date`,
+`checksums.txt` and the CCD checksum pin the inputs; the tag, or its commit, pins the artifact
+a run trained on. Acceptance evidence lives in [`docs/fold/m2a/`](fold/m2a/).
+
+**Published:** `wwpdb/2026-10-12` at tag `wwpdb-2026-10-12` (commit `0fad20d4`):
+254,424 entries, 1,080,220 chains, 82 shards, 37 GiB, preprocessed from the 2026-10-12 archive
+snapshot with `feat/fold-m2a` at e0ea2fd. Held-out splits: `cameo` 744 entries, `casp14` 128.

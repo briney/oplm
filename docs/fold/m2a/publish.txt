@@ -1,0 +1,13 @@
+repo:      brineylab/oplmfold-training-data (dataset, public)
+url:       https://huggingface.co/datasets/brineylab/oplmfold-training-data
+folder:    wwpdb/2026-10-12/
+tag:       wwpdb-2026-10-12 (annotated tag object 19643967de5999eddd04d170d277cc262138f29d)
+revision:  0fad20d41cbf7f7e1a8ddea0ab098443bbec3172
+code:      oplm feat/fold-m2a e0ea2fd4837a45b7733c1e7dd3360c70d6489d1c (PR #34)
+uploaded:  2026-10-12 20:10-20:15 UTC, `hf upload-large-folder brineylab/oplmfold-training-data $OPLM_DATA/hf --repo-type dataset`
+           107 files, 38,902,642,683 bytes, 5 min 20 s, 0 errors:
+           README.md (root card) + wwpdb/2026-10-12/{README.md, manifest.json, index.parquet, ccd_table.json,
+           checksums.txt, shards/shard-*.parquet x82, targets/{cameo,casp14}.json, targets/{cameo,casp14}.txt,
+           targets/casp14_targets.json, targets/sources/* x14}
+note:      a first attempt at 17:04 UTC failed with HTTP 403 on every LFS preupload (the fine-grained token
+           had no scope on the brineylab organization); rerun after the token received org write access.
