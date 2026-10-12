@@ -251,13 +251,20 @@ class ChemCompTable:
     def protein_parent(self, code: str) -> str:
         """The standard amino acid a polymer residue collapses to (spec §4.1), else ``"UNK"``.
 
-        A standard residue is its own parent; a modified residue resolves to its single
-        ``mon_nstd_parent_comp_id`` when that is a standard amino acid; everything else,
-        including multi-parent components and unknown codes, becomes ``UNK``.
+        A standard residue is its own parent. A modified L-peptide residue (type contains
+        "PEPTIDE" and does not start with "D-") resolves to its single
+        ``mon_nstd_parent_comp_id`` when that is a standard amino acid. D-peptides,
+        NON-POLYMER, multi-parent, and unknown codes become ``UNK``.
         """
         if code in PROTEIN_RES_TYPES:
             return code
         comp = self._comps.get(code)
-        if comp is not None and comp.parent in PROTEIN_RES_TYPES and comp.parent != "UNK":
+        if (
+            comp is not None
+            and self.is_peptide(code)
+            and not comp.type.startswith("D-")
+            and comp.parent in PROTEIN_RES_TYPES
+            and comp.parent != "UNK"
+        ):
             return comp.parent
         return "UNK"

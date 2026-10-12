@@ -119,3 +119,25 @@ def test_inverse_tables() -> None:
         and RES_TYPE_TO_CODE[22] == "UNK"
         and len(RES_TYPE_TO_CODE) == 21
     )
+
+
+def test_protein_parent_checks_component_type() -> None:
+    """D-peptides and NON-POLYMER components collapse to UNK, not their parent."""
+    from oplm.fold.data.ccd import ChemComp
+
+    # Create a small table with synthetic test cases
+    comps = {
+        "DXX": ChemComp("DXX", "D-PEPTIDE LINKING", "ALA", "A"),
+        "NPX": ChemComp("NPX", "NON-POLYMER", "VAL", None),
+        "PLX": ChemComp("PLX", "PEPTIDE-LIKE", "LEU", "L"),
+        "LPX": ChemComp("LPX", "L-PEPTIDE LINKING", "MET", "M"),
+    }
+    table = ChemCompTable(comps, "test")
+
+    # D-peptides and NON-POLYMER collapse to UNK regardless of parent
+    assert table.protein_parent("DXX") == "UNK"
+    assert table.protein_parent("NPX") == "UNK"
+
+    # L-peptides (including PEPTIDE-LIKE) collapse to their parent
+    assert table.protein_parent("PLX") == "LEU"
+    assert table.protein_parent("LPX") == "MET"
