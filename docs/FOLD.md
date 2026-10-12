@@ -3,18 +3,36 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 1 (inference port), accepted
-2026-10-11.** Kernels, the model, data featurization, and prediction exist, with the
-acceptance evidence in §7; losses and training land in milestone 2.
+this file records what is implemented. **Status: milestone 2a (data) implemented; milestone 1 (inference port) accepted 2026-10-11.**
+Kernels, the model, prediction and the training data pipeline exist (§7 holds the M1 acceptance
+evidence, §8 the data contract); losses and training land in milestone 2b.
 
 ## 1. Package layout (implemented so far)
 
 ```
 src/oplm/fold/
-├── trimul.py      # staged triangle multiplication + cuEquivariance dispatch
-├── attention.py   # pair-biased / sliding-window attention: FlexAttention + dense oracle
-└── cli.py         # oplm fold bench-kernels
-tests/fold/        # mirrors the above; GPU parity tests are `slow` and skip without CUDA
+├── configuration_fold.py   # FoldConfig (released ESMFold2-Fast defaults)
+├── modeling_fold.py        # OplmFoldPreTrainedModel, OplmForFolding, frozen-LM ownership
+├── lm_shim.py              # per-layer LN + proj, softmax layer mix, LM -> pair
+├── pair.py                 # block-local pair features
+├── trimul.py               # staged triangle multiplication + cuEquivariance dispatch
+├── trunk.py                # pair update block, pair stack, contractive recurrence
+├── atoms.py                # atom encoder/decoder, 3D RoPE, inputs embedder
+├── attention.py            # pair-biased / sliding-window attention: FlexAttention + dense oracle
+├── diffusion.py            # DiT, EDM schedule, sampler
+├── confidence.py           # confidence + distogram heads, pTM/ipTM
+├── predict.py              # fold(), mmCIF writer
+├── fixtures.py             # ESMFold2 golden-fixture generator (runs in the esm venv)
+├── cli.py                  # oplm fold bench-kernels | make-fixtures | predict | preprocess
+└── data/
+    ├── ccd.py              # residue vocabulary, reference conformers, ChemCompTable (CCD parents)
+    ├── complex.py          # MolecularComplex (flat atoms/tokens/bonds) + Parquet row
+    ├── mmcif.py            # gemmi mmCIF -> MolecularComplex with the §4.4 filters
+    ├── crop.py             # contiguous / spatial single-chain crops
+    ├── featurize.py        # ChainSpec or MolecularComplex -> FoldFeatures (+ FoldTargets)
+    ├── collate.py          # FoldBatch under the atom budget
+    └── dataset.py          # oplm fold preprocess + StructureDataset (resume contract)
+tests/fold/                 # mirrors the above; tests/fixtures/fold/ holds real entries
 ```
 
 Dependency direction: `oplm.fold` imports core packages; core imports nothing
@@ -277,3 +295,93 @@ pass: the milestone-0 FlexAttention and fused-trimul parity tests and
 end on trp-cage: finite coordinates and PAE, final pair within the 5e-2 relative Frobenius bound of
 the CPU oracle). That run predates the test recording its observed value; it now lands in the job's
 JUnit XML as the `pair_rel_fro_err` property.
+
+## 8. Milestone 2a: training data (`oplm.fold.data`)
+
+Implements spec §4.2–4.4, §4.7, §7.1–7.3 and §11 for the PDB source under the
+[M2 addendum](superpowers/specs/2026-10-11-fold-m2-pipeline-proof-design.md) §4: whole
+archive, protein chains only, single-chain training examples, published to Hugging Face.
+
+### Representation and parsing
+
+`MolecularComplex` (`data/complex.py`) is the flat layout of spec §4.2: atom arrays
+(coordinates, resolved, element, name, charge, B-factor, atom→token), token arrays (residue
+type, molecule type, asym/entity/symmetry ids, residue index, center and representative atom,
+atom range), an always-present bond list (empty in v1), per-chain `ChainInfo` (label and
+auth chain ids, entity, copy, full sequence, mean pLDDT for predicted data) and
+`ComplexMetadata` (id, source, method, resolution, release date, dropped-entity counts). The
+atoms of a token are contiguous and in the packaged template order, so training coordinates
+line up with the `ref_*` features by construction (`featurize_complex` verifies the names).
+
+`parse_mmcif` (`data/mmcif.py`, gemmi) applies §4.4 at parse time and records why an entry
+was rejected (`parse_error`, `resolution`, `no_protein_chains`, `no_resolved_chain`,
+`internal_error`) or what was dropped (`water`, `ligand`, `nucleic_acid`, `other_polymer`,
+`short_chain`, `empty_sequence`, `unknown`): L-peptide polymer entities of the asymmetric unit
+only; the token sequence is the entity polymer sequence (unmodeled residues are tokens with
+`atom_resolved` false); first model; highest-occupancy altloc per atom name; hydrogens dropped;
+microheterogeneity keeps the sequence's first alternative; resolution ≤ 9 Å (NMR has none);
+chains with fewer than 4 resolved residues dropped. Non-standard residues collapse to their
+CCD parent (`ChemCompTable.protein_parent`, from `_chem_comp.mon_nstd_parent_comp_id`) only
+when the component type contains "PEPTIDE" and is not D-handed (`D-` prefix); D-peptides,
+non-polymer components, multi-parent and parent-less components become `UNK`. Atoms match the
+parent template by name, with AlphaFold's `MSE` `SE → SD` convention, and parent atoms the
+modified residue lacks are unresolved (norleucine loses `CD1`/`CD2`). Release date is the first
+`_pdbx_audit_revision_history.revision_date`.
+
+### Shards, index and splits (`oplm fold preprocess`)
+
+```bash
+oplm fold preprocess --archive <mmCIF root> --ccd components.cif.gz --out <dataset dir> \
+    --heldout cameo=targets/cameo.txt --heldout casp14=targets/casp14.txt [--workers N] [--ids ids.txt]
+```
+
+| Output | Contents |
+| --- | --- |
+| `shards/shard-NNNNN.parquet` | one row per entry (`COMPLEX_SCHEMA`), ~1 GB each, row groups of 16 rows for random access |
+| `index.parquet` | one row per chain: id, chain ids, chain index, entity/sym, sequence, length, resolved count, chain count, resolution, release date, method, shard, row, `split` |
+| `targets/<name>.json` | the held-out target lists as `[{"id", "chain"}]` |
+| `ccd_table.json`, `checksums.txt`, `manifest.json`, `README.md` | the parsed CCD table, sha256 of every input, provenance/config/counts, dataset card |
+
+Splits are entry-level: `cameo`/`casp14` (from the target lists, ids case-insensitive),
+`excluded_heldout_sequence` (pre-cutoff entries sharing a chain sequence with a held-out
+entry), `train` (release date ≤ 2021-09-30), `valid` (64 seeded post-cutoff monomer chains:
+one protein chain, resolution ≤ 2.5 Å, length 50–400), `post_cutoff`, `undated`. Clustering
+and homology exclusions are milestone 3 (a dataset revision).
+
+The tool refuses an empty archive and requires `out/` to be empty or absent (reruns need a
+fresh directory); `--cutoff` is normalized to an ISO date, and `checksums.txt` is written
+with paths relative to the archive root (so `sha256sum -c checksums.txt` works from the
+archive root).
+
+### Runtime
+
+`StructureDataset(path, split="train", crop_size=384, contiguous_prob=0.5,
+max_chain_length=1024)` subclasses `ShardedProteinDataset`: rank/worker striping, per-epoch
+shuffling, `InterleavedDataset` mixing and the data-exact resume contract (`set_resume_skip`,
+`_arm_sample_skip`) are inherited. It strides over the index-eligible rows of each shard and
+yields exactly one example per row: a generator seeded from `(seed, epoch, shard, row)` picks
+one eligible chain uniformly, crops it (`crop_chain`: contiguous window or spatial crop around
+a resolved center; unresolved tokens fill a spatial crop last, by index) and featurizes it
+with the full chain as the LM row (`lm_positions = residue_index + 1`) and fresh per-token
+rotations of the centered reference conformers. Rows are `{"id": "<entry>_<chain>",
+"example": FoldExample(features, targets)}`; `collate_rows(rows, crop_size=...)` pads tokens
+to the crop and atoms to `24 × crop` rounded up to 32, stacks the LM rows of the batch and
+offsets `lm_rows`, and rejects an over-budget example instead of truncating it.
+`FoldTargets` carries coordinates, resolved mask, B-factor and the N/CA/C atom indices of
+each token for M2b's frame-based losses.
+
+### Acquisition, publishing, download
+
+```bash
+# wwPDB mmCIF archive (about 60 GB gzipped; read in place, never decompressed)
+rsync -rlpt -v -z --delete --port=33444 rsync.rcsb.org::ftp_data/structures/divided/mmCIF/ $OPLM_DATA/pdb/mmCIF/
+# Chemical Component Dictionary
+curl -o $OPLM_DATA/pdb/components.cif.gz https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz
+# publish (resumable) and pull on a cluster node
+hf upload-large-folder <namespace>/<dataset> <dataset dir> --repo-type dataset
+hf download <namespace>/<dataset> --repo-type dataset --local-dir $OPLM_DATA/fold/<dataset>
+```
+
+The manifest's `snapshot_date`, `checksums.txt` and the CCD checksum pin the inputs; the
+repo revision pins the artifact a run trained on. Acceptance evidence lives in
+[`docs/fold/m2a/`](fold/m2a/).
