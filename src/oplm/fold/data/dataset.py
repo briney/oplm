@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from oplm.fold.data.complex import MolecularComplex
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "PreprocessConfig",
@@ -206,10 +209,10 @@ def _parse_one(path_str: str) -> dict[str, Any]:
     from oplm.fold.data.mmcif import Rejection, parse_mmcif
 
     path = Path(path_str)
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
     # ``path`` is relative to the archive root so ``sha256sum -c checksums.txt`` works there.
-    out: dict[str, Any] = {"path": str(path.relative_to(_WORKER["archive"])), "sha256": digest}
+    out: dict[str, Any] = {"path": str(path.relative_to(_WORKER["archive"])), "sha256": ""}
     try:
+        out["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         result = parse_mmcif(
             path,
             ccd=_WORKER["ccd"],
@@ -241,8 +244,11 @@ def _parse_one(path_str: str) -> dict[str, Any]:
     return out
 
 
-def _parse_all(cfg: PreprocessConfig, paths: list[Path]) -> Iterator[dict[str, Any]]:
-    init_args = (str(cfg.ccd), cfg.max_resolution, cfg.min_resolved_residues, str(cfg.archive))
+def _parse_all(
+    cfg: PreprocessConfig, paths: list[Path], ccd_json: Path
+) -> Iterator[dict[str, Any]]:
+    # Workers load the small saved JSON, not the multi-hundred-MB components.cif.gz.
+    init_args = (str(ccd_json), cfg.max_resolution, cfg.min_resolved_residues, str(cfg.archive))
     if cfg.workers <= 1:
         _init_worker(*init_args)
         yield from (_parse_one(str(p)) for p in paths)
@@ -372,7 +378,8 @@ Source data: wwPDB (CC0 1.0) and the wwPDB Chemical Component Dictionary (CC0 1.
 Layout: `shards/*.parquet` (one row per entry; see `manifest.json` for the schema version and
 `oplm.fold.data.complex.COMPLEX_SCHEMA` for the columns), `index.parquet` (one row per chain
 with the `split` column), `targets/*.json` (held-out target lists), `checksums.txt`
-(sha256 of every input file), `manifest.json` (provenance, configuration, counts).
+(sha256 of every archive entry file; the CCD's sha256 is in `manifest.json` under
+`ccd.sha256`), `manifest.json` (provenance, configuration, counts).
 
 Splits: {splits}
 
@@ -411,33 +418,43 @@ def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
     dropped: dict[str, int] = {}
     checksums: list[str] = []
     accepted = 0
-    for result in _parse_all(cfg, paths):
-        checksums.append(f"{result['sha256']}  {result['path']}")
+    for i, result in enumerate(_parse_all(cfg, paths, out / "ccd_table.json")):
+        if result["sha256"]:  # '' when the file could not be read: no line for sha256sum -c
+            checksums.append(f"{result['sha256']}  {result['path']}")
         if "rejection" in result:
             rej = result["rejection"]
             rejected[rej["reason"]] = rejected.get(rej["reason"], 0) + 1
             rejections.append(rej)
-            continue
-        accepted += 1
-        meta = result["metadata"]
-        for kind, n in meta["dropped"].items():
-            dropped[kind] = dropped.get(kind, 0) + n
-        shard, row_idx = writer.current
-        for chain in result["chains"]:
-            index_rows.append(
-                {
-                    "id": meta["id"],
-                    **chain,
-                    "n_chains": len(result["chains"]),
-                    "resolution": meta["resolution"],
-                    "release_date": meta["release_date"],
-                    "method": meta["method"],
-                    "shard": shard,
-                    "row": row_idx,
-                    "split": "",
-                }
+        else:
+            accepted += 1
+            meta = result["metadata"]
+            for kind, n in meta["dropped"].items():
+                dropped[kind] = dropped.get(kind, 0) + n
+            shard, row_idx = writer.current
+            for chain in result["chains"]:
+                index_rows.append(
+                    {
+                        "id": meta["id"],
+                        **chain,
+                        "n_chains": len(result["chains"]),
+                        "resolution": meta["resolution"],
+                        "release_date": meta["release_date"],
+                        "method": meta["method"],
+                        "shard": shard,
+                        "row": row_idx,
+                        "split": "",
+                    }
+                )
+            writer.append(result["row"], result["nbytes"])
+        if (i + 1) % 1000 == 0 or i + 1 == len(paths):
+            logger.info(
+                "preprocess: %d/%d parsed, %d accepted, %d rejected, %d shards written",
+                i + 1,
+                len(paths),
+                accepted,
+                sum(rejected.values()),
+                len(writer.shards),
             )
-        writer.append(result["row"], result["nbytes"])
     writer.flush()
 
     assign_splits(
@@ -447,6 +464,8 @@ def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
         valid_size=cfg.valid_size,
         valid_seed=cfg.valid_seed,
     )
+    present = {r["id"] for r in index_rows}
+    heldout_missing = {name: sorted(ids - present) for name, ids in heldout.items()}
     pq.write_table(rows_to_index_table(index_rows), out / "index.parquet")
     (out / "checksums.txt").write_text("\n".join(checksums) + ("\n" if checksums else ""))
 
@@ -455,8 +474,9 @@ def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
     for split in entry_splits.values():
         split_counts[split] = split_counts.get(split, 0) + 1
     snapshot = dt.date.today().isoformat()
-    config = {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()}
-    config["heldout"] = {k: str(v) for k, v in cfg.heldout.items()}
+    # Local paths do not belong in a published manifest: keep the names only.
+    config = {k: (v.name if isinstance(v, Path) else v) for k, v in asdict(cfg).items()}
+    config["heldout"] = {k: Path(v).name for k, v in cfg.heldout.items()}
     config["cutoff"] = cutoff
     from oplm.fold.data.mmcif import PARSE_VERSION
 
@@ -466,9 +486,9 @@ def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
         "source": cfg.source,
         "created": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "snapshot_date": snapshot,
-        "archive": str(cfg.archive),
+        "archive": Path(cfg.archive).name,
         "ccd": {
-            "path": str(ccd_path),
+            "path": ccd_path.name,
             "sha256": hashlib.sha256(ccd_path.read_bytes()).hexdigest(),
             "components": len(ccd),
         },
@@ -479,11 +499,14 @@ def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
         "dropped": dropped,
         "chains": len(index_rows),
         "splits": dict(sorted(split_counts.items())),
+        "heldout_missing": heldout_missing,
         "row_group_size": cfg.row_group_size,
         "shards": writer.shards,
         "config": config,
         "licenses": {"wwPDB": "CC0 1.0", "CCD": "CC0 1.0"},
         "index_columns": _INDEX_SCHEMA.names,
+        "note": "paths are basenames; the archive snapshot is identified by snapshot_date "
+        "and checksums.txt",
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
     pretty = f"OPLM fold data: {cfg.source} {snapshot}"

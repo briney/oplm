@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import itertools
 import json
+import logging
 import os
 import platform
 import subprocess
@@ -419,6 +420,7 @@ def preprocess_cmd(
     ids: Annotated[Path | None, typer.Option(help="Restrict to the entry ids in this file")] = None,
 ) -> None:
     """Parse an mmCIF archive into structure shards, index, splits and manifest."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     from oplm.fold.data.dataset import PreprocessConfig, preprocess
 
     lists: dict[str, Path] = {}

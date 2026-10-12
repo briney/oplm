@@ -159,6 +159,13 @@ def test_conformer_rotations_are_per_token_rigid_and_seeded(
         a, b = raw[start : start + count], rot[start : start + count]
         assert torch.allclose(torch.cdist(a, a), torch.cdist(b, b), atol=1e-4)  # rigid
         assert torch.allclose(b.mean(0), torch.zeros(3), atol=1e-4)  # centered
+    start = int(c.token_atom_start[0])  # THR: atoms N, CA, C, O, CB, ...
+
+    def vol(x: torch.Tensor) -> torch.Tensor:  # signed volume of the N-CA-C-CB frame
+        n, ca, cb = x[start], x[start + 1], x[start + 4]
+        return torch.det(torch.stack([n - ca, x[start + 2] - ca, cb - ca]))
+
+    assert torch.sign(vol(raw)) == torch.sign(vol(rot)) and vol(rot).abs() > 1e-3  # no reflection
     thr1, thr2 = rot[:7], rot[7:14]  # two THR tokens get different rotations
     assert not torch.allclose(thr1, thr2, atol=1e-3)
     again = featurize_complex(c, generator=torch.Generator().manual_seed(7)).features.ref_pos[0]

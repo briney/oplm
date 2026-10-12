@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import shutil
 from functools import partial
 from typing import TYPE_CHECKING
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader
 
 import oplm.data.sequence.dataset as seq_dataset
 from oplm.data.sequence.dataset import InterleavedDataset
+from oplm.fold.data.ccd import ChemCompTable
 from oplm.fold.data.collate import collate_rows
 from oplm.fold.data.complex import COMPLEX_SCHEMA, row_to_complex
 from oplm.fold.data.dataset import (
@@ -57,6 +59,11 @@ def test_preprocess_layout_counts_and_schema(
     assert manifest["row_group_size"] == 2 and manifest["config"]["cutoff"] == "2021-09-30"
     assert manifest["licenses"] == {"wwPDB": "CC0 1.0", "CCD": "CC0 1.0"}
     assert manifest["ccd"]["components"] == 45 and len(manifest["ccd"]["sha256"]) == 64
+    assert manifest["archive"] == "mmcif" and manifest["ccd"]["path"] == "ccd_subset.cif"
+    assert manifest["config"]["archive"] == "mmcif" and manifest["config"]["out"] == "dataset"
+    assert manifest["config"]["heldout"] == {"cameo": "cameo.txt", "casp14": "casp14.txt"}
+    assert manifest["heldout_missing"] == {"cameo": [], "casp14": []}
+    assert "basenames" in manifest["note"]
     shards = sorted((fixture_dataset / "shards").glob("shard-*.parquet"))
     assert len(shards) >= 2 and [s["file"] for s in manifest["shards"]] == [s.name for s in shards]
     assert sum(s["rows"] for s in manifest["shards"]) == 6
@@ -289,6 +296,50 @@ def test_rerun_into_an_existing_output_raises(tmp_path: Path) -> None:
     preprocess(cfg)
     with pytest.raises(FileExistsError, match="shards"):
         preprocess(cfg)
+
+
+def test_preprocess_logs_progress(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO", logger="oplm.fold.data.dataset")
+    preprocess(_small_config(tmp_path))
+    assert any("1/1 parsed" in r.getMessage() for r in caplog.records)
+
+
+def test_heldout_targets_missing_from_the_snapshot_are_recorded(tmp_path: Path) -> None:
+    (tmp_path / "cameo.txt").write_text("1crn_A\n9xyz\n")
+    cfg = _small_config(tmp_path, archive=MMCIF_DIR, heldout={"cameo": tmp_path / "cameo.txt"})
+    manifest = preprocess(cfg)
+    assert manifest["heldout_missing"] == {"cameo": ["9xyz"]}
+    assert manifest["splits"]["cameo"] == 1
+
+
+def test_workers_load_the_saved_ccd_json_not_the_cif(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+    original = ChemCompTable.parse
+
+    def counting(cls: type[ChemCompTable], path: Path) -> ChemCompTable:
+        calls.append(path)
+        return original(path)
+
+    monkeypatch.setattr(ChemCompTable, "parse", classmethod(counting))
+    manifest = preprocess(_small_config(tmp_path))
+    assert manifest["accepted"] == 1 and len(calls) == 1  # _load_ccd only; workers read the JSON
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads files regardless of mode")
+def test_unreadable_input_is_a_rejection_not_an_abort(tmp_path: Path) -> None:
+    cfg = _small_config(tmp_path)
+    shutil.copy(MMCIF_DIR / "1l2y.cif.gz", cfg.archive / "1l2y.cif.gz")
+    victim = cfg.archive / "1l2y.cif.gz"
+    victim.chmod(0o000)
+    try:
+        manifest = preprocess(cfg)
+    finally:
+        victim.chmod(0o644)
+    assert manifest["accepted"] == 1 and manifest["rejected"] == {"internal_error": 1}
+    assert manifest["rejections"][0]["id"] == "1l2y.cif.gz"
+    assert len((cfg.out / "checksums.txt").read_text().splitlines()) == 1  # only the readable file
 
 
 @pytest.fixture

@@ -91,7 +91,8 @@ def parse_mmcif(
     if resolution is not None and resolution > max_resolution:
         return Rejection(entry_id, "resolution", f"{resolution} > {max_resolution}")
     dates = block.find_values("_pdbx_audit_revision_history.revision_date")
-    release_date = gemmi.cif.as_string(dates[0]) if len(dates) else None
+    # The earliest revision is the release; skip '?' rows so they never win the min.
+    release_date = min((d for d in (gemmi.cif.as_string(v) for v in dates) if d), default=None)
 
     dropped: dict[str, int] = {}
 

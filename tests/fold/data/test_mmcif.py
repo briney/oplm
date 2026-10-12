@@ -147,7 +147,11 @@ def test_nmr_first_model_1l2y(parsed: Callable[[str], MolecularComplex]) -> None
     c.validate()
     assert c.metadata.method == "SOLUTION NMR" and c.metadata.resolution is None
     assert c.num_tokens == 20 and c.atom_resolved.all()
-    assert c.num_atoms == int(c.token_atom_count.sum())  # one model's worth of atoms
+    st = gemmi.read_structure(str(MMCIF_DIR / "1l2y.cif.gz"))
+    first, second = st[0]["A"][0][0].pos, st[1]["A"][0][0].pos  # first atom of models 0 and 1
+    xyz = np.asarray(c.atom_coords[0])
+    assert np.allclose(xyz, [first.x, first.y, first.z], atol=1e-4)
+    assert not np.allclose(xyz, [second.x, second.y, second.z], atol=1e-3)
 
 
 def test_resolution_and_short_chain_filters(
