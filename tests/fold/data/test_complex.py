@@ -122,3 +122,11 @@ def test_round_trip_keeps_none_resolution_and_plddt() -> None:
     back = row_to_complex(rows_to_table([complex_to_row(c)]).to_pylist()[0])
     assert back.metadata.resolution is None and back.metadata.release_date is None
     assert back.chains[0].mean_plddt is None and back.chains[1].mean_plddt == 0.5
+
+
+def test_select_tokens_empty_selection() -> None:
+    c = two_chain_complex()
+    empty = c.select_tokens(np.array([], dtype=np.int64))
+    empty.validate()
+    assert empty.num_tokens == 0 and empty.num_atoms == 0 and empty.chains == []
+    assert empty.bonds.shape == (0, 2)

@@ -159,7 +159,7 @@ class MolecularComplex:
             ]
             or [np.zeros(0, dtype=np.int64)]
         ).astype(np.int64)
-        starts = np.concatenate([[0], np.cumsum(counts)[:-1]]).astype(np.int32)
+        starts = np.cumsum(counts, dtype=np.int32) - counts
         present = np.unique(self.token_asym_id[tokens])
         asym_map = np.full(len(self.chains), -1, dtype=np.int32)
         asym_map[present] = np.arange(present.size, dtype=np.int32)
@@ -230,18 +230,6 @@ COMPLEX_SCHEMA = pa.schema(
     ]
 )
 
-_TOKEN_FIELDS = (
-    "token_res_type",
-    "token_mol_type",
-    "token_asym_id",
-    "token_entity_id",
-    "token_sym_id",
-    "token_residue_index",
-    "token_center_atom",
-    "token_rep_atom",
-    "token_atom_start",
-    "token_atom_count",
-)
 _ARRAY_DTYPES: dict[str, type] = {
     "atom_resolved": np.bool_,
     "atom_element": np.uint8,
