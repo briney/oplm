@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 import torch
@@ -13,9 +13,6 @@ from oplm.cli import app
 from oplm.fold.cli import run_kernel_benchmark
 from tests.cli_output import plain
 from tests.fold.helpers import tiny_fold_config, tiny_lm
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 runner = CliRunner()
 
@@ -140,3 +137,13 @@ def test_predict_cli_writes_a_cif(tmp_path: Path) -> None:
     result = runner.invoke(app, args)
     assert result.exit_code == 0, result.output
     assert out.exists() and "pTM" in plain(result.output)
+
+
+def test_preprocess_command_runs_on_the_fixtures(tmp_path: Path) -> None:
+    fixtures = Path(__file__).parent.parent / "fixtures" / "fold"
+    args = ["fold", "preprocess", "--archive", str(fixtures / "mmcif")]
+    args += ["--ccd", str(fixtures / "ccd_subset.cif"), "--out", str(tmp_path / "ds")]
+    args += ["--workers", "1", "--cutoff", "1990-01-01"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert "accepted" in result.output and (tmp_path / "ds" / "manifest.json").exists()

@@ -1,4 +1,5 @@
-"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``predict`` (design §5.2).
+"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``predict`` (design §5.2) and
+``preprocess``.
 
 Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 """
@@ -8,6 +9,8 @@ from __future__ import annotations
 import copy
 import itertools
 import json
+import logging
+import os
 import platform
 import subprocess
 import time
@@ -396,3 +399,59 @@ def predict(
         f"wrote {out}  pTM {result.ptm:.3f}  ipTM {result.iptm:.3f}  "
         f"mean pLDDT {float(result.plddt.mean()) * 100:.1f}  sample {result.best_sample}/{samples}"
     )
+
+
+@app.command("preprocess")
+def preprocess_cmd(
+    archive: Annotated[Path, typer.Option("--archive", help="Root of the mmCIF tree")],
+    ccd: Annotated[Path, typer.Option("--ccd", help="components.cif.gz or a ccd_table.json")],
+    out: Annotated[Path, typer.Option("--out", help="Dataset directory to create")],
+    workers: Annotated[int, typer.Option(help="Parser processes")] = max(
+        1, (os.cpu_count() or 2) - 1
+    ),
+    shard_bytes: Annotated[int, typer.Option(help="Target bytes per shard")] = 1 << 30,
+    row_group_size: Annotated[int, typer.Option(help="Rows per Parquet row group")] = 16,
+    cutoff: Annotated[str, typer.Option(help="Training release-date cutoff (ISO)")] = "2021-09-30",
+    valid_size: Annotated[int, typer.Option(help="Post-cutoff monomer chains held for valid")] = 64,
+    valid_seed: Annotated[int, typer.Option()] = 0,
+    heldout: Annotated[
+        list[str] | None, typer.Option("--heldout", help="name=path of a target list; repeatable")
+    ] = None,
+    ids: Annotated[Path | None, typer.Option(help="Restrict to the entry ids in this file")] = None,
+) -> None:
+    """Parse an mmCIF archive into structure shards, index, splits and manifest."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    from oplm.fold.data.dataset import PreprocessConfig, preprocess
+
+    lists: dict[str, Path] = {}
+    for item in heldout or []:
+        name, sep, path = item.partition("=")
+        if not sep or not name or not path:
+            raise typer.BadParameter(f"--heldout expects name=path, got {item!r}")
+        lists[name] = Path(path)
+    manifest = preprocess(
+        PreprocessConfig(
+            archive=archive,
+            ccd=ccd,
+            out=out,
+            workers=workers,
+            shard_bytes=shard_bytes,
+            row_group_size=row_group_size,
+            cutoff=cutoff,
+            valid_size=valid_size,
+            valid_seed=valid_seed,
+            heldout=lists,
+            ids=ids,
+        )
+    )
+    table = Table(title=f"preprocess -> {out}")
+    table.add_column("key")
+    table.add_column("value")
+    table.add_row("inputs", str(manifest["inputs"]))
+    table.add_row("accepted", str(manifest["accepted"]))
+    table.add_row("rejected", json.dumps(manifest["rejected"]))
+    table.add_row("dropped", json.dumps(manifest["dropped"]))
+    table.add_row("chains", str(manifest["chains"]))
+    table.add_row("splits", json.dumps(manifest["splits"]))
+    table.add_row("shards", str(len(manifest["shards"])))
+    console.print(table)
