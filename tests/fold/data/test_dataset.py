@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 from oplm.fold.data.complex import COMPLEX_SCHEMA, row_to_complex
 from oplm.fold.data.dataset import (
@@ -60,9 +61,13 @@ def test_preprocess_layout_counts_and_schema(
         )
     checksums = (fixture_dataset / "checksums.txt").read_text().splitlines()
     assert len(checksums) == 6 and all(len(line.split()[0]) == 64 for line in checksums)
+    assert all((MMCIF_DIR / line.split()[1]).exists() for line in checksums)  # archive-relative
     assert (fixture_dataset / "ccd_table.json").exists()
     card = (fixture_dataset / "README.md").read_text()
     assert card.startswith("---\nlicense: cc0-1.0") and "6 entries" in card
+    front_matter = yaml.safe_load(card.split("---\n")[1])  # the Hub parses this block
+    assert front_matter["license"] == "cc0-1.0"
+    assert front_matter["pretty_name"].startswith("OPLM fold data")
     assert json.loads((fixture_dataset / "targets" / "cameo.json").read_text()) == [
         {"id": "1crn", "chain": "A"}
     ]
@@ -123,6 +128,7 @@ def test_assign_splits_valid_is_seeded_and_capped() -> None:
         entry("nmr1", "2022-01-01", res=None),
         entry("short", "2022-01-01", length=20),
         entry("none1", None),
+        entry("none2", ""),  # the parser yields '' for a '?' release date
     ]
     assign_splits(rows, cutoff="2021-09-30", heldout={}, valid_size=4, valid_seed=0)
     chosen = sorted(r["id"] for r in rows if r["split"] == "valid")
@@ -134,6 +140,7 @@ def test_assign_splits_valid_is_seeded_and_capped() -> None:
         "nmr1": "post_cutoff",
         "short": "post_cutoff",
         "none1": "undated",
+        "none2": "undated",
     }
     again = [dict(r, split="") for r in rows]
     assign_splits(again, cutoff="2021-09-30", heldout={}, valid_size=4, valid_seed=0)
@@ -208,4 +215,70 @@ def test_rejections_are_counted_not_fatal(tmp_path: Path) -> None:
         )
     )
     assert manifest["accepted"] == 2 and manifest["rejected"] == {"parse_error": 1}
-    assert manifest["rejections"] == [{"id": "zzzz.cif.gz", "reason": "parse_error"}]
+    assert len(manifest["rejections"]) == 1
+    rejection = manifest["rejections"][0]
+    assert rejection["id"] == "zzzz.cif.gz" and rejection["reason"] == "parse_error"
+    assert "detail" in rejection
+
+
+def _small_config(tmp_path: Path, **overrides: object) -> PreprocessConfig:
+    """One fixture (1crn) in a fresh archive, preprocessed in-process into ``tmp_path / "out"``."""
+    archive = tmp_path / "archive"
+    archive.mkdir(exist_ok=True)
+    shutil.copy(MMCIF_DIR / "1crn.cif.gz", archive / "1crn.cif.gz")
+    kwargs: dict[str, object] = {
+        "archive": archive,
+        "ccd": FOLD_FIXTURES / "ccd_subset.cif",
+        "out": tmp_path / "out",
+        "workers": 1,
+    }
+    return PreprocessConfig(**(kwargs | overrides))  # type: ignore[arg-type]
+
+
+def test_unexpected_worker_exception_is_an_internal_error_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("oplm.fold.data.dataset._chain_stats", boom)
+    cfg = _small_config(tmp_path)
+    shutil.copy(MMCIF_DIR / "1l2y.cif.gz", cfg.archive / "1l2y.cif.gz")
+    manifest = preprocess(cfg)
+    assert manifest["accepted"] == 0 and manifest["rejected"] == {"internal_error": 2}
+    assert manifest["rejections"][0]["detail"] == "RuntimeError: boom"
+    assert (cfg.out / "manifest.json").exists() and len(manifest["shards"]) == 0
+
+
+def test_checksums_name_files_relative_to_the_archive_root(tmp_path: Path) -> None:
+    cfg = _small_config(tmp_path)  # a divided archive, as wwPDB ships: <mid>/<id>.cif.gz
+    (cfg.archive / "cr").mkdir()
+    (cfg.archive / "1crn.cif.gz").rename(cfg.archive / "cr" / "1crn.cif.gz")
+    preprocess(cfg)
+    digest, name = (cfg.out / "checksums.txt").read_text().split()
+    assert name == "cr/1crn.cif.gz" and len(digest) == 64
+
+
+def test_malformed_cutoff_raises(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="2021-9-30"):
+        preprocess(_small_config(tmp_path, cutoff="2021-9-30"))
+
+
+def test_cutoff_is_normalised_in_the_manifest(tmp_path: Path) -> None:
+    manifest = preprocess(_small_config(tmp_path, cutoff="20210930"))
+    assert manifest["config"]["cutoff"] == "2021-09-30"
+
+
+def test_empty_archive_raises(tmp_path: Path) -> None:
+    (tmp_path / "empty").mkdir()
+    cfg = _small_config(tmp_path, archive=tmp_path / "empty")
+    with pytest.raises(ValueError, match="no mmCIF files"):
+        preprocess(cfg)
+    assert not cfg.out.exists()
+
+
+def test_rerun_into_an_existing_output_raises(tmp_path: Path) -> None:
+    cfg = _small_config(tmp_path)
+    preprocess(cfg)
+    with pytest.raises(FileExistsError, match="shards"):
+        preprocess(cfg)

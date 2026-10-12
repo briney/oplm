@@ -140,8 +140,9 @@ def _load_ccd(path: Path) -> ChemCompTable:
 _WORKER: dict[str, Any] = {}
 
 
-def _init_worker(ccd: str, max_resolution: float, min_resolved_residues: int) -> None:
+def _init_worker(ccd: str, max_resolution: float, min_resolved_residues: int, archive: str) -> None:
     _WORKER.update(
+        archive=Path(archive),
         ccd=_load_ccd(Path(ccd)),
         conformers=ReferenceConformers.load(),
         max_resolution=max_resolution,
@@ -202,34 +203,42 @@ def _parse_one(path_str: str) -> dict[str, Any]:
 
     path = Path(path_str)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    result = parse_mmcif(
-        path,
-        ccd=_WORKER["ccd"],
-        conformers=_WORKER["conformers"],
-        max_resolution=_WORKER["max_resolution"],
-        min_resolved_residues=_WORKER["min_resolved_residues"],
-    )
-    out: dict[str, Any] = {"path": path.name, "sha256": digest}
-    if isinstance(result, Rejection):
-        out["rejection"] = {"id": result.id, "reason": result.reason}
-        return out
-    out.update(
-        row=complex_to_row(result),
-        nbytes=_row_bytes(result),
-        chains=_chain_stats(result),
-        metadata={
-            "id": result.metadata.id,
-            "resolution": result.metadata.resolution,
-            "release_date": result.metadata.release_date,
-            "method": result.metadata.method,
-            "dropped": result.metadata.dropped,
-        },
-    )
+    # ``path`` is relative to the archive root so ``sha256sum -c checksums.txt`` works there.
+    out: dict[str, Any] = {"path": str(path.relative_to(_WORKER["archive"])), "sha256": digest}
+    try:
+        result = parse_mmcif(
+            path,
+            ccd=_WORKER["ccd"],
+            conformers=_WORKER["conformers"],
+            max_resolution=_WORKER["max_resolution"],
+            min_resolved_residues=_WORKER["min_resolved_residues"],
+        )
+        if isinstance(result, Rejection):
+            out["rejection"] = {"id": result.id, "reason": result.reason, "detail": result.detail}
+            return out
+        out.update(
+            row=complex_to_row(result),
+            nbytes=_row_bytes(result),
+            chains=_chain_stats(result),
+            metadata={
+                "id": result.metadata.id,
+                "resolution": result.metadata.resolution,
+                "release_date": result.metadata.release_date,
+                "method": result.metadata.method,
+                "dropped": result.metadata.dropped,
+            },
+        )
+    except Exception as exc:  # one bad entry must not abort an hours-long run: count it instead
+        out["rejection"] = {
+            "id": path.name,
+            "reason": "internal_error",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
     return out
 
 
 def _parse_all(cfg: PreprocessConfig, paths: list[Path]) -> Iterator[dict[str, Any]]:
-    init_args = (str(cfg.ccd), cfg.max_resolution, cfg.min_resolved_residues)
+    init_args = (str(cfg.ccd), cfg.max_resolution, cfg.min_resolved_residues, str(cfg.archive))
     if cfg.workers <= 1:
         _init_worker(*init_args)
         yield from (_parse_one(str(p)) for p in paths)
@@ -314,7 +323,7 @@ def assign_splits(
         if entry in entry_split:
             continue
         date = rows[0]["release_date"]
-        if date is None:
+        if not date:  # None, or '' from a '?' in the mmCIF
             entry_split[entry] = "undated"
         elif date <= cutoff:  # ISO dates compare lexicographically
             excluded = any(r["sequence"] in heldout_sequences for r in rows)
@@ -343,7 +352,7 @@ def assign_splits(
 
 _CARD = """---
 license: cc0-1.0
-pretty_name: {pretty}
+pretty_name: {pretty_json}
 tags:
 - protein-structure
 - wwpdb
@@ -370,10 +379,16 @@ see `docs/FOLD.md` in https://github.com/briney/oplm.
 
 def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
     """Run the whole pipeline and return the manifest (also written to ``out/manifest.json``)."""
+    cutoff = dt.date.fromisoformat(cfg.cutoff).isoformat()  # ValueError on a malformed cutoff
     out = Path(cfg.out)
+    paths = discover_entries(cfg.archive, cfg.ids)
+    if not paths:
+        raise ValueError(f"no mmCIF files found under {cfg.archive}")
+    for stale in ("shards", "targets"):  # ``out`` is the published repo: never mix two runs
+        if (out / stale).is_dir() and any((out / stale).iterdir()):
+            raise FileExistsError(f"{out / stale} is not empty; preprocess into a fresh directory")
     out.mkdir(parents=True, exist_ok=True)
     (out / "targets").mkdir(exist_ok=True)
-    paths = discover_entries(cfg.archive, cfg.ids)
     ccd_path = Path(cfg.ccd)
     ccd = _load_ccd(ccd_path)
     ccd.save(out / "ccd_table.json")
@@ -423,7 +438,7 @@ def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
 
     assign_splits(
         index_rows,
-        cutoff=cfg.cutoff,
+        cutoff=cutoff,
         heldout=heldout,
         valid_size=cfg.valid_size,
         valid_seed=cfg.valid_seed,
@@ -438,6 +453,7 @@ def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
     snapshot = dt.date.today().isoformat()
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()}
     config["heldout"] = {k: str(v) for k, v in cfg.heldout.items()}
+    config["cutoff"] = cutoff
     from oplm.fold.data.mmcif import PARSE_VERSION
 
     manifest: dict[str, Any] = {
@@ -466,9 +482,11 @@ def preprocess(cfg: PreprocessConfig) -> dict[str, Any]:
         "index_columns": _INDEX_SCHEMA.names,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    pretty = f"OPLM fold data: {cfg.source} {snapshot}"
     (out / "README.md").write_text(
         _CARD.format(
-            pretty=f"OPLM fold data: {cfg.source} {snapshot}",
+            pretty=pretty,
+            pretty_json=json.dumps(pretty),
             snapshot=snapshot,
             accepted=accepted,
             chains=len(index_rows),
