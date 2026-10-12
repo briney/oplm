@@ -52,15 +52,19 @@ def test_spatial_crop_takes_the_nearest_tokens_to_a_resolved_center(
 def test_spatial_crop_never_centers_on_unresolved_tokens(
     parsed: Callable[[str], MolecularComplex],
 ) -> None:
-    """2ds7: tokens 0-10 have no atoms; with 40 resolved tokens a crop of 8 is all resolved."""
+    """2ds7: tokens 0-10 have no atoms; the center is always drawn from the 40 resolved tokens."""
     c = parsed("2ds7")
     tokens = c.chain_tokens(0)
     centers = c.atom_coords[c.token_center_atom[tokens]]
     valid = c.atom_resolved[c.token_center_atom[tokens]]
     assert valid.sum() == 40
+    resolved = np.flatnonzero(valid)
     for seed in range(50):
         crop = spatial_crop(centers, valid, 8, gen(seed))
-        assert valid[crop].all()
+        pick = resolved[int(torch.randint(0, resolved.size, (1,), generator=gen(seed)))]
+        dist = np.where(valid, np.linalg.norm(centers - centers[pick], axis=1), np.inf)
+        nearest = np.sort(np.lexsort((np.arange(len(dist)), dist))[:8])
+        assert pick in crop and np.array_equal(crop, nearest)
 
 
 def test_spatial_crop_fills_with_unresolved_tokens_by_index(
@@ -108,3 +112,10 @@ def test_crop_chain_short_chain_is_whole(parsed: Callable[[str], MolecularComple
     c = parsed("1l2y")
     sub = crop_chain(c, 0, 384, contiguous_prob=0.5, generator=gen(0))
     assert sub.num_tokens == 20 and sub.num_atoms == c.num_atoms
+
+
+def test_crop_size_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="crop_size"):
+        contiguous_crop(10, 0, gen(0))
+    with pytest.raises(ValueError, match="crop_size"):
+        spatial_crop(np.zeros((10, 3), dtype=np.float32), np.ones(10, dtype=bool), -1, gen(0))

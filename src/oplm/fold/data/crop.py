@@ -21,7 +21,13 @@ __all__ = ["contiguous_crop", "crop_chain", "spatial_crop"]
 
 
 def contiguous_crop(n: int, crop_size: int, generator: torch.Generator) -> np.ndarray:
-    """Positions of a random ``crop_size`` window of ``range(n)``, or all of it when it fits."""
+    """Positions of a random ``crop_size`` window of ``range(n)``, or all of it when it fits.
+
+    Raises:
+        ValueError: ``crop_size`` is less than 1.
+    """
+    if crop_size < 1:
+        raise ValueError(f"crop_size must be >= 1; got {crop_size!r}")
     if n <= crop_size:
         return np.arange(n)
     start = int(torch.randint(0, n - crop_size + 1, (1,), generator=generator))
@@ -38,7 +44,12 @@ def spatial_crop(
         valid: ``(n,)`` whether each center atom is resolved.
         crop_size: Tokens to keep; everything when ``n <= crop_size``.
         generator: Draws the center (and the window when no center is resolved).
+
+    Raises:
+        ValueError: ``crop_size`` is less than 1.
     """
+    if crop_size < 1:
+        raise ValueError(f"crop_size must be >= 1; got {crop_size!r}")
     n = centers.shape[0]
     if n <= crop_size:
         return np.arange(n)
