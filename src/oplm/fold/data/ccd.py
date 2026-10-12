@@ -7,7 +7,8 @@ the three charged atoms, and the atom-name character encoding. Reference conform
 from ``reference_conformers.json`` next to this file: upstream's ``get_idealized_atom_pos``
 dump of the CCD conformers in ``biohub/ESMFold2``'s ``ccd.pkl`` (see its ``source`` field),
 written by ``oplm fold make-fixtures``; ESMFold2-Fast ships no ``ccd.pkl``.
-Milestone 5 widens this module to ligands and nucleic acids via a gemmi-parsed CCD cache.
+A gemmi-parsed CCD table (``ChemCompTable``) now exists for the parent mapping; ligand and
+nucleic-acid atom tables remain milestone 5.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ import torch
 __all__ = [
     "ATOM_NAME_CHARS",
     "ATOM_NAME_VOCAB",
+    "ChemComp",
+    "ChemCompTable",
     "LM_UNKNOWN_ID",
     "MAX_ATOMIC_NUMBER",
     "MOL_TYPE_DNA",
@@ -30,7 +33,9 @@ __all__ = [
     "MOL_TYPE_RNA",
     "NUM_RES_TYPES",
     "PROTEIN_1TO3",
+    "PROTEIN_3TO1",
     "PROTEIN_RES_TYPES",
+    "RES_TYPE_TO_CODE",
     "UNK_RES_TYPE",
     "ReferenceConformers",
     "ResidueTemplate",
@@ -157,3 +162,102 @@ class ReferenceConformers:
 
     def __getitem__(self, code: str) -> ResidueTemplate:
         return self._residues[code]
+
+
+PROTEIN_3TO1: dict[str, str] = {code: letter for letter, code in PROTEIN_1TO3.items()}
+RES_TYPE_TO_CODE: dict[int, str] = {res_type: code for code, res_type in PROTEIN_RES_TYPES.items()}
+
+
+def _cif_value(raw: str | None) -> str | None:
+    """A ``_chem_comp`` value with CIF quoting removed; ``None`` for absent, ``?`` and ``.``."""
+    if raw is None or raw in ("?", "."):
+        return None
+    import gemmi
+
+    return gemmi.cif.as_string(raw)
+
+
+@dataclass(frozen=True)
+class ChemComp:
+    """One ``_chem_comp`` row of the wwPDB Chemical Component Dictionary."""
+
+    code: str
+    type: str  # ``_chem_comp.type`` upper-cased, e.g. "L-PEPTIDE LINKING"
+    parent: str | None  # ``mon_nstd_parent_comp_id`` when it names exactly one component
+    one_letter: str | None
+
+
+class ChemCompTable:
+    """``_chem_comp`` rows keyed by code, from ``components.cif.gz`` or a saved JSON cache."""
+
+    def __init__(self, comps: dict[str, ChemComp], source: str) -> None:
+        self._comps = comps
+        self.source = source
+
+    @classmethod
+    def parse(cls, components_cif: Path) -> ChemCompTable:
+        """Parse the dictionary (gzipped or plain mmCIF); about 3 s for the full 51k-block file."""
+        import gemmi
+
+        doc = gemmi.cif.read(str(components_cif))
+        comps: dict[str, ChemComp] = {}
+        for block in doc:
+            parent = _cif_value(block.find_value("_chem_comp.mon_nstd_parent_comp_id"))
+            if parent is not None and "," in parent:
+                parent = None  # multi-parent (e.g. "ALA, SER, GLY") have no single parent
+            comps[block.name] = ChemComp(
+                code=block.name,
+                type=(_cif_value(block.find_value("_chem_comp.type")) or "").upper(),
+                parent=parent,
+                one_letter=_cif_value(block.find_value("_chem_comp.one_letter_code")),
+            )
+        return cls(comps, f"{Path(components_cif).name} ({len(comps)} components)")
+
+    def save(self, path: Path) -> None:
+        """Write the table as JSON (``{"source": ..., "components": {code: {...}}}``)."""
+        payload = {
+            "source": self.source,
+            "components": {
+                code: {"type": c.type, "parent": c.parent, "one_letter": c.one_letter}
+                for code, c in self._comps.items()
+            },
+        }
+        Path(path).write_text(json.dumps(payload), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: Path) -> ChemCompTable:
+        """Read a table written by :meth:`save`."""
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        comps = {
+            code: ChemComp(code, entry["type"], entry["parent"], entry["one_letter"])
+            for code, entry in raw["components"].items()
+        }
+        return cls(comps, raw["source"])
+
+    def __len__(self) -> int:
+        return len(self._comps)
+
+    def __contains__(self, code: str) -> bool:
+        return code in self._comps
+
+    def __getitem__(self, code: str) -> ChemComp:
+        return self._comps[code]
+
+    def is_peptide(self, code: str) -> bool:
+        """Whether the component's type names a peptide (any chirality or linkage)."""
+        comp = self._comps.get(code)
+        return comp is not None and "PEPTIDE" in comp.type
+
+    def protein_parent(self, code: str) -> str:
+        """The standard amino acid a polymer residue collapses to (spec §4.1), else ``"UNK"``.
+
+        A standard residue is its own parent; a modified residue resolves to its single
+        ``mon_nstd_parent_comp_id`` when that is a standard amino acid; everything else,
+        including multi-parent components and unknown codes, becomes ``UNK``.
+        """
+        if code in PROTEIN_RES_TYPES:
+            return code
+        comp = self._comps.get(code)
+        if comp is not None and comp.parent in PROTEIN_RES_TYPES and comp.parent != "UNK":
+            return comp.parent
+        return "UNK"
