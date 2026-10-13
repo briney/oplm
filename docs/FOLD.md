@@ -418,9 +418,11 @@ are masked (id 32; never BOS, EOS or padding), the loop count is a clamped Poiss
 the last 2 loops, per-loop LM-pair dropout), and the distogram logits come from the symmetrized
 final pair. Then `diffusion_samples` copies of the reference are centred, randomly rotated and
 translated, noised at `σ = 16 · exp(N(−1.2, 1.5))` and denoised once each, in microbatches of
-`diffusion_microbatch` samples (each microbatch runs under `torch.utils.checkpoint` when there are
-several, so the sample count never multiplies live memory; the per-sample losses are averaged, so
-the microbatch size does not change the objective). A `confidence_rollout_steps`-step sampler
+`diffusion_microbatch` samples. When `diffusion_microbatch` is below `diffusion_samples`, each
+chunk runs under `torch.utils.checkpoint`, so only one chunk's activations are live at a time;
+with the default `null` every sample is denoised in one unchecked call and activations scale with
+the sample count (the proof configs use 4 of 8). The per-sample losses are averaged, so the
+microbatch size does not change the objective. A `confidence_rollout_steps`-step sampler
 rollout runs without gradient and the confidence head scores it on detached trunk outputs.
 `FoldTrainOutput` carries the weighted loss, the detached per-term metrics, the valid token count
 and the example (chain) count. The branch runs whenever `targets` is given; masking, the Poisson

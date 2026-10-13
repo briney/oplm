@@ -447,7 +447,7 @@ top-level `model.*` block (the MLM architecture) is not used.
 | `fold.contiguous_prob` | `float` | `0.5` | Probability a crop is a contiguous window rather than a spatial crop; in `[0, 1]`. |
 | `fold.atoms_per_token_budget` | `int` | `24` | Atom-axis budget per token: batches pad atoms to `atoms_per_token_budget × crop_size` rounded up to `fold.model.atom_pad_multiple` (32), and an example over the budget is rejected, not truncated; `≥ 1`. |
 | `fold.diffusion_samples` | `int` | `8` | Noised copies of each example denoised per step; `≥ 1`. |
-| `fold.diffusion_microbatch` | `int \| null` | `null` | Samples per denoiser call; `null` denoises all samples at once. Several microbatches run under activation checkpointing; one (`null` or `≥ diffusion_samples`) does not. `≥ 1` when set. |
+| `fold.diffusion_microbatch` | `int \| null` | `null` | Samples per denoiser call. Below `diffusion_samples`, each chunk runs under activation checkpointing so one chunk's activations are live at a time; `null` (or `≥ diffusion_samples`) denoises all samples in one unchecked call, and activations scale with `diffusion_samples`. `≥ 1` when set. |
 | `fold.confidence_rollout_steps` | `int` | `20` | Sampler steps of the no-grad rollout the confidence head is scored on; `≥ 1`. |
 | `fold.loss_diffusion_mse` | `float` | `4.0` | Weight of the EDM-weighted diffusion MSE; `≥ 0`. |
 | `fold.loss_smooth_lddt` | `float` | `1.0` | Weight of the smooth-lDDT term; `≥ 0`. |
