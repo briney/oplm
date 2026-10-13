@@ -14,7 +14,9 @@ from oplm.fold.lm_shim import (
     SingleToPair,
     frozen_lm_hidden_states,
     lm_state_count,
+    mask_lm_inputs,
 )
+from oplm.model.tokenization_oplm import VOCAB
 from tests.fold.helpers import tiny_lm
 
 
@@ -118,7 +120,9 @@ def test_frozen_lm_states_accept_a_stacked_hidden_state_tensor() -> None:
     class _Stacked(nn.Module):
         num_hidden_states = 3
 
-        def forward(self, input_ids, attention_mask=None, output_hidden_states=True, return_dict=True):
+        def forward(
+            self, input_ids, attention_mask=None, output_hidden_states=True, return_dict=True
+        ):
             x = torch.ones(*input_ids.shape, 4) * input_ids[..., None].float()
             return type("Out", (), {"hidden_states": torch.stack([x, 2 * x, 3 * x])})()
 
@@ -126,3 +130,18 @@ def test_frozen_lm_states_accept_a_stacked_hidden_state_tensor() -> None:
     states = frozen_lm_hidden_states(_Stacked(), f)
     assert states.shape == (1, 3, 3, 4) and lm_state_count(_Stacked()) == 3
     torch.testing.assert_close(states[0, 0, 1], 2 * f.lm_input_ids[0, 1].float() * torch.ones(4))
+
+
+def test_lm_input_masking_touches_only_inner_positions() -> None:
+    """Review Focus 5: BOS, EOS and padding are never masked; fraction 0 is the identity."""
+    f = featurize([ChainSpec("MKVLAG", "A"), ChainSpec("WW", "B")])
+    torch.manual_seed(0)
+    masked = mask_lm_inputs(f, 1.0, VOCAB["<mask>"])
+    ids, mask = masked.lm_input_ids, f.lm_attention_mask.bool()
+    lengths = mask.sum(1)
+    for row in range(ids.shape[0]):
+        assert ids[row, 0] == VOCAB["<cls>"] and ids[row, lengths[row] - 1] == VOCAB["<eos>"]
+        assert (ids[row, 1 : lengths[row] - 1] == VOCAB["<mask>"]).all()
+        assert torch.equal(ids[row, lengths[row] :], f.lm_input_ids[row, lengths[row] :])
+    assert torch.equal(mask_lm_inputs(f, 0.0, VOCAB["<mask>"]).lm_input_ids, f.lm_input_ids)
+    assert masked.token_mask is f.token_mask  # everything but the ids is shared

@@ -12,6 +12,7 @@ batch row with BOS/EOS (spec §4.5) instead of one packed row per complex.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,7 +27,13 @@ if TYPE_CHECKING:
     from oplm.fold.configuration_fold import FoldConfig
     from oplm.fold.data.featurize import FoldFeatures
 
-__all__ = ["LanguageModelShim", "SingleToPair", "frozen_lm_hidden_states", "lm_state_count"]
+__all__ = [
+    "LanguageModelShim",
+    "SingleToPair",
+    "frozen_lm_hidden_states",
+    "lm_state_count",
+    "mask_lm_inputs",
+]
 
 
 class SingleToPair(nn.Module):
@@ -101,3 +108,22 @@ def frozen_lm_hidden_states(
         states = states.to(dtype)
     gathered = states[features.lm_rows, features.lm_positions]  # (B, L, K, D)
     return gathered * features.token_mask[..., None, None].to(gathered.dtype)
+
+
+def mask_lm_inputs(features: FoldFeatures, fraction: float, mask_id: int) -> FoldFeatures:
+    """Replace a ``fraction`` of inner residue ids on every LM row with ``mask_id`` (spec §6.1).
+
+    BOS (position 0), EOS (the last attended position) and padding are never masked. Draws from
+    the global torch RNG, which the Trainer seeds and checkpoints per rank. ``fraction <= 0``
+    returns ``features`` unchanged.
+    """
+    if fraction <= 0:
+        return features
+    ids, attended = features.lm_input_ids, features.lm_attention_mask.bool()
+    inner = attended.clone()
+    inner[:, 0] = False
+    last = attended.sum(dim=1) - 1
+    inner[torch.arange(ids.shape[0], device=ids.device), last] = False
+    draw = torch.rand(ids.shape, device=ids.device) < fraction
+    masked = torch.where(inner & draw, torch.full_like(ids, mask_id), ids)
+    return replace(features, lm_input_ids=masked)
