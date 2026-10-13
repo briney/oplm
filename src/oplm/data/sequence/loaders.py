@@ -20,6 +20,7 @@ evaluation freezes shuffling and masking for reproducibility (docs/DATA_TOOLING.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -53,6 +54,9 @@ class DeviceDataLoader:
     IterableDataset in ``IterableDatasetShard`` and stripe a second time (each rank would then see
     1/N of its already-1/N stripe). This wrapper supplies the only two things ``prepare`` was
     providing: device placement and ``set_epoch`` forwarding.
+
+    Dict batches move tensor values; any other batch must implement `.to(device, non_blocking=...)`
+    and is moved as a whole.
     """
 
     def __init__(self, dataloader: DataLoader, device: torch.device) -> None:
@@ -74,10 +78,13 @@ class DeviceDataLoader:
 
     def __iter__(self):
         for batch in self._dataloader:
-            yield {
-                k: v.to(self._device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
+            if isinstance(batch, Mapping):
+                yield {
+                    k: v.to(self._device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()
+                }
+            else:  # a batch object that owns its placement (oplm.fold.data.collate.FoldBatch)
+                yield batch.to(self._device, non_blocking=True)
 
 
 def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:

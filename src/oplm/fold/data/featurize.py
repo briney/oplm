@@ -18,7 +18,7 @@ centered reference conformers; prediction keeps the raw conformers (M1 parity).
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -34,7 +34,7 @@ from oplm.fold.data.ccd import (
 from oplm.model.tokenization_oplm import VOCAB
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from torch import Tensor
 
@@ -50,6 +50,15 @@ __all__ = [
 ]
 
 _BOS, _EOS, _PAD, _X = VOCAB["<cls>"], VOCAB["<eos>"], VOCAB["<pad>"], VOCAB["X"]
+
+
+def _map_tensors(obj: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> dict[str, Any]:
+    """Apply ``fn`` to every tensor field of a dataclass instance; other fields pass through."""
+    out: dict[str, Any] = {}
+    for f in fields(obj):
+        value = getattr(obj, f.name)
+        out[f.name] = fn(value) if isinstance(value, torch.Tensor) else value
+    return out
 
 
 @dataclass(frozen=True)
@@ -105,13 +114,13 @@ class FoldFeatures:
     def num_chains(self) -> int:
         return int(self.lm_input_ids.shape[0])
 
-    def to(self, device: torch.device | str) -> FoldFeatures:
+    def to(self, device: torch.device | str, *, non_blocking: bool = False) -> FoldFeatures:
         """Return a copy with every tensor on ``device``."""
-        moved = {}
-        for f in fields(self):
-            value = getattr(self, f.name)
-            moved[f.name] = value.to(device) if isinstance(value, torch.Tensor) else value
-        return FoldFeatures(**moved)
+        return FoldFeatures(**_map_tensors(self, lambda t: t.to(device, non_blocking=non_blocking)))
+
+    def pin_memory(self) -> FoldFeatures:
+        """Return a copy in pinned host memory; ``DataLoader(pin_memory=True)`` calls this."""
+        return FoldFeatures(**_map_tensors(self, lambda t: t.pin_memory()))
 
 
 @dataclass
@@ -128,9 +137,13 @@ class FoldTargets:
     bfactor: Tensor  # (B, A) fp32
     frame_atom_idx: Tensor  # (B, L, 3) long
 
-    def to(self, device: torch.device | str) -> FoldTargets:
+    def to(self, device: torch.device | str, *, non_blocking: bool = False) -> FoldTargets:
         """Return a copy with every tensor on ``device``."""
-        return FoldTargets(**{f.name: getattr(self, f.name).to(device) for f in fields(self)})
+        return FoldTargets(**_map_tensors(self, lambda t: t.to(device, non_blocking=non_blocking)))
+
+    def pin_memory(self) -> FoldTargets:
+        """Return a copy in pinned host memory; ``DataLoader(pin_memory=True)`` calls this."""
+        return FoldTargets(**_map_tensors(self, lambda t: t.pin_memory()))
 
 
 @dataclass
