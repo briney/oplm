@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from oplm.fold.configuration_fold import FoldConfig
 from oplm.model import OplmConfig, OplmModel
+
+if TYPE_CHECKING:
+    from oplm.fold.data.featurize import FoldFeatures, FoldTargets
 
 
 def tiny_lm(num_loops: int = 1) -> OplmModel:
@@ -47,3 +50,16 @@ def tiny_fold_config(**overrides: Any) -> FoldConfig:
     )
     base.update(overrides)
     return FoldConfig(**base)
+
+
+def dummy_targets(features: FoldFeatures) -> FoldTargets:
+    """All-unresolved targets with the right axes, for tests that need a FoldExample."""
+    from oplm.fold.data.featurize import FoldTargets
+
+    L, A = features.num_tokens, features.num_atoms
+    return FoldTargets(
+        coords=torch.zeros(1, A, 3),
+        resolved=torch.zeros(1, A, dtype=torch.bool),
+        bfactor=torch.zeros(1, A),
+        frame_atom_idx=torch.zeros(1, L, 3, dtype=torch.long),
+    )
