@@ -208,18 +208,24 @@ def test_pae_mask_drops_unresolved_and_collinear_frames(batch: FoldBatch) -> Non
     pred = _pred(batch, noise=1.0)
     torch.manual_seed(2)
     logits = torch.randn(2, f.num_tokens, f.num_tokens, BINS)
-    base = pae_loss(
-        logits, pred, coords, resolved, f.token_mask, t.frame_atom_idx, max_dist=MAX_DIST
-    )
-    perturbed = logits.clone()
-    perturbed[0, 3] += 10.0
-    perturbed[0, 5] += 10.0
-    torch.testing.assert_close(
-        pae_loss(
-            perturbed, pred, coords, resolved, f.token_mask, t.frame_atom_idx, max_dist=MAX_DIST
-        ),
-        base,
-    )
+
+    def loss_of(x: torch.Tensor) -> torch.Tensor:
+        return pae_loss(
+            x, pred, coords, resolved, f.token_mask, t.frame_atom_idx, max_dist=MAX_DIST
+        )
+
+    base = loss_of(logits)
+    # Bump one bin (a constant shift over all bins leaves cross-entropy unchanged).
+    rows = logits.clone()
+    rows[0, 3, :, 0] += 10.0  # unresolved CA frame row
+    rows[0, 5, :, 0] += 10.0  # collinear frame row
+    torch.testing.assert_close(loss_of(rows), base)
+    column = logits.clone()
+    column[0, :, 3, 0] += 10.0  # token 3's CA is unresolved: its column is masked too
+    torch.testing.assert_close(loss_of(column), base)
+    control = logits.clone()
+    control[0, 4, :, 0] += 10.0  # a valid frame row must move the loss
+    assert not torch.allclose(loss_of(control), base, atol=1e-3)
 
 
 def test_pde_and_plddt_and_resolved_match_boltz(batch: FoldBatch) -> None:
