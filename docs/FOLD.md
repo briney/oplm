@@ -444,8 +444,8 @@ attribution in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)); parity, r
 recovery, mask and degeneracy tests in `tests/fold/test_losses.py`.
 
 **Frozen ESM-C** (`esmc.py`, addendum §3): `fold.lm: esmc:esmc_600m` loads `biohub/ESMC-600M`
-through the `esm` package (`oplm[esmc]`, Python ≥ 3.12; the weights are gated behind the Cambrian
-license) wrapped as `FrozenEsmC`, which exposes `num_hidden_states = num_hidden_layers + 1`: the
+through the `esm` package (`oplm[esmc]`, Python ≥ 3.12; the `biohub/ESMC-*` weights are public,
+MIT-licensed and ungated, so no Hub login is needed) wrapped as `FrozenEsmC`, which exposes `num_hidden_states = num_hidden_layers + 1`: the
 package returns every block input (the embedding output first) plus the final post-norm output,
 so 600M gives 37 states of width 1152. `lm_hidden_size` and `lm_num_hidden_states` are inferred
 from the loaded LM when `fold.model` does not set them.

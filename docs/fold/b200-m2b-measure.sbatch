@@ -3,9 +3,9 @@
 # peak GPU memory of the real training step at both proof widths so milestone 2c can size
 # train.batch_size, gradient_accumulation_steps and max_steps. Builds a Python 3.12 venv with
 # `esm==3.4.1.post1` plus this repo's [dev,train,fold] extras, downloads the published
-# training dataset, runs the gated ESM-C weights test (the env file must export HF_TOKEN of a
-# Hugging Face account that accepted the Cambrian license on BOTH gated repos: biohub/ESMC-300M
-# for the esmc test step and biohub/ESMC-600M for the measure steps), then the fold CPU suite
+# training dataset, runs the ESM-C weights test (biohub/ESMC-300M for the esmc test step and
+# biohub/ESMC-600M for the measure steps; both are public, MIT-licensed and ungated, so no Hub
+# token is required, though an exported HF_TOKEN raises Hub rate limits), then the fold CPU suite
 # (`-m "not slow"`, on this venv's transformers < 5 / Python 3.12, which has never run it), then
 # `oplm fold measure` at pair width 128 and 256 (configs/fold/proof-w{128,256}.yaml, 20 optimizer
 # steps each), and finally the GPU-marked fold tests. One-shot job, no requeue; a failing step
@@ -16,7 +16,7 @@
 # Overrides (environment variables, all optional):
 #   OPLM_REPO=/mnt/home/<you>/git/oplm       mounted checkout instead of cloning
 #   OPLM_GIT_REF=main                        branch/tag/sha to clone when OPLM_REPO is unset
-#   OPLM_ENV_FILE=/mnt/home/<you>/.env       credentials/JOB_WORK_DIR script to source (HF_TOKEN)
+#   OPLM_ENV_FILE=/mnt/home/<you>/.env       JOB_WORK_DIR script to source (optional HF_TOKEN)
 #   OPLM_CONTAINER=/mnt/data/containers/deeplearning_v2026-05-26.sqsh
 #   OPLM_ESM_VENV=/mnt/data/<you>/fold-m2b/esm-venv   reused across jobs
 #   OPLM_DATA_ROOT=/mnt/data/<you>/oplm-data/hf       where the dataset is downloaded
@@ -82,7 +82,7 @@ export HF_HOME="/mnt/data/${SLURM_JOB_USER}/hf-cache"   # ESM-C weights and the 
 DATA="${OPLM_DATA_ROOT:-/mnt/data/${SLURM_JOB_USER}/oplm-data/hf}"
 : > "$RESULTS/status.txt"
 if [ -z "${HF_TOKEN:-}" ]; then
-  log "WARNING: HF_TOKEN is not set; the gated ESM-C weights and the esmc/measure steps will fail"
+  log "HF_TOKEN is not set; downloading the public ESM-C weights and dataset anonymously (lower Hub rate limits)"
 fi
 
 if [ -z "$REPO" ]; then

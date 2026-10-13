@@ -49,7 +49,7 @@ Tasks 1–11 need no GPU; Task 12 is the user-run GPU measurement on the cluster
 - Spec §6.2 and addendum §2: four terms with starting weights diffusion MSE 4.0, smooth lDDT 1.0, distogram 0.03, confidence 1e-4 (the confidence composite is pLDDT + PDE + resolved + `pae_weight` · PAE with `pae_weight` 1.0); the bond term and interface weighting are not implemented; protein atom weight 1; references and alignments are detached; invalid frames, empty masks and degenerate alignments give finite values. Bin edges, reductions and sub-term weights are recorded in code and config, not prose.
 - Spec §6.4 / docs/TRAIN.md §17: `FoldTask` implements `build_model`, `build_dataloader`, `step -> StepResult(loss, tokens, samples, metrics)`, `flops_per_token -> None`; `StepResult.metrics` keys avoid the Trainer's reserved names; the default `MLMTask` behaviour and the MLM test suite are unchanged.
 - Addendum §2 "no new entry field": every `data.train` entry of a fold run is a structure shard directory; `FoldTask` interprets them through `parse_train_configs` and mixes several with `InterleavedDataset`.
-- Addendum §3 ESM-C facts, settled from the package source: `esm.models.esmc.model.EsmcModel.forward(input_ids, attention_mask, output_hidden_states, return_dict)` returns `.hidden_states` stacked on dim 0 with `num_hidden_layers + 1` entries: the input of every block (index 0 is the embedding output) and the final post-LayerNorm output. ESM-C 600M (`biohub/ESMC-600M`): 36 blocks, width 1152, 37 states, pad 1, BOS 0, EOS 2, mask 32. Identifier `esmc:esmc_600m`; `esmc_300m` and `esmc_6b` accepted (6B is non-commercial and not the default). The weights are gated behind the Cambrian license on the Hub.
+- Addendum §3 ESM-C facts, settled from the package source: `esm.models.esmc.model.EsmcModel.forward(input_ids, attention_mask, output_hidden_states, return_dict)` returns `.hidden_states` stacked on dim 0 with `num_hidden_layers + 1` entries: the input of every block (index 0 is the embedding output) and the final post-LayerNorm output. ESM-C 600M (`biohub/ESMC-600M`): 36 blocks, width 1152, 37 states, pad 1, BOS 0, EOS 2, mask 32. Identifier `esmc:esmc_600m`; `esmc_300m` and `esmc_6b` accepted (6B is not the default). The `biohub/ESMC-*` weights are MIT-licensed, public and ungated (amended 2026-10-13; the original text described the gated EvolutionaryScale releases).
 - Addendum §5 config: the `fold:` block carries the LM identifier, revision and `lm_max_chain_length` (1024), `FoldConfig` overrides, crop size (384) and contiguous-crop probability (0.5), diffusion sample count (8) and microbatch, confidence rollout steps (20) and the loss weights. `oplm fold train` parses a run config exactly as `oplm train` does. EMA uses `train.ema_decay` (0.999 in the run configs). Optimizer and schedule reuse the existing options with μP disabled; the starting point is AdamW at 1e-3 with 1000 warmup steps; the run configs are authoritative.
 - Carried from M2a (ledger): `FoldTask` passes `cfg.train.seed` to `StructureDataset` and relies on the Trainer's `set_epoch` forwarding; losses mask crops with zero resolved atoms; the frozen-LM gather uses the batched global `lm_rows` the collator offsets.
 - Spec §9: loss parity against the vendored Boltz-2 oracles, rigid-transform recovery, masks and degeneracies on CPU with the real fixtures under `tests/fixtures/fold/`; trainer checks (gradients, overfit, resume with EMA, DDP smoke) in the fast or `slow` CPU suites; ESM-C tests skip without the extra.
@@ -503,7 +503,7 @@ ESMC_PREFIX = "esmc:"
 ESMC_REPOS = {
     "esmc_300m": "biohub/ESMC-300M",
     "esmc_600m": "biohub/ESMC-600M",
-    "esmc_6b": "biohub/ESMC-6B",  # non-commercial license; a config choice, never the default
+    "esmc_6b": "biohub/ESMC-6B",  # ~3x the frozen-LM cost per step; never the default
 }
 
 
@@ -577,8 +577,8 @@ def load_esmc(
     """Load ``esmc_300m`` / ``esmc_600m`` / ``esmc_6b`` (or any ESM-C repo id or local dir).
 
     The package selects its kernels from ``device`` at load time, so the device is passed
-    explicitly (CPU when ``None``). The Hub weights are gated behind the Cambrian license; a
-    logged-in ``huggingface_hub`` token is required once per machine.
+    explicitly (CPU when ``None``). The ``biohub/ESMC-*`` Hub repos are public, MIT-licensed and
+    ungated, so no ``huggingface_hub`` login is needed (a token only raises Hub rate limits).
 
     Raises:
         ImportError: The ``esm`` package is missing (install ``oplm[esmc]`` on Python >= 3.12).
@@ -3041,7 +3041,7 @@ def test_proof_configs_load(width: int) -> None:
 
 - [ ] **Step 4: The measurement job**
 
-`docs/fold/b200-m2b-measure.sbatch`, modelled on `docs/fold/b200-fixtures.sbatch` (same container, mounts, `ENV_FILE`, `run` step helper, `OPLM_REPO`/`OPLM_GIT_REF`/`OPLM_RESULTS` overrides). Header comment: milestone-2b acceptance (addendum §5), one B200, Python 3.12 venv with `esm==3.4.1.post1` plus this repo's `[dev,train,fold]` extras, the gated ESM-C weights (the env file must export `HF_TOKEN` of an account that accepted the Cambrian license), the dataset download, then `oplm fold measure` at both widths. Steps and commands (inside the `run` helper):
+`docs/fold/b200-m2b-measure.sbatch`, modelled on `docs/fold/b200-fixtures.sbatch` (same container, mounts, `ENV_FILE`, `run` step helper, `OPLM_REPO`/`OPLM_GIT_REF`/`OPLM_RESULTS` overrides). Header comment: milestone-2b acceptance (addendum §5), one B200, Python 3.12 venv with `esm==3.4.1.post1` plus this repo's `[dev,train,fold]` extras, the public ESM-C weights (no Hub token needed; an exported `HF_TOKEN` only raises rate limits), the dataset download, then `oplm fold measure` at both widths. Steps and commands (inside the `run` helper):
 
 ```bash
 export HF_HOME="/mnt/data/${SLURM_JOB_USER}/hf-cache"
@@ -3110,7 +3110,7 @@ Oracles: Boltz-2 (`boltz==2.2.1`) functions vendored under `tests/fold/oracles/`
 recovery, mask and degeneracy tests in `tests/fold/test_losses.py`.
 
 **Frozen ESM-C** (`esmc.py`, addendum §3): `fold.lm: esmc:esmc_600m` loads `biohub/ESMC-600M` through
-the `esm` package (`oplm[esmc]`, Python ≥ 3.12; gated weights) wrapped as `FrozenEsmC`, which exposes
+the `esm` package (`oplm[esmc]`, Python ≥ 3.12; public MIT weights) wrapped as `FrozenEsmC`, which exposes
 `num_hidden_states = num_hidden_layers + 1` (the package returns every block input, the embedding output
 first, plus the final post-norm output: 37 states of width 1152 for 600M). `lm_hidden_size` and
 `lm_num_hidden_states` are inferred from the loaded LM when the run does not set them.
@@ -3172,7 +3172,7 @@ Then run the whole fast suite, ruff and ty one last time before the final review
 - Create: `docs/fold/m2/measure-w128.json`, `docs/fold/m2/measure-w256.json`, `docs/fold/m2/fold-gpu-tests.xml`, `docs/fold/m2/pip-freeze.txt`, `docs/fold/m2/status.txt`; fill `docs/fold/m2/README.md`
 - Modify: `docs/FOLD.md` §9 status line; `configs/fold/proof-w*.yaml` (batch, accumulation, steps)
 
-This task runs on the cluster after Tasks 1–11 are pushed. Prerequisites: a Hub account that accepted the ESM-C license, `HF_TOKEN` exported from the job's env file, and the published dataset tag `wwpdb-2026-10-12`.
+This task runs on the cluster after Tasks 1–11 are pushed. Prerequisites: the published dataset tag `wwpdb-2026-10-12`. The `biohub/ESMC-*` weights are public and ungated, so no Hub token is required (an exported `HF_TOKEN` only raises rate limits).
 
 - [ ] **Step 1: Submit**
 
@@ -3182,7 +3182,7 @@ OPLM_GIT_REF=feat/fold-m2b sbatch docs/fold/b200-m2b-measure.sbatch
 
 - [ ] **Step 2: Read the results**
 
-Copy `measure-w128.json`, `measure-w256.json`, `fold-gpu-tests.xml`, `pip-freeze.txt`, `status.txt` from the job's results directory into `docs/fold/m2/`. Check: every step finite, `peak_allocated_gib` well under the B200's usable memory at both widths, the `esmc` and `gpu-tests` steps exited 0 (the ESM-C 300M test downloads the gated weights; a 403 means the token's account has not accepted the license).
+Copy `measure-w128.json`, `measure-w256.json`, `fold-cpu-tests.xml`, `fold-gpu-tests.xml`, `pip-freeze.txt`, `status.txt` from the job's results directory into `docs/fold/m2/`. Check: every step finite, `peak_allocated_gib` well under the B200's usable memory at both widths, the `esmc`, `cpu-tests` and `gpu-tests` steps exited 0 (the ESM-C 300M test downloads the public weights anonymously).
 
 - [ ] **Step 3: Derive the milestone-2c budget**
 

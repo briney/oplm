@@ -439,7 +439,7 @@ top-level `model.*` block (the MLM architecture) is not used.
 
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
-| `fold.lm` | `str` | `esmc:esmc_600m` | The frozen language model: `esmc:<name>` (`esmc_300m`, `esmc_600m`, `esmc_6b`; needs `oplm[esmc]` on Python `≥ 3.12` and a Hugging Face login for the gated weights), an OPLM checkpoint path, or a Hub id. Must be non-empty. |
+| `fold.lm` | `str` | `esmc:esmc_600m` | The frozen language model: `esmc:<name>` (`esmc_300m`, `esmc_600m`, `esmc_6b`; needs `oplm[esmc]` on Python `≥ 3.12`; the `biohub/ESMC-*` weights are public, MIT-licensed and ungated), an OPLM checkpoint path, or a Hub id. Must be non-empty. |
 | `fold.lm_revision` | `str \| null` | `null` | Hub revision of the LM weights; recorded in the saved head's config. |
 | `fold.lm_max_chain_length` | `int` | `1024` | Longest full chain the data pipeline samples (the LM reads the whole chain, not the crop); `≥ 1`. |
 | `fold.model` | `dict` | `{}` | `FoldConfig` overrides (`pair_width`, `trunk_blocks`, `inference_num_loops`, ...). Keys are `FoldConfig` constructor names, validated when the model is built (`build_fold_config` in `oplm.fold.training`): an unknown key raises, and the LM identity fields (`lm_name_or_path`, `lm_revision`, `lm_max_chain_length`) come from `fold.lm*` and may not be set here. Unset fields take the ESMFold2-Fast defaults; `lm_hidden_size` and `lm_num_hidden_states` are inferred from the loaded LM. |

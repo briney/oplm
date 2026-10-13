@@ -26,7 +26,7 @@ ESMC_PREFIX = "esmc:"
 ESMC_REPOS = {
     "esmc_300m": "biohub/ESMC-300M",
     "esmc_600m": "biohub/ESMC-600M",
-    "esmc_6b": "biohub/ESMC-6B",  # non-commercial license; a config choice, never the default
+    "esmc_6b": "biohub/ESMC-6B",  # ~3x the frozen-LM cost per step; never the default
 }
 
 
@@ -102,8 +102,8 @@ def load_esmc(
     """Load ``esmc_300m`` / ``esmc_600m`` / ``esmc_6b`` (or any ESM-C repo id or local dir).
 
     The package selects its kernels from ``device`` at load time, so the device is passed
-    explicitly (CPU when ``None``). The Hub weights are gated behind the Cambrian license; a
-    logged-in ``huggingface_hub`` token is required once per machine.
+    explicitly (CPU when ``None``). The ``biohub/ESMC-*`` Hub repos are public, MIT-licensed and
+    ungated, so no ``huggingface_hub`` login is needed (a token only raises Hub rate limits).
 
     Raises:
         ImportError: The ``esm`` package is missing (install ``oplm[esmc]`` on Python >= 3.12).
