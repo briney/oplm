@@ -399,7 +399,9 @@ class OplmForFolding(OplmFoldPreTrainedModel):
             )
             z = self.parcae.readout(z, pair_mask)
         z = z.float()
-        distogram_logits = symmetrized_distogram(self.distogram_head, z)
+        # accelerate's outer autocast would otherwise make these logits bf16 (spec §5.4: fp32)
+        with fp32_autocast_off(self.device):
+            distogram_logits = symmetrized_distogram(self.distogram_head, z)
         if targets is not None:
             return self._train_branch(
                 f, targets, train or TrainSettings(), emb, z, distogram_logits, loops, generator

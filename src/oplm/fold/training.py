@@ -172,6 +172,12 @@ class FoldTask:
                 pae=run.loss_pae,
             ),
         )
+        # Decorrelate the in-model draws (loop count, sigma, noise, augmentation, dropout, LM
+        # masking) across ranks. This comes after construction so every rank initialises the
+        # head identically (DDP's parameter broadcast stays a no-op); a resume restores each
+        # rank's RNG from its own sidecar afterwards. Seeds CUDA too; the data stream has its own
+        # explicit (seed, epoch, shard, row) generators.
+        torch.manual_seed(cfg.train.seed + PartialState().process_index)
         return model
 
     def build_dataloader(self, cfg: OplmConfig) -> DataLoader[Any]:
@@ -236,10 +242,14 @@ class PeakMemoryCallback(TrainerCallback):
     def __init__(self) -> None:
         self.records: list[dict[str, float]] = []
         self._started = time.monotonic()
+        self._cuda = False
 
     def on_train_start(self, trainer: Trainer) -> None:
         self._started = time.monotonic()
-        if torch.cuda.is_available():
+        # Gate on the trainer's device, not torch.cuda.is_available(): a CPU-forced run on a
+        # GPU host has no CUDA peaks to report.
+        self._cuda = trainer.accelerator.device.type == "cuda"
+        if self._cuda:
             torch.cuda.reset_peak_memory_stats()
 
     def on_log(self, trainer: Trainer, metrics: dict[str, float], step: int) -> None:
@@ -253,7 +263,7 @@ class PeakMemoryCallback(TrainerCallback):
                 if k.startswith("train/")
             }
         )
-        if torch.cuda.is_available():
+        if self._cuda:
             record["peak_allocated_gib"] = torch.cuda.max_memory_allocated() / 2**30
             record["peak_reserved_gib"] = torch.cuda.max_memory_reserved() / 2**30
         self.records.append(record)

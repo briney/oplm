@@ -173,3 +173,25 @@ def test_train_mode_draws_loops_and_eval_uses_the_config(batch: FoldBatch) -> No
     with torch.no_grad():
         inference = model(batch.features, return_intermediates=True)
     assert len(inference.intermediates["states"]) == model.config.inference_num_loops
+
+
+def test_distogram_logits_and_loss_stay_fp32_under_an_outer_bf16_autocast(
+    batch: FoldBatch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """accelerate wraps ``forward`` in an autocast; the logits and losses must still be fp32."""
+    import oplm.fold.modeling_fold as modeling
+
+    seen: list[torch.dtype] = []
+    real = modeling.distogram_loss
+
+    def recording(logits: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        seen.append(logits.dtype)
+        return real(logits, *args, **kwargs)
+
+    monkeypatch.setattr(modeling, "distogram_loss", recording)
+    model = _model()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(batch.features, targets=batch.targets, train=_SETTINGS, num_loops=1)
+    assert seen == [torch.float32]
+    assert out.loss.dtype == torch.float32 and torch.isfinite(out.loss)
+

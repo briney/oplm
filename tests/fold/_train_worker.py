@@ -10,6 +10,8 @@ from pathlib import Path
 
 
 def main(config_path: str, result_dir: str) -> None:
+    import torch
+
     from oplm.config import load_config
     from oplm.fold.training import FoldTask
     from oplm.training.trainer import Trainer
@@ -20,15 +22,21 @@ def main(config_path: str, result_dir: str) -> None:
 
     class _Recording(FoldTask):
         ids: list[list[str]] = []
+        # Per micro-step in-model draws; the callback's train_logs only fire on the main process.
+        loops: list[float] = []
+        sigma_mean: list[float] = []
 
         def step(self, model, batch):
             result = super().step(model, batch)
             self.ids.append(list(batch.ids))
+            self.loops.append(result.metrics["loops"])
+            self.sigma_mean.append(result.metrics["sigma_mean"])
             return result
 
     task = _Recording()
     trainer = Trainer(cfg, task=task, callbacks=[callback])
     rank = trainer.accelerator.process_index
+    seed = torch.initial_seed()  # FoldTask.build_model reseeds as train.seed + rank
     resumed_from = trainer.global_step
     trainer.train()
     losses = [m["train/loss"] for _, m in callback.train_logs]
@@ -39,6 +47,9 @@ def main(config_path: str, result_dir: str) -> None:
         "global_step": trainer.global_step,
         "ids": task.ids,
         "all_losses_finite": all(math.isfinite(x) for x in losses),
+        "initial_seed": seed,
+        "loops": task.loops,
+        "sigma_mean": task.sigma_mean,
         "ema_n_averaged": None if trainer._ema is None else int(trainer._ema.n_averaged),
         "is_ddp": type(trainer.model).__name__ == "DistributedDataParallel",
     }

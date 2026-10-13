@@ -3186,7 +3186,7 @@ Copy `measure-w128.json`, `measure-w256.json`, `fold-gpu-tests.xml`, `pip-freeze
 
 - [ ] **Step 3: Derive the milestone-2c budget**
 
-From `step_time_s` and `peak_allocated_gib` at `batch_size=1`, `diffusion_microbatch=4`: choose the largest per-device batch that keeps peak allocated below 75 % of the device, set `gradient_accumulation_steps` so `8 × batch × accumulation = 128`, and the step budget as the smaller of spec §6.3's 50k and what fits the allocation (steps × step time × accumulation). Write the numbers and the reasoning into `docs/fold/m2/README.md` (machine, job id, environment, both widths' step time and peak memory, the chosen batch/accumulation/steps) and into both proof configs.
+From `step_time_s` and `peak_allocated_gib` at `batch_size=1`, `diffusion_microbatch=4`: choose the largest per-device batch that keeps peak allocated below 75 % of the device, set `gradient_accumulation_steps` so `8 × batch × accumulation = 128`, and the step budget as the smaller of spec §6.3's 50k and what fits the allocation (steps × `step_time_s`, measured at the same accumulation; the reported time is per optimizer step). Write the numbers and the reasoning into `docs/fold/m2/README.md` (machine, job id, environment, both widths' step time and peak memory, the chosen batch/accumulation/steps) and into both proof configs.
 
 - [ ] **Step 4: Record and commit**
 

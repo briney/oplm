@@ -465,7 +465,10 @@ FLOP-derived metrics are not logged.
 
 **Measurement.** `oplm fold measure --config configs/fold/proof-w128.yaml --steps 20 --out m.json`
 runs real optimizer steps and writes a JSON report (`environment`, `settings`, per-log `steps`,
-`peak_allocated_gib`, `peak_reserved_gib`, mean `step_time_s`);
+`peak_allocated_gib`, `peak_reserved_gib`, mean `step_time_s`, `micro_step_time_s`). `step_time_s`
+is per optimizer step at the config's `gradient_accumulation_steps` (it already includes every
+accumulation micro-step); `micro_step_time_s` is that divided by the accumulation, the time of
+one micro-batch. A run that fails still writes the records so far plus an `error` field.
 [`docs/fold/b200-m2b-measure.sbatch`](fold/b200-m2b-measure.sbatch) runs it for
 `configs/fold/proof-w128.yaml` and `proof-w256.yaml` on one B200 and then the GPU-marked fold
 tests. The results and the per-device batch, accumulation and step budget derived from them for

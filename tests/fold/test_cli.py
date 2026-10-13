@@ -191,6 +191,36 @@ def test_fold_measure_writes_a_report(
     assert report["environment"]["torch"] and "git" in report["environment"]
     assert report["settings"]["pair_width"] == 32 and report["settings"]["crop_size"] == 128
     assert report["peak_allocated_gib"] is None  # CPU run
+    assert isinstance(report["step_time_s"], float) and report["step_time_s"] > 0
+    assert "micro_step_time_s" in report  # step_time_s / gradient_accumulation_steps
+    accumulation = report["settings"]["gradient_accumulation_steps"]
+    assert report["micro_step_time_s"] == pytest.approx(report["step_time_s"] / accumulation)
+
+
+def test_fold_measure_writes_a_partial_report_when_the_run_fails(
+    tmp_path: Path, fixture_dataset: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oplm.training.trainer import Trainer
+
+    def boom(self: Trainer) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
+    monkeypatch.setattr(Trainer, "train", boom)
+    lm_dir = tmp_path / "lm"
+    tiny_lm().save_pretrained(lm_dir)
+    config = tmp_path / "run.yaml"
+    config.write_text(
+        serialize_config(tiny_fold_run_cfg(tmp_path / "run", fixture_dataset, lm_dir))
+    )
+    out = tmp_path / "measure.json"
+    result = runner.invoke(
+        app, ["fold", "measure", "--config", str(config), "--steps", "2", "--out", str(out)]
+    )
+    assert result.exit_code != 0 and isinstance(result.exception, RuntimeError)
+    report = json.loads(out.read_text())
+    assert "boom" in report["error"] and report["steps"] == []
+    assert report["step_time_s"] is None and report["micro_step_time_s"] is None
 
 
 @pytest.mark.parametrize("width", [128, 256])

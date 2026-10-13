@@ -86,3 +86,11 @@ def test_two_rank_training_checkpoints_and_resumes_the_example_stream(
         assert first[rank]["ids"] + second[rank]["ids"] == full[rank]["ids"]
         assert second[rank]["ema_n_averaged"] == 4
     assert full[0]["ids"] != full[1]["ids"]  # the ranks see different stripes
+    # In-model draws are per rank: FoldTask.build_model seeds the global RNG with seed + rank.
+    # The seeds are the direct check (the draws also diverge from data-dependent consumption,
+    # e.g. the LM-input mask shape); sigma is continuous, so equal per-step values on both ranks
+    # would still mean identical RNG streams.
+    assert full[1]["initial_seed"] == full[0]["initial_seed"] + 1
+    assert len(full[0]["sigma_mean"]) == len(full[1]["sigma_mean"]) == 4
+    assert full[0]["sigma_mean"] != full[1]["sigma_mean"]
+    assert len(full[0]["loops"]) == len(full[1]["loops"]) == 4
