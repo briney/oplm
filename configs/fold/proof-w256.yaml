@@ -2,8 +2,8 @@
 # published dataset: hf download brineylab/oplmfold-training-data --repo-type dataset \
 #   --revision wwpdb-2026-10-12 --include "wwpdb/2026-10-12/*" --local-dir $OPLM_DATA/hf
 # and point data.train at $OPLM_DATA/hf/wwpdb/2026-10-12 (override on the command line).
-# train.batch_size, gradient_accumulation_steps and max_steps are set by milestone 2c from the
-# milestone-2b measurement (docs/fold/m2/); the values below are the measurement defaults.
+# train.batch_size and gradient_accumulation_steps come from the milestone-2b B200 batch sweep
+# (docs/fold/m2/README.md); max_steps is spec §6.3's stage-1 budget.
 fold:
   lm: esmc:esmc_600m          # 36 blocks, width 1152 -> 37 hidden states (inferred at load)
   lm_max_chain_length: 1024
@@ -32,8 +32,8 @@ train:
   scheduler: warmup_linear
   weight_decay: 0.01
   max_grad_norm: 1.0
-  batch_size: 1               # per device
-  gradient_accumulation_steps: 16   # 8 devices x 1 x 16 = 128 (spec §6.3 initial global batch)
+  batch_size: 4               # per device
+  gradient_accumulation_steps: 4    # 8 devices x 4 x 4 = 128 (spec §6.3); 67.7 GiB peak, 17.3 s/step on a B200
   max_steps: 50000
   ema_decay: 0.999
   mixed_precision: bf16

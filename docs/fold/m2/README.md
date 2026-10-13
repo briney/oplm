@@ -4,21 +4,28 @@ Plan: `docs/superpowers/plans/2026-10-12-fold-m2b-training.md`, Task 12. Addendu
 `docs/superpowers/specs/2026-10-11-fold-m2-pipeline-proof-design.md` §5–6. Script:
 [`docs/fold/b200-m2b-measure.sbatch`](../b200-m2b-measure.sbatch).
 
-**State: run 1 recorded. Both widths measured cleanly. Three steps failed, none of them in the
-code under measurement, and all three are fixed on the branch. Run 2 (tests plus a per-device
-batch sweep) is pending; the milestone-2c batch and accumulation are set from it.**
+**State: accepted 2026-10-13.**
+
+- **Run 1** measured both widths at batch 1. Three steps failed, none of them in the code under
+  measurement, and all three were fixed.
+- **Run 2** passed every step on the corrected environment, and its per-device batch sweep set
+  the milestone-2c configs: width 128 at batch 8 × accumulation 2, width 256 at batch 4 ×
+  accumulation 4, 50k steps.
+
+The status, environment, test and node files here are run 2's. Run 1's copies are in git
+history at `25ce5af`, e.g. `git show 25ce5af:docs/fold/m2/status.txt`.
 
 ## Run 1: job 25716, 2026-10-13
 
-- Node `slurm-b200-193-139`, one NVIDIA B200 (183,359 MiB, [`nvidia-smi.txt`](nvidia-smi.txt)),
-  container `deeplearning_v2026-05-26.sqsh`.
-- Code: branch `feat/fold-m2b` at `f05d625` ([`git-rev.txt`](git-rev.txt)).
-- Environment ([`pip-freeze.txt`](pip-freeze.txt)): CPython 3.12.13, torch 2.11.0+cu130 (CUDA 13.0),
+- Node `slurm-b200-193-139`, one NVIDIA B200 (183,359 MiB), container
+  `deeplearning_v2026-05-26.sqsh`.
+- Code: branch `feat/fold-m2b` at `f05d625`.
+- Environment (run 1's `pip-freeze.txt`): CPython 3.12.13, torch 2.11.0+cu130 (CUDA 13.0),
   cuequivariance 0.12.0, esm 3.4.1.post1, accelerate 1.15.0, **transformers 5.3.0** and
   huggingface-hub 1.33.0. That transformers version is outside esm's `<5` pin (failure 3 below).
 - Data: `brineylab/oplmfold-training-data` at tag `wwpdb-2026-10-12`.
 
-Step exits ([`status.txt`](status.txt)): `venv`, `install`, `env`, `download`, `measure-w128`
+Step exits (run 1's `status.txt`): `venv`, `install`, `env`, `download`, `measure-w128`
 and `measure-w256` passed (exit 0). `esmc`, `cpu-tests` and `gpu-tests` failed (exit 1).
 
 ### Measurement
@@ -60,7 +67,7 @@ every micro-step costs the full 384-token shape.
 ### Failures and fixes
 
 1. **`esmc` and `gpu-tests`: one test, a tolerance too strict for fp32**
-   ([`esmc.log`](esmc.log), [`fold-gpu-tests.xml`](fold-gpu-tests.xml)).
+   (run 1's `esmc.log` and `fold-gpu-tests.xml`).
    `test_real_esmc_300m_padded_chain_rows_match_the_unpadded_chain` compared a chain's ESM-C
    states, batched right-padded next to a longer chain, against the chain alone at `atol=1e-4`.
    It failed at 6.7e-4, on layer 29.
@@ -73,8 +80,8 @@ every micro-step costs the full 384-token shape.
 
    The test now bounds the worst per-layer `max|diff| / RMS` below 1e-4. It also asserts that the
    unmasked control exceeds 0.1, so the check can still see a leak.
-2. **`cpu-tests`: an artefact of a GPU host** ([`cpu-tests.log`](cpu-tests.log),
-   [`fold-cpu-tests.xml`](fold-cpu-tests.xml)).
+2. **`cpu-tests`: an artefact of a GPU host** (run 1's `cpu-tests.log` and
+   `fold-cpu-tests.xml`).
    `test_step_returns_accounting_and_gradients_stay_in_the_head` builds the model without a
    Trainer. `build_model` places the frozen LM on `PartialState().device`, and a fresh
    `PartialState` ignores `ACCELERATE_USE_CPU` and picks the visible GPU. The LM ran in bf16 on
@@ -103,47 +110,84 @@ CPU):
 - **Effect on this job:** none, since the job runs only `tests/fold`. The failure is a gap in the
   declared `transformers>=4.45` range, tracked separately.
 
-## Run 2: tests and batch sweep (pending)
+## Run 2: job 25799, 2026-10-13
 
 ```bash
 OPLM_GIT_REF=feat/fold-m2b OPLM_STEPS="venv install env esmc cpu-tests sweep gpu-tests" \
   sbatch docs/fold/b200-m2b-measure.sbatch
 ```
 
-The `sweep` group runs `oplm fold measure` at per-device batch 2, 4 and 8, each width, with
-accumulation 16/batch. That keeps 16 samples per device per optimizer step, so
-8 devices × batch × accumulation stays 128. Copy `status.txt`, `pip-freeze.txt`, the two junit
-XMLs and `sweep-w*.json` here. Run 2's files replace run 1's; git history keeps run 1's.
+- Node `slurm-b200-193-135`, one NVIDIA B200 (183,359 MiB, [`nvidia-smi.txt`](nvidia-smi.txt)).
+- Code: `25ce5af` ([`git-rev.txt`](git-rev.txt)).
+- Environment ([`pip-freeze.txt`](pip-freeze.txt), [`install.log`](install.log)): esm
+  3.4.1.post1, **transformers 4.57.6**, huggingface-hub 0.36.2, torch 2.11.0+cu130, cuequivariance
+  0.12.0. `uv pip check` reports all 162 packages compatible.
+
+Every step that ran exited 0 ([`status.txt`](status.txt)); `download` and the batch-1 `measure`
+steps were skipped by `OPLM_STEPS`.
+
+| step | result |
+|---|---|
+| `esmc` ([`esmc.log`](esmc.log)) | 5 passed, 1 skipped (the ImportError path, unreachable with esm installed) |
+| `cpu-tests` ([`fold-cpu-tests.xml`](fold-cpu-tests.xml), [`cpu-tests.log`](cpu-tests.log)) | 309 tests, 0 failures, 40 skipped |
+| `gpu-tests` ([`fold-gpu-tests.xml`](fold-gpu-tests.xml), [`gpu-tests.log`](gpu-tests.log)) | 34 tests, 0 failures, 1 skipped (ESMFold2 parity, which needs the M1 fixtures) |
+
+### Batch sweep
+
+Each sweep entry is 20 optimizer steps at 16 samples per device per step (batch × accumulation =
+16), with otherwise the same settings as run 1. Every value is finite at every size, and no
+`error` field was written. The batch-1 row is run 1's, measured on another node of the same type.
+
+| width | batch × accum | step time | range | peak allocated | peak reserved | report |
+|---|---|---|---|---|---|---|
+| 128 | 1 × 16 | 16.21 s | 15.3–17.2 s | 15.26 GiB (8.5 %) | 21.62 GiB (12.1 %) | [`measure-w128.json`](measure-w128.json) |
+| 128 | 2 × 8 | 12.09 s | 11.2–12.7 s | 26.22 GiB (14.6 %) | 40.16 GiB (22.4 %) | [`sweep-w128-b2.json`](sweep-w128-b2.json) |
+| 128 | 4 × 4 | 10.89 s | 10.0–11.8 s | 48.02 GiB (26.8 %) | 67.24 GiB (37.6 %) | [`sweep-w128-b4.json`](sweep-w128-b4.json) |
+| 128 | **8 × 2** | **10.22 s** | 8.1–11.4 s | **91.70 GiB (51.2 %)** | 131.53 GiB (73.5 %) | [`sweep-w128-b8.json`](sweep-w128-b8.json) |
+| 256 | 1 × 16 | 20.62 s | 19.3–22.0 s | 20.76 GiB (11.6 %) | 26.91 GiB (15.0 %) | [`measure-w256.json`](measure-w256.json) |
+| 256 | 2 × 8 | 18.48 s | 16.4–20.0 s | 36.41 GiB (20.3 %) | 50.20 GiB (28.0 %) | [`sweep-w256-b2.json`](sweep-w256-b2.json) |
+| 256 | **4 × 4** | **17.31 s** | 15.2–19.5 s | **67.66 GiB (37.8 %)** | 86.65 GiB (48.4 %) | [`sweep-w256-b4.json`](sweep-w256-b4.json) |
+| 256 | 8 × 2 | 16.89 s | 11.8–19.7 s | 130.21 GiB (72.7 %) | 169.77 GiB (94.8 %) | [`sweep-w256-b8.json`](sweep-w256-b8.json) |
+
+Percentages are of the 179.1 GiB device.
+
+- **Memory** grows linearly with batch, as padding every sample to the crop predicts. Run 1
+  projected 95 GiB (w128 batch 8), 69 GiB (w256 batch 4) and 134 GiB (w256 batch 8); the measured
+  values are 91.7, 67.7 and 130.2 GiB.
+- **Throughput** gains from batching are modest. Batch 1 already keeps a B200 mostly busy at a
+  384-token crop. From batch 1 to batch 8, an optimizer step gets 1.59× faster at width 128 and
+  1.22× faster at width 256. Most of that comes by batch 4.
 
 ## Milestone-2c budget
 
 **Device budget.** Rule (plan Task 12): the largest per-device batch whose peak allocated memory
-stays under 75 % of the device (134.3 GiB of 179.1 GiB). `8 × batch × accumulation = 128`.
+stays under 75 % of the device (134.3 GiB). `8 × batch × accumulation = 128`.
 
-**Projection from run 1, to be replaced by run 2's measurements.**
+- **Width 128: batch 8, accumulation 2.** Batch 16 would need about 180 GiB. Batch 8 peaks at
+  51 % allocated and 74 % reserved.
+- **Width 256: batch 4, accumulation 4. This is one step below the rule.** Batch 8 passes the
+  rule at 72.7 % allocated, but in 20 steps the caching allocator already reserved 94.8 % of the
+  device. A 50k-step run will meet rarer shapes than 20 steps do, such as more recycling loops
+  or longer LM inputs, so batch 8 would run with almost no margin against an out-of-memory error.
+  It is only 2.4 % faster than batch 4 (16.89 s against 17.31 s). Batch 4 peaks at 38 %
+  allocated and 48 % reserved. If a later run wants the 2.4 %, change `batch_size: 8` and
+  `gradient_accumulation_steps: 2` in `configs/fold/proof-w256.yaml`; nothing else depends on
+  the choice.
 
-- Fixed state, per device:
-  - head parameters, gradients, two AdamW moments and the EMA copy at 20 bytes per parameter:
-    2.73 GiB (146.3 M parameters, w128) and 3.50 GiB (188.1 M, w256);
-  - the bf16 ESM-C 600M: about 1.1 GiB.
-- Per sample: what remains of the batch-1 peak, about 11.4 GiB (w128) and 16.2 GiB (w256).
-- Linear projection, which padding to the crop makes reasonable:
+**Step budget: 50k**, spec §6.3's stage-1 budget. The spec sets no GPU-hour allocation that
+would cut it. At the chosen batches, on 8 B200s, with DDP all-reduce and data loading assumed
+hidden:
 
-| width | batch 2 | batch 4 | batch 8 | batch 16 | projected choice |
-|---|---|---|---|---|---|
-| 128 | 27 GiB | 49 GiB | 95 GiB (53 %) | 186 GiB (over) | batch 8, accumulation 2 |
-| 256 | 37 GiB | 69 GiB | 134 GiB (75 %, at the line) | — | batch 4, accumulation 4; batch 8 only if measured under the line |
+| width | step time | 50k steps | GPU-hours |
+|---|---|---|---|
+| 128 | 10.22 s | 142 h (5.9 days) | 1,136 |
+| 256 | 17.31 s | 240 h (10.0 days) | 1,923 |
 
-**Step budget.** Spec §6.3 sets 50k steps for stage 1. At batch 1 × 16 on 8 devices (DDP
-all-reduce not included), 50k steps take:
+Together: 382 h on one node in sequence (15.9 days), or 10 days on two nodes in parallel; about
+3,060 GPU-hours. At batch 1 the same budget would have cost 225 h and 286 h, so batching saves 37 %
+(w128) and 16 % (w256).
 
-- w128: 225 h, 9.4 days, about 1,800 GPU-hours;
-- w256: 286 h, 11.9 days, about 2,300 GPU-hours.
-
-A larger batch shortens that only by as much as run 2 shows it raising throughput. The spec gives
-no GPU-hour allocation. The steps that fit, and so the cut below 50k if any, are set against the
-allocation once run 2's step times are in.
-
-`configs/fold/proof-w{128,256}.yaml` keep the measurement defaults (batch 1, accumulation 16,
-50k steps) until then. The `measure-w*` steps read those values, and the sweep overrides them on
-the command line.
+Both settings are in [`configs/fold/proof-w128.yaml`](../../../configs/fold/proof-w128.yaml) and
+[`proof-w256.yaml`](../../../configs/fold/proof-w256.yaml).
+`tests/fold/test_cli.py::test_proof_configs_load` checks that each config gives a global batch of
+128 on 8 devices.

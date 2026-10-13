@@ -3,7 +3,7 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 2b (losses and training) implemented, first B200 measurement recorded (docs/fold/m2/), test and batch-sweep re-run pending; milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
+this file records what is implemented. **Status: milestone 2b (losses and training) accepted 2026-10-13 (measured on one B200; docs/fold/m2/); milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
 Kernels, the model, prediction, the training data pipeline, the losses and the training step exist
 (§7 holds the M1 acceptance evidence, §8 the data contract, §9 the losses and training; the
 single-B200 cost measurement of §9 is still to be run).

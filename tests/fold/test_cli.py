@@ -231,3 +231,4 @@ def test_proof_configs_load(width: int) -> None:
     assert cfg.fold is not None and cfg.fold.model["pair_width"] == width
     assert cfg.train.optimizer == "adamw" and cfg.train.ema_decay == 0.999
     assert cfg.fold.crop_size == 384
+    assert 8 * cfg.train.batch_size * cfg.train.gradient_accumulation_steps == 128  # 8 x B200
