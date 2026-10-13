@@ -68,7 +68,7 @@ def evidence() -> tuple[dict, list[dict], list[dict]]:
         wandb_enabled=True,
         terminal_state="COMPLETED",
     )
-    history = [{"recovery/attempt": 1, "recovery/step": 11}]
+    history = [{"_step": 11, "recovery/attempt": 1, "recovery/step": 11}]
     return manifest, events, history
 
 
@@ -104,6 +104,48 @@ def test_recovery_report_does_not_confuse_completion_with_recovery(mutation: str
     else:
         events = [e for e in events if e["attempt"] == 0]
     assert assess(manifest, events, history)["status"] == "failed"
+
+
+def test_wandb_step_must_be_the_training_step() -> None:
+    """Rows are logged at step=global_step: a misaligned or repeated step is a failure."""
+    from oplm.slurm.recovery.checks import assess
+
+    manifest, events, history = evidence()
+    report = assess(manifest, events, history)
+    assert report["status"] == "passed" and report["wandb_rewind"] == "not needed"
+    misaligned = assess(manifest, events, [dict(history[0], _step=3)])
+    assert misaligned["status"] == "failed"
+    assert any("differs from the training step" in e for e in misaligned["errors"])
+    assert assess(manifest, events, history + [dict(history[0])])["status"] == "failed"
+
+
+@pytest.mark.parametrize(("window_attempt", "outcome"), [(1, "applied"), (0, "unavailable")])
+def test_replayed_steps_keep_either_attempt_but_later_steps_must_be_resumed(
+    window_attempt: int, outcome: str
+) -> None:
+    """Step 11 was logged by the killed attempt after checkpoint 10, then replayed.
+
+    W&B either rewound to the checkpoint (row from attempt 1) or refused the rewind and
+    kept the killed attempt's row; step 12, past the replay window, must be attempt 1's.
+    """
+    from oplm.slurm.recovery.checks import assess
+
+    manifest, events, _ = evidence()
+    manifest["max_steps"] = 12
+    events = [e for e in events if e["kind"] != "complete"] + [
+        dict(kind="log", attempt=0, rank=0, step=11, time=3.5),
+        dict(kind="log", attempt=1, rank=0, step=12, time=6.5),
+        dict(kind="complete", attempt=1, rank=0, step=12, time=7),
+    ]
+    history = [
+        {"_step": 11, "recovery/attempt": window_attempt, "recovery/step": 11},
+        {"_step": 12, "recovery/attempt": 1, "recovery/step": 12},
+    ]
+    report = assess(manifest, events, history)
+    assert report["status"] == "passed", report
+    assert report["wandb_rewind"] == outcome
+    stale = [history[0], {"_step": 12, "recovery/attempt": 0, "recovery/step": 12}]
+    assert assess(manifest, events, stale)["status"] == "failed"
 
 
 def test_node_drill_requires_a_replacement_node() -> None:

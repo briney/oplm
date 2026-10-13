@@ -172,15 +172,17 @@ The checks require:
 - For node loss, a different replacement node, exclusion of the failed node, and the same
   total number of training nodes. The node adapter must actually induce node failure;
   a process kill plus manual requeue is not equivalent evidence.
-- The same W&B entity/project/run ID/name, and unsampled server history containing the
-  resumed attempt's logged steps. `recovery/attempt` and `recovery/step` distinguish replayed
-  metrics from stale metrics left by the abandoned attempt.
+- The same W&B entity/project/run ID/name, and unsampled server history in which every row's
+  `Step` equals its training step (`recovery/step`), no step repeats, and every step the
+  resumed attempt logged is present. Steps past the abandoned attempt's last logged step must
+  be the resumed attempt's rows (`recovery/attempt` = 1).
 
-W&B's internal history counter keeps increasing across attempts. Metrics use
-`train/global_step` as their chart axis, so replayed training steps are retained instead
-of being dropped as writes to past history. The abandoned attempt's metrics remain;
-use `recovery/attempt` to distinguish them. Existing custom charts using W&B's default
-`Step` axis should be switched to `train/global_step`.
+The trainer logs every row at the training step and, when a resume lands behind the server's
+history, rewinds the run to the checkpoint first (docs/TRAIN.md "W&B continuity"). Inside
+that replay window a row is therefore the resumed attempt's when W&B rewound the history,
+and still the abandoned attempt's when the server refused the rewind (rewinding is a W&B
+private-preview feature, enabled per entity). Both pass; `result.json` reports which as
+`wandb_rewind`: `applied`, `unavailable`, or `not needed` when nothing was replayed (a drain).
 
 After updating recovery or logging code, prepare fresh drill directories and ensure the
 controller and container install the fixed version. For unpublished fixes, install the
@@ -196,11 +198,11 @@ all model/optimizer tensors or promise bitwise RNG/masking equivalence to uninte
 training; checkpoint state round-trips have separate tests in `tests/training/`.
 
 W&B must be reachable from both compute nodes (logging) and the controller (read API), with
-the same account/entity settings. Online mode is forced for enabled tracking. The current
-trainer's ordinary `resume="allow"` may drop metrics when a checkpoint rollback goes behind
-the server's latest step: **that is a legitimate drill failure**, not something the harness
-hides. A late upload can be checked again with `--check`. No production W&B runs are rewound
-or deleted by these scripts.
+the same account/entity settings. Online mode is forced for enabled tracking. A missing
+resumed step, a misaligned `Step`, or an abandoned-attempt row past the replay window is a
+**legitimate drill failure**, not something the harness hides. A late upload can be checked
+again with `--check`. The drill scripts never rewind or delete W&B runs themselves; the
+trainer rewinds only the drill's own run, and only when the entity allows it.
 
 ## Actual node failures and spare capacity
 

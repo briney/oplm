@@ -292,13 +292,13 @@ def report(directory: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 # Allow the final upload to become queryable; --check can be repeated later.
                 for attempt in range(3):
                     run = api.run(path)
+                    # Rows carry `_step` (the training step); a refused rewind keeps the
+                    # killed attempt's rows for replayed steps, so wait on steps, not attempts.
                     history = list(run.scan_history(keys=["recovery/attempt", "recovery/step"]))
                     expected = {
-                        (e["attempt"], e["step"])
-                        for e in events
-                        if e["kind"] == "log" and e["attempt"] == 1
+                        e["step"] for e in events if e["kind"] == "log" and e["attempt"] == 1
                     }
-                    if expected <= {(r["recovery/attempt"], r["recovery/step"]) for r in history}:
+                    if expected <= {r["recovery/step"] for r in history}:
                         break
                     if attempt < 2:
                         time.sleep(10)

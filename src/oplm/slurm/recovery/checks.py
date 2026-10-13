@@ -6,6 +6,59 @@ from pathlib import Path
 from typing import Any
 
 
+def _check_wandb_history(
+    history: list[dict[str, Any]], events: list[dict[str, Any]], checkpoint_step: int | None
+) -> tuple[list[str], str]:
+    """Errors and the rewind outcome for the online history of the resumed run.
+
+    Rows are logged at the training step, so each row's ``_step`` equals its
+    ``recovery/step`` and no step repeats. Every step the resumed attempt logged must be in
+    the history. Steps past the killed attempt's last logged step must be the resumed
+    attempt's rows; inside that replay window a row is the resumed attempt's when W&B
+    rewound the history to the checkpoint ("applied"), or still the killed attempt's when
+    the server refused the rewind ("unavailable"). "not needed" means nothing was replayed.
+    """
+    errors: list[str] = []
+    misaligned = sorted(
+        r.get("recovery/step") for r in history if r.get("_step") != r.get("recovery/step")
+    )
+    if misaligned:
+        errors.append(f"W&B Step differs from the training step at {misaligned}")
+    attempt_by_step: dict[Any, Any] = {}
+    for row in history:
+        step = row.get("recovery/step")
+        if step in attempt_by_step:
+            errors.append(f"W&B history repeats step {step}")
+        attempt_by_step[step] = row.get("recovery/attempt")
+
+    def logged(attempt: int) -> list[int]:
+        return sorted(
+            e["step"]
+            for e in events
+            if e["kind"] == "log" and e["rank"] == 0 and e["attempt"] == attempt
+        )
+
+    replayed = [s for s in logged(0) if checkpoint_step is not None and s > checkpoint_step]
+    window_end = max(replayed, default=None)
+    resumed = logged(1)
+    missing = [s for s in resumed if s not in attempt_by_step]
+    if missing:
+        errors.append(f"W&B dropped resumed metrics at {missing}")
+    stale = [
+        s
+        for s in resumed
+        if s in attempt_by_step
+        and attempt_by_step[s] != 1
+        and (window_end is None or s > window_end)
+    ]
+    if stale:
+        errors.append(f"W&B kept the killed attempt's metrics past the replay window at {stale}")
+    kept = [s for s in resumed if attempt_by_step.get(s) == 0 and window_end is not None]
+    if not replayed:
+        return errors, "not needed"
+    return errors, "unavailable" if kept else "applied"
+
+
 def assess(
     manifest: dict[str, Any],
     events: list[dict[str, Any]],
@@ -120,23 +173,16 @@ def assess(
         errors.append("local observations do not cover every resumed training step")
 
     identities = [e.get("wandb") for e in starts if e["rank"] == 0]
-    if manifest["wandb_enabled"]:
-        if (
-            not identities
-            or any(not identity for identity in identities)
-            or any(identity != identities[0] for identity in identities)
-        ):
-            errors.append("W&B entity/project/id/name missing or changed")
-        if history is not None:
-            observed = {(e.get("recovery/attempt"), e.get("recovery/step")) for e in history}
-            expected = {
-                (e["attempt"], e["step"])
-                for e in events
-                if e["kind"] == "log" and e["rank"] == 0 and e["attempt"] == 1
-            }
-            missing = sorted(expected - observed)
-            if missing:
-                errors.append(f"W&B dropped resumed metrics at {missing}")
+    if manifest["wandb_enabled"] and (
+        not identities
+        or any(not identity for identity in identities)
+        or any(identity != identities[0] for identity in identities)
+    ):
+        errors.append("W&B entity/project/id/name missing or changed")
+    wandb_rewind = None
+    if manifest["wandb_enabled"] and history is not None:
+        history_errors, wandb_rewind = _check_wandb_history(history, events, checkpoint_step)
+        errors += history_errors
     online_checked = manifest["wandb_enabled"] and history is not None
     status = "failed" if errors else ("passed" if online_checked else "incomplete")
     resumed = [e["time"] for e in starts if e["attempt"] == 1]
@@ -145,6 +191,7 @@ def assess(
         "errors": errors,
         "checkpoint_step": checkpoint_step,
         "wandb": "checked" if online_checked else "not checked",
+        "wandb_rewind": wandb_rewind,
         "restart_seconds": min(resumed) - initial_injection["time"]
         if resumed and initial_injection
         else None,

@@ -92,7 +92,7 @@ def test_grad_norm_logged_every_train_log() -> None:
     cb.on_log(trainer, {"train/loss": 2.0}, step=10)
 
     step, metrics = trainer.accelerator.logged[-1]
-    assert step is None
+    assert step == 10  # W&B's Step is the training step
     assert metrics["train/global_step"] == 10
     assert metrics["diag/grad_norm"] == torch.tensor(1.23).item()
     assert not any(key in metrics for key in _PROBE_KEYS)

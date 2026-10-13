@@ -143,5 +143,5 @@ class WeightDiagnosticsCallback(TrainerCallback):
 
     def on_log(self, trainer: Trainer, metrics: dict[str, float], step: int) -> None:
         if self._pending and "train/loss" in metrics:
-            trainer.accelerator.log(self._pending | {"train/global_step": step})
+            trainer.accelerator.log(self._pending | {"train/global_step": step}, step=step)
             self._pending = {}

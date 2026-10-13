@@ -41,7 +41,7 @@ pytestmark = [
     ),
 ]
 
-PROJECT = os.environ.get("OPLM_WANDB_DRILL_PROJECT", "oplm-wandb-drill")
+PROJECT: str = os.environ.get("OPLM_WANDB_DRILL_PROJECT", "oplm-wandb-drill")
 _POLL_SECONDS = 5.0
 _TIMEOUT_SECONDS = 180.0
 
@@ -153,6 +153,84 @@ def test_rewind_past_the_last_step(wandb_mod: Any, created: list[str]) -> None:
     )
     assert {s: history[s] for s in range(10)} == {s: float(s) for s in range(10)}
     assert history.get(15) == 1015.0 and history.get(16) == 1016.0, sorted(history)
+
+
+def test_trainer_resume_behind_the_server_history(
+    wandb_mod: Any,
+    created: list[str],
+    training_parquet: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The real Trainer: Step equals the training step and each step is logged exactly once.
+
+    Attempt 0 logs steps 1-6 but checkpoints only at 4 (a crash after step 6). Attempt 1
+    resumes from checkpoint 4 and trains to 8. With W&B rewind enabled, steps 5-6 are the
+    resumed attempt's rows; with it refused, the Trainer warns and steps 5-6 keep attempt
+    0's rows. Steps 7-8 are always attempt 1's.
+    """
+    import logging
+
+    from oplm.training.trainer import Trainer
+    from tests.training.conftest import tiny_train_cfg
+
+    class _TaggedTrainer(Trainer):
+        attempt = 0
+
+        def _log_metrics(self, metrics: dict[str, float]) -> None:
+            if "train/loss" in metrics:
+                metrics = metrics | {"drill/attempt": float(self.attempt)}
+            super()._log_metrics(metrics)
+
+    def cfg(max_steps: int, **overrides: Any) -> Any:
+        return tiny_train_cfg(
+            tmp_path,
+            training_parquet,
+            max_steps=max_steps,
+            log_every=1,
+            save_every=4,
+            save_final=False,
+            wandb_enabled=True,
+            wandb_project=PROJECT,
+            wandb_run_name=f"trainer-rewind-drill-{uuid.uuid4().hex[:8]}",
+            **overrides,
+        )
+
+    first = _TaggedTrainer(cfg(6), callbacks=[])
+    path = f"{wandb_mod.run.entity}/{PROJECT}/{wandb_mod.run.id}"
+    created.append(path)
+    first.train()
+    _history_steps(wandb_mod, path, until=lambda rows: 6 in rows)
+
+    second = _TaggedTrainer(cfg(8, auto_resume=True), callbacks=[])
+    second.attempt = 1
+    with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
+        second.train()
+    refused = "W&B history rewind unavailable" in caplog.text
+    print(f"rewind {'refused (fallback)' if refused else 'applied'}")
+
+    rows = _history_steps(wandb_mod, path, until=lambda rows: 8 in rows)
+    print(f"history (step: global_step, attempt): {rows}")
+    assert sorted(rows) == list(range(1, 9)), "every training step exactly once"
+    assert all(global_step == step for step, (global_step, _) in rows.items())
+    window_attempt = 0.0 if refused else 1.0
+    assert [rows[s][1] for s in range(1, 9)] == [0.0] * 4 + [window_attempt] * 2 + [1.0] * 2
+
+
+def _history_steps(wandb: Any, path: str, *, until: Any) -> dict[int, tuple[int, float]]:
+    """``{_step: (train/global_step, drill/attempt)}`` of a Trainer run, polled like _history."""
+    deadline = time.monotonic() + _TIMEOUT_SECONDS
+    while True:
+        run = wandb.Api().run(path)
+        raw = list(run.scan_history(keys=["train/global_step", "drill/attempt"]))
+        steps = [int(r["_step"]) for r in raw]
+        assert len(steps) == len(set(steps)), f"duplicate steps in history: {sorted(steps)}"
+        rows = {
+            int(r["_step"]): (int(r["train/global_step"]), float(r["drill/attempt"])) for r in raw
+        }
+        if until(rows) or time.monotonic() > deadline:
+            return rows
+        time.sleep(_POLL_SECONDS)
 
 
 def test_two_consecutive_rewinds(wandb_mod: Any, created: list[str]) -> None:

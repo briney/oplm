@@ -389,9 +389,10 @@ full flattened config is logged under `model/*`, `train/*`, `data/*`. Every
 `train.log_every` optimizer steps the trainer logs `train/loss`, `train/lr`,
 `train/epoch`, `train/samples`, `train/tokens`, and, when the task provides a FLOP
 estimate ([§17](#17-training-tasks-traintask)), `train/flops` (a cumulative estimate);
-eval passes add `eval/<dataset>/<metric>`. Set `train.wandb_project`
-and `train.wandb_run_name` (or `--name`) to organize runs. Disable W&B entirely
-with `train.wandb_enabled=false`.
+eval passes add `eval/<dataset>/<metric>`. Every row is logged at the training step, so
+W&B's `Step` axis equals `train/global_step` (also logged on every row). Set
+`train.wandb_project` and `train.wandb_run_name` (or `--name`) to organize runs. Disable W&B
+entirely with `train.wandb_enabled=false`.
 
 Each train log also carries per-window diagnostics (the window is the steps since
 the previous log): `train/loss_mean` (mean loss over the window, versus the
@@ -750,6 +751,18 @@ initializes tracking. On resume, it reads that id back and passes `id=<run_id>,
 resume="allow"` to `wandb.init`, so a requeued/resumed run continues logging into the **same** W&B
 run instead of starting a new one — one continuous loss curve across any number of
 preemptions.
+
+Rows are logged at the training step, and W&B never accepts a step below its latest. After a
+crash, training resumes from the last committed checkpoint, which can be behind the steps the
+dead attempt already logged. In that case the trainer first rewinds the run's history to the
+checkpoint (`wandb.init(resume_from="<id>?_step=<checkpoint step + 1>")`), so the resumed
+attempt's rows replace the dead attempt's and the history records only the run that produced
+the model. W&B enables rewinding per entity (private preview, on request to W&B support).
+Where it is not enabled, the trainer logs a warning and resumes without it: the rolled-back
+steps keep the dead attempt's rows, and the resumed attempt's rows for those steps are
+dropped. A drain checkpoint never needs a rewind, because it is saved before its step is
+logged. `tests/training/test_wandb_rewind_online.py` is the opt-in drill that checks the
+server behaviour (`OPLM_WANDB_ONLINE_DRILL=1`).
 
 ### Distributed hardening (NCCL / preflight / abort)
 
