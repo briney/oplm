@@ -82,8 +82,11 @@ class TrainTask(Protocol):
         """Construct the rank/worker-striped training dataloader."""
         ...
 
-    def step(self, model: nn.Module, batch: dict[str, Any]) -> StepResult:
-        """Run one micro-batch forward and return its loss and accounting."""
+    def step(self, model: nn.Module, batch: Any) -> StepResult:
+        """Run one micro-batch forward and return its loss and accounting.
+
+        ``batch`` is the dataloader's batch: a dict for MLM, a ``FoldBatch`` for folding.
+        """
         ...
 
     def flops_per_token(self, cfg: OplmConfig) -> int | None:
@@ -116,7 +119,7 @@ class MLMTask:
 
         return build_train_dataloader(cfg)
 
-    def step(self, model: nn.Module, batch: dict[str, Any]) -> StepResult:
+    def step(self, model: nn.Module, batch: Any) -> StepResult:
         outputs = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],

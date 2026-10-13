@@ -12,8 +12,17 @@ if TYPE_CHECKING:
     from oplm.fold.configuration_fold import FoldConfig
     from oplm.fold.data.featurize import ChainSpec, FoldFeatures, featurize
     from oplm.fold.modeling_fold import FoldOutput, OplmForFolding
+    from oplm.fold.training import FoldTask
 
-__all__ = ["ChainSpec", "FoldConfig", "FoldFeatures", "FoldOutput", "OplmForFolding", "featurize"]
+__all__ = [
+    "ChainSpec",
+    "FoldConfig",
+    "FoldFeatures",
+    "FoldOutput",
+    "FoldTask",
+    "OplmForFolding",
+    "featurize",
+]
 
 _LAZY = {
     "FoldConfig": ("oplm.fold.configuration_fold", "FoldConfig"),
@@ -22,6 +31,7 @@ _LAZY = {
     "featurize": ("oplm.fold.data.featurize", "featurize"),
     "FoldOutput": ("oplm.fold.modeling_fold", "FoldOutput"),
     "OplmForFolding": ("oplm.fold.modeling_fold", "OplmForFolding"),
+    "FoldTask": ("oplm.fold.training", "FoldTask"),
 }
 
 
