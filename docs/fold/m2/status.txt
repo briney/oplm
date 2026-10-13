@@ -1,0 +1,9 @@
+venv 0
+install 0
+env 0
+download 0
+esmc 1
+cpu-tests 1
+measure-w128 0
+measure-w256 0
+gpu-tests 1

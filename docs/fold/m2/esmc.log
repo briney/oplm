@@ -1,0 +1,34 @@
+...s.F                                                                   [100%]
+=================================== FAILURES ===================================
+________ test_real_esmc_300m_padded_chain_rows_match_the_unpadded_chain ________
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(not _HAS_ESM, reason="esm package not installed (oplm[esmc], Python >= 3.12)")
+    def test_real_esmc_300m_padded_chain_rows_match_the_unpadded_chain() -> None:
+        """Two chains of different lengths share one LM batch (right-padded); padding must not leak."""
+        lm = load_esmc("esmc_300m", device="cpu")
+        long_seq, short_seq = "MKTAYIAKQRQISFVKSHFSRQ", "GSHMLEDPV"
+        both = featurize([ChainSpec(long_seq, "A"), ChainSpec(short_seq, "B")])
+        assert both.lm_input_ids.shape[0] == 2 and both.lm_input_ids.shape[1] > len(short_seq) + 2
+        padded = frozen_lm_hidden_states(lm, both)
+        alone = frozen_lm_hidden_states(lm, featurize([ChainSpec(short_seq, "A")]))
+        n = len(short_seq)
+>       torch.testing.assert_close(padded[0, len(long_seq) :], alone[0, :n], atol=1e-4, rtol=0)
+E       AssertionError: Tensor-likes are not close!
+E       
+E       Mismatched elements: 1348 / 267840 (0.5%)
+E       Greatest absolute difference: 0.00067138671875 at index (3, 29, 212) (up to 0.0001 allowed)
+E       Greatest relative difference: 0.012709337286651134 at index (2, 29, 526) (up to 0 allowed)
+
+tests/fold/test_esmc.py:114: AssertionError
+----------------------------- Captured stderr call -----------------------------
+Fetching 5 files:   0%|          | 0/5 [00:00<?, ?it/s]Fetching 5 files: 100%|██████████| 5/5 [00:00<00:00, 1582.28it/s]
+=============================== warnings summary ===============================
+../../../mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/fold/test_esmc.py:84: esm is installed; the ImportError path is unreachable
+1 failed, 4 passed, 1 skipped, 1 warning in 34.86s

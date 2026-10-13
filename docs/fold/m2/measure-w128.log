@@ -1,0 +1,18 @@
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+Building model...
+ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install an xformers build matching your PyTorch and CUDA versions for a fused attention kernel.
+ESMC: flash-attn rotary kernel not installed; falling back to pure-PyTorch RoPE. For faster GPU inference run `pip install flash-attn`.
+Fetching 5 files:   0%|          | 0/5 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 5 files:  20%|██        | 1/5 [00:00<00:01,  2.98it/s]Fetching 5 files: 100%|██████████| 5/5 [00:06<00:00,  1.32s/it]Fetching 5 files: 100%|██████████| 5/5 [00:06<00:00,  1.26s/it]
+Loading training data...
+Preparing for training...
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/conda/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=4017349) is multi-threaded, use of fork() may lead to deadlocks in the child.
+  self.pid = os.fork()
+20/20 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ loss=4.2759 eval=N/A 0:00:00
+wrote /mnt/home/briney/fold-m2b/25716/measure-w128.json  steps 20  step_time_s 
+16.21001381009324 (per optimizer step, all accumulation micro-steps)  
+peak_allocated_gib 15.258745670318604

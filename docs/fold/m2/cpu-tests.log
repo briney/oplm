@@ -1,0 +1,112 @@
+.................................................................s...... [ 23%]
+.................................................s...................... [ 46%]
+..........................s............................................. [ 69%]
+...........sssssssssssssssssssssssssssssssssssss.........F.............. [ 93%]
+.....................                                                    [100%]
+=================================== FAILURES ===================================
+_________ test_step_returns_accounting_and_gradients_stay_in_the_head __________
+
+tmp_path = PosixPath('/tmp/pytest-of-briney/pytest-0/test_step_returns_accounting_a0')
+fixture_dataset = PosixPath('/tmp/pytest-of-briney/pytest-0/fold_ds0/dataset')
+lm_dir = PosixPath('/tmp/pytest-of-briney/pytest-0/lm0/tiny')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x771b3add6990>
+
+    def test_step_returns_accounting_and_gradients_stay_in_the_head(
+        tmp_path: Path, fixture_dataset: Path, lm_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        configure_accelerator_device("cpu", monkeypatch)
+        cfg = tiny_fold_run_cfg(tmp_path, fixture_dataset, lm_dir)
+        task = FoldTask()
+        model = task.build_model(cfg, None)
+        assert model.training and model.lm is not None and not model.lm.training
+        assert model.folding_trunk.gradient_checkpointing
+        loader = task.build_dataloader(cfg)
+        batch = next(iter(loader))
+>       result = task.step(model, batch)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/fold/test_training.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/oplm/fold/training.py:229: in step
+    out = model(batch.features, targets=batch.targets, train=self.settings)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py:1779: in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py:1790: in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/oplm/fold/modeling_fold.py:386: in forward
+    lm_z = self.language_model(lm_hidden_states)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py:1779: in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py:1790: in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/oplm/fold/lm_shim.py:73: in forward
+    return self.pair_output_norm(self.single_to_pair(self.mix(hidden_states), rows, cols))
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^
+src/oplm/fold/lm_shim.py:66: in mix
+    h = self.pair_proj(self.pair_input_norm(hidden_states))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py:1779: in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py:1790: in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Linear(in_features=32, out_features=32, bias=False)
+input = tensor([[[[ 0.5508, -0.2793,  0.9844,  ...,  0.8164, -0.5352,  0.3828],
+          [ 0.4941, -0.1934,  0.9492,  ...,  0... 0.0000,  0.0000,  ...,  0.0000,  0.0000,  0.0000]]]],
+       dtype=torch.bfloat16, grad_fn=<NativeLayerNormBackward0>)
+
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Runs the forward pass.
+        """
+>       return F.linear(input, self.weight, self.bias)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       RuntimeError: expected m1 and m2 to have the same dtype, but got: c10::BFloat16 != float
+
+/mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/nn/modules/linear.py:134: RuntimeError
+----------------------------- Captured stderr call -----------------------------
+Loading weights:   0%|          | 0/35 [00:00<?, ?it/s]Loading weights: 100%|██████████| 35/35 [00:00<00:00, 14081.60it/s]
+=============================== warnings summary ===============================
+../../../mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/fold/data/test_dataset.py::test_resume_with_two_dataloader_workers_matches_batch_suffix
+tests/fold/data/test_dataset.py::test_resume_with_two_dataloader_workers_matches_batch_suffix
+tests/fold/data/test_dataset.py::test_resume_with_two_dataloader_workers_matches_batch_suffix
+tests/fold/data/test_dataset.py::test_resume_with_two_dataloader_workers_matches_batch_suffix
+  /opt/conda/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=4016931) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+tests/fold/test_attention.py::test_pair_biased_zero_valid_keys_row_is_zero_and_finite[flex]
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/nn/attention/flex_attention.py:1704: UserWarning: flex_attention called without torch.compile() - this will use an unfused implementation that materializes the full scores matrix instead of generating a fused kernel.
+  
+  SOLUTION: Use torch.compile(flex_attention)(...)
+  
+  If you want to debug your score_mod/mask_mod, you can set:
+  torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
+  
+  This will allow you to use print statements or breakpoints. Note: This doesn't work with the backwards pass and may produce incorrect results.
+    _warn_once(
+
+tests/fold/test_cli.py: 14 warnings
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/fold/test_cli.py::test_fold_train_runs_a_tiny_cpu_run_from_a_config
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:483: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.
+    return func(*args, **kwargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/fold/test_training.py::test_step_returns_accounting_and_gradients_stay_in_the_head
+1 failed, 268 passed, 40 skipped, 34 deselected, 21 warnings in 37.49s

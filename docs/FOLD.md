@@ -3,7 +3,7 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 2b (losses and training) implemented, GPU measurement pending; milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
+this file records what is implemented. **Status: milestone 2b (losses and training) implemented, first B200 measurement recorded (docs/fold/m2/), test and batch-sweep re-run pending; milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
 Kernels, the model, prediction, the training data pipeline, the losses and the training step exist
 (§7 holds the M1 acceptance evidence, §8 the data contract, §9 the losses and training; the
 single-B200 cost measurement of §9 is still to be run).
@@ -470,7 +470,8 @@ is per optimizer step at the config's `gradient_accumulation_steps` (it already 
 accumulation micro-step); `micro_step_time_s` is that divided by the accumulation, the time of
 one micro-batch. A run that fails still writes the records so far plus an `error` field.
 [`docs/fold/b200-m2b-measure.sbatch`](fold/b200-m2b-measure.sbatch) runs it for
-`configs/fold/proof-w128.yaml` and `proof-w256.yaml` on one B200, plus the fold CPU suite and the
+`configs/fold/proof-w128.yaml` and `proof-w256.yaml` on one B200, a per-device batch sweep (`sweep`:
+batch 2, 4 and 8 at the same 16 samples per optimizer step), plus the fold CPU suite and the
 GPU-marked fold tests in the ESM-C environment. The results and the per-device batch, accumulation and step budget derived from them for
 milestone 2c are recorded in [`docs/fold/m2/`](fold/m2/).
 

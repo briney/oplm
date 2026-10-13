@@ -85,11 +85,18 @@ def test_require_fold_names_the_missing_block(
 def test_step_returns_accounting_and_gradients_stay_in_the_head(
     tmp_path: Path, fixture_dataset: Path, lm_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from accelerate import PartialState
+
     configure_accelerator_device("cpu", monkeypatch)
+    # build_model places the LM on PartialState().device. The Trainer creates its Accelerator
+    # (which honours ACCELERATE_USE_CPU) first; without one, a fresh PartialState would pick a
+    # visible GPU and put the LM there while the head stays on the CPU.
+    PartialState(cpu=True)
     cfg = tiny_fold_run_cfg(tmp_path, fixture_dataset, lm_dir)
     task = FoldTask()
     model = task.build_model(cfg, None)
     assert model.training and model.lm is not None and not model.lm.training
+    assert next(model.lm.parameters()).device.type == "cpu"
     assert model.folding_trunk.gradient_checkpointing
     loader = task.build_dataloader(cfg)
     batch = next(iter(loader))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 from types import SimpleNamespace
 
@@ -103,12 +104,24 @@ def test_real_esmc_300m_states_match_its_config() -> None:
 @pytest.mark.slow
 @pytest.mark.skipif(not _HAS_ESM, reason="esm package not installed (oplm[esmc], Python >= 3.12)")
 def test_real_esmc_300m_padded_chain_rows_match_the_unpadded_chain() -> None:
-    """Two chains of different lengths share one LM batch (right-padded); padding must not leak."""
+    """Two chains of different lengths share one LM batch (right-padded); padding must not leak.
+
+    Masked padding still changes the fp32 reduction order, so differences grow with depth (to
+    ~1e-5 of the layer RMS, ~4e-4 absolute in mid layers); padding that leaks moves the states by
+    about the layer RMS itself.
+    """
     lm = load_esmc("esmc_300m", device="cpu")
     long_seq, short_seq = "MKTAYIAKQRQISFVKSHFSRQ", "GSHMLEDPV"
     both = featurize([ChainSpec(long_seq, "A"), ChainSpec(short_seq, "B")])
     assert both.lm_input_ids.shape[0] == 2 and both.lm_input_ids.shape[1] > len(short_seq) + 2
-    padded = frozen_lm_hidden_states(lm, both)
     alone = frozen_lm_hidden_states(lm, featurize([ChainSpec(short_seq, "A")]))
-    n = len(short_seq)
-    torch.testing.assert_close(padded[0, len(long_seq) :], alone[0, :n], atol=1e-4, rtol=0)
+    alone = alone[0, : len(short_seq)]
+    rms = alone.pow(2).mean(dim=(0, 2)).sqrt()  # per layer
+
+    def worst_relative_error(features) -> float:
+        states = frozen_lm_hidden_states(lm, features)[0, len(long_seq) :]
+        return float(((states - alone).abs().amax(dim=(0, 2)) / rms).max())
+
+    assert worst_relative_error(both) < 1e-4
+    ones = torch.ones_like(both.lm_attention_mask)
+    assert worst_relative_error(dataclasses.replace(both, lm_attention_mask=ones)) > 0.1
