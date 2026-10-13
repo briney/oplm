@@ -34,6 +34,7 @@ from oplm.fold.attention import (
 from oplm.fold.confidence import ConfidenceHead, ConfidenceOutput, symmetrized_distogram
 from oplm.fold.configuration_fold import FoldConfig
 from oplm.fold.diffusion import StructureHead
+from oplm.fold.esmc import parse_esmc_name
 from oplm.fold.lm_shim import LanguageModelShim, frozen_lm_hidden_states, lm_state_count
 from oplm.fold.trunk import PairStack, Recurrence, pair_stack_kwargs
 from oplm.model import OplmModel
@@ -99,14 +100,22 @@ def load_frozen_lm(
     revision: str | None = None,
     dtype: torch.dtype | None = None,
     device: torch.device | str | None = None,
-) -> OplmModel:
-    """Load the bare OPLM encoder (local dir, ``<ckpt>/hf``, or Hub id) frozen in eval mode.
+) -> nn.Module:
+    """Load a frozen encoder: ``esmc:<name>`` loads the frozen ESM-C adapter; OPLM paths and Hub ids
+    load the bare encoder; the ``<repo>#esmc`` form raises.
 
     Raises:
         ValueError: ``name_or_path`` has the ``<repo>#esmc`` form written by
             ``fold_config_from_upstream``: the head was trained against the ESMC bundled in
             that repo, which is not an OPLM; pass ``lm_hidden_states`` to ``forward`` instead.
+        ImportError: ``name_or_path`` has the ``esmc:`` prefix but the ``esm`` package is
+            missing (install ``oplm[esmc]`` on Python >= 3.12).
     """
+    esmc_name = parse_esmc_name(str(name_or_path))
+    if esmc_name is not None:
+        from oplm.fold.esmc import load_esmc
+
+        return load_esmc(esmc_name, revision=revision, device=device, dtype=dtype)
     if str(name_or_path).endswith("#esmc"):
         raise ValueError(
             f"{name_or_path!r} names a language model bundled in an upstream checkpoint, not an "

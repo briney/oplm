@@ -73,6 +73,12 @@ fold = [
     # mmCIF output (oplm.fold.predict.write_mmcif).
     "gemmi>=0.7",
 ]
+esmc = [
+    # Frozen ESM-C for the milestone-2 pipeline proof (oplm.fold.esmc, docs/FOLD.md §9). The
+    # package needs Python >= 3.12 and transformers < 5, both inside this repo's ranges; the
+    # repo's own dev venv is 3.11, so GPU jobs build a 3.12 venv (docs/fold/b200-m2b-measure.sbatch).
+    "esm==3.4.1.post1",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

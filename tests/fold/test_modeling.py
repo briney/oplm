@@ -239,3 +239,27 @@ def test_gradient_checkpointing_reaches_every_pair_stack() -> None:
     assert model.confidence_head.folding_trunk.gradient_checkpointing
     model.gradient_checkpointing_disable()
     assert not model.lm_encoder.gradient_checkpointing
+
+
+def test_from_pretrained_resolves_an_esmc_identifier_through_the_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oplm.fold.esmc as esmc
+
+    class _Fake(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = type("C", (), {"hidden_size": 32, "num_hidden_layers": 2})()
+            self.embed = torch.nn.Embedding(64, 32)
+
+        def forward(self, input_ids, attention_mask=None, output_hidden_states=True, return_dict=True):
+            x = self.embed(input_ids)
+            return type("O", (), {"hidden_states": torch.stack([x, x, x])})()
+
+    monkeypatch.setattr(
+        esmc, "load_esmc", lambda name, **kw: esmc.FrozenEsmC(_Fake(), name=name, revision=kw.get("revision"))
+    )
+    model = OplmForFolding(_tiny_cfg(lm_name_or_path="esmc:esmc_fake", lm_revision="v1"))
+    model.save_pretrained(tmp_path / "fold")
+    reloaded = OplmForFolding.from_pretrained(tmp_path / "fold")
+    assert reloaded.lm is not None and reloaded.lm.name == "esmc_fake" and reloaded.lm.revision == "v1"
