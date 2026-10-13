@@ -57,6 +57,22 @@ class FoldBatch:
     features: FoldFeatures
     targets: FoldTargets
 
+    def to(self, device: torch.device | str, *, non_blocking: bool = False) -> FoldBatch:
+        """Return a copy with every tensor on ``device`` (``DeviceDataLoader`` calls this)."""
+        return FoldBatch(
+            ids=list(self.ids),
+            features=self.features.to(device, non_blocking=non_blocking),
+            targets=self.targets.to(device, non_blocking=non_blocking),
+        )
+
+    def pin_memory(self) -> FoldBatch:
+        """Return a copy in pinned host memory; ``DataLoader(pin_memory=True)`` calls this."""
+        return FoldBatch(
+            ids=list(self.ids),
+            features=self.features.pin_memory(),
+            targets=self.targets.pin_memory(),
+        )
+
 
 def atom_budget(crop_size: int, atoms_per_token_budget: int, atom_pad_multiple: int) -> int:
     """Padded atom-axis length for a crop: budget × crop rounded up to the block multiple."""

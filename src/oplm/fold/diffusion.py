@@ -336,25 +336,54 @@ class StructureHead(nn.Module):
         token_mask: Tensor,
         num_samples: int,
     ) -> DenoiserInputs:
-        """Condition the pair, embed the atoms and expand the masks once for ``num_samples``."""
+        """Condition the pair, embed the atoms, then :meth:`expand` to ``num_samples`` rows."""
         if num_samples < 1:
             raise ValueError(f"num_samples must be >= 1; got {num_samples!r}")
+        with fp32_autocast_off(s_inputs.device):
+            z = self.conditioning.pair(z_trunk, relpos)
+            c = self.atom_encoder.embed(atom_features)
+            flex = resolve_attention_backend(z, self.config.attention_backend) == "flex"
+            base = DenoiserInputs(
+                s_inputs=s_inputs,
+                z=z,
+                c=c,
+                rope=rope,
+                atom_mask=atom_mask,
+                atom_to_token=atom_to_token,
+                token_mask=token_mask,
+                token_block_mask=pair_bias_block_mask(token_mask) if flex else None,
+                atom_block_mask=(
+                    sliding_window_block_mask(atom_mask, self.config.atom_window // 2)
+                    if flex
+                    else None
+                ),
+            )
+        return self.expand(base, num_samples)
+
+    def expand(self, inp: DenoiserInputs, num_samples: int) -> DenoiserInputs:
+        """Repeat every per-sample tensor of a one-sample ``DenoiserInputs`` ``num_samples`` times.
+
+        ``z`` stays at the base batch (the blocks broadcast it); the block masks are rebuilt for
+        the expanded masks. Returns ``inp`` itself for ``num_samples == 1``.
+        """
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1; got {num_samples!r}")
+        if num_samples == 1:
+            return inp
 
         def rep(t: Tensor) -> Tensor:
             return t.repeat_interleave(num_samples, dim=0)
 
-        with fp32_autocast_off(s_inputs.device):
-            z = self.conditioning.pair(z_trunk, relpos)
-            c = self.atom_encoder.embed(atom_features)
-            atom_mask_s, token_mask_s = rep(atom_mask), rep(token_mask)
-            flex = resolve_attention_backend(z, self.config.attention_backend) == "flex"
+        with fp32_autocast_off(inp.z.device):
+            atom_mask_s, token_mask_s = rep(inp.atom_mask), rep(inp.token_mask)
+            flex = resolve_attention_backend(inp.z, self.config.attention_backend) == "flex"
             return DenoiserInputs(
-                s_inputs=rep(s_inputs),
-                z=z,
-                c=rep(c),
-                rope=(rep(rope[0]), rep(rope[1])),
+                s_inputs=rep(inp.s_inputs),
+                z=inp.z,
+                c=rep(inp.c),
+                rope=(rep(inp.rope[0]), rep(inp.rope[1])),
                 atom_mask=atom_mask_s,
-                atom_to_token=rep(atom_to_token),
+                atom_to_token=rep(inp.atom_to_token),
                 token_mask=token_mask_s,
                 token_block_mask=pair_bias_block_mask(token_mask_s) if flex else None,
                 atom_block_mask=(

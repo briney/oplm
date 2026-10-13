@@ -71,12 +71,12 @@ ids (the OPLM tokenizer is ESM-C compatible: BOS 0, PAD 1, EOS 2, X 24, mask 32)
 - **Identifier.** `FoldConfig.lm_name_or_path = "esmc:esmc_600m"` (the package's
   model name after the prefix). `load_frozen_lm` resolves the `esmc:` prefix through
   the adapter; OPLM paths and the M1 `<repo>#esmc` form behave as before.
-- **Model.** ESM-C 600M: 36 blocks, width 1152, Cambrian Open License Agreement. The
-  adapter accepts the 300M and 6B names too; 6B is non-commercial and roughly
-  triples the frozen-LM cost per step, so it is a config flag, not the default.
-  The EvolutionaryScale weights are gated behind accepting the license on
-  Hugging Face; that acceptance is a one-time prerequisite for any job that loads
-  them.
+- **Model.** ESM-C 600M (`biohub/ESMC-600M`): 36 blocks, width 1152. The adapter
+  accepts the 300M and 6B names too; 6B roughly triples the frozen-LM cost per
+  step, so it is a config flag, not the default. *Amended 2026-10-13:* the
+  `biohub/ESMC-*` repos (300M, 600M, 6B) are MIT-licensed, public and ungated, so
+  no license acceptance or Hub token is needed. The earlier text described the
+  EvolutionaryScale releases (Cambrian Open License, gated, 6B non-commercial).
 - **Dependency.** New optional extra `esmc = ["esm==3.4.1.post1"]`. The package
   requires Python ≥ 3.12 and transformers < 5, both inside this repo's supported
   ranges; the M1 fixture venv (`docs/fold/b200-fixtures.sbatch`) already runs this

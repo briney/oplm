@@ -343,3 +343,31 @@ def test_denoise_and_sample_ignore_outer_autocast() -> None:
     assert den.dtype == torch.float32 and sample.dtype == torch.float32
     torch.testing.assert_close(den, plain_den, rtol=0, atol=1e-6)
     torch.testing.assert_close(sample, plain_sample, rtol=0, atol=1e-6)
+
+
+def test_expand_matches_prepare_with_num_samples() -> None:
+    cfg = tiny_fold_config()
+    torch.manual_seed(0)
+    f = featurize([ChainSpec("MKVLAG", "A")])
+    emb = InputsEmbedder(cfg).eval()(f)
+    head = StructureHead(cfg).eval()
+    z_trunk = torch.randn(1, f.num_tokens, f.num_tokens, cfg.pair_width)
+    kwargs = dict(
+        s_inputs=emb.s_inputs,
+        z_trunk=z_trunk,
+        relpos=emb.relpos,
+        atom_features=emb.atom_features,
+        rope=emb.rope,
+        atom_mask=f.atom_mask,
+        atom_to_token=f.atom_to_token,
+        token_mask=f.token_mask,
+    )
+    with torch.no_grad():
+        base = head.prepare(**kwargs, num_samples=1)
+        three = head.expand(base, 3)
+        direct = head.prepare(**kwargs, num_samples=3)
+    assert three.s_inputs.shape[0] == 3 and three.c.shape[0] == 3 and three.z.shape[0] == 1
+    torch.testing.assert_close(three.atom_mask, base.atom_mask.repeat_interleave(3, 0))
+    torch.testing.assert_close(three.c, direct.c)
+    torch.testing.assert_close(three.z, direct.z)
+    assert head.expand(base, 1) is base

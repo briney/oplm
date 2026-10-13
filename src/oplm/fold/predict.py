@@ -15,6 +15,7 @@ import torch
 
 from oplm.fold.data.ccd import PROTEIN_RES_TYPES
 from oplm.fold.data.featurize import ChainSpec, featurize
+from oplm.fold.modeling_fold import FoldOutput
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
     from oplm.fold.data.featurize import FoldFeatures
-    from oplm.fold.modeling_fold import FoldOutput, OplmForFolding
+    from oplm.fold.modeling_fold import OplmForFolding
 
 __all__ = ["FoldResult", "fold", "parse_chain_arg", "rank_samples", "write_mmcif"]
 
@@ -115,6 +116,7 @@ def fold(
             num_steps=num_steps,
             generator=generator,
         )
+    assert isinstance(output, FoldOutput), "fold() never passes targets"
     order = rank_samples(output, f.num_chains)
     best = int(order[0])
     real = f.atom_mask[0].cpu()

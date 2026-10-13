@@ -480,6 +480,71 @@ class DataConfig:
 
 
 @dataclass
+class FoldRunConfig:
+    """The ``fold:`` block of a structure-head run (docs/FOLD.md §9; addendum §5).
+
+    ``model`` holds ``FoldConfig`` overrides (``pair_width``, ``trunk_blocks``, ...); the
+    ``lm_*`` shape fields are inferred from the loaded LM unless given. Loss weights are spec
+    §6.2's starting values; ``loss_pae`` weights the PAE sub-term of the confidence composite.
+    """
+
+    lm: str = "esmc:esmc_600m"
+    lm_revision: str | None = None
+    lm_max_chain_length: int = 1024
+    model: Any = field(default_factory=dict)
+    crop_size: int = 384
+    contiguous_prob: float = 0.5
+    atoms_per_token_budget: int = 24
+    diffusion_samples: int = 8
+    diffusion_microbatch: int | None = None
+    confidence_rollout_steps: int = 20
+    loss_diffusion_mse: float = 4.0
+    loss_smooth_lddt: float = 1.0
+    loss_distogram: float = 0.03
+    loss_confidence: float = 1e-4
+    loss_pae: float = 1.0
+
+    def __post_init__(self) -> None:
+        """Validate the block (crop multiples, probabilities, counts, weights)."""
+        if not self.lm or not str(self.lm).strip():
+            raise ValueError("fold.lm must name a language model (esmc:<name>, a path or a Hub id)")
+        if self.lm_max_chain_length < 1:
+            raise ValueError(
+                f"fold.lm_max_chain_length must be >= 1, got {self.lm_max_chain_length}"
+            )
+        if self.crop_size < 128 or self.crop_size % 128:
+            raise ValueError(
+                f"fold.crop_size must be a positive multiple of 128, got {self.crop_size}"
+            )
+        if not 0.0 <= self.contiguous_prob <= 1.0:
+            raise ValueError(f"fold.contiguous_prob must be in [0, 1], got {self.contiguous_prob}")
+        if self.atoms_per_token_budget < 1:
+            raise ValueError(
+                f"fold.atoms_per_token_budget must be >= 1, got {self.atoms_per_token_budget}"
+            )
+        if self.diffusion_samples < 1:
+            raise ValueError(f"fold.diffusion_samples must be >= 1, got {self.diffusion_samples}")
+        if self.diffusion_microbatch is not None and self.diffusion_microbatch < 1:
+            raise ValueError(
+                f"fold.diffusion_microbatch must be >= 1 or null, got {self.diffusion_microbatch}"
+            )
+        if self.confidence_rollout_steps < 1:
+            raise ValueError(
+                f"fold.confidence_rollout_steps must be >= 1, got {self.confidence_rollout_steps}"
+            )
+        for name in (
+            "loss_diffusion_mse",
+            "loss_smooth_lddt",
+            "loss_distogram",
+            "loss_confidence",
+            "loss_pae",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"fold.{name} must be finite and >= 0, got {value}")
+
+
+@dataclass
 class OplmConfig:
     """Root configuration composing model, training, and data configs."""
 
@@ -489,6 +554,7 @@ class OplmConfig:
     model: Any = field(default_factory=dict)
     train: TrainConfig = field(default_factory=TrainConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    fold: FoldRunConfig | None = None
 
 
 def validate_parallelism_compat(cfg: OplmConfig) -> None:
@@ -714,6 +780,11 @@ def load_config(argv: list[str]) -> OplmConfig:
     # `model` is an Any field so it round-trips as a plain dict here.
     cfg: OplmConfig = OmegaConf.to_object(base)  # ty: ignore[invalid-assignment]  # OmegaConf union
 
+    # ``fold`` is an optional structured node: ``to_object`` yields FoldRunConfig or None.
+    # A plain dict can only appear if OmegaConf typed the node loosely; normalize it.
+    if isinstance(cfg.fold, dict):
+        cfg.fold = FoldRunConfig(**cast("dict[str, Any]", cfg.fold))
+
     # Instantiate the HF model config from the merged `model` subtree. HF owns
     # derivation (head_dim, intermediate_size, rope_dim/nope_dim) and validation.
     # Derived fields are omitted unless set, resolving to None → derived inside
@@ -761,9 +832,9 @@ def serialize_config(cfg: OplmConfig) -> str:
     """Serialize a resolved :class:`OplmConfig` to reloadable YAML text.
 
     The ``model`` subtree is an HF ``OplmConfig`` (serialized via ``to_dict``);
-    ``train`` and ``data`` are dataclasses. The result round-trips through
-    ``load_config(["--config", <path>])``. Shared by the top-level run config dump
-    and the per-checkpoint ``config.yaml``.
+    ``train``, ``data``, and ``fold`` (when present) are dataclasses. The result
+    round-trips through ``load_config(["--config", <path>])``. Shared by the
+    top-level run config dump and the per-checkpoint ``config.yaml``.
     """
     from dataclasses import asdict
 
@@ -787,4 +858,6 @@ def serialize_config(cfg: OplmConfig) -> str:
         "train": asdict(cfg.train),
         "data": asdict(cfg.data),
     }
+    if cfg.fold is not None:
+        config_dict["fold"] = asdict(cfg.fold)
     return OmegaConf.to_yaml(OmegaConf.create(config_dict))

@@ -42,6 +42,7 @@ def test_defaults_match_the_released_fast_checkpoint() -> None:
         ("trimul_backend", "triton", "trimul_backend"),
         ("attention_backend", "sdpa", "attention_backend"),
         ("confidence_min_dist", 60.0, "confidence_min_dist"),
+        ("distogram_max_dist", 1.0, "distogram_min_dist"),
         ("noise_scale", -1.0, "noise_scale"),
     ],
 )

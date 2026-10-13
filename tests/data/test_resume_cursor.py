@@ -44,7 +44,7 @@ def _arm_skip(ds: ShardedProteinDataset, skip: int) -> None:
 
     With ``num_workers=1``, ``worker_id=0``: ``len(range(0, batches_in_epoch, 1)) ==
     batches_in_epoch``, so ``per_rank_batch=1`` makes the resolved raw skip exactly
-    ``batches_in_epoch`` (mod ``stream_length()``).
+    ``batches_in_epoch`` (clamped to ``stream_length()``).
     """
     ds.set_resume_skip(batches_in_epoch=skip, per_rank_batch=1, num_workers=1)
 
@@ -55,7 +55,7 @@ def _arm_skip(ds: ShardedProteinDataset, skip: int) -> None:
 
 
 def test_resumed_stream_is_baseline_suffix(sequence_shards: Path) -> None:
-    """Armed skip yields ``baseline[skip % len(baseline):]`` exactly, for several skips."""
+    """Armed skip yields ``baseline[min(skip, len(baseline)):]`` exactly, for several skips."""
     baseline_ds = ShardedProteinDataset(sequence_shards, seed=0)
     baseline_ds.set_epoch(0)
     baseline = _ids(baseline_ds)
@@ -73,8 +73,48 @@ def test_resumed_stream_is_baseline_suffix(sequence_shards: Path) -> None:
         ds.set_epoch(0)
         _arm_skip(ds, skip)
         resumed = _ids(ds)
-        expected = baseline[skip % stream_len :]
+        expected = baseline[min(skip, stream_len) :]
         assert resumed == expected, f"mismatch for skip={skip}"
+
+
+def test_skip_equal_to_stream_length_is_an_empty_stream(sequence_shards: Path) -> None:
+    """A cursor exactly on the epoch boundary resolves to an empty stream, not a replay.
+
+    The Trainer rolls to the next epoch on the resulting ``StopIteration``; wrapping the
+    skip to 0 would instead re-yield the finished epoch (the next epoch reshuffles).
+    """
+    ds = ShardedProteinDataset(sequence_shards, seed=0)
+    ds.set_epoch(0)
+    stream_len = ds.stream_length()
+    assert stream_len > 1
+
+    assert (
+        dataset_mod._resolve_sample_skip(
+            stream_len, per_rank_batch=1, num_workers=1, stream_length=stream_len
+        )
+        == stream_len
+    )
+    # Over-skipping (a final partial batch counted as a whole one) clamps; it never wraps.
+    assert (
+        dataset_mod._resolve_sample_skip(
+            stream_len + 2, per_rank_batch=1, num_workers=1, stream_length=stream_len
+        )
+        == stream_len
+    )
+    assert (
+        dataset_mod._resolve_sample_skip(3, per_rank_batch=1, num_workers=1, stream_length=0) == 0
+    )
+
+    _arm_skip(ds, stream_len)
+    assert _ids(ds) == []
+    assert list(ds._iter_stream(stream_len)) == []  # the underlying stream is just empty
+
+    # Per-source arming (InterleavedDataset's path) still wraps: a source refills in-epoch.
+    baseline_ds = ShardedProteinDataset(sequence_shards, seed=0)
+    baseline_ds.set_epoch(0)
+    baseline = _ids(baseline_ds)
+    wrapped = baseline_ds._arm_sample_skip(stream_len)
+    assert [str(row["sequence_id"]) for row in wrapped] == baseline
 
 
 # --------------------------------------------------------------------------- #
@@ -374,6 +414,31 @@ def test_interleaved_refill_does_not_reapply_skip(
     # drop extra rows too, shortening the stream and shifting the cycle phase.
     assert len(resumed) == num_samples - skip
     assert resumed == baseline[skip:]
+
+
+def test_interleaved_skip_equal_to_epoch_length_is_empty(
+    tmp_path: Path,
+    make_sequence_shards: Callable[..., Path],
+    real_records: list[tuple[str, str]],
+) -> None:
+    """A fully consumed interleaved epoch resumes into an empty stream, not a replay."""
+    small_dir = (tmp_path / "full_small").resolve()
+    large_dir = (tmp_path / "full_large").resolve()
+    small_dir.mkdir()
+    large_dir.mkdir()
+    make_sequence_shards(small_dir, real_records[:3], n_shards=1, id_prefix="fs_")
+    make_sequence_shards(large_dir, real_records[3:15], n_shards=2, id_prefix="fl_")
+
+    num_samples = 30
+    inter = InterleavedDataset(
+        [ShardedProteinDataset(small_dir, seed=0), ShardedProteinDataset(large_dir, seed=0)],
+        [0.5, 0.5],
+        num_samples=num_samples,
+        seed=0,
+    )
+    inter.set_epoch(0)
+    _arm_interleaved_skip(inter, num_samples)
+    assert _interleaved_ids(inter) == []
 
 
 def test_interleaved_clear_resume_skip_restores_full_stream(

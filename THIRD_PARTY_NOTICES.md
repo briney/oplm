@@ -3,6 +3,35 @@
 OPLM is MIT-licensed (see `LICENSE`). The components below are derived from
 third-party work and keep their upstream notices.
 
+## Boltz-2 (test oracles only)
+
+`tests/fold/oracles/` carries frozen copies of loss functions from Boltz-2
+(<https://github.com/jwohlwend/boltz>, `boltz==2.2.1`), used only to check
+`src/oplm/fold/losses.py`; see `tests/fold/oracles/README.md` for the file list and
+modifications. Nothing under `src/` is derived from Boltz. The MIT license text follows.
+
+MIT License
+
+Copyright (c) 2024 Jeremy Wohlwend, Gabriele Corso, Saro Passaro
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ## ESMFold2 (Chan Zuckerberg Biohub)
 
 Portions of `src/oplm/fold/` are ported from Biohub's ESMFold2 implementation,

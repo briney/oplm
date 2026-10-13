@@ -1,0 +1,26 @@
+......s...........................                                       [100%]
+=============================== warnings summary ===============================
+../../../mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/transformers/utils/hub.py:110
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+    warnings.warn(
+
+../../../mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/fold/test_attention.py: 14 warnings
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/fold/test_training.py::test_resume_restores_step_cursor_and_ema
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:483: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.
+    return func(*args, **kwargs)
+
+tests/fold/test_training.py::test_resume_restores_step_cursor_and_ema
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:483: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+    return func(*args, **kwargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/fold/test_parity.py:261: OPLM_FOLD_FIXTURES is unset: ESMFold2 golden fixtures unavailable (docs/FOLD.md §7)
+33 passed, 1 skipped, 309 deselected, 18 warnings in 151.01s (0:02:31)

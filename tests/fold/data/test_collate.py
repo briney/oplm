@@ -90,3 +90,16 @@ def test_collate_rows_unwraps_dataset_rows(parsed: Callable[[str], MolecularComp
     ex = featurize_complex(parsed("1l2y"))
     batch = collate_rows([{"id": ex.id, "example": ex}], crop_size=32)
     assert batch.ids == ["1l2y_A"] and batch.features.num_tokens == 32
+
+
+def test_fold_batch_to_and_pin_memory(parsed: Callable[[str], MolecularComplex]) -> None:
+    ex = featurize_complex(parsed("1crn"))
+    batch = collate_examples([ex, ex], crop_size=64)
+    moved = batch.to("cpu")
+    assert moved is not batch and moved.ids == batch.ids
+    assert moved.features.chain_ids == batch.features.chain_ids
+    torch.testing.assert_close(moved.features.ref_pos, batch.features.ref_pos)
+    torch.testing.assert_close(moved.targets.coords, batch.targets.coords)
+    if torch.cuda.is_available():
+        pinned = batch.pin_memory()
+        assert pinned.features.ref_pos.is_pinned() and pinned.targets.coords.is_pinned()

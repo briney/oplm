@@ -93,14 +93,15 @@ def mup_lr_multiplier(name: str, param: torch.Tensor, config: OplmConfig) -> flo
     weights), μP readouts (``lm_head.decoder.weight``, ``classifier.weight``),
     norms, biases, and every non-2-D parameter take ``1.0``. Returns ``1.0``
     wholesale when μP is disabled, so param-group assembly is identical to the
-    non-μP path. Mirrors the role dispatch of width-aware init (Phase 2).
+    non-μP path (a config without μP knobs, such as ``FoldConfig``, takes the non-μP
+    path). Mirrors the role dispatch of width-aware init (Phase 2).
 
     Args:
         name: The parameter's dotted name from ``model.named_parameters()``.
         param: The parameter tensor (its ndim/fan-in select the role).
         config: The model config carrying the μP knobs.
     """
-    if not config.mup_enable:
+    if not getattr(config, "mup_enable", False):
         return 1.0
     if param.ndim != 2 or "embed" in name or name.endswith(_READOUT_WEIGHT_SUFFIXES):
         return 1.0

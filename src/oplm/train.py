@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping
 
     from oplm.config import OplmConfig
+    from oplm.training.task import TrainTask
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -83,11 +84,13 @@ def _bootstrap_training_environment(
     return _ensure_triton_cache_dir(runtime_env, home_dir=home_dir, tmp_dir=tmp_dir)
 
 
-def main(cfg: OplmConfig | None = None) -> None:
+def main(cfg: OplmConfig | None = None, *, task: TrainTask | None = None) -> None:
     """Run training.
 
     Args:
         cfg: Pre-loaded config. If None, parses from sys.argv.
+        task: Training task (model, dataloader, step). ``None`` is MLM. Fold runs enter through
+            ``oplm.fold.train``.
     """
     _bootstrap_training_environment()
 
@@ -98,7 +101,7 @@ def main(cfg: OplmConfig | None = None) -> None:
 
     from oplm.training import Trainer
 
-    trainer = Trainer(cfg)
+    trainer = Trainer(cfg, task=task)
     trainer.train()
 
 

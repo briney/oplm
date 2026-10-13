@@ -1,0 +1,14 @@
+...s..                                                                   [100%]
+=============================== warnings summary ===============================
+../../../mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/transformers/utils/hub.py:110
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+    warnings.warn(
+
+../../../mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488
+  /mnt/data/briney/fold-m2b/esm-venv/lib/python3.12/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/fold/test_esmc.py:85: esm is installed; the ImportError path is unreachable
+5 passed, 1 skipped, 2 warnings in 11.27s

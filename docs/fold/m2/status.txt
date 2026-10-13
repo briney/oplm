@@ -1,0 +1,15 @@
+venv 0
+install 0
+env 0
+download skipped
+esmc 0
+cpu-tests 0
+measure-w128 skipped
+measure-w256 skipped
+sweep-w128-b2 0
+sweep-w128-b4 0
+sweep-w128-b8 0
+sweep-w256-b2 0
+sweep-w256-b4 0
+sweep-w256-b8 0
+gpu-tests 0

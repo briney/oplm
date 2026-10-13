@@ -1,5 +1,5 @@
-"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``predict`` (design §5.2) and
-``preprocess``.
+"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``measure``, ``predict``
+(design §5.2), ``preprocess``, and ``train``.
 
 Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 """
@@ -350,6 +350,93 @@ def make_fixtures(
     console.print(f"[green]fixtures written to {path}[/green]")
 
 
+@app.command("measure")
+def measure(
+    config: Annotated[Path, typer.Option("--config", help="Run config YAML with a fold: block")],
+    out: Annotated[Path, typer.Option("--out", help="JSON report path")],
+    steps: Annotated[
+        int,
+        typer.Option(
+            help="Optimizer steps to run; step_time_s is per optimizer step (all accumulation "
+            "micro-steps)"
+        ),
+    ] = 20,
+    overrides: Annotated[list[str] | None, typer.Argument(help="Dotlist overrides")] = None,
+) -> None:
+    """Run a few real optimizer steps and record step time and peak memory (docs/FOLD.md §9).
+
+    A failed run still writes the records gathered so far, plus an "error" field, then re-raises.
+    """
+    from oplm.config import load_config
+    from oplm.fold.training import FoldTask, PeakMemoryCallback, require_fold
+    from oplm.training.trainer import Trainer
+
+    cfg = load_config(["--config", str(config), *(overrides or [])])
+    run = require_fold(cfg)
+    cfg.train.max_steps = steps
+    cfg.train.log_every = 1
+    cfg.train.save_every = 10**9
+    cfg.train.save_final = False
+    cfg.train.save_every_minutes = None
+    cfg.train.wandb_enabled = False
+    cfg.train.throughput_warmup_steps = min(3, steps - 1) if steps > 1 else 0
+    callback = PeakMemoryCallback()
+    task = FoldTask()
+    trainer = Trainer(cfg, task=task, callbacks=[callback])
+    error: str | None = None
+    try:
+        trainer.train()
+    except BaseException as exc:  # write the partial report below, then re-raise
+        error = repr(exc)
+        raise
+    finally:
+        device = trainer.accelerator.device
+        model = run.model or {}
+        records = callback.records
+        settled = [r for r in records if r["step"] > cfg.train.throughput_warmup_steps] or records
+        times = [r["step_time_s"] for r in settled if "step_time_s" in r]
+        cuda = device.type == "cuda"
+        step_time_s = (sum(times) / len(times)) if times else None
+        report: dict[str, Any] = {
+            "environment": _environment(device),
+            "settings": {
+                "steps": steps,
+                "pair_width": int(model.get("pair_width", 256)),
+                "trunk_blocks": int(model.get("trunk_blocks", 24)),
+                "lm": run.lm,
+                "crop_size": run.crop_size,
+                "batch_size": cfg.train.batch_size,
+                "gradient_accumulation_steps": cfg.train.gradient_accumulation_steps,
+                "diffusion_samples": run.diffusion_samples,
+                "diffusion_microbatch": run.diffusion_microbatch,
+                "confidence_rollout_steps": run.confidence_rollout_steps,
+                "mixed_precision": cfg.train.mixed_precision,
+                "num_processes": trainer.accelerator.num_processes,
+            },
+            "steps": records,
+            "peak_allocated_gib": (
+                max((r["peak_allocated_gib"] for r in records), default=None) if cuda else None
+            ),
+            "peak_reserved_gib": (
+                max((r["peak_reserved_gib"] for r in records), default=None) if cuda else None
+            ),
+            # Per optimizer step: includes all gradient_accumulation_steps micro-steps.
+            "step_time_s": step_time_s,
+            "micro_step_time_s": (
+                None if step_time_s is None else step_time_s / cfg.train.gradient_accumulation_steps
+            ),
+        }
+        if error is not None:
+            report["error"] = error
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, indent=1))
+        console.print(
+            f"wrote {out}  steps {steps}  step_time_s {report['step_time_s']} "
+            f"(per optimizer step, all accumulation micro-steps)  "
+            f"peak_allocated_gib {report['peak_allocated_gib']}"
+        )
+
+
 @app.command("predict")
 def predict(
     chains: Annotated[
@@ -455,3 +542,42 @@ def preprocess_cmd(
     table.add_row("splits", json.dumps(manifest["splits"]))
     table.add_row("shards", str(len(manifest["shards"])))
     console.print(table)
+
+
+@app.command("train")
+def train(
+    overrides: Annotated[
+        list[str] | None, typer.Argument(help="Dotlist overrides, e.g. train.max_steps=10")
+    ] = None,
+    config: Annotated[
+        Path | None, typer.Option("--config", help="Run config YAML with a fold: block")
+    ] = None,
+    name: Annotated[
+        str | None, typer.Option("--name", help="W&B run name and ./<name> output dir")
+    ] = None,
+) -> None:
+    """Train the structure head.
+
+    Single process; use `accelerate launch -m oplm.fold.train` for DDP.
+    """
+    from oplm.config import load_config
+
+    argv: list[str] = []
+    if config is not None:
+        argv += ["--config", str(config)]
+    if name is not None:
+        argv += ["--name", name]
+    argv += list(overrides or [])
+    cfg = load_config(argv)
+    if cfg.fold is None:
+        raise typer.BadParameter("the config has no fold: block (docs/FOLD.md §9)")
+    model = cfg.fold.model or {}
+    console.print(
+        f"[bold]Head:[/bold] pair_width {model.get('pair_width', 256)} / trunk_blocks "
+        f"{model.get('trunk_blocks', 24)}  [bold]LM:[/bold] {cfg.fold.lm}  "
+        f"[bold]crop:[/bold] {cfg.fold.crop_size}"
+    )
+    console.print(f"[bold]Output:[/bold] {cfg.train.output_dir}")
+    from oplm.fold.train import main as train_main
+
+    train_main(cfg)

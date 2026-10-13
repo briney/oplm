@@ -65,3 +65,11 @@ def test_module_subprocess_trains_and_exits_zero(training_parquet: Path, tmp_pat
 
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert (output_dir / "checkpoint-2").is_dir()
+
+
+def test_fold_entry_module_requires_a_fold_block() -> None:
+    from oplm.config import load_config
+    from oplm.fold.train import main
+
+    with pytest.raises(ValueError, match="fold:"):
+        main(load_config([]))

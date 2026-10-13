@@ -28,6 +28,8 @@ class FoldConfig(PretrainedConfig):
     ``trunk_dropout`` is the row-shared residual dropout inside every pair-update block
     (upstream ``DropoutResidual``, 0 in the release). ``inference_num_loops`` counts iterations
     executed (upstream's ``num_loops + 1``; spec default 10, the release runs 21).
+    ``distogram_{min,max}_dist`` are the training target's bin range (AF3/Boltz: 64 bins over
+    2-22 Å); they do not change the released head.
     """
 
     model_type = "oplm_fold"
@@ -94,6 +96,8 @@ class FoldConfig(PretrainedConfig):
         step_scale: float = 1.5,
         inference_num_samples: int = 1,
         distogram_bins: int = 64,
+        distogram_min_dist: float = 2.0,
+        distogram_max_dist: float = 22.0,
         confidence_blocks: int = 4,
         plddt_bins: int = 50,
         pae_bins: int = 64,
@@ -167,6 +171,8 @@ class FoldConfig(PretrainedConfig):
         self.step_scale = float(step_scale)
         self.inference_num_samples = int(inference_num_samples)
         self.distogram_bins = int(distogram_bins)
+        self.distogram_min_dist = float(distogram_min_dist)
+        self.distogram_max_dist = float(distogram_max_dist)
         self.confidence_blocks = int(confidence_blocks)
         self.plddt_bins = int(plddt_bins)
         self.pae_bins = int(pae_bins)
@@ -277,6 +283,8 @@ class FoldConfig(PretrainedConfig):
         for name in ("gamma_0", "gamma_min", "noise_scale", "recurrence_poisson_mean"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be >= 0; got {getattr(self, name)!r}.")
+        if not 0 < self.distogram_min_dist < self.distogram_max_dist:
+            raise ValueError("distogram_min_dist must be positive and below distogram_max_dist.")
         if not 0 < self.confidence_min_dist < self.confidence_max_dist:
             raise ValueError("confidence_min_dist must be positive and below confidence_max_dist.")
         if self.trimul_backend not in _VALID_TRIMUL_BACKENDS:

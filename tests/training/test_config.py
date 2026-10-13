@@ -711,3 +711,40 @@ def test_weight_diag_every_validation() -> None:
     with pytest.raises(ValueError, match="weight_diag_every"):
         TrainConfig(parallelism="hsdp", weight_diag_every=100)
     assert TrainConfig(weight_diag_every=100).weight_diag_every == 100
+
+
+# --- fold block (Task 6) ---------------------------------------------------------
+
+
+def test_fold_block_defaults_to_none_and_parses_from_overrides(tmp_path: Path) -> None:
+    from oplm.config import FoldRunConfig, load_config, serialize_config
+
+    assert load_config([]).fold is None
+    cfg = load_config(["fold.crop_size=256", "fold.model.pair_width=128", "fold.diffusion_microbatch=4"])
+    assert isinstance(cfg.fold, FoldRunConfig)
+    assert cfg.fold.crop_size == 256 and cfg.fold.diffusion_microbatch == 4
+    assert cfg.fold.model == {"pair_width": 128}
+    assert cfg.fold.lm == "esmc:esmc_600m" and cfg.fold.loss_confidence == 1e-4
+    path = tmp_path / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    assert "fold:" in path.read_text()
+    reloaded = load_config(["--config", str(path)])
+    assert reloaded.fold == cfg.fold
+
+
+def test_fold_block_validates_its_fields() -> None:
+    from oplm.config import FoldRunConfig
+
+    with pytest.raises(ValueError, match="crop_size"):
+        FoldRunConfig(crop_size=100)
+    with pytest.raises(ValueError, match="contiguous_prob"):
+        FoldRunConfig(contiguous_prob=1.5)
+    with pytest.raises(ValueError, match="diffusion_microbatch"):
+        FoldRunConfig(diffusion_microbatch=0)
+    with pytest.raises(ValueError, match="loss_"):
+        FoldRunConfig(loss_distogram=-1.0)
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="loss_confidence must be finite and >= 0"):
+            FoldRunConfig(loss_confidence=bad)
+    with pytest.raises(ValueError, match="lm"):
+        FoldRunConfig(lm="")

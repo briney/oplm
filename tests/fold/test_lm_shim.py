@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 from oplm.fold.configuration_fold import FoldConfig
-from oplm.fold.data.featurize import ChainSpec, featurize
+from oplm.fold.data.collate import collate_examples
+from oplm.fold.data.featurize import ChainSpec, FoldExample, FoldTargets, featurize
 from oplm.fold.lm_shim import (
     LanguageModelShim,
     SingleToPair,
     frozen_lm_hidden_states,
     lm_state_count,
+    mask_lm_inputs,
 )
+from oplm.model.tokenization_oplm import VOCAB
 from tests.fold.helpers import tiny_lm
 
 
@@ -86,3 +90,58 @@ def test_frozen_lm_hidden_states_gathers_per_chain_rows() -> None:
 
 def test_state_count_follows_the_executed_depth() -> None:
     assert lm_state_count(tiny_lm(num_loops=2)) == 5  # 2 layers x 2 loops + embedding
+
+
+def _targets(features) -> FoldTargets:
+    L, A = features.num_tokens, features.num_atoms
+    return FoldTargets(
+        coords=torch.zeros(1, A, 3),
+        resolved=torch.zeros(1, A, dtype=torch.bool),
+        bfactor=torch.zeros(1, A),
+        frame_atom_idx=torch.zeros(1, L, 3, dtype=torch.long),
+    )
+
+
+def test_frozen_lm_states_gather_a_batch_like_single_examples() -> None:
+    lm = tiny_lm()
+    a = featurize([ChainSpec("MKVLA", "A")])
+    b = featurize([ChainSpec("GGS", "B"), ChainSpec("WW", "C")])
+    batch = collate_examples(
+        [FoldExample("a", a, _targets(a)), FoldExample("b", b, _targets(b))], crop_size=8
+    )
+    states = frozen_lm_hidden_states(lm, batch.features)
+    assert states.shape == (2, 8, 3, 32)
+    torch.testing.assert_close(states[0, :5], frozen_lm_hidden_states(lm, a)[0])
+    torch.testing.assert_close(states[1, :5], frozen_lm_hidden_states(lm, b)[0])
+    assert states[:, 5:].abs().sum() == 0  # padded tokens are zero
+
+
+def test_frozen_lm_states_accept_a_stacked_hidden_state_tensor() -> None:
+    class _Stacked(nn.Module):
+        num_hidden_states = 3
+
+        def forward(
+            self, input_ids, attention_mask=None, output_hidden_states=True, return_dict=True
+        ):
+            x = torch.ones(*input_ids.shape, 4) * input_ids[..., None].float()
+            return type("Out", (), {"hidden_states": torch.stack([x, 2 * x, 3 * x])})()
+
+    f = featurize([ChainSpec("MKV", "A")])
+    states = frozen_lm_hidden_states(_Stacked(), f)
+    assert states.shape == (1, 3, 3, 4) and lm_state_count(_Stacked()) == 3
+    torch.testing.assert_close(states[0, 0, 1], 2 * f.lm_input_ids[0, 1].float() * torch.ones(4))
+
+
+def test_lm_input_masking_touches_only_inner_positions() -> None:
+    """Review Focus 5: BOS, EOS and padding are never masked; fraction 0 is the identity."""
+    f = featurize([ChainSpec("MKVLAG", "A"), ChainSpec("WW", "B")])
+    torch.manual_seed(0)
+    masked = mask_lm_inputs(f, 1.0, VOCAB["<mask>"])
+    ids, mask = masked.lm_input_ids, f.lm_attention_mask.bool()
+    lengths = mask.sum(1)
+    for row in range(ids.shape[0]):
+        assert ids[row, 0] == VOCAB["<cls>"] and ids[row, lengths[row] - 1] == VOCAB["<eos>"]
+        assert (ids[row, 1 : lengths[row] - 1] == VOCAB["<mask>"]).all()
+        assert torch.equal(ids[row, lengths[row] :], f.lm_input_ids[row, lengths[row] :])
+    assert torch.equal(mask_lm_inputs(f, 0.0, VOCAB["<mask>"]).lm_input_ids, f.lm_input_ids)
+    assert masked.token_mask is f.token_mask  # everything but the ids is shared

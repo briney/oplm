@@ -207,7 +207,7 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
     if (
         cfg.optimizer == "muon"
         and cfg.muon_adjust_lr_fn == "match_rms_adamw"
-        and cast("OplmConfig", model.config).mup_enable
+        and getattr(model.config, "mup_enable", False)
     ):
         raise ValueError(
             "μP with Muon requires muon_adjust_lr_fn='original' (the default; got "

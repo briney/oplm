@@ -12,6 +12,7 @@ batch row with BOS/EOS (spec §4.5) instead of one packed row per complex.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,7 +27,13 @@ if TYPE_CHECKING:
     from oplm.fold.configuration_fold import FoldConfig
     from oplm.fold.data.featurize import FoldFeatures
 
-__all__ = ["LanguageModelShim", "SingleToPair", "frozen_lm_hidden_states", "lm_state_count"]
+__all__ = [
+    "LanguageModelShim",
+    "SingleToPair",
+    "frozen_lm_hidden_states",
+    "lm_state_count",
+    "mask_lm_inputs",
+]
 
 
 class SingleToPair(nn.Module):
@@ -67,18 +74,27 @@ class LanguageModelShim(nn.Module):
 
 
 def lm_state_count(lm: nn.Module) -> int:
-    """Number of hidden states an ``OplmModel`` returns: executed blocks + the embedding output."""
+    """Number of hidden states ``lm`` returns.
+
+    A module that declares ``num_hidden_states`` (the ESM-C adapter) is believed; an
+    ``OplmModel`` returns its executed blocks plus the embedding output.
+    """
+    declared = getattr(lm, "num_hidden_states", None)
+    if declared is not None:
+        return int(declared)
     return len(lm.backbone.layer_execution_order) + 1  # ty: ignore[unresolved-attribute, invalid-argument-type]  # nn.Module attrs are Tensor | Module
 
 
 def frozen_lm_hidden_states(
     lm: nn.Module, features: FoldFeatures, *, dtype: torch.dtype | None = None
 ) -> Tensor:
-    """Run the frozen LM on the per-chain rows and gather every state per token: ``(1, L, K, D)``.
+    """Run the frozen LM on the per-chain rows and gather every state per token: ``(B, L, K, D)``.
 
-    The LM must already be in eval mode on the features' device (the fold model owns that).
-    Padded tokens are zero. Runs under ``torch.no_grad`` (not inference mode: the OPLM RoPE
-    cache re-assigns buffers lazily).
+    ``features.lm_rows`` names each token's row in the batch-wide LM stack (the collator offsets
+    it per example) and ``lm_positions`` its position inside that row. ``out.hidden_states`` may
+    be a sequence of ``(C, T, D)`` tensors (OPLM) or one ``(K, C, T, D)`` tensor (ESM-C). The LM
+    must already be in eval mode on the features' device. Padded tokens are zero. Runs under
+    ``torch.no_grad`` (not inference mode: the OPLM RoPE cache re-assigns buffers lazily).
     """
     with torch.no_grad():
         out = lm(
@@ -90,6 +106,24 @@ def frozen_lm_hidden_states(
     states = torch.stack(tuple(out.hidden_states), dim=2)  # (C, T, K, D)
     if dtype is not None:
         states = states.to(dtype)
-    gathered = states[features.lm_rows[0], features.lm_positions[0]]  # (L, K, D)
-    gathered = gathered * features.token_mask[0][:, None, None].to(gathered.dtype)
-    return gathered[None]
+    gathered = states[features.lm_rows, features.lm_positions]  # (B, L, K, D)
+    return gathered * features.token_mask[..., None, None].to(gathered.dtype)
+
+
+def mask_lm_inputs(features: FoldFeatures, fraction: float, mask_id: int) -> FoldFeatures:
+    """Replace a ``fraction`` of inner residue ids on every LM row with ``mask_id`` (spec §6.1).
+
+    BOS (position 0), EOS (the last attended position) and padding are never masked. Draws from
+    the global torch RNG, which the Trainer seeds and ``FoldTask`` offsets per rank.
+    ``fraction <= 0`` returns ``features`` unchanged.
+    """
+    if fraction <= 0:
+        return features
+    ids, attended = features.lm_input_ids, features.lm_attention_mask.bool()
+    inner = attended.clone()
+    inner[:, 0] = False
+    last = attended.sum(dim=1) - 1
+    inner[torch.arange(ids.shape[0], device=ids.device), last] = False
+    draw = torch.rand(ids.shape, device=ids.device) < fraction
+    masked = torch.where(inner & draw, torch.full_like(ids, mask_id), ids)
+    return replace(features, lm_input_ids=masked)

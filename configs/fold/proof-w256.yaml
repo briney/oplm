@@ -1,0 +1,51 @@
+# Milestone-2 pipeline proof, pair width 256 (addendum §6; docs/FOLD.md §9). Train from the
+# published dataset: hf download brineylab/oplmfold-training-data --repo-type dataset \
+#   --revision wwpdb-2026-10-12 --include "wwpdb/2026-10-12/*" --local-dir $OPLM_DATA/hf
+# and point data.train at $OPLM_DATA/hf/wwpdb/2026-10-12 (override on the command line).
+# train.batch_size and gradient_accumulation_steps come from the milestone-2b B200 batch sweep
+# (docs/fold/m2/README.md); max_steps is spec §6.3's stage-1 budget.
+fold:
+  lm: esmc:esmc_600m          # 36 blocks, width 1152 -> 37 hidden states (inferred at load)
+  lm_max_chain_length: 1024
+  model:
+    pair_width: 256
+    trunk_blocks: 24
+    lm_encoder_blocks: 4
+    coda_blocks: 2
+    confidence_blocks: 4
+    inference_num_loops: 10
+  crop_size: 384
+  contiguous_prob: 0.5
+  diffusion_samples: 8
+  diffusion_microbatch: 4
+  confidence_rollout_steps: 20
+  loss_diffusion_mse: 4.0
+  loss_smooth_lddt: 1.0
+  loss_distogram: 0.03
+  loss_confidence: 1.0e-4
+  loss_pae: 1.0
+train:
+  optimizer: adamw            # μP/Muon are the MLM defaults; the head trains with plain AdamW
+  lr: 1.0e-3
+  min_lr: 0.0
+  warmup_steps: 1000
+  scheduler: warmup_linear
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  batch_size: 4               # per device
+  gradient_accumulation_steps: 4    # 8 devices x 4 x 4 = 128 (spec §6.3); 67.7 GiB peak, 17.3 s/step on a B200
+  max_steps: 50000
+  ema_decay: 0.999
+  mixed_precision: bf16
+  seed: 0
+  save_every: 2000
+  save_total_limit: 3
+  keep_every_n_steps: 10000
+  log_every: 10
+  wandb_project: oplm-fold
+  output_dir: outputs/fold-proof-w256
+data:
+  train: /mnt/data/briney/oplm-data/hf/wwpdb/2026-10-12
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 4
