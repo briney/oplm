@@ -168,3 +168,36 @@ def test_fold_train_runs_a_tiny_cpu_run_from_a_config(
 def test_fold_train_refuses_a_config_without_a_fold_block(tmp_path: Path) -> None:
     result = runner.invoke(app, ["fold", "train", "train.max_steps=1"])
     assert result.exit_code != 0 and "fold:" in plain(result.output)
+
+
+def test_fold_measure_writes_a_report(
+    tmp_path: Path, fixture_dataset: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
+    lm_dir = tmp_path / "lm"
+    tiny_lm().save_pretrained(lm_dir)
+    config = tmp_path / "run.yaml"
+    config.write_text(
+        serialize_config(tiny_fold_run_cfg(tmp_path / "run", fixture_dataset, lm_dir))
+    )
+    out = tmp_path / "measure.json"
+    result = runner.invoke(
+        app, ["fold", "measure", "--config", str(config), "--steps", "2", "--out", str(out)]
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads(out.read_text())
+    assert report["settings"]["steps"] == 2 and len(report["steps"]) == 2
+    assert all(torch.isfinite(torch.tensor(s["loss"])) for s in report["steps"])
+    assert report["environment"]["torch"] and "git" in report["environment"]
+    assert report["settings"]["pair_width"] == 32 and report["settings"]["crop_size"] == 128
+    assert report["peak_allocated_gib"] is None  # CPU run
+
+
+@pytest.mark.parametrize("width", [128, 256])
+def test_proof_configs_load(width: int) -> None:
+    from oplm.config import load_config
+
+    cfg = load_config(["--config", f"configs/fold/proof-w{width}.yaml"])
+    assert cfg.fold is not None and cfg.fold.model["pair_width"] == width
+    assert cfg.train.optimizer == "adamw" and cfg.train.ema_decay == 0.999
+    assert cfg.fold.crop_size == 384

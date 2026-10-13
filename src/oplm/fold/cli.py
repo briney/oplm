@@ -1,5 +1,5 @@
-"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``predict`` (design §5.2),
-``preprocess``, and ``train``.
+"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``measure``, ``predict``
+(design §5.2), ``preprocess``, and ``train``.
 
 Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 """
@@ -348,6 +348,72 @@ def make_fixtures(
         raise typer.BadParameter(f"no fixture case matches {cases!r}")
     path = generate_fixtures(out, repo=repo, revision=revision, cases=chosen, seed=seed)
     console.print(f"[green]fixtures written to {path}[/green]")
+
+
+@app.command("measure")
+def measure(
+    config: Annotated[Path, typer.Option("--config", help="Run config YAML with a fold: block")],
+    out: Annotated[Path, typer.Option("--out", help="JSON report path")],
+    steps: Annotated[int, typer.Option(help="Optimizer steps to run")] = 20,
+    overrides: Annotated[list[str] | None, typer.Argument(help="Dotlist overrides")] = None,
+) -> None:
+    """Run a few real optimizer steps and record step time and peak memory (docs/FOLD.md §9)."""
+    import torch
+
+    from oplm.config import load_config
+    from oplm.fold.training import FoldTask, PeakMemoryCallback, require_fold
+    from oplm.training.trainer import Trainer
+
+    cfg = load_config(["--config", str(config), *(overrides or [])])
+    run = require_fold(cfg)
+    cfg.train.max_steps = steps
+    cfg.train.log_every = 1
+    cfg.train.save_every = 10**9
+    cfg.train.save_final = False
+    cfg.train.save_every_minutes = None
+    cfg.train.wandb_enabled = False
+    cfg.train.throughput_warmup_steps = min(3, steps - 1) if steps > 1 else 0
+    callback = PeakMemoryCallback()
+    task = FoldTask()
+    trainer = Trainer(cfg, task=task, callbacks=[callback])
+    trainer.train()
+    device = trainer.accelerator.device
+    model = run.model or {}
+    records = callback.records
+    settled = [r for r in records if r["step"] > cfg.train.throughput_warmup_steps] or records
+    times = [r["step_time_s"] for r in settled if "step_time_s" in r]
+    cuda = torch.cuda.is_available()
+    report = {
+        "environment": _environment(device),
+        "settings": {
+            "steps": steps,
+            "pair_width": int(model.get("pair_width", 256)),
+            "trunk_blocks": int(model.get("trunk_blocks", 24)),
+            "lm": run.lm,
+            "crop_size": run.crop_size,
+            "batch_size": cfg.train.batch_size,
+            "gradient_accumulation_steps": cfg.train.gradient_accumulation_steps,
+            "diffusion_samples": run.diffusion_samples,
+            "diffusion_microbatch": run.diffusion_microbatch,
+            "confidence_rollout_steps": run.confidence_rollout_steps,
+            "mixed_precision": cfg.train.mixed_precision,
+            "num_processes": trainer.accelerator.num_processes,
+        },
+        "steps": records,
+        "peak_allocated_gib": (
+            max((r["peak_allocated_gib"] for r in records), default=None) if cuda else None
+        ),
+        "peak_reserved_gib": (
+            max((r["peak_reserved_gib"] for r in records), default=None) if cuda else None
+        ),
+        "step_time_s": (sum(times) / len(times)) if times else None,
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=1))
+    console.print(
+        f"wrote {out}  steps {steps}  step_time_s {report['step_time_s']}  "
+        f"peak_allocated_gib {report['peak_allocated_gib']}"
+    )
 
 
 @app.command("predict")
