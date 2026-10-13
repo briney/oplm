@@ -19,6 +19,8 @@ from tests.training.conftest import FullRecordingCallback, configure_accelerator
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from oplm.fold.data.collate import FoldBatch
+
 
 @pytest.fixture(scope="module")
 def lm_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
@@ -36,6 +38,24 @@ class _Recording(FoldTask):
         result = super().step(model, batch)
         self.ids.append(list(batch.ids))
         return result
+
+
+class _FixedBatchTask(FoldTask):
+    """Trains on one repeated batch and scores it under a fixed seed, so progress is measurable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fixed: FoldBatch | None = None
+
+    def step(self, model, batch) -> StepResult:
+        return super().step(model, self.fixed)
+
+    def score(self, model, seed: int = 123) -> float:
+        """Loss of the fixed batch in train mode under ``seed`` (noise, masks, loops repeat)."""
+        model.train()
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            return float(super().step(model, self.fixed).loss)
 
 
 def test_build_fold_config_infers_lm_shape_and_rejects_bad_keys() -> None:
@@ -113,12 +133,17 @@ def test_trainer_overfits_one_chain(
         tmp_path / "run", fixture_dataset, lm_dir, max_steps=40, batch_size=1, lr=2e-3
     )
     cfg.data.train = str(fixture_dataset)
+    cfg.train.scheduler, cfg.train.stable_steps = "wsd_linear", 40  # constant lr: no decay
+    task = _FixedBatchTask()
+    task.fixed = next(iter(task.build_dataloader(cfg)))
     callback = FullRecordingCallback()
-    trainer = Trainer(cfg, task=FoldTask(), callbacks=[callback])
+    trainer = Trainer(cfg, task=task, callbacks=[callback])
+    before = task.score(trainer.model)
     trainer.train()
+    after = task.score(trainer.model)
     losses = [m["train/loss"] for _, m in callback.train_logs]
     assert len(losses) == 40 and all(torch.isfinite(torch.tensor(losses)).tolist())
-    assert sum(losses[-5:]) / 5 < sum(losses[:5]) / 5
+    assert after < 0.9 * before, (before, after)
     assert "train/distogram" in callback.train_logs[0][1]
 
 
