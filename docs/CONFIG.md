@@ -17,6 +17,9 @@ A run config has three top-level blocks, each mapping to a different object:
 | `train.*` | `oplm.config.TrainConfig` (dataclass)        | Optimizer, schedule, logging, checkpointing. |
 | `data.*`  | `oplm.config.DataConfig` (dataclass)         | Datasets, masking, DataLoader. |
 
+Structure-head runs add an optional fourth block, `fold.*`
+(`oplm.config.FoldRunConfig`; see [Fold fields](#fold-fields-fold)), which is `null` for MLM runs.
+
 Only the `model.*` block travels with a saved model. `train.*` and `data.*`
 describe a *run* and are not part of a published checkpoint.
 
@@ -423,6 +426,39 @@ clinical-substitution CSVs (`protein_sequence`, `mutant`, `DMS_bin_score`).
 
 Registered but currently documented stubs; they consume no task-specific keys
 yet. See [EVAL_HARNESS.md](EVAL_HARNESS.md) for status.
+
+## Fold fields (`fold.*`)
+
+Backed by `oplm.config.FoldRunConfig`; the structure-head training block
+([FOLD.md §9](FOLD.md#9-milestone-2b-losses-and-training-oplmfoldlosses-oplmfoldtraining)). The
+block is absent (`null`) for MLM runs, so `oplm train` is unchanged; `oplm fold train`,
+`python -m oplm.fold.train` and `oplm fold measure` require it and raise without it. Unknown
+`fold.*` keys are rejected at load time. In a fold run every `data.train` entry is a structure
+shard directory (see [FOLD.md §8](FOLD.md#8-milestone-2a-training-data-oplmfolddata)) and the
+top-level `model.*` block (the MLM architecture) is not used.
+
+| Override | Type | Default | Valid values / notes |
+| --- | --- | --- | --- |
+| `fold.lm` | `str` | `esmc:esmc_600m` | The frozen language model: `esmc:<name>` (`esmc_300m`, `esmc_600m`, `esmc_6b`; needs `oplm[esmc]` on Python `≥ 3.12` and a Hugging Face login for the gated weights), an OPLM checkpoint path, or a Hub id. Must be non-empty. |
+| `fold.lm_revision` | `str \| null` | `null` | Hub revision of the LM weights; recorded in the saved head's config. |
+| `fold.lm_max_chain_length` | `int` | `1024` | Longest full chain the data pipeline samples (the LM reads the whole chain, not the crop); `≥ 1`. |
+| `fold.model` | `dict` | `{}` | `FoldConfig` overrides (`pair_width`, `trunk_blocks`, `inference_num_loops`, ...). Keys are `FoldConfig` constructor names, validated when the model is built (`build_fold_config` in `oplm.fold.training`): an unknown key raises, and the LM identity fields (`lm_name_or_path`, `lm_revision`, `lm_max_chain_length`) come from `fold.lm*` and may not be set here. Unset fields take the ESMFold2-Fast defaults; `lm_hidden_size` and `lm_num_hidden_states` are inferred from the loaded LM. |
+| `fold.crop_size` | `int` | `384` | Tokens per crop; a positive multiple of 128. |
+| `fold.contiguous_prob` | `float` | `0.5` | Probability a crop is a contiguous window rather than a spatial crop; in `[0, 1]`. |
+| `fold.atoms_per_token_budget` | `int` | `24` | Atom-axis budget per token: batches pad atoms to `atoms_per_token_budget × crop_size` rounded up to `fold.model.atom_pad_multiple` (32), and an example over the budget is rejected, not truncated; `≥ 1`. |
+| `fold.diffusion_samples` | `int` | `8` | Noised copies of each example denoised per step; `≥ 1`. |
+| `fold.diffusion_microbatch` | `int \| null` | `null` | Samples per denoiser call; `null` denoises all samples at once. Several microbatches run under activation checkpointing; one (`null` or `≥ diffusion_samples`) does not. `≥ 1` when set. |
+| `fold.confidence_rollout_steps` | `int` | `20` | Sampler steps of the no-grad rollout the confidence head is scored on; `≥ 1`. |
+| `fold.loss_diffusion_mse` | `float` | `4.0` | Weight of the EDM-weighted diffusion MSE; `≥ 0`. |
+| `fold.loss_smooth_lddt` | `float` | `1.0` | Weight of the smooth-lDDT term; `≥ 0`. |
+| `fold.loss_distogram` | `float` | `0.03` | Weight of the distogram cross-entropy; `≥ 0`. |
+| `fold.loss_confidence` | `float` | `1e-4` | Weight of the confidence composite (pLDDT + PDE + resolved + `loss_pae` × PAE); `≥ 0`. |
+| `fold.loss_pae` | `float` | `1.0` | Weight of the PAE sub-term inside the confidence composite; `≥ 0`. |
+
+Set `train.optimizer=adamw` explicitly in a fold run: the packaged `train` defaults are μP + Muon
+(`optimizer: muon`, `muon_adjust_lr_fn: original`), tuned for the MLM, and the head trains with plain
+AdamW. [`configs/fold/proof-w128.yaml`](../configs/fold/proof-w128.yaml) and
+[`proof-w256.yaml`](../configs/fold/proof-w256.yaml) are the complete milestone-2 run configs.
 
 ## Examples
 

@@ -3,9 +3,10 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
-Kernels, the model, prediction and the training data pipeline exist (§7 holds the M1 acceptance
-evidence, §8 the data contract); losses and training land in milestone 2b.
+this file records what is implemented. **Status: milestone 2b (losses and training) implemented, GPU measurement pending; milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
+Kernels, the model, prediction, the training data pipeline, the losses and the training step exist
+(§7 holds the M1 acceptance evidence, §8 the data contract, §9 the losses and training; the
+single-B200 cost measurement of §9 is still to be run).
 
 ## 1. Package layout (implemented so far)
 
@@ -14,6 +15,7 @@ src/oplm/fold/
 ├── configuration_fold.py   # FoldConfig (released ESMFold2-Fast defaults)
 ├── modeling_fold.py        # OplmFoldPreTrainedModel, OplmForFolding, frozen-LM ownership
 ├── lm_shim.py              # per-layer LN + proj, softmax layer mix, LM -> pair
+├── esmc.py                 # frozen ESM-C adapter (FrozenEsmC, load_esmc; extra oplm[esmc])
 ├── pair.py                 # block-local pair features
 ├── trimul.py               # staged triangle multiplication + cuEquivariance dispatch
 ├── trunk.py                # pair update block, pair stack, contractive recurrence
@@ -21,9 +23,12 @@ src/oplm/fold/
 ├── attention.py            # pair-biased / sliding-window attention: FlexAttention + dense oracle
 ├── diffusion.py            # DiT, EDM schedule, sampler
 ├── confidence.py           # confidence + distogram heads, pTM/ipTM
+├── losses.py               # diffusion MSE, smooth lDDT, distogram and confidence losses (fp32)
+├── training.py             # FoldTask, build_fold_config, PeakMemoryCallback
+├── train.py                # python -m oplm.fold.train entry point
 ├── predict.py              # fold(), mmCIF writer
 ├── fixtures.py             # ESMFold2 golden-fixture generator (runs in the esm venv)
-├── cli.py                  # oplm fold bench-kernels | make-fixtures | predict | preprocess
+├── cli.py                  # oplm fold bench-kernels | make-fixtures | measure | predict | preprocess | train
 └── data/
     ├── ccd.py              # residue vocabulary, reference conformers, ChemCompTable (CCD parents)
     ├── complex.py          # MolecularComplex (flat atoms/tokens/bonds) + Parquet row
@@ -33,6 +38,7 @@ src/oplm/fold/
     ├── collate.py          # FoldBatch under the atom budget
     └── dataset.py          # oplm fold preprocess + StructureDataset (resume contract)
 tests/fold/                 # mirrors the above; tests/fixtures/fold/ holds real entries
+tests/fold/oracles/         # frozen Boltz-2 loss functions the losses are checked against (§9)
 ```
 
 Dependency direction: `oplm.fold` imports core packages; core imports nothing
@@ -98,11 +104,11 @@ must bucket shapes (crops are multiples of 128), accept a precomputed `BlockMask
 ## 4. Training seam and EMA
 
 The Trainer builds the model/dataloader and runs a step through a `TrainTask`
-(`docs/TRAIN.md` §17); `FoldTask` lands in milestone 2. `train.ema_decay` keeps an
-EMA of the trainable weights, updated once per optimizer step, saved as `ema.pt` and
-exported as `hf_ema/` with every checkpoint (`docs/TRAIN.md` §16). The frozen LM
-will be an unregistered attribute of the fold model and must be excluded from the
-EMA's deep copy (milestone 1).
+(`docs/TRAIN.md` §17); the structure head's `FoldTask` is described in §9. `train.ema_decay`
+keeps an EMA of the trainable weights, updated once per optimizer step, saved as `ema.pt` and
+exported as `hf_ema/` with every checkpoint (`docs/TRAIN.md` §16). The frozen LM is an
+unregistered attribute of the fold model that `__deepcopy__` shares instead of copying, so the
+EMA never holds a second LM (milestone 1).
 
 ## 5. Kernel benchmark
 
@@ -399,3 +405,70 @@ a run trained on. Acceptance evidence lives in [`docs/fold/m2a/`](fold/m2a/).
 **Published:** `wwpdb/2026-10-12` at tag `wwpdb-2026-10-12` (commit `0fad20d4`):
 254,424 entries, 1,080,220 chains, 82 shards, 37 GiB, preprocessed from the 2026-10-12 archive
 snapshot with `feat/fold-m2a` at e0ea2fd. Held-out splits: `cameo` 744 entries, `casp14` 128.
+
+## 9. Milestone 2b: losses and training (`oplm.fold.losses`, `oplm.fold.training`)
+
+Implements spec §6.1–6.4 for stage 1 under the
+[M2 addendum](superpowers/specs/2026-10-11-fold-m2-pipeline-proof-design.md) §2, §3 and §5.
+
+**One training step** (spec §6.1) runs inside `OplmForFolding.forward(features, targets=...)` so
+DDP synchronizes through one forward. In train mode 10 % of the inner residue ids on the LM rows
+are masked (id 32; never BOS, EOS or padding), the loop count is a clamped Poisson draw per rank
+(mean 3, 1–6; eval uses `inference_num_loops`), the trunk runs as at inference (gradient through
+the last 2 loops, per-loop LM-pair dropout), and the distogram logits come from the symmetrized
+final pair. Then `diffusion_samples` copies of the reference are centred, randomly rotated and
+translated, noised at `σ = 16 · exp(N(−1.2, 1.5))` and denoised once each, in microbatches of
+`diffusion_microbatch` samples (each microbatch runs under `torch.utils.checkpoint` when there are
+several, so the sample count never multiplies live memory; the per-sample losses are averaged, so
+the microbatch size does not change the objective). A `confidence_rollout_steps`-step sampler
+rollout runs without gradient and the confidence head scores it on detached trunk outputs.
+`FoldTrainOutput` carries the weighted loss, the detached per-term metrics, the valid token count
+and the example (chain) count. The branch runs whenever `targets` is given; masking, the Poisson
+draw and dropout still follow `self.training`.
+
+**Losses** (`losses.py`; all fp32 with any outer autocast off, one value per sample, finite on
+empty masks) and their conventions:
+
+| term | definition | weight |
+|---|---|---|
+| diffusion MSE | reference aligned onto the prediction (detached), `Σ w ‖Δ‖² / (3 Σ w)` over resolved atoms, times the EDM weight `(σ² + σ_d²) / (σ σ_d)²` | `loss_diffusion_mse` 4.0 |
+| smooth lDDT | pairs under 15 Å in the reference, both atoms resolved, `i ≠ j`; `1 − mean ¼ Σ_t sigmoid(t − \|Δd\|)` for `t` in 0.5, 1, 2, 4 Å | `loss_smooth_lddt` 1.0 |
+| distogram | representative-atom (CB, CA for glycine) distances in 64 bins over 2–22 Å (`distogram_{min,max}_dist`), masked mean cross-entropy | `loss_distogram` 0.03 |
+| confidence | pLDDT (per-atom lDDT against the token CA atoms within 15 Å, 50 bins) + PDE (representative-atom distance error, 64 bins over 0–32 Å) + resolved (class 0 = resolved) + `loss_pae` × PAE (token CA in the N–CA–C frame of the other token, 64 bins over 0–32 Å; frames need resolved, non-collinear atoms) | `loss_confidence` 1e-4 |
+
+The confidence terms train only the confidence head. Oracles: Boltz-2 (`boltz==2.2.1`) loss
+functions vendored under [`tests/fold/oracles/`](../tests/fold/oracles/README.md) (test code only;
+attribution in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)); parity, rigid-transform
+recovery, mask and degeneracy tests in `tests/fold/test_losses.py`.
+
+**Frozen ESM-C** (`esmc.py`, addendum §3): `fold.lm: esmc:esmc_600m` loads `biohub/ESMC-600M`
+through the `esm` package (`oplm[esmc]`, Python ≥ 3.12; the weights are gated behind the Cambrian
+license) wrapped as `FrozenEsmC`, which exposes `num_hidden_states = num_hidden_layers + 1`: the
+package returns every block input (the embedding output first) plus the final post-norm output,
+so 600M gives 37 states of width 1152. `lm_hidden_size` and `lm_num_hidden_states` are inferred
+from the loaded LM when `fold.model` does not set them.
+
+**Run config and CLI.** A run is an ordinary `OplmConfig` plus a `fold:` block
+([`CONFIG.md`](CONFIG.md#fold-fields-fold)); every `data.train` entry is a structure shard
+directory. `oplm fold train --config run.yaml [overrides]` runs one process and
+`accelerate launch -m oplm.fold.train --config run.yaml` runs DDP; both build
+`Trainer(cfg, task=FoldTask())`. `FoldTask.build_model` builds the head from `fold.model`
+(`build_fold_config`), attaches the frozen LM on the process device (bf16 on CUDA), enables
+block-level checkpointing of the pair stacks and, with `train.init_from`, loads a saved `hf/` or
+`hf_ema/` head whose architecture must match the run's `fold.model`. EMA, checkpoints (`hf/` and
+`hf_ema/`), resume (step, data cursor, EMA, RNG) and DDP come from the Trainer unchanged;
+`tests/fold/test_training.py` and `test_training_distributed.py` exercise them on CPU.
+`flops_per_token` is `None` (the cost depends on crop, loops and sample count), so the
+FLOP-derived metrics are not logged.
+
+**Measurement.** `oplm fold measure --config configs/fold/proof-w128.yaml --steps 20 --out m.json`
+runs real optimizer steps and writes a JSON report (`environment`, `settings`, per-log `steps`,
+`peak_allocated_gib`, `peak_reserved_gib`, mean `step_time_s`);
+[`docs/fold/b200-m2b-measure.sbatch`](fold/b200-m2b-measure.sbatch) runs it for
+`configs/fold/proof-w128.yaml` and `proof-w256.yaml` on one B200 and then the GPU-marked fold
+tests. The results and the per-device batch, accumulation and step budget derived from them for
+milestone 2c are recorded in [`docs/fold/m2/`](fold/m2/).
+
+**Deviations, all deliberate** (addendum §2). Four loss terms (no bond term, no interface
+weighting); single-chain examples, so no atom-symmetry correction; block-level checkpointing only;
+the ESM-C head is not transferable to OPLM.

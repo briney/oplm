@@ -853,8 +853,12 @@ FLOP estimate — lives behind `oplm.training.task.TrainTask`:
 `MLMTask` is the default (`Trainer(cfg)`), and reproduces the pre-seam behaviour
 exactly. `StepResult.metrics` are logged as `train/<key>`, averaged over the log
 window; the keys the trainer emits itself (`loss`, `lr`, `epoch`, `samples`,
-`tokens`, `flops`, ...) are reserved. The folding head's `FoldTask`
-(docs/FOLD.md) is the second implementation.
+`tokens`, `flops`, ...) are reserved.
+
+`FoldTask` (`oplm.fold.training`) is the second implementation: `oplm fold train` /
+`python -m oplm.fold.train` build `Trainer(cfg, task=FoldTask())`; batches are `FoldBatch` objects
+moved through their own `.to`, and `train/<term>` metrics come from `StepResult.metrics`
+([FOLD.md §9](FOLD.md#9-milestone-2b-losses-and-training-oplmfoldlosses-oplmfoldtraining)).
 
 ---
 

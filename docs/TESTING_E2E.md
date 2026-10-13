@@ -16,9 +16,9 @@ Tests mirror the source layout under `tests/`:
 | `tests/training/` | The real `Trainer`: logging, checkpoint rotation/resume, gradient accumulation, epochs, mixed precision, `torch.compile`, optimizers/schedulers, grad clipping, eval scheduling, W&B. |
 | `tests/eval/` | Eval harness: scheduling cadences, sequence/structure tasks, the registry, token accounting, the categorical Jacobian, trainer integration. |
 | `tests/data/` | Data pipeline: dataloaders, collation, MLM masking, determinism, weighted-masking invariants, import hygiene. |
-| `tests/fold/` | Structure head: kernels, the ESMFold2 port, prediction, and the data pipeline (`tests/fold/data/`: CCD table, `MolecularComplex`, mmCIF parsing on the real entries under `tests/fixtures/fold/`, crops, featurization with targets, collation, preprocessing and `StructureDataset` resume). GPU parity tests are `slow` and skip without CUDA. |
+| `tests/fold/` | Structure head: kernels, the ESMFold2 port, prediction, and the data pipeline (`tests/fold/data/`: CCD table, `MolecularComplex`, mmCIF parsing on the real entries under `tests/fixtures/fold/`, crops, featurization with targets, collation, preprocessing and `StructureDataset` resume), and training: losses against the vendored Boltz-2 oracles (`tests/fold/oracles/`), the training branch, `FoldTask` through the real Trainer (gradients, overfit, resume with EMA; `slow`), and a two-rank gloo DDP smoke (`slow`). The real ESM-C 300M states test (gated weights) is `slow` and skips without `oplm[esmc]`. GPU parity tests are `slow` and skip without CUDA. |
 | `tests/` (root) | Cross-module: CLI, training entrypoint, train→serve lifecycle. |
-| `tests/fixtures/` | Real data: `training/test_sequences.parquet` (real protein sequences), `eval/structures/` (PDB fixtures), and `fold/` (real wwPDB mmCIF entries and a CCD subset for the structure head's data pipeline). |
+| `tests/fixtures/` | Real data: `training/test_sequences.parquet` (real protein sequences), `eval/structures/` (PDB fixtures), and `fold/` (real wwPDB mmCIF entries and a CCD subset for the structure head's data pipeline). The Boltz-2 loss oracles are test code, not data: they live in `tests/fold/oracles/` ([README](../tests/fold/oracles/README.md)). |
 
 ## 2. Markers & selection
 
