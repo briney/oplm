@@ -158,6 +158,8 @@ def _assert_data_exact_resume(
     stop_step: int,
     *,
     expect_epoch_crossing: bool,
+    save_every: int = 5,
+    expect_batches_in_epoch: int | None = None,
 ) -> None:
     """Control (0->12) vs. interrupted (0->stop_step, checkpoint) + resumed (auto_resume->12).
 
@@ -169,7 +171,9 @@ def _assert_data_exact_resume(
     checkpoint landed is read back from the recording callback and checked, not
     assumed. ``expect_epoch_crossing`` asserts whether the checkpoint's epoch is >= 1
     (already rolled over once) or exactly 0, cross-checked against both the trainer's
-    own counter and the checkpoint's persisted cursor.
+    own counter and the checkpoint's persisted cursor. ``save_every`` moves the periodic
+    trigger, and ``expect_batches_in_epoch`` pins the persisted cursor's in-epoch count
+    (used to put the checkpoint exactly on an epoch boundary).
     """
     from oplm.training.trainer import Trainer
 
@@ -198,7 +202,7 @@ def _assert_data_exact_resume(
         interrupt_dir,
         train_data,
         max_steps=stop_step,
-        save_every=5,
+        save_every=save_every,
         save_final=False,
         **common,
     )
@@ -219,6 +223,8 @@ def _assert_data_exact_resume(
         (interrupt_dir / f"checkpoint-{checkpoint_step}" / "trainer_state.json").read_text()
     )
     cursor_epoch = checkpoint_state["cursor"]["epoch"]
+    if expect_batches_in_epoch is not None:
+        assert checkpoint_state["cursor"]["batches_in_epoch"] == expect_batches_in_epoch
     if expect_epoch_crossing:
         assert run1.epoch >= 1, "expected the checkpoint to land after an epoch rollover"
         assert cursor_epoch >= 1
@@ -285,4 +291,29 @@ def test_resume_matches_control_exactly_across_epoch_boundary(
     _force_keep_sequence_ids(monkeypatch)
     _assert_data_exact_resume(
         tiny_training_parquet, tmp_path, num_workers, stop_step, expect_epoch_crossing=True
+    )
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_resume_from_a_checkpoint_on_the_epoch_boundary_rolls_to_the_next_epoch(
+    tiny_training_parquet: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    num_workers: int,
+) -> None:
+    """16-row fixture: the step-4 checkpoint is the end of epoch 0 (4 of 4 batches).
+
+    The cursor records ``epoch=0, batches_in_epoch=4`` because the trainer only rolls the
+    epoch over on the next pull. Resuming must continue with epoch 1's (reshuffled) stream,
+    exactly as the control does, rather than replaying epoch 0 from row 0.
+    """
+    _force_keep_sequence_ids(monkeypatch)
+    _assert_data_exact_resume(
+        tiny_training_parquet,
+        tmp_path,
+        num_workers,
+        stop_step=4,
+        expect_epoch_crossing=False,
+        save_every=4,
+        expect_batches_in_epoch=4,
     )

@@ -732,7 +732,8 @@ default), a resume converts that cursor into a per-stream sample offset and skip
 arithmetic** — walking shard metadata (row counts) rather than reading and discarding rows — so
 the resumed run sees exactly the same sequence of training examples, in the same order, as an
 uninterrupted control run; no row is re-seen or skipped, and `tokens_seen` matches the
-uninterrupted run exactly. Masking is unaffected by this: the collator's masking RNG is untouched,
+uninterrupted run exactly. A checkpoint taken exactly at an epoch boundary resumes into the next
+epoch rather than replaying the finished one. Masking is unaffected by this: the collator's masking RNG is untouched,
 so post-resume masks differ bit-for-bit from an uninterrupted run even though the *data* stream is
 identical (data-exact, not bitwise). A cursor whose recorded layout doesn't match the live run's
 (different world size, worker count, batch size, or seed) raises rather than silently reproducing

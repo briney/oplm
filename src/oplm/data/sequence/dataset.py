@@ -107,8 +107,11 @@ def _resolve_sample_skip(
     and :class:`InterleavedDataset`'s ``__iter__``: each worker computes its own share of
     the globally-armed ``batches_in_epoch``, matching DataLoader's round-robin batch
     assignment across workers, then converts that batch count to a sample count and
-    reduces it modulo ``stream_length`` (a full wrap is the identity since these streams
-    refill deterministically).
+    clamps it to ``stream_length``. It must not wrap: a stream that was fully consumed
+    when the checkpoint was taken (a cursor exactly on the epoch boundary) resolves to
+    a skip equal to ``stream_length``, i.e. an empty stream, so the Trainer's
+    ``StopIteration`` path rolls to the next epoch just as the uninterrupted run did.
+    Wrapping to 0 would replay the finished epoch, since the next epoch reshuffles.
 
     Args:
         batches_in_epoch: Globally-armed batch count already consumed this epoch, or
@@ -118,7 +121,8 @@ def _resolve_sample_skip(
         stream_length: This stream's total sample count for the epoch.
 
     Returns:
-        The resolved sample skip, in ``[0, stream_length)``; ``0`` when unarmed or when
+        The resolved sample skip, in ``[0, stream_length]`` (``stream_length`` meaning
+        the whole stream was already consumed); ``0`` when unarmed or when
         ``stream_length <= 0``.
     """
     if batches_in_epoch is None:
@@ -126,7 +130,7 @@ def _resolve_sample_skip(
     _, _, worker_id, _ = _resolve_distributed_context()
     batch_count = len(range(worker_id, batches_in_epoch, num_workers))
     skip = batch_count * per_rank_batch
-    return skip % max(stream_length, 1)
+    return min(skip, max(stream_length, 0))
 
 
 @dataclass(frozen=True)
@@ -333,15 +337,16 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
     def _arm_sample_skip(self, n: int) -> Iterator[dict[str, object]]:
         """Return a fresh, one-shot stream over this dataset, skipping ``n`` samples.
 
-        Reduces ``n`` modulo :meth:`stream_length` (this stream refills
-        deterministically on re-iteration, so a full wrap is the identity — see
-        :meth:`_iter_stream`). This is the internal, sample-count-based arming path
-        shared by :meth:`__iter__` (via :meth:`_resolved_skip`, which is itself
-        batch-count-based) and by :class:`InterleavedDataset`, which computes a
-        per-source *sample* count directly from its own ``choices`` draws and arms
-        this source's first pass only — bypassing :meth:`set_resume_skip`, whose
-        batch-based arithmetic assumes this dataset is iterated standalone by a
-        DataLoader, not as one source among several in a mix.
+        Reduces ``n`` modulo :meth:`stream_length`: as one source of an
+        :class:`InterleavedDataset`, this stream refills deterministically within one
+        epoch (see :meth:`InterleavedDataset._next_or_refill`), so a full wrap is the
+        identity there. This is the sample-count-based arming path of
+        :class:`InterleavedDataset`, which computes a per-source *sample* count
+        directly from its own ``choices`` draws and arms this source's first pass
+        only — bypassing :meth:`set_resume_skip`, whose batch-based arithmetic assumes
+        this dataset is iterated standalone by a DataLoader, not as one source among
+        several in a mix. A top-level iteration (:meth:`__iter__`) does not go through
+        here: it must not wrap, see :func:`_resolve_sample_skip`.
 
         Args:
             n: Number of samples to skip.
@@ -370,7 +375,9 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         return torch.randperm(n_rows, generator=generator).tolist()
 
     def __iter__(self) -> Iterator[dict[str, object]]:
-        yield from self._arm_sample_skip(self._resolved_skip())
+        # Straight to the stream, not `_arm_sample_skip`: a skip equal to the stream length
+        # (checkpoint taken on the epoch boundary) must stay an empty stream, not wrap to 0.
+        yield from self._iter_stream(self._resolved_skip())
 
     def _iter_stream(self, skip: int) -> Iterator[dict[str, object]]:
         """Yield this (rank, worker) stream, skipping its first ``skip`` selected rows.
