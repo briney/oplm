@@ -7,16 +7,21 @@ from typing import Any
 
 
 def _check_wandb_history(
-    history: list[dict[str, Any]], events: list[dict[str, Any]], checkpoint_step: int | None
+    history: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    checkpoint_step: int | None,
+    recorded: str | None,
 ) -> tuple[list[str], str]:
     """Errors and the rewind outcome for the online history of the resumed run.
 
-    Rows are logged at the training step, so each row's ``_step`` equals its
-    ``recovery/step`` and no step repeats. Every step the resumed attempt logged must be in
-    the history. Steps past the killed attempt's last logged step must be the resumed
-    attempt's rows; inside that replay window a row is the resumed attempt's when W&B
-    rewound the history to the checkpoint ("applied"), or still the killed attempt's when
-    the server refused the rewind ("unavailable"). "not needed" means nothing was replayed.
+    ``recorded`` is what the resumed trainer reported doing to the history (``start`` event
+    ``wandb_rewind``): "applied", "unavailable" (the server refused; plain resume), or
+    ``None`` (no rewind was needed), reported as "not needed". Rows are logged at the
+    training step, so each row's ``_step`` equals its ``recovery/step`` and no step repeats.
+    Every step the resumed attempt logged must be present as the resumed attempt's row,
+    except inside the replay window (steps the killed attempt logged past the checkpoint)
+    after a refused rewind, where the killed attempt's rows may remain. A reported rewind
+    must leave no killed-attempt row past the checkpoint.
     """
     errors: list[str] = []
     misaligned = sorted(
@@ -38,25 +43,30 @@ def _check_wandb_history(
             if e["kind"] == "log" and e["rank"] == 0 and e["attempt"] == attempt
         )
 
+    outcome = recorded or "not needed"
     replayed = [s for s in logged(0) if checkpoint_step is not None and s > checkpoint_step]
     window_end = max(replayed, default=None)
     resumed = logged(1)
     missing = [s for s in resumed if s not in attempt_by_step]
     if missing:
         errors.append(f"W&B dropped resumed metrics at {missing}")
+    kept_allowed = outcome == "unavailable" and window_end is not None
     stale = [
         s
         for s in resumed
         if s in attempt_by_step
         and attempt_by_step[s] != 1
-        and (window_end is None or s > window_end)
+        and not (kept_allowed and window_end is not None and s <= window_end)
     ]
     if stale:
-        errors.append(f"W&B kept the killed attempt's metrics past the replay window at {stale}")
-    kept = [s for s in resumed if attempt_by_step.get(s) == 0 and window_end is not None]
-    if not replayed:
-        return errors, "not needed"
-    return errors, "unavailable" if kept else "applied"
+        errors.append(f"W&B kept the killed attempt's metrics at {stale}")
+    if outcome == "applied" and checkpoint_step is not None:
+        leftover = sorted(s for s, a in attempt_by_step.items() if a == 0 and s > checkpoint_step)
+        if leftover:
+            errors.append(
+                f"trainer reported a W&B rewind but killed-attempt rows remain at {leftover}"
+            )
+    return errors, outcome
 
 
 def assess(
@@ -181,7 +191,12 @@ def assess(
         errors.append("W&B entity/project/id/name missing or changed")
     wandb_rewind = None
     if manifest["wandb_enabled"] and history is not None:
-        history_errors, wandb_rewind = _check_wandb_history(history, events, checkpoint_step)
+        recorded = next(
+            (e.get("wandb_rewind") for e in starts if e["attempt"] == 1 and e["rank"] == 0), None
+        )
+        history_errors, wandb_rewind = _check_wandb_history(
+            history, events, checkpoint_step, recorded
+        )
         errors += history_errors
     online_checked = manifest["wandb_enabled"] and history is not None
     status = "failed" if errors else ("passed" if online_checked else "incomplete")

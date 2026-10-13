@@ -181,8 +181,10 @@ The trainer logs every row at the training step and, when a resume lands behind 
 history, rewinds the run to the checkpoint first (docs/TRAIN.md "W&B continuity"). Inside
 that replay window a row is therefore the resumed attempt's when W&B rewound the history,
 and still the abandoned attempt's when the server refused the rewind (rewinding is a W&B
-private-preview feature, enabled per entity). Both pass; `result.json` reports which as
-`wandb_rewind`: `applied`, `unavailable`, or `not needed` when nothing was replayed (a drain).
+private-preview feature, enabled per entity). Both pass. The resumed trainer records what it
+did, and `result.json` reports it as `wandb_rewind`: `applied`, `unavailable`, or `not needed`
+when the server history was not ahead of the checkpoint (a drain). A reported `applied` with
+any abandoned-attempt row left past the checkpoint fails the drill.
 
 After updating recovery or logging code, prepare fresh drill directories and ensure the
 controller and container install the fixed version. For unpublished fixes, install the

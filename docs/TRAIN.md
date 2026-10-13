@@ -759,8 +759,8 @@ checkpoint (`wandb.init(resume_from="<id>?_step=<checkpoint step + 1>")`), so th
 attempt's rows replace the dead attempt's and the history records only the run that produced
 the model. W&B enables rewinding per entity (private preview, on request to W&B support).
 Where it is not enabled, the trainer logs a warning and resumes without it: the rolled-back
-steps keep the dead attempt's rows, and the resumed attempt's rows for those steps are
-dropped. A drain checkpoint never needs a rewind, because it is saved before its step is
+steps keep the dead attempt's rows, and the resumed attempt's metrics for those steps are
+dropped, including any (such as an eval) the dead attempt never got to log. A drain checkpoint never needs a rewind, because it is saved before its step is
 logged. `tests/training/test_wandb_rewind_online.py` is the opt-in drill that checks the
 server behaviour (`OPLM_WANDB_ONLINE_DRILL=1`).
 

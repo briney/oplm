@@ -469,6 +469,10 @@ class Trainer:
         # extra_state key on every checkpoint save. Stays None when wandb is disabled or
         # (main-process-only) on non-main ranks, so save_checkpoint's extra_state omits it.
         self._wandb_run_id: str | None = None
+        # What _init_wandb did to the resumed run's history: "applied" (rewound to the
+        # checkpoint), "unavailable" (the server refused; plain resume), or None (no rewind
+        # was needed). Main process only; the recovery drills record it.
+        self._wandb_rewind: str | None = None
 
         # Init wandb early so login prompt appears before slow setup steps
         if cfg.train.wandb_enabled:
@@ -1913,6 +1917,13 @@ class Trainer:
         rewind_kwargs["resume_from"] = f"{run_id}?_step={checkpoint_step + 1}"
         try:
             init(rewind_kwargs)
+            self._wandb_rewind = "applied"
+            logger.info(
+                "Rewound W&B run %s to step %d (its history reached step %d)",
+                run_id,
+                checkpoint_step + 1,
+                server_step,
+            )
         except Exception as exc:  # noqa: BLE001 -- a refused rewind must not stop training
             import wandb
 
@@ -1921,9 +1932,11 @@ class Trainer:
             # ("run ID ... is in use"); tearing the service down lets the next init respawn it.
             self.accelerator.trackers.clear()
             wandb.teardown()
+            self._wandb_rewind = "unavailable"
             logger.warning(
                 "W&B history rewind unavailable (%s); resuming run %s without it: "
-                "steps %d-%d keep the earlier attempt's values",
+                "steps %d-%d keep the earlier attempt's values and this attempt's "
+                "metrics for them are dropped",
                 exc,
                 run_id,
                 checkpoint_step + 1,

@@ -267,15 +267,18 @@ def test_resume_rewinds_wandb_only_when_its_history_is_ahead(
     monkeypatch.setattr(
         trainer_module, "_wandb_last_history_step", lambda project, rid: server_last_step
     )
-    trainer_module.Trainer(_resume_cfg(tmp_path, training_parquet), callbacks=[]).train()
+    trainer = trainer_module.Trainer(_resume_cfg(tmp_path, training_parquet), callbacks=[])
+    trainer.train()
 
     (kwargs,) = captured
     if rewinds:
         assert kwargs["resume_from"] == f"{run_id}?_step=5"
         assert "id" not in kwargs and "resume" not in kwargs
+        assert trainer._wandb_rewind == "applied"
     else:
         assert "resume_from" not in kwargs
         assert kwargs["id"] == run_id and kwargs["resume"] == "allow"
+        assert trainer._wandb_rewind is None
     assert (tmp_path / "wandb_run_id").read_text().strip() == run_id
 
 
@@ -302,8 +305,22 @@ def test_refused_rewind_falls_back_to_a_plain_resume(
         original_start(self)
 
     monkeypatch.setattr(WandBTracker, "start", _refuse_rewind)
+    import wandb
+
+    teardowns: list[None] = []
+    original_teardown = wandb.teardown
+
+    def _counting_teardown(*args: Any, **kwargs: Any) -> None:
+        teardowns.append(None)
+        original_teardown(*args, **kwargs)
+
+    # A refused online init leaves the run id registered in W&B's service; the fallback must
+    # tear the service down before retrying (offline cannot reproduce the "in use" error).
+    monkeypatch.setattr(wandb, "teardown", _counting_teardown)
     with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
         trainer = trainer_module.Trainer(_resume_cfg(tmp_path, training_parquet), callbacks=[])
+    assert len(teardowns) == 1
+    assert trainer._wandb_rewind == "unavailable"
     assert len(trainer.accelerator.trackers) == 1
     assert [("resume_from" in k, k.get("id"), k.get("resume")) for k in captured] == [
         (True, None, None),

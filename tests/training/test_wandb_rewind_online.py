@@ -1,9 +1,10 @@
 """Online drill: does the W&B server honour ``wandb.init(resume_from="<id>?_step=N")``?
 
-The Trainer will log with ``step=global_step`` and, on a resume behind W&B's latest step,
-rewind the run's history to the checkpoint with ``resume_from``. That W&B feature is beta
-and server-side, so offline mode cannot test it. These tests pin the exact behaviour the
-implementation relies on, against the real server:
+The Trainer logs with ``step=global_step`` and, on a resume behind W&B's latest step,
+rewinds the run's history to the checkpoint with ``resume_from``. That W&B feature is a
+server-side private preview enabled per entity, so offline mode cannot test it. The rewind
+probes pin the exact behaviour the implementation relies on, against the real server; they
+skip, naming the reason, while the entity does not have the feature:
 
 - the rewind keeps the run id, keeps history before step ``N``, removes history at and after
   ``N``, and accepts new rows from step ``N`` on (``test_rewind_truncates_and_replays``);
@@ -11,6 +12,10 @@ implementation relies on, against the real server:
 - rewinding past the last logged step either works or fails loudly (W&B behind the
   checkpoint, e.g. a crash before the last rows were flushed);
 - two consecutive rewinds work (a crash during the replay).
+
+``test_trainer_resume_behind_the_server_history`` runs the real Trainer through a crash and
+resume and passes either way: rewound when the entity has the feature, the documented
+fallback when it does not.
 
 Opt-in only: set ``OPLM_WANDB_ONLINE_DRILL=1`` and log in to W&B (``wandb login`` or
 ``WANDB_API_KEY``). Runs go to the project ``OPLM_WANDB_DRILL_PROJECT`` (default
@@ -86,7 +91,12 @@ def _new_run(wandb: Any, steps: range, created: list[str]) -> str:
 def _rewind(wandb: Any, path: str, step: int, values: dict[int, float]) -> dict[str, Any]:
     """``resume_from`` the run at ``step``, log ``values`` (step -> x), return observations."""
     run_id = path.rsplit("/", 1)[1]
-    run = wandb.init(project=PROJECT, resume_from=f"{run_id}?_step={step}", config={"a": 1})
+    try:
+        run = wandb.init(project=PROJECT, resume_from=f"{run_id}?_step={step}", config={"a": 1})
+    except Exception as exc:
+        if "private preview" in str(exc):
+            pytest.skip("W&B rewind is not enabled for this entity (private preview)")
+        raise
     seen = {"id": run.id, "step_after_init": run.step, "config_a": run.config.get("a")}
     for s, x in values.items():
         run.log({"x": x}, step=s)
