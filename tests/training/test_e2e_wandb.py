@@ -8,13 +8,16 @@ without a network or login. Config flattening is a genuine serialization risk
 Also covers Task 1.7 (W&B run continuity): the persisted ``wandb_run_id`` file and
 ``trainer_state.json`` field, and that a resumed run's ``wandb.init`` receives
 ``id=<first run's id>, resume="allow"`` so a requeue continues the same W&B run
-instead of starting a new one.
+instead of starting a new one; and the step-aligned history: every row is logged at
+``step=global_step``, a resume behind the server's history rewinds it to the checkpoint
+(``resume_from``), and a refused rewind falls back to the plain resume.
 """
 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+import logging
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -156,48 +159,187 @@ def test_resume_continues_the_same_wandb_run(
     assert captured_init_kwargs[1]["resume"] == "allow"
 
 
-def test_checkpoint_rollback_keeps_replayed_wandb_metrics(
-    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A W&B history ahead of the checkpoint must accept every replayed training step."""
-    wandb = pytest.importorskip("wandb")
+def _offline_wandb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("wandb")
     monkeypatch.setenv("WANDB_MODE", "offline")
     monkeypatch.setenv("WANDB_SILENT", "true")
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
 
-    import torch
+
+def _capture_wandb_init_kwargs(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    from accelerate.tracking import WandBTracker
+
+    captured: list[dict[str, object]] = []
+    original_init = WandBTracker.__init__
+
+    def _capturing_init(self: WandBTracker, run_name: str, **kwargs: object) -> None:
+        captured.append(dict(kwargs))
+        original_init(self, run_name, **kwargs)
+
+    monkeypatch.setattr(WandBTracker, "__init__", _capturing_init)
+    return captured
+
+
+def _train_and_checkpoint_at_4(tmp_path: Path, training_parquet: Path) -> str:
+    """Phase 1 of the resume tests: train to step 4, checkpoint, return the W&B run id."""
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=4,
+        save_every=4,
+        wandb_enabled=True,
+        wandb_run_name="e2e-rewind",
+    )
+    Trainer(cfg, callbacks=[]).train()
+    return (tmp_path / "wandb_run_id").read_text().strip()
+
+
+def _resume_cfg(tmp_path: Path, training_parquet: Path) -> Any:
+    return tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=6,
+        save_every=6,
+        auto_resume=True,
+        wandb_enabled=True,
+        wandb_run_name="e2e-rewind",
+    )
+
+
+def test_every_wandb_row_is_logged_at_the_training_step(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Train, eval-free, and both diagnostics callbacks log with ``step=global_step``.
+
+    W&B's ``Step`` is its history counter; passing the training step keeps it equal to
+    ``train/global_step`` instead of counting log calls.
+    """
+    _offline_wandb(tmp_path, monkeypatch)
+    from accelerate.tracking import WandBTracker
 
     from oplm.training.mup import StabilityDiagnosticsCallback
     from oplm.training.trainer import Trainer
 
-    callback = FullRecordingCallback()
-    trainer = Trainer(
-        tiny_train_cfg(tmp_path, training_parquet, wandb_enabled=True),
-        callbacks=[callback, StabilityDiagnosticsCallback(probe_every=0)],
+    logged: list[tuple[int | None, dict[str, Any]]] = []
+    original_log = WandBTracker.log
+
+    def _recording_log(
+        self: WandBTracker, values: dict[str, Any], step: int | None = None, **kwargs: Any
+    ) -> None:
+        logged.append((step, dict(values)))
+        original_log(self, values, step=step, **kwargs)
+
+    monkeypatch.setattr(WandBTracker, "log", _recording_log)
+    cfg = tiny_train_cfg(
+        tmp_path,
+        training_parquet,
+        max_steps=4,
+        log_every=1,
+        max_grad_norm=1.0,
+        weight_diag_every=2,
+        wandb_enabled=True,
     )
-    run = wandb.run
-    assert run is not None
-    try:
-        # Offline W&B cannot resume server history. Seed the real SDK's history counter
-        # at the failed checkpoint instead, reproducing its state after an online resume.
-        run.log({"train/loss": 99.0}, step=32, commit=True)
-        for step in range(17, 33):
-            trainer.global_step = step
-            trainer._last_grad_norm = torch.tensor(float(step))
-            previous_history_step = run.step
-            trainer._log_metrics(
-                {"train/loss": step / 100, "recovery/attempt": 1, "recovery/step": step}
-            )
-            assert run.step > previous_history_step, f"replayed step {step} was not committed"
-        trainer._log_metrics({"eval/heldout/loss": 0.5})
-        summary = dict(run.summary)
-        assert summary["train/global_step"] == 32
-        assert summary["recovery/step"] == 32
-        assert summary["train/loss"] == pytest.approx(0.32)
-        assert summary["diag/grad_norm"] == 32
-        assert summary["eval/heldout/loss"] == 0.5
-        assert callback.train_log_steps == list(range(17, 33))
-    finally:
-        trainer.accelerator.end_training()
+    Trainer(cfg, callbacks=[StabilityDiagnosticsCallback(probe_every=0)]).train()
+
+    assert logged
+    assert all(step is not None and values["train/global_step"] == step for step, values in logged)
+    assert [step for step, values in logged if "train/loss" in values] == [1, 2, 3, 4]
+    assert [step for step, values in logged if "diag/grad_norm" in values] == [1, 2, 3, 4]
+    assert [step for step, values in logged if "diag/weight_step" in values] == [2, 4]
+
+
+@pytest.mark.parametrize(("server_last_step", "rewinds"), [(6, True), (4, False), (None, False)])
+def test_resume_rewinds_wandb_only_when_its_history_is_ahead(
+    training_parquet: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_last_step: int | None,
+    rewinds: bool,
+) -> None:
+    """Checkpoint 4 with the server at 6 rewinds to step 5; at 4 or unknown, a plain resume."""
+    _offline_wandb(tmp_path, monkeypatch)
+    import oplm.training.trainer as trainer_module
+
+    run_id = _train_and_checkpoint_at_4(tmp_path, training_parquet)
+    captured = _capture_wandb_init_kwargs(monkeypatch)
+    monkeypatch.setattr(
+        trainer_module, "_wandb_last_history_step", lambda project, rid: server_last_step
+    )
+    trainer = trainer_module.Trainer(_resume_cfg(tmp_path, training_parquet), callbacks=[])
+    trainer.train()
+
+    (kwargs,) = captured
+    if rewinds:
+        assert kwargs["resume_from"] == f"{run_id}?_step=5"
+        assert "id" not in kwargs and "resume" not in kwargs
+        assert trainer._wandb_rewind == "applied"
+    else:
+        assert "resume_from" not in kwargs
+        assert kwargs["id"] == run_id and kwargs["resume"] == "allow"
+        assert trainer._wandb_rewind is None
+    assert (tmp_path / "wandb_run_id").read_text().strip() == run_id
+
+
+def test_refused_rewind_falls_back_to_a_plain_resume(
+    training_parquet: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server that refuses the rewind (private preview) costs a warning, never the run."""
+    _offline_wandb(tmp_path, monkeypatch)
+    from accelerate.tracking import WandBTracker
+
+    import oplm.training.trainer as trainer_module
+
+    run_id = _train_and_checkpoint_at_4(tmp_path, training_parquet)
+    captured = _capture_wandb_init_kwargs(monkeypatch)
+    monkeypatch.setattr(trainer_module, "_wandb_last_history_step", lambda project, rid: 6)
+    original_start = WandBTracker.start
+
+    def _refuse_rewind(self: WandBTracker) -> None:
+        if "resume_from" in self.init_kwargs:
+            raise RuntimeError("Rewind is in private preview -- contact support@wandb.com")
+        original_start(self)
+
+    monkeypatch.setattr(WandBTracker, "start", _refuse_rewind)
+    import wandb
+
+    teardowns: list[None] = []
+    original_teardown = wandb.teardown
+
+    def _counting_teardown(*args: Any, **kwargs: Any) -> None:
+        teardowns.append(None)
+        original_teardown(*args, **kwargs)
+
+    # A refused online init leaves the run id registered in W&B's service; the fallback must
+    # tear the service down before retrying (offline cannot reproduce the "in use" error).
+    monkeypatch.setattr(wandb, "teardown", _counting_teardown)
+    with caplog.at_level(logging.WARNING, logger="oplm.training.trainer"):
+        trainer = trainer_module.Trainer(_resume_cfg(tmp_path, training_parquet), callbacks=[])
+    assert len(teardowns) == 1
+    assert trainer._wandb_rewind == "unavailable"
+    assert len(trainer.accelerator.trackers) == 1
+    assert [("resume_from" in k, k.get("id"), k.get("resume")) for k in captured] == [
+        (True, None, None),
+        (False, run_id, "allow"),
+    ]
+    assert "W&B history rewind unavailable" in caplog.text
+    assert "steps 5-6 keep the earlier attempt's values" in caplog.text
+    trainer.train()  # logging goes through the surviving tracker
+    assert trainer.global_step == 6
+
+
+def test_last_history_step_is_not_queried_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offline (and disabled) W&B never touches the network for the rewind decision."""
+    pytest.importorskip("wandb")
+    from oplm.training.trainer import _wandb_last_history_step
+
+    for mode in ("offline", "disabled"):
+        monkeypatch.setenv("WANDB_MODE", mode)
+        assert _wandb_last_history_step("any-project", "any-run") is None
 
 
 def test_wandb_run_none_after_init_trackers_is_skipped_gracefully(

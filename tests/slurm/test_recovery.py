@@ -68,7 +68,7 @@ def evidence() -> tuple[dict, list[dict], list[dict]]:
         wandb_enabled=True,
         terminal_state="COMPLETED",
     )
-    history = [{"recovery/attempt": 1, "recovery/step": 11}]
+    history = [{"_step": 11, "recovery/attempt": 1, "recovery/step": 11}]
     return manifest, events, history
 
 
@@ -104,6 +104,70 @@ def test_recovery_report_does_not_confuse_completion_with_recovery(mutation: str
     else:
         events = [e for e in events if e["attempt"] == 0]
     assert assess(manifest, events, history)["status"] == "failed"
+
+
+def test_wandb_step_must_be_the_training_step() -> None:
+    """Rows are logged at step=global_step: a misaligned or repeated step is a failure."""
+    from oplm.slurm.recovery.checks import assess
+
+    manifest, events, history = evidence()
+    report = assess(manifest, events, history)
+    assert report["status"] == "passed" and report["wandb_rewind"] == "not needed"
+    misaligned = assess(manifest, events, [dict(history[0], _step=3)])
+    assert misaligned["status"] == "failed"
+    assert any("differs from the training step" in e for e in misaligned["errors"])
+    assert assess(manifest, events, history + [dict(history[0])])["status"] == "failed"
+
+
+def _replayed_evidence(recorded: str | None) -> tuple[dict, list[dict]]:
+    """Checkpoint 10; the killed attempt logged step 11; the resumed attempt logged 11-12.
+
+    ``recorded`` is what the resumed trainer reported doing to the W&B history.
+    """
+    manifest, events, _ = evidence()
+    manifest["max_steps"] = 12
+    for event in events:
+        if event["kind"] == "start" and event["attempt"] == 1 and event["rank"] == 0:
+            event["wandb_rewind"] = recorded
+    events = [e for e in events if e["kind"] != "complete"] + [
+        dict(kind="log", attempt=0, rank=0, step=11, time=3.5),
+        dict(kind="log", attempt=1, rank=0, step=12, time=6.5),
+        dict(kind="complete", attempt=1, rank=0, step=12, time=7),
+    ]
+    return manifest, events
+
+
+@pytest.mark.parametrize(("recorded", "window_attempt"), [("applied", 1), ("unavailable", 0)])
+def test_replay_window_matches_what_the_trainer_did(recorded: str, window_attempt: int) -> None:
+    """A rewound history has the resumed attempt's row at 11; a refused rewind keeps the
+    killed attempt's. Step 12, past the replay window, must be attempt 1's either way."""
+    from oplm.slurm.recovery.checks import assess
+
+    manifest, events = _replayed_evidence(recorded)
+    history = [
+        {"_step": 11, "recovery/attempt": window_attempt, "recovery/step": 11},
+        {"_step": 12, "recovery/attempt": 1, "recovery/step": 12},
+    ]
+    report = assess(manifest, events, history)
+    assert report["status"] == "passed", report
+    assert report["wandb_rewind"] == recorded
+    stale = [history[0], {"_step": 12, "recovery/attempt": 0, "recovery/step": 12}]
+    assert assess(manifest, events, stale)["status"] == "failed"
+    if recorded == "applied":  # a rewound history cannot keep the killed attempt's row
+        killed_row = [dict(history[0], **{"recovery/attempt": 0}), history[1]]
+        assert assess(manifest, events, killed_row)["status"] == "failed"
+
+
+def test_a_reported_rewind_must_leave_no_killed_attempt_rows() -> None:
+    """crash_loop's resumed attempt logs nothing; a claimed rewind with old rows is false."""
+    from oplm.slurm.recovery.checks import _check_wandb_history
+
+    events = [dict(kind="log", attempt=0, rank=0, step=s, time=s) for s in range(1, 13)]
+    history = [{"_step": s, "recovery/attempt": 0, "recovery/step": s} for s in range(1, 13)]
+    errors, outcome = _check_wandb_history(history, events, 10, "applied")
+    assert outcome == "applied" and any("rewind" in e for e in errors), errors
+    assert _check_wandb_history(history, events, 10, "unavailable") == ([], "unavailable")
+    assert _check_wandb_history(history[:10], events, 10, None) == ([], "not needed")
 
 
 def test_node_drill_requires_a_replacement_node() -> None:

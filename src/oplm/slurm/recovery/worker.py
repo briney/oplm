@@ -156,6 +156,7 @@ def main() -> None:
         wandb=identity,
         node=os.environ.get("SLURMD_NODENAME", socket.gethostname()),
         resume=trainer._resolved_resume_target,
+        wandb_rewind=trainer._wandb_rewind,
     )
     trainer.accelerator.wait_for_everyone()
     if manifest["mode"] == "crash_loop" and trainer.attempt >= 1:

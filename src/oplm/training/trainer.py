@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -468,6 +469,10 @@ class Trainer:
         # extra_state key on every checkpoint save. Stays None when wandb is disabled or
         # (main-process-only) on non-main ranks, so save_checkpoint's extra_state omits it.
         self._wandb_run_id: str | None = None
+        # What _init_wandb did to the resumed run's history: "applied" (rewound to the
+        # checkpoint), "unavailable" (the server refused; plain resume), or None (no rewind
+        # was needed). Main process only; the recovery drills record it.
+        self._wandb_rewind: str | None = None
 
         # Init wandb early so login prompt appears before slow setup steps
         if cfg.train.wandb_enabled:
@@ -478,6 +483,7 @@ class Trainer:
             wandb_kwargs: dict[str, Any] = {"dir": cfg.train.output_dir}
             if cfg.train.wandb_run_name is not None:
                 wandb_kwargs["name"] = cfg.train.wandb_run_name
+            rewind: tuple[int, int] | None = None
             if resume_target is not None:
                 # Task 1.7: continue the same W&B run across a requeue instead of
                 # starting a new one. Checkpoint's trainer_state.json is the first
@@ -488,11 +494,11 @@ class Trainer:
                 run_id = _read_resume_wandb_run_id(resume_target, cfg.train.output_dir)
                 if run_id is not None:
                     wandb_kwargs |= {"id": run_id, "resume": "allow"}
-            self.accelerator.init_trackers(
-                project_name=cfg.train.wandb_project,
-                config=_config_to_flat_dict(cfg),
-                init_kwargs={"wandb": wandb_kwargs},
-            )
+                    if self.accelerator.is_main_process:
+                        rewind = _wandb_rewind_window(
+                            resume_target, cfg.train.wandb_project, run_id
+                        )
+            self._init_wandb(cfg, wandb_kwargs, rewind)
 
             # Persist the run id immediately so a mid-run kill still leaves a
             # resumable marker. Lazy/guarded import: wandb is an optional dependency,
@@ -1879,11 +1885,73 @@ class Trainer:
             return None
         return sum(losses) / len(losses)
 
+    def _init_wandb(
+        self, cfg: OplmConfig, wandb_kwargs: dict[str, Any], rewind: tuple[int, int] | None
+    ) -> None:
+        """Start or resume the W&B run, rewinding its history first when it is ahead.
+
+        Rows are logged at ``step=global_step`` and W&B never accepts a step below its
+        latest, so after a rollback (a crash resumed from an earlier checkpoint) the
+        resumed attempt's rows for the replayed steps would be dropped. ``rewind`` is
+        ``(checkpoint_step, server_last_step)`` in that case: the run is reattached with
+        ``resume_from="<id>?_step=<checkpoint_step + 1>"``, which truncates the abandoned
+        attempt's rows from that step on, so the history records only the run that
+        continues. W&B enables rewinding per entity (private preview); a refusal falls back
+        to the plain resume and a warning names the steps that keep the earlier attempt's
+        values. ``tests/training/test_wandb_rewind_online.py`` pins the server behaviour.
+        """
+
+        def init(kwargs: dict[str, Any]) -> None:
+            self.accelerator.init_trackers(
+                project_name=cfg.train.wandb_project,
+                config=_config_to_flat_dict(cfg),
+                init_kwargs={"wandb": kwargs},
+            )
+
+        if rewind is None:
+            init(wandb_kwargs)
+            return
+        checkpoint_step, server_step = rewind
+        run_id = wandb_kwargs["id"]
+        rewind_kwargs = {k: v for k, v in wandb_kwargs.items() if k not in ("id", "resume")}
+        rewind_kwargs["resume_from"] = f"{run_id}?_step={checkpoint_step + 1}"
+        try:
+            init(rewind_kwargs)
+            self._wandb_rewind = "applied"
+            logger.info(
+                "Rewound W&B run %s to step %d (its history reached step %d)",
+                run_id,
+                checkpoint_step + 1,
+                server_step,
+            )
+        except Exception as exc:  # noqa: BLE001 -- a refused rewind must not stop training
+            import wandb
+
+            # init_trackers appends each tracker before starting it; drop the one that failed.
+            # The refused init also leaves the run id registered in W&B's background service
+            # ("run ID ... is in use"); tearing the service down lets the next init respawn it.
+            self.accelerator.trackers.clear()
+            wandb.teardown()
+            self._wandb_rewind = "unavailable"
+            logger.warning(
+                "W&B history rewind unavailable (%s); resuming run %s without it: "
+                "steps %d-%d keep the earlier attempt's values and this attempt's "
+                "metrics for them are dropped",
+                exc,
+                run_id,
+                checkpoint_step + 1,
+                server_step,
+            )
+            init(wandb_kwargs)
+
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         """Log metrics and notify callbacks."""
-        # Training can roll back to a checkpoint; W&B's history step cannot.
-        # Append history rows and use the actual training step as the chart axis.
-        self.accelerator.log(metrics | {"train/global_step": self.global_step})
+        # W&B's history step is the training step, so its `Step` axis matches
+        # `train/global_step`. W&B rejects a step below its latest: a resume behind the
+        # server's history rewinds it first (`_init_wandb`), or warns when it cannot.
+        self.accelerator.log(
+            metrics | {"train/global_step": self.global_step}, step=self.global_step
+        )
         if not self.accelerator.is_main_process:
             return
 
@@ -2199,6 +2267,51 @@ def _resolve_resume_target(
     return resume_target
 
 
+def _read_trainer_state(checkpoint_dir: str) -> dict[str, Any]:
+    """A checkpoint's ``trainer_state.json``, or ``{}`` when it is missing or unreadable."""
+    state_path = Path(checkpoint_dir) / "trainer_state.json"
+    if not state_path.is_file():
+        return {}
+    try:
+        return json.loads(state_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _wandb_last_history_step(project: str, run_id: str) -> int | None:
+    """The last step in a W&B run's server history, or ``None`` when it cannot be read.
+
+    Uses the public API with ``wandb.init``'s entity resolution (``WANDB_ENTITY`` or the
+    account default). Offline or disabled W&B never touches the network, and any API error
+    returns ``None``: the rewind only tidies the record, training never depends on it.
+    """
+    if os.environ.get("WANDB_MODE", "").lower() in ("offline", "disabled", "dryrun"):
+        return None
+    try:
+        import wandb
+
+        step = wandb.Api(timeout=30).run(f"{project}/{run_id}").lastHistoryStep
+    except Exception as exc:  # noqa: BLE001 -- unknown means "resume without a rewind"
+        logger.warning("Could not read W&B history of run %s (%s); no rewind", run_id, exc)
+        return None
+    return int(step) if step is not None and step >= 0 else None
+
+
+def _wandb_rewind_window(resume_target: str, project: str, run_id: str) -> tuple[int, int] | None:
+    """``(checkpoint_step, server_last_step)`` when the run's W&B history is past the checkpoint.
+
+    ``None`` when the server is not ahead (a drain checkpoint, saved before its step was
+    logged) or either step is unknown; the caller then resumes without a rewind.
+    """
+    checkpoint_step = _read_trainer_state(resume_target).get("global_step")
+    if checkpoint_step is None:
+        return None
+    server_step = _wandb_last_history_step(project, run_id)
+    if server_step is None or server_step <= int(checkpoint_step):
+        return None
+    return int(checkpoint_step), server_step
+
+
 def _read_resume_wandb_run_id(resume_target: str, output_dir: str) -> str | None:
     """Read the wandb run id to resume, for threading into ``wandb.init(id=..., ...)``.
 
@@ -2214,15 +2327,9 @@ def _read_resume_wandb_run_id(resume_target: str, output_dir: str) -> str | None
     Returns:
         The wandb run id string, or ``None`` if neither source has one.
     """
-    state_path = Path(resume_target) / "trainer_state.json"
-    if state_path.is_file():
-        try:
-            state = json.loads(state_path.read_text())
-        except json.JSONDecodeError:
-            state = {}
-        run_id = state.get("wandb_run_id")
-        if run_id:
-            return str(run_id)
+    run_id = _read_trainer_state(resume_target).get("wandb_run_id")
+    if run_id:
+        return str(run_id)
 
     id_path = Path(output_dir) / "wandb_run_id"
     if id_path.is_file():
