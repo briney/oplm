@@ -14,12 +14,12 @@ Corso, Saro Passaro; full text in `THIRD_PARTY_NOTICES.md`). These modules are t
 
 Modifications: `einx`/`einops` calls rewritten as `torch.einsum` (no new dependency);
 `boltz.data.const.chain_type_ids` inlined as `CHAIN_TYPE_IDS`; `torch.cuda.amp.autocast` replaced by
-`torch.autocast("cuda", ...)`; unused wrappers (`confidence_loss`, `tm_function`, `compute_ptms`)
-omitted. Everything else is verbatim, including the eps constants and reductions the parity tests
+`torch.autocast("cuda", ...)`; unused wrappers (`confidence_loss`, `tm_function`, `compute_ptms`,
+`compute_aggregated_metric`) omitted. Everything else is verbatim, including the eps constants and reductions the parity tests
 in `tests/fold/test_losses.py` match.
 
 Conventions the oracles encode (and OPLM reproduces): the reference is aligned onto the
 prediction; smooth lDDT scores pairs under 15 Å (30 Å for nucleotides) excluding `i == j`;
-pLDDT targets are per-atom lDDT against representative atoms within 15 Å; PAE expresses token `j`'s
+pLDDT targets are per-atom lDDT against token center atoms (CA for protein) within 15 Å; PAE expresses token `j`'s
 frame center in token `i`'s (N, CA, C) frame; PDE is the representative-atom distance error;
 `resolved` class 0 means resolved.

@@ -539,8 +539,9 @@ class FoldRunConfig:
             "loss_confidence",
             "loss_pae",
         ):
-            if getattr(self, name) < 0:
-                raise ValueError(f"fold.{name} must be >= 0, got {getattr(self, name)}")
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"fold.{name} must be finite and >= 0, got {value}")
 
 
 @dataclass

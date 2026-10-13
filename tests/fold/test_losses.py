@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     from oplm.fold.data.collate import FoldBatch
     from oplm.fold.data.complex import MolecularComplex
 
+# The bin counts (BINS = 8 for distogram/PAE/PDE, 10 for pLDDT below) are kept small on purpose:
+# parity at the production 50/64 bins fails on ~1-2 % of seeds, because the oracle's `cdist`
+# matmul path tips distances across bin thresholds.
 BINS = 8
 MAX_DIST = 32.0
 
@@ -234,7 +237,7 @@ def test_pde_and_plddt_and_resolved_match_boltz(batch: FoldBatch) -> None:
     feats = _boltz_feats(batch)
     torch.manual_seed(3)
     pde_logits = torch.randn(2, f.num_tokens, f.num_tokens, BINS)
-    plddt_logits = torch.randn(2, f.num_atoms, 10)
+    plddt_logits = torch.randn(2, f.num_atoms, 10)  # 10 bins: see the BINS note
     resolved_logits = torch.randn(2, f.num_atoms, 2)
     ours_pde = pde_loss(
         pde_logits,

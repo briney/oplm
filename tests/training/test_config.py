@@ -743,5 +743,8 @@ def test_fold_block_validates_its_fields() -> None:
         FoldRunConfig(diffusion_microbatch=0)
     with pytest.raises(ValueError, match="loss_"):
         FoldRunConfig(loss_distogram=-1.0)
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="loss_confidence must be finite and >= 0"):
+            FoldRunConfig(loss_confidence=bad)
     with pytest.raises(ValueError, match="lm"):
         FoldRunConfig(lm="")

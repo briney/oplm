@@ -114,8 +114,8 @@ def mask_lm_inputs(features: FoldFeatures, fraction: float, mask_id: int) -> Fol
     """Replace a ``fraction`` of inner residue ids on every LM row with ``mask_id`` (spec §6.1).
 
     BOS (position 0), EOS (the last attended position) and padding are never masked. Draws from
-    the global torch RNG, which the Trainer seeds and checkpoints per rank. ``fraction <= 0``
-    returns ``features`` unchanged.
+    the global torch RNG, which the Trainer seeds and ``FoldTask`` offsets per rank.
+    ``fraction <= 0`` returns ``features`` unchanged.
     """
     if fraction <= 0:
         return features

@@ -195,3 +195,52 @@ def test_distogram_logits_and_loss_stay_fp32_under_an_outer_bf16_autocast(
     assert seen == [torch.float32]
     assert out.loss.dtype == torch.float32 and torch.isfinite(out.loss)
 
+
+def test_confidence_loss_trains_only_the_confidence_head(batch: FoldBatch) -> None:
+    model = _model()
+    only_confidence = TrainSettings(
+        3,
+        2,
+        2,
+        LossWeights(diffusion_mse=0, smooth_lddt=0, distogram=0, confidence=1.0),
+    )
+    out = model(batch.features, targets=batch.targets, train=only_confidence, num_loops=1)
+    out.loss.backward()
+    for name, p in model.named_parameters():
+        if not name.startswith("confidence_head."):
+            assert p.grad is None or not p.grad.abs().any(), name
+    assert any(
+        p.grad is not None and p.grad.abs().any()
+        for n, p in model.named_parameters()
+        if n.startswith("confidence_head.")
+    )
+
+
+def test_train_mode_masks_every_inner_lm_position_and_eval_does_not(
+    batch: FoldBatch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _model()
+    # The config validator caps the fraction below 1; ``rand < 1.0`` is always true.
+    model.config.lm_input_mask_fraction = 1.0
+    assert model.lm is not None
+    seen: list[torch.Tensor] = []
+    real_forward = model.lm.forward
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["input_ids"].clone())
+        return real_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model.lm, "forward", recording)
+    model(batch.features, targets=batch.targets, train=_SETTINGS, num_loops=1)
+    ids = batch.features.lm_input_ids
+    lengths = batch.features.lm_attention_mask.sum(dim=1).tolist()
+    expected = ids.clone()
+    for row, n in enumerate(lengths):
+        expected[row, 1 : int(n) - 1] = model.config.lm_mask_token_id  # BOS, EOS, padding stay
+    assert len(seen) == 1 and not torch.equal(ids, expected)
+    assert torch.equal(seen[0], expected)
+
+    model.eval()
+    with torch.no_grad():
+        model(batch.features, generator=torch.Generator().manual_seed(0))
+    assert torch.equal(seen[1], ids)

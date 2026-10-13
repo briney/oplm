@@ -412,8 +412,8 @@ Implements spec §6.1–6.4 for stage 1 under the
 [M2 addendum](superpowers/specs/2026-10-11-fold-m2-pipeline-proof-design.md) §2, §3 and §5.
 
 **One training step** (spec §6.1) runs inside `OplmForFolding.forward(features, targets=...)` so
-DDP synchronizes through one forward. In train mode 10 % of the inner residue ids on the LM rows
-are masked (id 32; never BOS, EOS or padding), the loop count is a clamped Poisson draw per rank
+DDP synchronizes through one forward. In train mode each inner residue id on the LM rows is masked
+with probability 0.1 (id 32; never BOS, EOS or padding), the loop count is a clamped Poisson draw per rank
 (mean 3, 1–6; eval uses `inference_num_loops`), the trunk runs as at inference (gradient through
 the last 2 loops, per-loop LM-pair dropout), and the distogram logits come from the symmetrized
 final pair. Then `diffusion_samples` copies of the reference are centred, randomly rotated and
@@ -433,7 +433,7 @@ empty masks) and their conventions:
 
 | term | definition | weight |
 |---|---|---|
-| diffusion MSE | reference aligned onto the prediction (detached), `Σ w ‖Δ‖² / (3 Σ w)` over resolved atoms, times the EDM weight `(σ² + σ_d²) / (σ σ_d)²` | `loss_diffusion_mse` 4.0 |
+| diffusion MSE | reference aligned onto the prediction (detached), `Σ w ‖Δ‖² / (3 Σ w)` over resolved atoms, times the EDM weight `(σ² + σ_d²) / (σ σ_d)²` with `σ_d` = `sigma_data` = 16 | `loss_diffusion_mse` 4.0 |
 | smooth lDDT | pairs under 15 Å in the reference, both atoms resolved, `i ≠ j`; `1 − mean ¼ Σ_t sigmoid(t − \|Δd\|)` for `t` in 0.5, 1, 2, 4 Å | `loss_smooth_lddt` 1.0 |
 | distogram | representative-atom (CB, CA for glycine) distances in 64 bins over 2–22 Å (`distogram_{min,max}_dist`), masked mean cross-entropy | `loss_distogram` 0.03 |
 | confidence | pLDDT (per-atom lDDT against the token CA atoms within 15 Å, 50 bins) + PDE (representative-atom distance error, 64 bins over 0–32 Å) + resolved (class 0 = resolved) + `loss_pae` × PAE (token CA in the N–CA–C frame of the other token, 64 bins over 0–32 Å; frames need resolved, non-collinear atoms) | `loss_confidence` 1e-4 |
@@ -470,8 +470,8 @@ is per optimizer step at the config's `gradient_accumulation_steps` (it already 
 accumulation micro-step); `micro_step_time_s` is that divided by the accumulation, the time of
 one micro-batch. A run that fails still writes the records so far plus an `error` field.
 [`docs/fold/b200-m2b-measure.sbatch`](fold/b200-m2b-measure.sbatch) runs it for
-`configs/fold/proof-w128.yaml` and `proof-w256.yaml` on one B200 and then the GPU-marked fold
-tests. The results and the per-device batch, accumulation and step budget derived from them for
+`configs/fold/proof-w128.yaml` and `proof-w256.yaml` on one B200, plus the fold CPU suite and the
+GPU-marked fold tests in the ESM-C environment. The results and the per-device batch, accumulation and step budget derived from them for
 milestone 2c are recorded in [`docs/fold/m2/`](fold/m2/).
 
 **Deviations, all deliberate** (addendum §2). Four loss terms (no bond term, no interface

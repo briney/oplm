@@ -733,15 +733,17 @@ arithmetic** — walking shard metadata (row counts) rather than reading and dis
 the resumed run sees exactly the same sequence of training examples, in the same order, as an
 uninterrupted control run; no row is re-seen or skipped, and `tokens_seen` matches the
 uninterrupted run exactly. A checkpoint taken exactly at an epoch boundary resumes into the next
-epoch rather than replaying the finished one. Masking is unaffected by this: the collator's masking RNG is untouched,
-so post-resume masks differ bit-for-bit from an uninterrupted run even though the *data* stream is
-identical (data-exact, not bitwise). A cursor whose recorded layout doesn't match the live run's
-(different world size, worker count, batch size, or seed) raises rather than silently reproducing
-the wrong data order or coverage; the fix is either to resume at the original layout or set
-`resume_data_position=false` to fall back to the pre-Phase-3 behavior (restart the current epoch's
-data stream from row 0 — a minor efficiency cost, not a correctness issue, for a shuffled,
+epoch rather than replaying the finished one. Masking is unaffected by this: the collator's masking
+RNG is untouched, so post-resume masks differ bit-for-bit from an uninterrupted run even though the
+*data* stream is identical (data-exact, not bitwise). A cursor whose recorded layout doesn't match
+the live run's (different world size, worker count, batch size, or seed) raises rather than silently
+reproducing the wrong data order or coverage; the fix is either to resume at the original layout or
+set `resume_data_position=false` to fall back to the pre-Phase-3 behavior (restart the current
+epoch's data stream from row 0 — a minor efficiency cost, not a correctness issue, for a shuffled,
 many-epoch run). A checkpoint saved before Task 3.3 (no cursor at all) always takes that same
-restart-from-row-0 fallback, regardless of `resume_data_position`.
+restart-from-row-0 fallback, regardless of `resume_data_position`. When the striping remainder gives
+ranks unequal batch counts, the single per-run cursor assumes lockstep ranks and the shorter rank's
+resume is exact only to within `num_workers` batches per epoch (tracked for milestone 3).
 
 ### W&B continuity
 

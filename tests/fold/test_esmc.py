@@ -9,11 +9,12 @@ import pytest
 import torch
 from torch import nn
 
-from oplm.fold.configuration_fold import FoldConfig
+from oplm.config import FoldRunConfig
 from oplm.fold.data.featurize import ChainSpec, featurize
 from oplm.fold.esmc import ESMC_PREFIX, ESMC_REPOS, FrozenEsmC, load_esmc, parse_esmc_name
 from oplm.fold.lm_shim import frozen_lm_hidden_states, lm_state_count
 from oplm.fold.modeling_fold import OplmForFolding, load_frozen_lm
+from oplm.fold.training import build_fold_config
 from tests.fold.helpers import tiny_fold_config
 
 _HAS_ESM = importlib.util.find_spec("esm") is not None
@@ -94,6 +95,20 @@ def test_real_esmc_300m_states_match_its_config() -> None:
     states = frozen_lm_hidden_states(lm, f)
     assert states.shape == (1, 22, lm.config.num_hidden_layers + 1, lm.config.hidden_size)
     assert torch.isfinite(states).all()
-    assert FoldConfig(
-        lm_hidden_size=lm.config.hidden_size, lm_num_hidden_states=lm.num_hidden_states
-    )
+    cfg = build_fold_config(FoldRunConfig(lm="esmc:esmc_300m"), lm=lm)
+    assert cfg.lm_hidden_size == lm.config.hidden_size
+    assert cfg.lm_num_hidden_states == lm.num_hidden_states
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _HAS_ESM, reason="esm package not installed (oplm[esmc], Python >= 3.12)")
+def test_real_esmc_300m_padded_chain_rows_match_the_unpadded_chain() -> None:
+    """Two chains of different lengths share one LM batch (right-padded); padding must not leak."""
+    lm = load_esmc("esmc_300m", device="cpu")
+    long_seq, short_seq = "MKTAYIAKQRQISFVKSHFSRQ", "GSHMLEDPV"
+    both = featurize([ChainSpec(long_seq, "A"), ChainSpec(short_seq, "B")])
+    assert both.lm_input_ids.shape[0] == 2 and both.lm_input_ids.shape[1] > len(short_seq) + 2
+    padded = frozen_lm_hidden_states(lm, both)
+    alone = frozen_lm_hidden_states(lm, featurize([ChainSpec(short_seq, "A")]))
+    n = len(short_seq)
+    torch.testing.assert_close(padded[0, len(long_seq) :], alone[0, :n], atol=1e-4, rtol=0)

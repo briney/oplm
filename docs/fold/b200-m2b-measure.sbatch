@@ -4,10 +4,12 @@
 # train.batch_size, gradient_accumulation_steps and max_steps. Builds a Python 3.12 venv with
 # `esm==3.4.1.post1` plus this repo's [dev,train,fold] extras, downloads the published
 # training dataset, runs the gated ESM-C weights test (the env file must export HF_TOKEN of a
-# Hugging Face account that accepted the Cambrian license), then `oplm fold measure` at pair
-# width 128 and 256 (configs/fold/proof-w{128,256}.yaml, 20 optimizer steps each), and finally
-# the GPU-marked fold tests. One-shot job, no requeue; a failing step is recorded in
-# status.txt and later steps still run.
+# Hugging Face account that accepted the Cambrian license on BOTH gated repos: biohub/ESMC-300M
+# for the esmc test step and biohub/ESMC-600M for the measure steps), then the fold CPU suite
+# (`-m "not slow"`, on this venv's transformers < 5 / Python 3.12, which has never run it), then
+# `oplm fold measure` at pair width 128 and 256 (configs/fold/proof-w{128,256}.yaml, 20 optimizer
+# steps each), and finally the GPU-marked fold tests. One-shot job, no requeue; a failing step
+# is recorded in status.txt and later steps still run.
 #
 # Submit from a login node:
 #   sbatch docs/fold/b200-m2b-measure.sbatch
@@ -19,7 +21,7 @@
 #   OPLM_ESM_VENV=/mnt/data/<you>/fold-m2b/esm-venv   reused across jobs
 #   OPLM_DATA_ROOT=/mnt/data/<you>/oplm-data/hf       where the dataset is downloaded
 #   OPLM_RESULTS=/mnt/home/<you>/fold-m2b/<jobid>     logs, JSON reports, junit XML
-#   OPLM_STEPS="venv install env download esmc measure-w128 measure-w256 gpu-tests"
+#   OPLM_STEPS="venv install env download esmc cpu-tests measure-w128 measure-w256 gpu-tests"
 #
 #SBATCH --job-name=fold-m2b-measure
 #SBATCH --partition=hpc-mid
@@ -40,7 +42,7 @@ RESULTS="${OPLM_RESULTS:-/mnt/home/${SLURM_JOB_USER}/fold-m2b/${SLURM_JOB_ID}}"
 ESM_VENV="${OPLM_ESM_VENV:-/mnt/data/${SLURM_JOB_USER}/fold-m2b/esm-venv}"
 GIT_REF="${OPLM_GIT_REF:-main}"
 REPO="${OPLM_REPO:-}"
-STEPS="${OPLM_STEPS:-venv install env download esmc measure-w128 measure-w256 gpu-tests}"
+STEPS="${OPLM_STEPS:-venv install env download esmc cpu-tests measure-w128 measure-w256 gpu-tests}"
 # The in-container script reads these; srun --export=ALL only forwards exported variables.
 export RESULTS ESM_VENV GIT_REF REPO STEPS
 
@@ -102,6 +104,7 @@ run install bash -c "python -m uv pip install --python '$ESM_VENV/bin/python' --
 run env bash -c "source '$ESM_VENV/bin/activate' && python -c 'import esm, torch, transformers; print(esm.__version__, torch.__version__, transformers.__version__, torch.cuda.get_device_name(0))'"
 run download bash -c "source '$ESM_VENV/bin/activate' && hf download brineylab/oplmfold-training-data --repo-type dataset --revision wwpdb-2026-10-12 --include 'wwpdb/2026-10-12/*' --local-dir '$DATA'"
 run esmc bash -c "source '$ESM_VENV/bin/activate' && python -m pytest tests/fold/test_esmc.py -q -rs"
+run cpu-tests bash -c "source '$ESM_VENV/bin/activate' && python -m pytest tests/fold -q -m 'not slow' --junitxml='$RESULTS/fold-cpu-tests.xml'"
 
 # Acceptance measurement: 20 real optimizer steps per width (docs/FOLD.md §9). The run
 # configs point data.train at the cluster's default dataset path; override it and the output
@@ -122,4 +125,4 @@ srun --nodes=1 --ntasks-per-node=1 \
   --no-container-mount-home \
   bash "$INNER"
 
-echo "=== $(date -Is) done; copy $RESULTS/{measure-w128.json,measure-w256.json,status.txt,pip-freeze.txt,git-rev.txt,esmc.log,fold-gpu-tests.xml} into docs/fold/m2/ ==="
+echo "=== $(date -Is) done; copy $RESULTS/{measure-w128.json,measure-w256.json,status.txt,pip-freeze.txt,git-rev.txt,esmc.log,fold-cpu-tests.xml,fold-gpu-tests.xml} into docs/fold/m2/ ==="

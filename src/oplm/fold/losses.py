@@ -6,15 +6,17 @@ The conventions, recorded here because the oracle code (tests/fold/oracles/) enc
 implicitly:
 
 - Diffusion MSE: the reference is aligned onto the prediction (AF3 algorithm 28), detached, then
-  ``Σ w |x − x_aligned|² / (3 Σ w)``; the EDM weight is ``(σ² + σ_d²) / (σ σ_d)²``.
+  ``Σ w |x − x_aligned|² / (3 Σ w)``; the EDM weight is ``(σ² + σ_d²) / (σ σ_d)²`` with
+  ``σ_d = sigma_data``.
 - Smooth lDDT: pairs with reference distance below ``cutoff`` (15 Å, protein), both atoms masked
   in, ``i ≠ j``; ``1 − mean(¼ Σ_{t ∈ {0.5, 1, 2, 4}} sigmoid(t − |Δd|))``.
 - Distogram: representative-atom distances bucketized with ``bins − 1`` boundaries evenly spaced
   on ``[min_dist, max_dist]``; masked mean cross-entropy over pairs whose representative atoms are
   both resolved, ``i ≠ j``.
-- pLDDT target: per-atom lDDT (thresholds 0.5, 1, 2, 4 Å) against the representative atoms within
-  ``cutoff`` in the reference, the atom's own representative excluded; ``floor(lddt · bins)``
-  clamped to the last bin; atoms without a scored neighbour are masked out.
+- pLDDT target: per-atom lDDT (thresholds 0.5, 1, 2, 4 Å) against the token CENTER atoms (CA for
+  protein; the caller passes ``frame_atom_idx[..., 1]``) within ``cutoff`` in the reference, the
+  atom's own center excluded; ``floor(lddt · bins)`` clamped to the last bin; atoms without a
+  scored neighbour are masked out.
 - PAE target: token ``j``'s CA expressed in token ``i``'s (N, CA, C) frame, reference minus
   prediction, Euclidean norm; ``floor(d · bins / max_dist)`` clamped. A frame row is valid when its
   three atoms are resolved and non-collinear in the reference (|cos| < 0.9063, bond norms > 0.01 Å)
@@ -23,7 +25,8 @@ implicitly:
 - Resolved: two-class cross-entropy per non-padding atom; class 0 means resolved.
 
 Rollout tensors (``pred``, logits) have ``N = B · k`` rows for ``k`` rollouts of each of the
-``B`` base examples, in the order ``b · k + j``; base-batch tensors are repeated inside.
+``B`` base examples, in the order ``b · k + j``; base-batch tensors are repeated inside, except by
+``diffusion_mse`` and ``smooth_lddt``, which take ``N``-row inputs throughout.
 """
 
 from __future__ import annotations
@@ -98,7 +101,10 @@ def _gather_atoms(values: Tensor, index: Tensor) -> Tensor:
 
 
 def diffusion_mse(pred: Tensor, target: Tensor, weights: Tensor) -> Tensor:
-    """Weighted MSE / 3 per sample after aligning ``target`` onto ``pred`` (detached): ``(N,)``."""
+    """Weighted MSE / 3 per sample after aligning ``target`` onto ``pred`` (detached): ``(N,)``.
+
+    All inputs have ``N`` rows; the caller repeats the base batch (unlike the rollout losses).
+    """
     with fp32_autocast_off(pred.device):
         w = weights.float()
         aligned = weighted_rigid_align(target.float(), pred.detach().float(), w).detach()
@@ -108,6 +114,10 @@ def diffusion_mse(pred: Tensor, target: Tensor, weights: Tensor) -> Tensor:
 
 def smooth_lddt(pred: Tensor, target: Tensor, mask: Tensor, *, cutoff: float = 15.0) -> Tensor:
     """``1 − smooth lDDT`` per sample ``(N,)``; 0 for a sample with fewer than two masked atoms.
+
+    All inputs have ``N`` rows; the caller repeats the base batch (unlike the rollout losses). A
+    sample with two or more masked atoms but no pair under ``cutoff`` returns 1.0 (no gradient
+    either way).
 
     Each sample is compacted to its masked atoms before the ``(n, n)`` distance matrices are
     formed, so a padded 9216-atom crop costs its real atoms squared, not the budget squared.
@@ -207,7 +217,11 @@ def plddt_loss(
     *,
     cutoff: float = 15.0,
 ) -> Tensor:
-    """Per-rollout pLDDT cross-entropy ``(N,)`` (per-atom lDDT target, ``bins`` from the logits)."""
+    """Per-rollout pLDDT cross-entropy ``(N,)`` (per-atom lDDT target, ``bins`` from the logits).
+
+    ``rep_atom_idx`` picks the atom each token is scored against: the model passes the token
+    center atom (CA), ``frame_atom_idx[..., 1]``.
+    """
     with fp32_autocast_off(logits.device):
         k = pred.shape[0] // target.shape[0]
         t_coords, t_res, a_mask, tok, rep_idx = _repeat(
@@ -226,8 +240,8 @@ def plddt_loss(
         l1 = (d_true - d_pred).abs()
         score = sum((l1 < t).float() for t in _LDDT_THRESHOLDS) / len(_LDDT_THRESHOLDS)
         n_scored = scored.float().sum(-1)
-        # Multiply by the reciprocal as the oracle does: a quotient can land one ulp across a bin
-        # edge (lddt = 15/25 floors to bin 5 or 6), which flips one atom's target class.
+        # Multiply by the reciprocal: this reproduces Boltz-2's binning of exact-edge lDDT values
+        # (its reciprocal product lands one ulp low); systematic, do not revert to division.
         lddt = (1e-10 + (score * scored).sum(-1)) * (1.0 / (1e-10 + n_scored))
         ce = _binned_cross_entropy(logits, lddt, float(logits.shape[-1]))
         return masked_mean(ce, t_res & a_mask & (n_scored > 0), (-1,))

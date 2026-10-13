@@ -56,9 +56,11 @@ class FrozenEsmC(nn.Module):
 
     @property
     def num_hidden_states(self) -> int:
+        """Hidden states the encoder returns: one per block input plus the final output."""
         return int(self.config.num_hidden_layers) + 1
 
     def train(self, mode: bool = True) -> FrozenEsmC:
+        """Keep the frozen LM in eval mode whatever ``mode`` says."""
         super().train(False)
         return self
 

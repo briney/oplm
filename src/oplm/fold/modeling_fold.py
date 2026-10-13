@@ -10,14 +10,15 @@ explicit; per-loop LM-pair dropout is training-only; the generic HF init respect
 zero/identity/−2 initialisations through module tags (spec §5.4).
 
 Training branch (spec §6.1): ``forward(features, targets=..., train=TrainSettings(...))`` runs
-the same prefix as inference (in-model LM-input masking of ``lm_input_mask_fraction`` inner
-residues, a per-rank clamped Poisson loop count drawn from the global RNG, the recurrent trunk
-with truncated gradients, the distogram head) and then, instead of sampling: (3) denoises
-``diffusion_samples`` noised copies of the ground truth per example in microbatches, each denoiser
-call under activation checkpointing so only one chunk is live at a time; (4) rolls the sampler out
-under ``no_grad`` from the shared conditioning; (5) runs the confidence head on detached trunk
-outputs and the rollout; (6) returns the weighted sum of the diffusion, smooth-lDDT, distogram and
-confidence losses with per-term metrics. The branch runs whenever ``targets`` is given; train-mode
+the same prefix as inference (steps 1-3: in-model LM-input masking of ``lm_input_mask_fraction``
+inner residues, a per-rank clamped Poisson loop count drawn from the global RNG, the recurrent
+trunk with truncated gradients, the distogram head) and then, instead of sampling: (4) denoises
+``diffusion_samples`` noised copies of the ground truth per example in microbatches; when
+``diffusion_microbatch < diffusion_samples`` each denoiser call runs under activation
+checkpointing so only one chunk is live at a time; (5) rolls the sampler out under ``no_grad``
+from the shared conditioning and runs the confidence head on detached trunk outputs and the
+rollout; (6) returns the weighted sum of the diffusion, smooth-lDDT, distogram and confidence
+losses with per-term metrics. The branch runs whenever ``targets`` is given; train-mode
 behaviour (dropout, masking, the Poisson draw) still follows ``self.training``.
 
 Loading a fold checkpoint requires ``oplm`` to be installed (``import oplm.fold`` registers
@@ -333,15 +334,18 @@ class OplmForFolding(OplmFoldPreTrainedModel):
                 returns :class:`FoldTrainOutput`. ``train`` supplies its settings (defaults
                 otherwise) and is ignored without ``targets``.
             train: Sample count, microbatch, rollout steps and loss weights.
-            lm_hidden_states: ``(B, L, K, D)`` precomputed LM states (skips the attached LM).
+            lm_hidden_states: ``(B, L, K, D)`` precomputed LM states (skips the attached LM; in
+                train mode the LM-input masking still consumes the global RNG).
             num_loops: Recurrence iterations; default ``config.inference_num_loops`` in eval mode
                 and a clamped Poisson draw in train mode.
             num_samples: Diffusion samples (inference); default ``config.inference_num_samples``.
             num_steps: Sampler steps before the sigma cap; default ``config.inference_num_steps``.
+                Ignored when ``targets`` is given (``train.confidence_rollout_steps`` applies).
             z0: Initial pair state; drawn from ``generator`` when ``None``.
             generator: RNG for the initial state and the samplers (deterministic when set);
                 must live on the model's device (a CPU generator fails with CUDA tensors).
-            return_intermediates: Also return the stage tensors used by the parity tests.
+            return_intermediates: Also return the stage tensors used by the parity tests;
+                ignored when ``targets`` is given.
 
         Raises:
             RuntimeError: No LM is attached and ``lm_hidden_states`` is ``None``.
@@ -596,6 +600,7 @@ class OplmForFolding(OplmFoldPreTrainedModel):
             "loops": float(loops),
             "sigma_mean": sigma.mean().item(),
         }
+        # chains == B: milestone-2 examples are single-chain, so one example is one chain
         return FoldTrainOutput(loss=loss, metrics=metrics, tokens=int(f.token_mask.sum()), chains=B)
 
 
