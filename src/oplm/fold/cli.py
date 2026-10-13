@@ -1,5 +1,5 @@
-"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``predict`` (design §5.2) and
-``preprocess``.
+"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``predict`` (design §5.2),
+``preprocess``, and ``train``.
 
 Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 """
@@ -455,3 +455,42 @@ def preprocess_cmd(
     table.add_row("splits", json.dumps(manifest["splits"]))
     table.add_row("shards", str(len(manifest["shards"])))
     console.print(table)
+
+
+@app.command("train")
+def train(
+    overrides: Annotated[
+        list[str] | None, typer.Argument(help="Dotlist overrides, e.g. train.max_steps=10")
+    ] = None,
+    config: Annotated[
+        Path | None, typer.Option("--config", help="Run config YAML with a fold: block")
+    ] = None,
+    name: Annotated[
+        str | None, typer.Option("--name", help="W&B run name and ./<name> output dir")
+    ] = None,
+) -> None:
+    """Train the structure head.
+
+    Single process; use `accelerate launch -m oplm.fold.train` for DDP.
+    """
+    from oplm.config import load_config
+
+    argv: list[str] = []
+    if config is not None:
+        argv += ["--config", str(config)]
+    if name is not None:
+        argv += ["--name", name]
+    argv += list(overrides or [])
+    cfg = load_config(argv)
+    if cfg.fold is None:
+        raise typer.BadParameter("the config has no fold: block (docs/FOLD.md §9)")
+    model = cfg.fold.model or {}
+    console.print(
+        f"[bold]Head:[/bold] pair_width {model.get('pair_width', 256)} / trunk_blocks "
+        f"{model.get('trunk_blocks', 24)}  [bold]LM:[/bold] {cfg.fold.lm}  "
+        f"[bold]crop:[/bold] {cfg.fold.crop_size}"
+    )
+    console.print(f"[bold]Output:[/bold] {cfg.train.output_dir}")
+    from oplm.fold.train import main as train_main
+
+    train_main(cfg)

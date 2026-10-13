@@ -10,9 +10,10 @@ import torch
 from typer.testing import CliRunner
 
 from oplm.cli import app
+from oplm.config import serialize_config
 from oplm.fold.cli import run_kernel_benchmark
 from tests.cli_output import plain
-from tests.fold.helpers import tiny_fold_config, tiny_lm
+from tests.fold.helpers import tiny_fold_config, tiny_fold_run_cfg, tiny_lm
 
 runner = CliRunner()
 
@@ -147,3 +148,23 @@ def test_preprocess_command_runs_on_the_fixtures(tmp_path: Path) -> None:
     result = runner.invoke(app, args)
     assert result.exit_code == 0, result.output
     assert "accepted" in result.output and (tmp_path / "ds" / "manifest.json").exists()
+
+
+def test_fold_train_runs_a_tiny_cpu_run_from_a_config(
+    tmp_path: Path, fixture_dataset: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
+    lm_dir = tmp_path / "lm"
+    tiny_lm().save_pretrained(lm_dir)
+    cfg = tiny_fold_run_cfg(tmp_path / "run", fixture_dataset, lm_dir, max_steps=2, save_every=2)
+    config = tmp_path / "run.yaml"
+    config.write_text(serialize_config(cfg))
+    result = runner.invoke(app, ["fold", "train", "--config", str(config), "train.max_steps=2"])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "run" / "checkpoint-2" / "hf" / "config.json").is_file()
+    assert "pair_width" in plain(result.output)
+
+
+def test_fold_train_refuses_a_config_without_a_fold_block(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["fold", "train", "train.max_steps=1"])
+    assert result.exit_code != 0 and "fold:" in plain(result.output)
