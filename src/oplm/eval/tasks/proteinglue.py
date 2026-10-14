@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 @register_eval_task("proteinglue")
-class ProteinGlueEvalTask(EvalTask):
+class ProteinGlueEvalTask(EvalTask["OplmForMaskedLM"]):
     """ProteinGlue benchmark evaluation.
 
     Multi-task protein understanding benchmark covering fold classification,

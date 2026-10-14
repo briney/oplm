@@ -17,9 +17,8 @@ if TYPE_CHECKING:
 runner = CliRunner()
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# A minimal, valid `slurm:` block -- everything `load_slurm_config` requires, and nothing
-# from `model:` / `train:` / `data:`, since generate/submit/status only ever touch the
-# `slurm:` key.
+# A minimal, valid `slurm:` block -- everything `load_slurm_config` requires -- plus the one
+# `train.output_dir` that `generate` resolves for the requeue guard (it must be absolute).
 _SLURM_BLOCK = textwrap.dedent(
     """\
     slurm:
@@ -37,6 +36,8 @@ _SLURM_BLOCK = textwrap.dedent(
       max_concurrent: 4
       nodes: {170M: 1, 400M: 4}
       max_batch_size: {170M: 256, 400M: 256}
+    train:
+      output_dir: /runs/test
     """
 )
 
@@ -343,3 +344,66 @@ def test_generate_rejects_non_keyvalue_override(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "KEY=VALUE" in plain(result.output)
+
+
+def test_generate_launches_the_fold_entry_for_a_fold_config(tmp_path: Path) -> None:
+    config = tmp_path / "fold.yaml"
+    config.write_text(_SLURM_BLOCK + "fold:\n  lm: esmc:esmc_600m\n")
+    result = runner.invoke(
+        app,
+        [
+            "slurm",
+            "generate",
+            "--config",
+            str(config),
+            "--out",
+            str(tmp_path / "out"),
+            "--nodes",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, plain(result.stdout)
+    text = (tmp_path / "out" / "oplm-run.sbatch").read_text()
+    assert "-m oplm.fold.train" in text and "-m oplm.train " not in text
+
+
+def test_generate_keeps_the_mlm_entry_without_a_fold_block(tmp_path: Path) -> None:
+    config = _write_config(tmp_path / "mlm.yaml")
+    result = runner.invoke(
+        app,
+        [
+            "slurm",
+            "generate",
+            "--config",
+            str(config),
+            "--out",
+            str(tmp_path / "out"),
+            "--nodes",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, plain(result.stdout)
+    text = (tmp_path / "out" / "oplm-run.sbatch").read_text()
+    assert "-m oplm.train" in text and "oplm.fold.train" not in text
+
+
+def test_generate_rejects_a_relative_output_dir(tmp_path: Path) -> None:
+    """A relative output_dir would land on the node-local $JOB_WORK_DIR and vanish at job end."""
+    config = _write_config(tmp_path / "rel.yaml")
+    result = runner.invoke(
+        app,
+        [
+            "slurm",
+            "generate",
+            "--config",
+            str(config),
+            "--out",
+            str(tmp_path / "out"),
+            "--nodes",
+            "1",
+            "train.output_dir=outputs/run",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "absolute" in plain(result.output)

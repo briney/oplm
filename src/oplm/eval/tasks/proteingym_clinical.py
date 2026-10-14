@@ -72,7 +72,7 @@ class ProteinGymClinicalTaskConfig:
 
 
 @register_eval_task("proteingym_clinical")
-class ProteinGymClinicalEvalTask(EvalTask):
+class ProteinGymClinicalEvalTask(EvalTask["OplmForMaskedLM"]):
     """Zero-shot clinical-variant pathogenicity prediction (Pathogenic vs Benign).
 
     Data format: a directory of CSV files from the ProteinGym clinical-substitution

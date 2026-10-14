@@ -80,7 +80,16 @@ def generate(
         if preset is not None:
             train_argv += ["--preset", preset]
         train_argv += overrides
-        progress_dir = str(load_config(train_argv).train.output_dir)
+        run_cfg = load_config(train_argv)
+        progress_dir = str(run_cfg.train.output_dir)
+        if not Path(progress_dir).is_absolute():
+            raise ValueError(
+                "train.output_dir must be an absolute path on shared storage, got "
+                f"{progress_dir!r}: the job runs from a node-local $JOB_WORK_DIR, where a "
+                "relative path would hold the checkpoints only until the job ends"
+            )
+        # A run config with a fold: block trains the structure head (docs/FOLD.md §10).
+        module = "oplm.fold.train" if run_cfg.fold is not None else "oplm.train"
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     except KeyError as exc:
@@ -99,9 +108,7 @@ def generate(
         name=job_name,
         nodes=resolved_nodes,
         time_limit=resolved_time,
-        command=accelerate_command(
-            module="oplm.train", gpus_per_node=slurm.gpus_per_node, args=args
-        ),
+        command=accelerate_command(module=module, gpus_per_node=slurm.gpus_per_node, args=args),
         progress_dir=progress_dir,
     )
     out.mkdir(parents=True, exist_ok=True)

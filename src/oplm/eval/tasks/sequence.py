@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 @register_eval_task("sequence")
-class SequenceEvalTask(EvalTask):
+class SequenceEvalTask(EvalTask["OplmForMaskedLM"]):
     """Evaluate MLM performance on held-out protein sequences.
 
     Data format: single parquet file or directory of sharded parquet files

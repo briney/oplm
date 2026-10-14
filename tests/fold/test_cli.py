@@ -226,9 +226,166 @@ def test_fold_measure_writes_a_partial_report_when_the_run_fails(
 @pytest.mark.parametrize("width", [128, 256])
 def test_proof_configs_load(width: int) -> None:
     from oplm.config import load_config
+    from oplm.slurm.config import load_slurm_config
 
-    cfg = load_config(["--config", f"configs/fold/proof-w{width}.yaml"])
+    path = Path("configs/fold") / f"proof-w{width}.yaml"
+    cfg = load_config(["--config", str(path)])
     assert cfg.fold is not None and cfg.fold.model["pair_width"] == width
     assert cfg.train.optimizer == "adamw" and cfg.train.ema_decay == 0.999
     assert cfg.fold.crop_size == 384
-    assert 8 * cfg.train.batch_size * cfg.train.gradient_accumulation_steps == 128  # 8 x B200
+    assert Path(cfg.train.output_dir).is_absolute()
+    assert cfg.train.max_steps == 50_000 and cfg.train.save_every == 2000
+    assert cfg.train.keep_every_n_steps == 10_000  # the offline job's KEEP_EVERY
+    assert cfg.train.output_dir.endswith(f"proof-w{width}")
+    assert cfg.train.wandb_run_name == f"fold-proof-w{width}"
+    valid = cfg.data.eval["valid"]
+    assert valid["type"] == "fold_monomer" and valid["target_set"] == "valid"
+    assert valid["path"] == cfg.data.train
+    assert valid["every"] == {"steps": 2000, "at_start": True}  # a broken eval fails at step 1
+    slurm = load_slurm_config(path)
+    nodes = slurm.nodes.resolve(phase=None, preset=None)
+    assert slurm.gpus_per_node == 8 and nodes == 4  # 4 nodes x 8 B200
+    devices = nodes * slurm.gpus_per_node
+    assert devices * cfg.train.batch_size * cfg.train.gradient_accumulation_steps == 128
+    assert "@fold-m2c-runs" in slurm.install and "esmc" in slurm.install
+    assert f"/tmp/oplm-fold-m2c/venv-w{width}" in slurm.install  # node-local: every node installs
+    assert "uv pip check" in slurm.install
+    assert "'" not in slurm.install  # rendered inside bash -c '...'
+
+
+def test_slurm_generate_renders_a_proof_run(tmp_path: Path) -> None:
+    args = ["slurm", "generate", "--config", "configs/fold/proof-w128.yaml"]
+    args += ["--name", "fold-proof-w128", "--out", str(tmp_path)]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    text = (tmp_path / "fold-proof-w128.sbatch").read_text()
+    assert "-m oplm.fold.train" in text and "train.auto_resume=true" in text
+    assert "#SBATCH --nodes=4" in text and "--num_machines" in text
+    assert "/tmp/oplm-fold-m2c/venv-w128/bin/activate" in text
+    assert "/mnt/data/briney/oplm-runs/fold-m2c/proof-w128/.last_requeue_step" in text
+
+
+def test_measure_ignores_data_eval(
+    tmp_path: Path, fixture_dataset: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
+    lm_dir = tmp_path / "lm"
+    tiny_lm().save_pretrained(lm_dir)
+    cfg = tiny_fold_run_cfg(tmp_path / "run", fixture_dataset, lm_dir)
+    cfg.data.eval = {"nope": {"path": "x", "type": "no_such_eval_type"}}  # fatal if built
+    config = tmp_path / "run.yaml"
+    config.write_text(serialize_config(cfg))
+    out = tmp_path / "measure.json"
+    result = runner.invoke(
+        app, ["fold", "measure", "--config", str(config), "--steps", "1", "--out", str(out)]
+    )
+    assert result.exit_code == 0, result.output
+
+
+def _saved_head(root: Path) -> tuple[Path, Path]:
+    from oplm.fold import OplmForFolding
+
+    torch.manual_seed(0)
+    cfg = tiny_fold_config(
+        plddt_bins=10,
+        pae_bins=8,
+        pde_bins=8,
+        confidence_dist_bins=5,
+        distogram_bins=8,
+        inference_num_steps=2,
+        inference_num_loops=1,
+        lm_hidden_size=32,
+        lm_num_hidden_states=3,
+    )
+    OplmForFolding(cfg).save_pretrained(root / "checkpoint-10" / "hf_ema")
+    tiny_lm().save_pretrained(root / "lm")
+    return root / "checkpoint-10", root / "lm"
+
+
+def test_eval_cli_writes_scores_and_summary(tmp_path: Path, fixture_dataset: Path) -> None:
+    ckpt, lm = _saved_head(tmp_path)
+    out = tmp_path / "eval"
+    args = ["fold", "eval", "--model", str(ckpt), "--lm", str(lm), "--data", str(fixture_dataset)]
+    args += ["--target-set", "cameo", "--target-set", "casp14"]
+    args += ["--out", str(out), "--device", "cpu"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert "[cameo 1/1] 1crn_A ok" in plain(result.output)  # Rich must not eat the prefix
+    from oplm.fold.eval.monomer import read_scores
+
+    rows = read_scores(out / "targets.csv")
+    assert [(r.target_set, r.entry_id, r.chain_id, r.status) for r in rows] == [
+        ("cameo", "1crn", "A", "ok"),
+        ("casp14", "1jb6", "A", "ok"),
+    ]
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["model"].endswith("hf_ema") and summary["weights"] == "ema"
+    assert summary["lm"] == str(lm)
+    assert summary["sampling"] == {
+        "num_loops": None,
+        "num_steps": None,
+        "num_samples": 1,
+        "seed": 0,
+    }
+    assert summary["resolved_sampling"] == {"num_loops": 1, "num_steps": 2}
+    cameo = summary["target_sets"]["cameo"]
+    assert cameo["coverage"] == {"listed": 1, "missing": [], "skipped": {}, "selected": 1}
+    assert cameo["metrics"]["targets"] == 1.0 and 0.0 <= cameo["metrics"]["tm_score"] <= 1.0
+
+
+def test_eval_cli_resolves_and_rejects_weights(tmp_path: Path, fixture_dataset: Path) -> None:
+    ckpt, lm = _saved_head(tmp_path)
+    base = ["fold", "eval", "--lm", str(lm), "--data", str(fixture_dataset)]
+    base += ["--target-set", "cameo", "--device", "cpu", "--out", str(tmp_path / "o")]
+    ok = runner.invoke(app, [*base, "--model", str(ckpt / "hf_ema")])  # an HF dir directly
+    assert ok.exit_code == 0, ok.output
+    raw = runner.invoke(app, [*base, "--model", str(ckpt), "--weights", "raw"])
+    assert raw.exit_code != 0 and "hf" in plain(raw.output)
+    bad = runner.invoke(app, [*base, "--model", str(ckpt), "--weights", "best"])
+    assert bad.exit_code != 0
+
+
+def test_eval_cli_rejects_an_unknown_target_set_before_scoring(
+    tmp_path: Path, fixture_dataset: Path
+) -> None:
+    ckpt, lm = _saved_head(tmp_path)
+    out = tmp_path / "eval"
+    args = ["fold", "eval", "--model", str(ckpt), "--lm", str(lm), "--data", str(fixture_dataset)]
+    args += ["--target-set", "cameo", "--target-set", "cmaeo"]
+    args += ["--out", str(out), "--device", "cpu"]
+    result = runner.invoke(app, args)
+    assert result.exit_code != 0 and "cmaeo" in plain(result.output)
+    assert not (out / "targets.csv").exists()
+    assert "1crn_A" not in plain(result.output)  # nothing was folded before the failure
+
+
+def test_compare_cli_prints_the_paired_difference(tmp_path: Path) -> None:
+    from oplm.fold.eval.monomer import TargetScore, write_scores
+
+    def rows(tms: list[float]) -> list[TargetScore]:
+        return [
+            TargetScore(
+                target_set="cameo",
+                entry_id=f"e{i}",
+                chain_id="A",
+                auth_chain_id="A",
+                length=50,
+                resolved_residues=50,
+                status="ok",
+                tm_score=v,
+                lddt_ca=v,
+                lddt=v,
+                plddt=v,
+                ptm=v,
+            )
+            for i, v in enumerate(tms)
+        ]
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    write_scores(tmp_path / "a" / "targets.csv", rows([0.4, 0.5, 0.6]))
+    write_scores(tmp_path / "b" / "targets.csv", rows([0.5, 0.6, 0.7]))
+    result = runner.invoke(app, ["fold", "compare", str(tmp_path / "a"), str(tmp_path / "b")])
+    assert result.exit_code == 0, result.output
+    out = json.loads(result.output)
+    assert out["n"] == 3.0 and out["mean_diff"] == pytest.approx(0.1)
