@@ -271,6 +271,7 @@ def test_eval_cli_writes_scores_and_summary(tmp_path: Path, fixture_dataset: Pat
     ]
     summary = json.loads((out / "summary.json").read_text())
     assert summary["model"].endswith("hf_ema") and summary["weights"] == "ema"
+    assert summary["lm"] == str(lm)
     assert summary["sampling"] == {
         "num_loops": None,
         "num_steps": None,
@@ -293,6 +294,20 @@ def test_eval_cli_resolves_and_rejects_weights(tmp_path: Path, fixture_dataset: 
     assert raw.exit_code != 0 and "hf" in plain(raw.output)
     bad = runner.invoke(app, [*base, "--model", str(ckpt), "--weights", "best"])
     assert bad.exit_code != 0
+
+
+def test_eval_cli_rejects_an_unknown_target_set_before_scoring(
+    tmp_path: Path, fixture_dataset: Path
+) -> None:
+    ckpt, lm = _saved_head(tmp_path)
+    out = tmp_path / "eval"
+    args = ["fold", "eval", "--model", str(ckpt), "--lm", str(lm), "--data", str(fixture_dataset)]
+    args += ["--target-set", "cameo", "--target-set", "cmaeo"]
+    args += ["--out", str(out), "--device", "cpu"]
+    result = runner.invoke(app, args)
+    assert result.exit_code != 0 and "cmaeo" in plain(result.output)
+    assert not (out / "targets.csv").exists()
+    assert "1crn_A" not in plain(result.output)  # nothing was folded before the failure
 
 
 def test_compare_cli_prints_the_paired_difference(tmp_path: Path) -> None:

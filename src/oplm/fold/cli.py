@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
     import torch
 
+    from oplm.fold.modeling_fold import OplmForFolding
     from oplm.fold.trimul import Backend, Direction, TriangleMultiplication
 
 app = typer.Typer(name="fold", help="Structure prediction head", add_completion=False)
@@ -438,6 +439,26 @@ def measure(
         )
 
 
+def _load_folder(model: Path, lm: str | None, device: str) -> tuple[OplmForFolding, torch.device]:
+    """Load a fold head onto ``device`` ("auto" picks CUDA when present) with its frozen LM."""
+    import torch
+
+    from oplm.fold.modeling_fold import OplmForFolding
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = torch.device(device)
+    folder = OplmForFolding.from_pretrained(model, lm_name_or_path=lm).to(dev).eval()
+    if folder.lm is None:
+        raise typer.BadParameter(
+            "no language model: pass --lm or save the checkpoint with lm_name_or_path"
+        )
+    folder.lm.to(dev)
+    if dev.type == "cuda":
+        folder.lm.to(torch.bfloat16)  # spec §5.4: the frozen LM runs in bf16 on CUDA
+    return folder, dev
+
+
 @app.command("predict")
 def predict(
     chains: Annotated[
@@ -464,23 +485,10 @@ def predict(
     device: Annotated[str, typer.Option(help="cuda, cpu or auto")] = "auto",
 ) -> None:
     """Predict a protein (complex) structure and write it as mmCIF."""
-    import torch
-
-    from oplm.fold.modeling_fold import OplmForFolding
     from oplm.fold.predict import fold, parse_chain_arg, write_mmcif
 
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    dev = torch.device(device)
     specs = [parse_chain_arg(text, chr(ord("A") + i)) for i, text in enumerate(chains)]
-    folder = OplmForFolding.from_pretrained(model, lm_name_or_path=lm).to(dev).eval()
-    if folder.lm is None:
-        raise typer.BadParameter(
-            "no language model: pass --lm or save the checkpoint with lm_name_or_path"
-        )
-    folder.lm.to(dev)
-    if dev.type == "cuda":
-        folder.lm.to(torch.bfloat16)  # spec §5.4: the frozen LM runs in bf16 on CUDA
+    folder, _ = _load_folder(model, lm, device)
     result = fold(folder, specs, num_samples=samples, num_loops=loops, num_steps=steps, seed=seed)
     write_mmcif(result, out)
     console.print(
@@ -544,28 +552,22 @@ def eval_(
     import oplm
     from oplm.fold.eval.monomer import SamplingSettings, score_target, summarize, write_scores
     from oplm.fold.eval.targets import load_targets
-    from oplm.fold.modeling_fold import OplmForFolding
 
     hf_dir = _resolve_model_dir(model, weights)
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    dev = torch.device(device)
-    folder = OplmForFolding.from_pretrained(hf_dir, lm_name_or_path=lm).to(dev).eval()
-    if folder.lm is None:
-        raise typer.BadParameter(
-            "no language model: pass --lm or save the checkpoint with lm_name_or_path"
-        )
-    folder.lm.to(dev)
-    if dev.type == "cuda":
-        folder.lm.to(torch.bfloat16)  # spec §5.4: the frozen LM runs in bf16 on CUDA
+    folder, dev = _load_folder(hf_dir, lm, device)
     settings = SamplingSettings(num_loops=loops, num_steps=steps, num_samples=samples, seed=seed)
     cap = max_length or folder.config.lm_max_chain_length
     started = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
     clock = time.perf_counter()
+    loaded = []  # every set is validated before any folding starts
+    for name in target_sets:
+        try:
+            loaded.append((name, *load_targets(data, name, max_length=cap, limit=limit)))
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     rows = []
     sets: dict[str, Any] = {}
-    for name in target_sets:
-        targets, coverage = load_targets(data, name, max_length=cap, limit=limit)
+    for name, targets, coverage in loaded:
         scores = []
         for i, target in enumerate(targets, 1):
             scores.append(score_target(folder, target, settings))
@@ -588,7 +590,7 @@ def eval_(
     summary = {
         "model": str(hf_dir),
         "weights": weights,
-        "lm": folder.config.lm_name_or_path,
+        "lm": lm or folder.config.lm_name_or_path,
         "data": str(data),
         "sampling": dataclasses.asdict(settings),
         "resolved_sampling": {
