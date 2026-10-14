@@ -2,8 +2,10 @@
 # published dataset: hf download brineylab/oplmfold-training-data --repo-type dataset \
 #   --revision wwpdb-2026-10-12 --include "wwpdb/2026-10-12/*" --local-dir $OPLM_DATA/hf
 # and point data.train and data.eval.valid.path at $OPLM_DATA/hf/wwpdb/2026-10-12.
-# train.batch_size and gradient_accumulation_steps come from the milestone-2b B200 batch sweep
-# (docs/fold/m2/README.md); max_steps is spec §6.3's stage-1 budget. On the cluster:
+# Four nodes of 8 B200s (32 devices) at batch 4 x accumulation 1 keep spec §6.3's global batch of
+# 128 at a quarter of the one-node wall clock; per-device memory and step time come from the
+# milestone-2b batch sweep (docs/fold/m2/README.md). max_steps is spec §6.3's stage-1 budget.
+# On the cluster:
 #   oplm slurm generate --config configs/fold/proof-w256.yaml --name fold-proof-w256 --out <dir>
 # The job installs oplm at the tag named in slurm.install (docs/FOLD.md §10).
 fold:
@@ -35,7 +37,7 @@ train:
   weight_decay: 0.01
   max_grad_norm: 1.0
   batch_size: 4               # per device
-  gradient_accumulation_steps: 4    # 8 devices x 4 x 4 = 128 (spec §6.3); 67.7 GiB peak, 17.3 s/step on a B200
+  gradient_accumulation_steps: 1    # 32 devices x 4 x 1 = 128 (spec §6.3); 67.7 GiB peak, ~4.3 s/step
   max_steps: 50000
   ema_decay: 0.999
   mixed_precision: bf16
@@ -62,7 +64,7 @@ data:
 slurm:
   partition: hpc-mid
   time_limit: "168:00:00"
-  nodes: 1
+  nodes: 4
   gpus_per_node: 8
   cpus_per_task: 128
   exclusive: true
@@ -77,12 +79,15 @@ slurm:
   # One shell line inside the container, so no single quotes. A Python 3.12 venv per run (esm
   # needs >= 3.12 and transformers < 5) resolved in ONE install and checked with `uv pip check`
   # (docs/fold/m2/README.md, run 1, failure 3); oplm from the immutable tag so every requeue runs
-  # identical code; ESM-C weights cached on shared storage.
+  # identical code; ESM-C weights cached on shared storage. Every node runs this line, so the venv,
+  # uv's cache and any uv-managed Python live on node-local /tmp: four nodes building one shared
+  # venv at once would corrupt it.
   install: >-
-    export HF_HOME=/mnt/data/briney/hf-cache &&
+    export HF_HOME=/mnt/data/briney/hf-cache UV_CACHE_DIR=/tmp/oplm-fold-m2c/uv-cache
+    UV_PYTHON_INSTALL_DIR=/tmp/oplm-fold-m2c/python &&
     python -m pip install --quiet uv &&
-    python -m uv venv --allow-existing --seed --python 3.12 /mnt/data/briney/fold-m2c/venv-w256 &&
-    python -m uv pip install --quiet --python /mnt/data/briney/fold-m2c/venv-w256/bin/python
+    python -m uv venv --allow-existing --seed --python 3.12 /tmp/oplm-fold-m2c/venv-w256 &&
+    python -m uv pip install --quiet --python /tmp/oplm-fold-m2c/venv-w256/bin/python
     "oplm[train,fold,esmc] @ git+https://github.com/briney/oplm@fold-m2c-runs" &&
-    python -m uv pip check --python /mnt/data/briney/fold-m2c/venv-w256/bin/python &&
-    source /mnt/data/briney/fold-m2c/venv-w256/bin/activate
+    python -m uv pip check --python /tmp/oplm-fold-m2c/venv-w256/bin/python &&
+    source /tmp/oplm-fold-m2c/venv-w256/bin/activate

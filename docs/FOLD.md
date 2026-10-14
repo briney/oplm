@@ -527,13 +527,17 @@ bootstrap 95 % CI.
 
 **The proof runs.** `configs/fold/proof-w128.yaml` and `proof-w256.yaml` set:
 
-- one node of 8 B200s, DDP, global batch 128, 50k steps, EMA 0.999;
+- four nodes of 8 B200s (32 devices), DDP, batch 4 x accumulation 1, so the global batch stays
+  128; 50k steps; EMA 0.999. Addendum §2 planned one node. Four nodes run the same optimizer
+  steps in about a quarter of the wall clock: roughly 40 h (w128) and 65 h (w256), against the
+  one-node projection of 142 h and 240 h in docs/fold/m2/README.md;
 - checkpoints every 2000 steps with permanent keeps every 10000;
 - `valid` eval every 2000 steps, and once right after the first step, so a broken eval path
   fails within minutes instead of at step 2000.
 
 `oplm slurm generate` launches `oplm.fold.train` for them (docs/SLURM.md §9). Each attempt builds
-or reuses a per-run Python 3.12 venv with `oplm[train,fold,esmc]` from the tag `fold-m2c-runs`.
+or reuses a per-run Python 3.12 venv with `oplm[train,fold,esmc]` from the tag `fold-m2c-runs`,
+on each node's local `/tmp` because every node runs the install.
 A resume is forced once per run with `scancel --signal=USR1 <jobid>` (docs/SLURM.md §8).
 `docs/fold/b200-m2c-eval.sbatch` then scores every permanent checkpoint's `hf_ema/` on CAMEO and
 CASP14. Results, the width decision and the reproduction commands are in

@@ -108,8 +108,10 @@ branch.
   - One failing target (an exception, CUDA OOM included) becomes a `failed` row. It never
     raises, so every rank reaches the gather.
 - Run shape (addendum §2, docs/fold/m2/README.md):
-  - One node, 8× B200, DDP, global batch 128, 50k steps, EMA 0.999.
-  - Width 128 at batch 8 × accumulation 2; width 256 at batch 4 × accumulation 4.
+  - Four nodes of 8× B200 (32 devices), DDP, global batch 128, 50k steps, EMA 0.999. Changed
+    from addendum §2's one node at the user's request on 2026-10-14, to cut the wall clock
+    about fourfold.
+  - Both widths at batch 4 × accumulation 1.
   - Checkpoints every 2000 steps; permanent keeps every 10000; in-training eval every 2000
     steps.
   - At least one resume per run forced through the drain path (`scancel --signal=USR1`) and
@@ -2487,8 +2489,7 @@ sbatch ~/fold-m2c/jobs/w128/fold-proof-w128.sbatch
 sbatch ~/fold-m2c/jobs/w256/fold-proof-w256.sbatch
 ```
 
-The runs can share a node pool. Each needs one 8-GPU node, for about 142 h (w128) and 240 h
-(w256), plus requeue overhead.
+Each run needs four 8-GPU nodes, for about 40 h (w128) and 65 h (w256), plus requeue overhead.
 
 - [ ] **Step 3: Check the first eval and the first checkpoint**
 

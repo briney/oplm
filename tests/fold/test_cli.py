@@ -233,7 +233,6 @@ def test_proof_configs_load(width: int) -> None:
     assert cfg.fold is not None and cfg.fold.model["pair_width"] == width
     assert cfg.train.optimizer == "adamw" and cfg.train.ema_decay == 0.999
     assert cfg.fold.crop_size == 384
-    assert 8 * cfg.train.batch_size * cfg.train.gradient_accumulation_steps == 128  # 8 x B200
     assert Path(cfg.train.output_dir).is_absolute()
     assert cfg.train.max_steps == 50_000 and cfg.train.save_every == 2000
     assert cfg.train.keep_every_n_steps == 10_000  # the offline job's KEEP_EVERY
@@ -244,9 +243,13 @@ def test_proof_configs_load(width: int) -> None:
     assert valid["path"] == cfg.data.train
     assert valid["every"] == {"steps": 2000, "at_start": True}  # a broken eval fails at step 1
     slurm = load_slurm_config(path)
-    assert slurm.gpus_per_node == 8 and slurm.nodes.resolve(phase=None, preset=None) == 1
+    nodes = slurm.nodes.resolve(phase=None, preset=None)
+    assert slurm.gpus_per_node == 8 and nodes == 4  # 4 nodes x 8 B200
+    devices = nodes * slurm.gpus_per_node
+    assert devices * cfg.train.batch_size * cfg.train.gradient_accumulation_steps == 128
     assert "@fold-m2c-runs" in slurm.install and "esmc" in slurm.install
-    assert f"venv-w{width}" in slurm.install and "uv pip check" in slurm.install
+    assert f"/tmp/oplm-fold-m2c/venv-w{width}" in slurm.install  # node-local: every node installs
+    assert "uv pip check" in slurm.install
     assert "'" not in slurm.install  # rendered inside bash -c '...'
 
 
@@ -257,7 +260,8 @@ def test_slurm_generate_renders_a_proof_run(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     text = (tmp_path / "fold-proof-w128.sbatch").read_text()
     assert "-m oplm.fold.train" in text and "train.auto_resume=true" in text
-    assert "/mnt/data/briney/fold-m2c/venv-w128/bin/activate" in text
+    assert "#SBATCH --nodes=4" in text and "--num_machines" in text
+    assert "/tmp/oplm-fold-m2c/venv-w128/bin/activate" in text
     assert "/mnt/data/briney/oplm-runs/fold-m2c/proof-w128/.last_requeue_step" in text
 
 
