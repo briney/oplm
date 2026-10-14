@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 @register_eval_task("tape")
-class TapeEvalTask(EvalTask):
+class TapeEvalTask(EvalTask["OplmForMaskedLM"]):
     """TAPE benchmark evaluation.
 
     Tasks: secondary structure prediction (Q3/Q8), contact prediction,

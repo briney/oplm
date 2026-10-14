@@ -90,7 +90,7 @@ class StructureTaskConfig:
 
 
 @register_eval_task("structure")
-class StructureEvalTask(EvalTask):
+class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
     """Evaluate contact prediction quality via the categorical Jacobian.
 
     Data format: directory containing PDB and/or CIF files.

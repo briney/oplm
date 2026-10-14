@@ -79,7 +79,7 @@ class ProteinGymTaskConfig:
 
 
 @register_eval_task("proteingym")
-class ProteinGymEvalTask(EvalTask):
+class ProteinGymEvalTask(EvalTask["OplmForMaskedLM"]):
     """Zero-shot DMS variant-effect prediction on the ProteinGym substitution benchmark.
 
     Data format: a directory of CSV files from the ProteinGym DMS substitution

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.utils.data import DataLoader
 
+import oplm.fold.eval  # noqa: F401  (registers the fold_monomer eval type, docs/FOLD.md §10)
 from oplm.data.config import parse_train_configs
 from oplm.data.sequence.dataset import InterleavedDataset
 from oplm.fold.configuration_fold import FoldConfig

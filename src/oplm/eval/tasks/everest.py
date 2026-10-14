@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 @register_eval_task("everest")
-class EverestEvalTask(EvalTask):
+class EverestEvalTask(EvalTask["OplmForMaskedLM"]):
     """EVEREST benchmark for priority virus variant effect prediction.
 
     Evaluates zero-shot variant effect prediction on clinically relevant
