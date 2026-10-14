@@ -136,3 +136,95 @@ and the raw uptick is noise-floor drift: continue. If decayed(600k) ≥ decayed(
 drift is doing real damage: lower the LR per the C results (most likely the AdamW side)
 before continuing the stable phase. This is also the LR check at the true horizon that the
 20k-step sweep could not provide.
+
+---
+
+## 4. Replication results (October 2026)
+
+The 170M re-run with diagnostics (W&B `thebrineylab/oplm-scaling/426y3e7m`, 600k steps,
+`weight_diag_every=1000`, permanent checkpoints every 50k under
+`/mnt/home/briney/projects/oplm/scaling/170M/`) reproduces the original 170M run
+(`dncy6l8u`) almost exactly: their binned train losses agree to about 0.003. The original 400M
+run (`hereiygl`) shows the same bumps at the same steps. The data stream is deterministic and
+identical across all three runs.
+
+### The late rise is a step at the data-epoch boundary
+
+- The run's mix is `uniref70` at 25 % (1,294 shards, 129.4M rows) and `deepclust70` at 75 %
+  (10,708 shards, 5.35B rows). The mixed epoch is their 5.48B rows at 8192 sequences per step:
+  669,312 steps per rank.
+- In both original runs, train loss steps up about 0.045 within the 2.5k-step window that holds
+  that boundary:
+  - 170M: 1.92 → 1.97;
+  - 400M: 1.85 → 1.90.
+
+  It stays up through 780k. The 170M − 400M gap holds at about 0.07 across it.
+- The fixed eval sets rise only about 0.005 right after the boundary (uniref70 2.021 → 2.025,
+  omg70 2.205 → 2.210), then drift up slowly. Before the boundary, eval/uniref70 is flat from
+  about 445k to 600k (2.022–2.025) rather than rising.
+- Most of the jump is therefore the second-epoch stream being harder, which repeated data alone
+  would not do.
+
+### The data stream drifts and repeats
+
+- Detrended train loss correlates −0.62 to −0.68 with the logging window's mean sequence length,
+  at every window size from 100 to 20,000 steps.
+- Every rank and worker reads the same shard at the same moment, so every batch's `deepclust70`
+  rows come from one shard for about 81 steps, and its `uniref70` rows from one shard for about
+  49. Loss follows each shard's composition.
+- `uniref70` is sampled at about 10.6 times its row share. The interleaver refills it in
+  identical order every 63,177 steps, about 10.6 passes per epoch, while only 77 % of
+  `deepclust70` is read per epoch.
+- This likely explains why eval/uniref70 plateaus around 450k while the `deepclust70` evals keep
+  improving.
+- Each worker's stream ends on a partial batch, so an epoch closes with four steps of about 7
+  rows per rank.
+
+### The optimizer side builds up slowly
+
+- The no-decay AdamW groups grow linearly with no sign of saturating:
+
+  | Group | RMS at 0–50k | RMS at 600k |
+  | --- | --- | --- |
+  | `norm_gain` | 1.46 | 7.84 |
+  | `residual_gate` | 1.68 | 9.98 |
+  | `embed` | 0.15 | 0.92 |
+  | `bias` | 0.21 | 1.50 |
+
+  The Muon-trained `attn` and `mlp` RMS have been flat since 50k.
+- Over the same span the gradient roughens:
+  - median grad norm 0.078 → 0.127;
+  - 99th percentile of the per-window max 0.20 → 0.54;
+  - windows with a clipped step: 0–1 per 50k until 450k, then 5, 4 and 10;
+  - largest spike: 3.1, at 550k.
+- Eval loss has not suffered yet. This is the structural issue of §1, and it will reach longer
+  runs.
+
+### Replaying the stream on a frozen checkpoint
+
+`oplm stream-replay <checkpoint> --world-size <N> --step S [--step S ...]` rebuilds the exact
+batches one rank trained on from each step. It reads the run's resolved `config.yaml` from the
+checkpoint and uses the trainer's own epoch and resume-skip arithmetic. It scores the
+checkpoint's frozen model on them and reports, per window:
+
+- the rows and mean sequence length;
+- the source mix;
+- the masked-token loss, overall and per `data.train` source.
+
+`docs/late-loss/stream-replay.sbatch` scores `checkpoint-600000` on 30 windows of each of three
+spans:
+
+- a mid-epoch control, 450–479k;
+- the last 29k steps of epoch 0;
+- the first 29k steps of epoch 1.
+
+Read the result like this:
+
+- **The frozen model's loss is about 0.045 higher after the boundary:** the epoch-1 data is
+  harder. The per-source columns and sequence lengths then say which source and why.
+- **Pre and post look alike:** the jump came from the trained model's trajectory around the
+  boundary.
+
+The comparison is biased toward an easier post-boundary side: the 600k checkpoint never saw the
+pre-boundary rows, but saw about 77 % of the post-boundary `deepclust70` shards once. A jump
+despite that bias is strong evidence.
