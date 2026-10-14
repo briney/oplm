@@ -3,7 +3,7 @@
 Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 2b (losses and training) accepted 2026-10-13 (measured on one B200; docs/fold/m2/); milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
+this file records what is implemented. **Status: milestone 2c (evaluation and proof runs) implemented, proof runs pending; milestone 2b (losses and training) accepted 2026-10-13 (measured on one B200; docs/fold/m2/); milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
 Kernels, the model, prediction, the training data pipeline, the losses and the training step exist
 (§7 holds the M1 acceptance evidence, §8 the data contract, §9 the losses and training; the
 single-B200 cost measurement of §9 is still to be run).
@@ -478,3 +478,57 @@ milestone 2c are recorded in [`docs/fold/m2/`](fold/m2/).
 **Deviations, all deliberate** (addendum §2). Four loss terms (no bond term, no interface
 weighting); single-chain examples, so no atom-symmetry correction; block-level checkpointing only;
 the ESM-C head is not transferable to OPLM.
+
+## 10. Milestone 2c: evaluation and the proof runs (`oplm.fold.eval`)
+
+**Metrics** (`metrics.py`, addendum §6). Predicted and reference atoms correspond by index: both
+come from the same entity sequence and the same reference-conformer templates. Reference atoms
+that are unresolved are excluded, never scored.
+
+- **TM-score** runs over resolved CA atoms and is normalized by their count. `d0 = 1.24·(L−15)^⅓ −
+  1.8` (0.5 for L ≤ 21). It uses the TM-score program's fragment-seeded iterative superposition
+  rather than one RMSD fit. It matches TM-align (`tmtools`) to machine precision on identity alignments.
+- **lDDT** is the global score: reference pairs within 15 Å, thresholds 0.5/1/2/4 Å, and no pairs
+  inside one residue for the all-atom score. It matches Boltz-2's `lddt_dist`.
+- **pLDDT** is the mean over residues (0–1). **pTM** is that of the best sample.
+- Scores are full-chain; CASP domain scoring is not reproduced.
+
+**Targets** (`targets.py`). A target set is `targets/<name>.json` when that file exists, else an
+index split:
+
+- An item with a chain names an author chain.
+- An item without one (CASP14) contributes one chain per distinct entity.
+- Chains longer than the model's `lm_max_chain_length` (1024) or with fewer than 3 resolved CA
+  atoms are skipped, and the skip is reported.
+- On the published snapshot: CAMEO has 752 of its 755 listed chains present. CASP14 has 131 of
+  133 listed entries present, which hold 248 distinct entities.
+
+**In training.** A `data.eval` entry of `type: fold_monomer` scores a target set with the live
+model, sharded across ranks and gathered. It logs `eval/<name>/{tm_score, lddt_ca, lddt, plddt,
+ptm, targets, failed}`. Its options are `target_set` (default `valid`), `max_targets`,
+`max_length`, `num_loops`, `num_steps`, `num_samples` (1) and `seed` (0). A target that raises
+(OOM included) counts as `failed`. `oplm.fold.training` imports `oplm.fold.eval`, which registers
+the type; MLM tooling never imports it.
+
+**Offline.**
+
+    oplm fold eval --model <run>/checkpoint-50000 --weights ema \
+      --data $OPLM_DATA/hf/wwpdb/2026-10-12 --target-set cameo --target-set casp14 --out <dir>
+
+It writes `targets.csv` (one row per target: status, error, seconds and the five metrics) and
+`summary.json` (coverage, failures, aggregates, sampling settings, versions).
+`oplm fold compare A B` prints the paired B − A difference over targets scored in both, with a
+bootstrap 95 % CI.
+
+**The proof runs.** `configs/fold/proof-w128.yaml` and `proof-w256.yaml` set:
+
+- one node of 8 B200s, DDP, global batch 128, 50k steps, EMA 0.999;
+- checkpoints every 2000 steps with permanent keeps every 10000;
+- `valid` eval every 2000 steps.
+
+`oplm slurm generate` launches `oplm.fold.train` for them (docs/SLURM.md §9). Each attempt builds
+or reuses a per-run Python 3.12 venv with `oplm[train,fold,esmc]` from the tag `fold-m2c-runs`.
+A resume is forced once per run with `scancel --signal=USR1 <jobid>` (docs/SLURM.md §8).
+`docs/fold/b200-m2c-eval.sbatch` then scores every permanent checkpoint's `hf_ema/` on CAMEO and
+CASP14. Results, the width decision and the reproduction commands are in
+[`docs/fold/m2/README.md`](fold/m2/README.md).

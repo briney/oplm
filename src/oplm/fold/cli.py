@@ -381,6 +381,7 @@ def measure(
     cfg.train.save_final = False
     cfg.train.save_every_minutes = None
     cfg.train.wandb_enabled = False
+    cfg.data.eval = None  # a cost measurement times training steps only
     cfg.train.throughput_warmup_steps = min(3, steps - 1) if steps > 1 else 0
     callback = PeakMemoryCallback()
     task = FoldTask()

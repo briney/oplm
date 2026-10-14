@@ -226,12 +226,53 @@ def test_fold_measure_writes_a_partial_report_when_the_run_fails(
 @pytest.mark.parametrize("width", [128, 256])
 def test_proof_configs_load(width: int) -> None:
     from oplm.config import load_config
+    from oplm.slurm.config import load_slurm_config
 
-    cfg = load_config(["--config", f"configs/fold/proof-w{width}.yaml"])
+    path = Path("configs/fold") / f"proof-w{width}.yaml"
+    cfg = load_config(["--config", str(path)])
     assert cfg.fold is not None and cfg.fold.model["pair_width"] == width
     assert cfg.train.optimizer == "adamw" and cfg.train.ema_decay == 0.999
     assert cfg.fold.crop_size == 384
     assert 8 * cfg.train.batch_size * cfg.train.gradient_accumulation_steps == 128  # 8 x B200
+    assert Path(cfg.train.output_dir).is_absolute()
+    assert cfg.train.output_dir.endswith(f"proof-w{width}")
+    assert cfg.train.wandb_run_name == f"fold-proof-w{width}"
+    valid = cfg.data.eval["valid"]
+    assert valid["type"] == "fold_monomer" and valid["target_set"] == "valid"
+    assert valid["path"] == cfg.data.train and valid["every"] == {"steps": 2000}
+    slurm = load_slurm_config(path)
+    assert slurm.gpus_per_node == 8 and slurm.nodes.resolve(phase=None, preset=None) == 1
+    assert "@fold-m2c-runs" in slurm.install and "esmc" in slurm.install
+    assert f"venv-w{width}" in slurm.install and "uv pip check" in slurm.install
+    assert "'" not in slurm.install  # rendered inside bash -c '...'
+
+
+def test_slurm_generate_renders_a_proof_run(tmp_path: Path) -> None:
+    args = ["slurm", "generate", "--config", "configs/fold/proof-w128.yaml"]
+    args += ["--name", "fold-proof-w128", "--out", str(tmp_path)]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    text = (tmp_path / "fold-proof-w128.sbatch").read_text()
+    assert "-m oplm.fold.train" in text and "train.auto_resume=true" in text
+    assert "/mnt/data/briney/fold-m2c/venv-w128/bin/activate" in text
+    assert "/mnt/data/briney/oplm-runs/fold-m2c/proof-w128/.last_requeue_step" in text
+
+
+def test_measure_ignores_data_eval(
+    tmp_path: Path, fixture_dataset: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
+    lm_dir = tmp_path / "lm"
+    tiny_lm().save_pretrained(lm_dir)
+    cfg = tiny_fold_run_cfg(tmp_path / "run", fixture_dataset, lm_dir)
+    cfg.data.eval = {"nope": {"path": "x", "type": "no_such_eval_type"}}  # fatal if built
+    config = tmp_path / "run.yaml"
+    config.write_text(serialize_config(cfg))
+    out = tmp_path / "measure.json"
+    result = runner.invoke(
+        app, ["fold", "measure", "--config", str(config), "--steps", "1", "--out", str(out)]
+    )
+    assert result.exit_code == 0, result.output
 
 
 def _saved_head(root: Path) -> tuple[Path, Path]:
