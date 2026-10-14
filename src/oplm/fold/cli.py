@@ -7,6 +7,7 @@ Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import itertools
 import json
 import logging
@@ -486,6 +487,154 @@ def predict(
         f"wrote {out}  pTM {result.ptm:.3f}  ipTM {result.iptm:.3f}  "
         f"mean pLDDT {float(result.plddt.mean()) * 100:.1f}  sample {result.best_sample}/{samples}"
     )
+
+
+_WEIGHT_DIRS = {"ema": "hf_ema", "raw": "hf"}
+
+
+def _resolve_model_dir(model: Path, weights: str) -> Path:
+    """An HF directory as given, or a checkpoint directory's ``hf_ema/`` / ``hf/``."""
+    if (model / "config.json").is_file():
+        return model
+    if weights not in _WEIGHT_DIRS:
+        raise typer.BadParameter(f"--weights must be ema or raw, got {weights!r}")
+    path = model / _WEIGHT_DIRS[weights]
+    if not (path / "config.json").is_file():
+        raise typer.BadParameter(f"{model} has no {_WEIGHT_DIRS[weights]}/ model directory")
+    return path
+
+
+@app.command("eval")
+def eval_(
+    model: Annotated[
+        Path, typer.Option("--model", help="A checkpoint directory (see --weights) or HF dir")
+    ],
+    data: Annotated[
+        Path, typer.Option("--data", help="Preprocessed dataset (index.parquet, shards/, targets/)")
+    ],
+    target_sets: Annotated[
+        list[str], typer.Option("--target-set", help="cameo, casp14, valid, ... (repeatable)")
+    ],
+    out: Annotated[Path, typer.Option("--out", help="Output directory")],
+    weights: Annotated[str, typer.Option(help="ema or raw, for a checkpoint directory")] = "ema",
+    lm: Annotated[
+        str | None,
+        typer.Option("--lm", help="Frozen LM path or Hub id (overrides the checkpoint's)"),
+    ] = None,
+    loops: Annotated[
+        int | None, typer.Option(help="Recurrence iterations (default: config)")
+    ] = None,
+    steps: Annotated[int | None, typer.Option(help="Sampler steps (default: config)")] = None,
+    samples: Annotated[int, typer.Option(help="Diffusion samples; the best by pTM is scored")] = 1,
+    seed: Annotated[int, typer.Option(help="Seed for every target")] = 0,
+    max_length: Annotated[
+        int | None, typer.Option(help="Skip longer chains (default: lm_max_chain_length)")
+    ] = None,
+    limit: Annotated[int | None, typer.Option(help="Score only the first N per set")] = None,
+    device: Annotated[str, typer.Option(help="cuda, cpu or auto")] = "auto",
+) -> None:
+    """Score a checkpoint on held-out target sets: per-target CSV plus a JSON summary.
+
+    Full-chain TM-score, CA and all-atom lDDT, mean pLDDT and pTM (docs/FOLD.md §10).
+    """
+    import datetime
+
+    import torch
+
+    import oplm
+    from oplm.fold.eval.monomer import SamplingSettings, score_target, summarize, write_scores
+    from oplm.fold.eval.targets import load_targets
+    from oplm.fold.modeling_fold import OplmForFolding
+
+    hf_dir = _resolve_model_dir(model, weights)
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = torch.device(device)
+    folder = OplmForFolding.from_pretrained(hf_dir, lm_name_or_path=lm).to(dev).eval()
+    if folder.lm is None:
+        raise typer.BadParameter(
+            "no language model: pass --lm or save the checkpoint with lm_name_or_path"
+        )
+    folder.lm.to(dev)
+    if dev.type == "cuda":
+        folder.lm.to(torch.bfloat16)  # spec §5.4: the frozen LM runs in bf16 on CUDA
+    settings = SamplingSettings(num_loops=loops, num_steps=steps, num_samples=samples, seed=seed)
+    cap = max_length or folder.config.lm_max_chain_length
+    started = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    clock = time.perf_counter()
+    rows = []
+    sets: dict[str, Any] = {}
+    for name in target_sets:
+        targets, coverage = load_targets(data, name, max_length=cap, limit=limit)
+        scores = []
+        for i, target in enumerate(targets, 1):
+            scores.append(score_target(folder, target, settings))
+            console.print(
+                f"[{name} {i}/{len(targets)}] {target.key} {scores[-1].status} "
+                f"TM {scores[-1].tm_score:.3f}"
+            )
+        rows.extend(scores)
+        sets[name] = {
+            "coverage": {
+                "listed": coverage.listed,
+                "missing": coverage.missing,
+                "skipped": coverage.skipped,
+                "selected": coverage.selected,
+            },
+            "metrics": summarize(scores),
+        }
+    out.mkdir(parents=True, exist_ok=True)
+    write_scores(out / "targets.csv", rows)
+    summary = {
+        "model": str(hf_dir),
+        "weights": weights,
+        "lm": folder.config.lm_name_or_path,
+        "data": str(data),
+        "sampling": dataclasses.asdict(settings),
+        "resolved_sampling": {
+            "num_loops": loops or folder.config.inference_num_loops,
+            "num_steps": steps or folder.config.inference_num_steps,
+        },
+        "device": str(dev),
+        "versions": {"oplm": oplm.__version__, "torch": torch.__version__},
+        "started": started,
+        "seconds": time.perf_counter() - clock,
+        "target_sets": sets,
+    }
+    (out / "summary.json").write_text(json.dumps(summary, indent=1))
+    for name, block in sets.items():
+        m = block["metrics"]
+        console.print(
+            f"{name}: {int(m['targets'])} scored, {int(m['failed'])} failed, "
+            f"{len(block['coverage']['skipped'])} skipped  TM {m['tm_score']:.3f}  "
+            f"lDDT {m['lddt']:.3f}  pLDDT {m['plddt']:.3f}"
+        )
+    console.print(f"wrote {out / 'targets.csv'} and {out / 'summary.json'}")
+
+
+@app.command("compare")
+def compare(
+    a: Annotated[Path, typer.Argument(help="Baseline eval directory or targets.csv")],
+    b: Annotated[Path, typer.Argument(help="Candidate eval directory or targets.csv")],
+    metric: Annotated[str, typer.Option(help="tm_score, lddt_ca, lddt, plddt or ptm")] = "tm_score",
+    target_set: Annotated[
+        str | None, typer.Option("--target-set", help="Only this set (default: all, pooled)")
+    ] = None,
+    samples: Annotated[int, typer.Option(help="Bootstrap resamples")] = 10_000,
+    seed: Annotated[int, typer.Option(help="Bootstrap seed")] = 0,
+) -> None:
+    """Paired B − A over targets scored in both, with a bootstrap 95 % CI, as JSON."""
+    from oplm.fold.eval.monomer import compare_scores, read_scores
+
+    def table(path: Path) -> list[Any]:
+        rows = read_scores(path / "targets.csv" if path.is_dir() else path)
+        return [r for r in rows if target_set is None or r.target_set == target_set]
+
+    try:
+        result = compare_scores(table(a), table(b), metric=metric, samples=samples, seed=seed)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(result, indent=1))
 
 
 @app.command("preprocess")

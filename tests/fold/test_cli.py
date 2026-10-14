@@ -232,3 +232,96 @@ def test_proof_configs_load(width: int) -> None:
     assert cfg.train.optimizer == "adamw" and cfg.train.ema_decay == 0.999
     assert cfg.fold.crop_size == 384
     assert 8 * cfg.train.batch_size * cfg.train.gradient_accumulation_steps == 128  # 8 x B200
+
+
+def _saved_head(root: Path) -> tuple[Path, Path]:
+    from oplm.fold import OplmForFolding
+
+    torch.manual_seed(0)
+    cfg = tiny_fold_config(
+        plddt_bins=10,
+        pae_bins=8,
+        pde_bins=8,
+        confidence_dist_bins=5,
+        distogram_bins=8,
+        inference_num_steps=2,
+        inference_num_loops=1,
+        lm_hidden_size=32,
+        lm_num_hidden_states=3,
+    )
+    OplmForFolding(cfg).save_pretrained(root / "checkpoint-10" / "hf_ema")
+    tiny_lm().save_pretrained(root / "lm")
+    return root / "checkpoint-10", root / "lm"
+
+
+def test_eval_cli_writes_scores_and_summary(tmp_path: Path, fixture_dataset: Path) -> None:
+    ckpt, lm = _saved_head(tmp_path)
+    out = tmp_path / "eval"
+    args = ["fold", "eval", "--model", str(ckpt), "--lm", str(lm), "--data", str(fixture_dataset)]
+    args += ["--target-set", "cameo", "--target-set", "casp14"]
+    args += ["--out", str(out), "--device", "cpu"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    from oplm.fold.eval.monomer import read_scores
+
+    rows = read_scores(out / "targets.csv")
+    assert [(r.target_set, r.entry_id, r.chain_id, r.status) for r in rows] == [
+        ("cameo", "1crn", "A", "ok"),
+        ("casp14", "1jb6", "A", "ok"),
+    ]
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["model"].endswith("hf_ema") and summary["weights"] == "ema"
+    assert summary["sampling"] == {
+        "num_loops": None,
+        "num_steps": None,
+        "num_samples": 1,
+        "seed": 0,
+    }
+    assert summary["resolved_sampling"] == {"num_loops": 1, "num_steps": 2}
+    cameo = summary["target_sets"]["cameo"]
+    assert cameo["coverage"] == {"listed": 1, "missing": [], "skipped": {}, "selected": 1}
+    assert cameo["metrics"]["targets"] == 1.0 and 0.0 <= cameo["metrics"]["tm_score"] <= 1.0
+
+
+def test_eval_cli_resolves_and_rejects_weights(tmp_path: Path, fixture_dataset: Path) -> None:
+    ckpt, lm = _saved_head(tmp_path)
+    base = ["fold", "eval", "--lm", str(lm), "--data", str(fixture_dataset)]
+    base += ["--target-set", "cameo", "--device", "cpu", "--out", str(tmp_path / "o")]
+    ok = runner.invoke(app, [*base, "--model", str(ckpt / "hf_ema")])  # an HF dir directly
+    assert ok.exit_code == 0, ok.output
+    raw = runner.invoke(app, [*base, "--model", str(ckpt), "--weights", "raw"])
+    assert raw.exit_code != 0 and "hf" in plain(raw.output)
+    bad = runner.invoke(app, [*base, "--model", str(ckpt), "--weights", "best"])
+    assert bad.exit_code != 0
+
+
+def test_compare_cli_prints_the_paired_difference(tmp_path: Path) -> None:
+    from oplm.fold.eval.monomer import TargetScore, write_scores
+
+    def rows(tms: list[float]) -> list[TargetScore]:
+        return [
+            TargetScore(
+                target_set="cameo",
+                entry_id=f"e{i}",
+                chain_id="A",
+                auth_chain_id="A",
+                length=50,
+                resolved_residues=50,
+                status="ok",
+                tm_score=v,
+                lddt_ca=v,
+                lddt=v,
+                plddt=v,
+                ptm=v,
+            )
+            for i, v in enumerate(tms)
+        ]
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    write_scores(tmp_path / "a" / "targets.csv", rows([0.4, 0.5, 0.6]))
+    write_scores(tmp_path / "b" / "targets.csv", rows([0.5, 0.6, 0.7]))
+    result = runner.invoke(app, ["fold", "compare", str(tmp_path / "a"), str(tmp_path / "b")])
+    assert result.exit_code == 0, result.output
+    out = json.loads(result.output)
+    assert out["n"] == 3.0 and out["mean_diff"] == pytest.approx(0.1)
