@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
     from oplm.config import OplmConfig as RunConfig
     from oplm.fold.data.featurize import FoldFeatures, FoldTargets
+    from oplm.fold.modeling_fold import OplmForFolding
 
 
 def tiny_lm(num_loops: int = 1) -> OplmModel:
@@ -53,6 +54,27 @@ def tiny_fold_config(**overrides: Any) -> FoldConfig:
     )
     base.update(overrides)
     return FoldConfig(**base)
+
+
+def tiny_folder() -> OplmForFolding:
+    """An eval-mode tiny folding model with a tiny LM attached, for fold() tests."""
+    from oplm.fold.modeling_fold import OplmForFolding
+
+    torch.manual_seed(0)
+    cfg = tiny_fold_config(
+        plddt_bins=10,
+        pae_bins=8,
+        pde_bins=8,
+        confidence_dist_bins=5,
+        distogram_bins=8,
+        inference_num_steps=2,
+        inference_num_loops=1,
+        lm_hidden_size=32,
+        lm_num_hidden_states=3,
+    )
+    model = OplmForFolding(cfg).eval()
+    model.attach_lm(tiny_lm())
+    return model
 
 
 def dummy_targets(features: FoldFeatures) -> FoldTargets:
