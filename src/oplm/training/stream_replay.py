@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.utils.data import DataLoader
@@ -26,7 +26,14 @@ if TYPE_CHECKING:
 
     from oplm.config import OplmConfig
 
-__all__ = ["StreamReplay", "score_batch", "steps_per_epoch"]
+__all__ = [
+    "StreamReplay",
+    "compile_like_trainer",
+    "compiled_step_loss",
+    "score_batch",
+    "steps_per_epoch",
+    "trim_batch",
+]
 
 
 class _SourceTagged(InterleavedDataset):
@@ -79,7 +86,9 @@ class StreamReplay:
         world_size: The run's world size (global batch / ``train.batch_size``).
     """
 
-    def __init__(self, cfg: OplmConfig, *, rank: int, world_size: int) -> None:
+    def __init__(
+        self, cfg: OplmConfig, *, rank: int, world_size: int, spawn_workers: bool = False
+    ) -> None:
         from oplm.data import build_train_dataloader
 
         template = build_train_dataloader(cfg)
@@ -99,6 +108,16 @@ class StreamReplay:
             num_workers=self.num_workers,
             batch_size=cfg.train.batch_size,
         )
+        stride = world_size * self.num_workers
+        rows = [
+            len(range(rank * self.num_workers + w, len(dataset), stride))
+            for w in range(self.num_workers)
+        ]
+        # Each worker's last batch of an epoch: the short steps that close every epoch.
+        self.partial_sizes = [n % cfg.train.batch_size for n in rows if n % cfg.train.batch_size]
+        # A process group in this process would override the RANK/WORLD_SIZE the stream reads;
+        # spawned (not forked) workers do not inherit it.
+        self.multiprocessing_context = "spawn" if spawn_workers else None
 
     def position(self, step: int) -> tuple[int, int]:
         """``(epoch, batches_in_epoch)`` of global optimizer step ``step``."""
@@ -119,6 +138,7 @@ class StreamReplay:
             collate_fn=self.collator,
             num_workers=workers,
             prefetch_factor=self.cfg.data.prefetch_factor if workers > 0 else None,
+            multiprocessing_context=self.multiprocessing_context if workers > 0 else None,
         )
         # With no process group the stream reads rank and world size from the environment
         # (DataLoader workers inherit it when they start); restored once iteration ends.
@@ -173,3 +193,77 @@ def score_batch(
     )
     out = torch.zeros(num_sources, 4, dtype=torch.float64)
     return out.index_add_(0, batch["source"].long(), per_row)
+
+
+def compiled_step_loss(
+    compiled: nn.Module, model: nn.Module, batch: Mapping[str, torch.Tensor]
+) -> tuple[float, float]:
+    """``(loss_sum, masked_tokens)`` of one training step through ``compiled``, weights untouched.
+
+    Runs what the trainer runs: train mode, bf16 autocast on CUDA, the model's own loss, and a
+    backward pass, so the compiled graph is the joint forward/backward training graph rather
+    than an inference graph. Gradients are discarded; no optimizer step is taken.
+
+    Args:
+        compiled: ``torch.compile`` of ``model`` (optionally of a DDP wrapper around it).
+        model: The underlying module (owns the parameters whose gradients are cleared).
+        batch: A replayed batch.
+    """
+    device = next(model.parameters()).device
+    labels = batch["labels"].to(device)
+    model.train()
+    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        loss = compiled(
+            input_ids=batch["input_ids"].to(device),
+            attention_mask=batch["attention_mask"].to(device),
+            labels=labels,
+        )["loss"]
+    loss.backward()
+    model.zero_grad(set_to_none=True)
+    model.eval()
+    masked = float((labels != -100).sum())
+    return float(loss.detach()) * masked, masked
+
+
+def compile_like_trainer(model: nn.Module, cfg: OplmConfig, *, ddp: bool) -> nn.Module:
+    """``torch.compile`` the model the way the trainer does, optionally behind DDP.
+
+    The trainer compiles the DDP-wrapped model (``torch.compile(model, dynamic=...,
+    mode=...)``), and Dynamo splits a DDP module's graph at gradient-bucket boundaries. With
+    ``ddp`` this sets up a single-process group so the compiled graph has that structure too.
+    """
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+
+    target = model
+    if ddp:
+        import socket
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        device = next(model.parameters()).device
+        dist.init_process_group(
+            "nccl" if device.type == "cuda" else "gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            rank=0,
+            world_size=1,
+        )
+        target = DistributedDataParallel(
+            model, device_ids=[device.index] if device.type == "cuda" else None
+        )
+    # torch.compile's stub returns a callable; the OptimizedModule it builds is an nn.Module.
+    return cast(
+        "nn.Module",
+        torch.compile(target, dynamic=cfg.train.compile_dynamic, mode=cfg.train.compile_mode),
+    )
+
+
+def trim_batch(batch: Mapping[str, torch.Tensor], rows: int) -> dict[str, torch.Tensor]:
+    """The first ``rows`` rows of a batch, padded only to their own longest row (as collated)."""
+    width = int(batch["attention_mask"][:rows].sum(1).max())
+    return {
+        k: v[:rows, :width] if v.dim() == 2 else v[:rows]
+        for k, v in batch.items()
+        if isinstance(v, torch.Tensor)
+    }

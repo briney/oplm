@@ -96,3 +96,40 @@ def test_stream_replay_cli_scores_a_frozen_checkpoint(tmp_path: Path) -> None:
     for r in rows:
         assert int(r["rows"]) == 4 and math.isfinite(float(r["loss"]))
         assert float(r["frac_a"]) + float(r["frac_b"]) == pytest.approx(1.0)
+
+
+def test_partial_sizes_are_each_workers_last_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg(tmp_path)
+    cfg.train.batch_size = 5  # each worker serves 12 rows: two full batches and one of 2
+    replay = StreamReplay(cfg, rank=0, world_size=WORLD)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", str(WORLD))
+    sizes = [len(b["input_ids"]) for b in build_train_dataloader(cfg)]
+    assert replay.partial_sizes == [s for s in sizes if s < 5] == [2, 2]
+
+
+@pytest.mark.parametrize("ddp", [False, True])
+def test_compiled_comparison_scores_identical_tensors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ddp: bool
+) -> None:
+    # With compilation stubbed out, the train-mode step and the eager score must agree
+    # exactly: the comparison itself adds no difference (masks, reduction, rows).
+    monkeypatch.setattr(torch, "compile", lambda module, **kwargs: module)
+    cfg = _cfg(tmp_path)
+    cfg.train.batch_size = 5
+    ckpt = tmp_path / "checkpoint-6"
+    torch.manual_seed(0)
+    OplmForMaskedLM(cfg.model).save_pretrained(ckpt / "hf")
+    (ckpt / "config.yaml").write_text(serialize_config(cfg))
+    out = tmp_path / "replay.csv"
+    args = ["stream-replay", str(ckpt), "--world-size", str(WORLD), "--step", "0", "--step", "2"]
+    args += ["--batches", "2", "--device", "cpu", "--compiled", "--partial-after", "1"]
+    args += ["--ddp"] if ddp else []
+    result = CliRunner().invoke(app, [*args, "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert result.output.count("epoch-end batch of 2 rows") == 2
+    for r in csv.DictReader(out.open()):
+        assert abs(float(r["compiled_minus_eager"])) < 1e-5
+    assert not torch.distributed.is_initialized()
