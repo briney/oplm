@@ -315,6 +315,13 @@ reserved exclusively for "drained cleanly, resume expected," distinct from `0` (
 `max_steps`) and any other nonzero exit (a crash). See
 [TRAIN.md §16](TRAIN.md#16-fault-tolerance) for the full knob table and what a resume restores.
 
+**Forcing a drain by hand** (for example, to exercise resume once per run): `scancel
+--signal=USR1 <jobid>`. Without `--batch`, Slurm signals only the job steps, so the batch
+wrapper survives to requeue. The trainer ranks checkpoint, write `.drained` and exit 85;
+`accelerate launch` reports that as `exit=1`. The wrapper then logs `requeueing (exit=1,
+drained=1, ...)` and requeues, and the next attempt logs `restart_count=1` and `Auto-resuming
+from checkpoint-<N>`.
+
 The marker exists because the exit code does not survive the production launch stack: the rank
 processes exit 85, but `accelerate launch --multi_gpu` reports any worker failure as its **own**
 exit `1` (torchelastic's `ChildFailedError` is re-raised inside the launcher), so the sbatch
@@ -423,6 +430,11 @@ working directory on a compute node, not wherever `generate` was invoked from, s
 would silently resolve to the wrong file there). `--nodes`/`--time-limit` override whatever the
 `slurm:` block's tables would otherwise resolve, and let you omit `--preset` entirely if you
 supply both.
+
+`generate` launches `oplm.fold.train` instead of `oplm.train` when the resolved run config has a
+`fold:` block (docs/FOLD.md §10), and refuses a relative `train.output_dir`: the job runs from a
+node-local `$JOB_WORK_DIR`, so a relative path would keep checkpoints only until the job ends and
+auto-resume would find nothing.
 
 ```bash
 oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
