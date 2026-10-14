@@ -50,11 +50,12 @@ train:
 data:
   train: /mnt/data/briney/oplm-data/hf/wwpdb/2026-10-12
   eval:
-    valid:                    # in-training eval of the live model (docs/FOLD.md §10)
+    valid:                    # in-training eval of the live model (docs/FOLD.md §10); also runs
+                              # once after step 1, so a broken eval path fails in minutes
       path: /mnt/data/briney/oplm-data/hf/wwpdb/2026-10-12
       type: fold_monomer
       target_set: valid       # 64 single-chain entries, 75-391 residues
-      every: {steps: 2000}
+      every: {steps: 2000, at_start: true}
   num_workers: 4
   pin_memory: true
   prefetch_factor: 4

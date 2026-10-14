@@ -65,6 +65,7 @@ for run in proof-w128 proof-w256; do
   done
 done
 echo "evaluating ${#jobs[@]} checkpoints"
+(( ${#jobs[@]} )) || { echo "no checkpoints under $RUNS" >> "$RESULTS/status.txt"; exit 1; }
 
 gpu=0
 for job in "${jobs[@]}"; do
@@ -72,7 +73,7 @@ for job in "${jobs[@]}"; do
   mkdir -p "$RESULTS/$run"
   (
     CUDA_VISIBLE_DEVICES=$gpu oplm fold eval --model "$ckpt" --weights ema --data "$DATASET" \
-      --target-set cameo --target-set casp14 --out "$RESULTS/$run/step-$step" \
+      --target-set cameo --target-set casp14 --device cuda --out "$RESULTS/$run/step-$step" \
       > "$RESULTS/$run/step-$step.log" 2>&1
     echo "$run step-$step $?" >> "$RESULTS/status.txt"
   ) &

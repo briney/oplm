@@ -2492,12 +2492,13 @@ The runs can share a node pool. Each needs one 8-GPU node, for about 142 h (w128
 
 - [ ] **Step 3: Check the first eval and the first checkpoint**
 
-After step 2000 (about 6 h for w128, 10 h for w256):
-- W&B project `oplm-fold` shows `eval/valid/tm_score` with `targets` = 64 and `failed` = 0.
+Right after launch, then again after step 2000 (about 6 h for w128, 10 h for w256):
+- W&B project `oplm-fold` shows `eval/valid/tm_score` with `targets` = 64 and `failed` = 0. The
+  config sets `at_start`, so the first point arrives right after step 1, and the next at step 2000.
 - `checkpoint-2000/` has both `hf/` and `hf_ema/`.
 - Loss curves look like the M2b measurement's first steps (distogram falling).
 
-If `failed` > 0, read the training log for the per-target error before continuing.
+If `failed` > 0, read the training log: each failed target is logged as a warning with its error.
 
 - [ ] **Step 4: Force one resume per run**
 

@@ -235,11 +235,14 @@ def test_proof_configs_load(width: int) -> None:
     assert cfg.fold.crop_size == 384
     assert 8 * cfg.train.batch_size * cfg.train.gradient_accumulation_steps == 128  # 8 x B200
     assert Path(cfg.train.output_dir).is_absolute()
+    assert cfg.train.max_steps == 50_000 and cfg.train.save_every == 2000
+    assert cfg.train.keep_every_n_steps == 10_000  # the offline job's KEEP_EVERY
     assert cfg.train.output_dir.endswith(f"proof-w{width}")
     assert cfg.train.wandb_run_name == f"fold-proof-w{width}"
     valid = cfg.data.eval["valid"]
     assert valid["type"] == "fold_monomer" and valid["target_set"] == "valid"
-    assert valid["path"] == cfg.data.train and valid["every"] == {"steps": 2000}
+    assert valid["path"] == cfg.data.train
+    assert valid["every"] == {"steps": 2000, "at_start": True}  # a broken eval fails at step 1
     slurm = load_slurm_config(path)
     assert slurm.gpus_per_node == 8 and slurm.nodes.resolve(phase=None, preset=None) == 1
     assert "@fold-m2c-runs" in slurm.install and "esmc" in slurm.install
@@ -303,6 +306,7 @@ def test_eval_cli_writes_scores_and_summary(tmp_path: Path, fixture_dataset: Pat
     args += ["--out", str(out), "--device", "cpu"]
     result = runner.invoke(app, args)
     assert result.exit_code == 0, result.output
+    assert "[cameo 1/1] 1crn_A ok" in plain(result.output)  # Rich must not eat the prefix
     from oplm.fold.eval.monomer import read_scores
 
     rows = read_scores(out / "targets.csv")

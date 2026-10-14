@@ -4,9 +4,9 @@ Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
 this file records what is implemented. **Status: milestone 2c (evaluation and proof runs) implemented, proof runs pending; milestone 2b (losses and training) accepted 2026-10-13 (measured on one B200; docs/fold/m2/); milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
-Kernels, the model, prediction, the training data pipeline, the losses and the training step exist
-(§7 holds the M1 acceptance evidence, §8 the data contract, §9 the losses and training; the
-single-B200 cost measurement of §9 is still to be run).
+Kernels, the model, prediction, the training data pipeline, the losses, the training step and the
+held-out evaluation package (`oplm.fold.eval`) exist (§7 holds the M1 acceptance evidence, §8 the
+data contract, §9 the losses and training, §10 the evaluation and the proof runs).
 
 ## 1. Package layout (implemented so far)
 
@@ -28,15 +28,20 @@ src/oplm/fold/
 ├── train.py                # python -m oplm.fold.train entry point
 ├── predict.py              # fold(), mmCIF writer
 ├── fixtures.py             # ESMFold2 golden-fixture generator (runs in the esm venv)
-├── cli.py                  # oplm fold bench-kernels | make-fixtures | measure | predict | preprocess | train
-└── data/
-    ├── ccd.py              # residue vocabulary, reference conformers, ChemCompTable (CCD parents)
-    ├── complex.py          # MolecularComplex (flat atoms/tokens/bonds) + Parquet row
-    ├── mmcif.py            # gemmi mmCIF -> MolecularComplex with the §4.4 filters
-    ├── crop.py             # contiguous / spatial single-chain crops
-    ├── featurize.py        # ChainSpec or MolecularComplex -> FoldFeatures (+ FoldTargets)
-    ├── collate.py          # FoldBatch under the atom budget
-    └── dataset.py          # oplm fold preprocess + StructureDataset (resume contract)
+├── cli.py                  # oplm fold bench-kernels | compare | eval | make-fixtures | measure | predict | preprocess | train
+├── data/
+│   ├── ccd.py              # residue vocabulary, reference conformers, ChemCompTable (CCD parents)
+│   ├── complex.py          # MolecularComplex (flat atoms/tokens/bonds) + Parquet row
+│   ├── mmcif.py            # gemmi mmCIF -> MolecularComplex with the §4.4 filters
+│   ├── crop.py             # contiguous / spatial single-chain crops
+│   ├── featurize.py        # ChainSpec or MolecularComplex -> FoldFeatures (+ FoldTargets)
+│   ├── collate.py          # FoldBatch under the atom budget
+│   └── dataset.py          # oplm fold preprocess + StructureDataset (resume contract)
+└── eval/
+    ├── metrics.py          # TM-score and lDDT with explicit correspondence and masking
+    ├── targets.py          # held-out target sets (cameo/casp14 lists, valid split) + ground truth
+    ├── monomer.py          # fold and score one chain; score tables, summaries, comparison
+    └── tasks.py            # fold_monomer eval task (in-training scoring of the live model)
 tests/fold/                 # mirrors the above; tests/fixtures/fold/ holds real entries
 tests/fold/oracles/         # frozen Boltz-2 loss functions the losses are checked against (§9)
 ```
@@ -524,7 +529,8 @@ bootstrap 95 % CI.
 
 - one node of 8 B200s, DDP, global batch 128, 50k steps, EMA 0.999;
 - checkpoints every 2000 steps with permanent keeps every 10000;
-- `valid` eval every 2000 steps.
+- `valid` eval every 2000 steps, and once right after the first step, so a broken eval path
+  fails within minutes instead of at step 2000.
 
 `oplm slurm generate` launches `oplm.fold.train` for them (docs/SLURM.md §9). Each attempt builds
 or reuses a per-run Python 3.12 venv with `oplm[train,fold,esmc]` from the tag `fold-m2c-runs`.

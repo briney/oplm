@@ -1,5 +1,5 @@
-"""``oplm fold`` command group: ``bench-kernels``, ``make-fixtures``, ``measure``, ``predict``
-(design §5.2), ``preprocess``, and ``train``.
+"""``oplm fold`` command group: ``bench-kernels``, ``compare``, ``eval``, ``make-fixtures``,
+``measure``, ``predict`` (design §5.2), ``preprocess``, and ``train``.
 
 Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 """
@@ -573,7 +573,7 @@ def eval_(
         for i, target in enumerate(targets, 1):
             scores.append(score_target(folder, target, settings))
             console.print(
-                f"[{name} {i}/{len(targets)}] {target.key} {scores[-1].status} "
+                f"\\[{name} {i}/{len(targets)}] {target.key} {scores[-1].status} "
                 f"TM {scores[-1].tm_score:.3f}"
             )
         rows.extend(scores)
@@ -595,8 +595,8 @@ def eval_(
         "data": str(data),
         "sampling": dataclasses.asdict(settings),
         "resolved_sampling": {
-            "num_loops": loops or folder.config.inference_num_loops,
-            "num_steps": steps or folder.config.inference_num_steps,
+            "num_loops": folder.config.inference_num_loops if loops is None else loops,
+            "num_steps": folder.config.inference_num_steps if steps is None else steps,
         },
         "device": str(dev),
         "versions": {"oplm": oplm.__version__, "torch": torch.__version__},

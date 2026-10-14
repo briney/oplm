@@ -87,6 +87,33 @@ def test_evaluate_counts_a_failed_target(
     assert metrics["targets"] == 0.0 and metrics["failed"] == 1.0
 
 
+def test_evaluate_logs_each_failed_target_on_rank_zero(
+    fixture_dataset_early_cutoff: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("trunk exploded")
+
+    monkeypatch.setattr("oplm.fold.eval.monomer.fold", boom)
+    with caplog.at_level("WARNING", logger="oplm.fold.eval.tasks"):
+        _task(fixture_dataset_early_cutoff).evaluate(tiny_folder(), Accelerator(cpu=True))
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert "valid" in messages[0] and "2ds7_A" in messages[0] and "trunk exploded" in messages[0]
+    # Only rank 0 logs; the other ranks hold the same gathered rows.
+    failed_row = TargetScore(
+        "valid", "2ds7", "A", "A", 1, 1, status="failed", error="trunk exploded"
+    )
+    monkeypatch.setattr(tasks, "gather_objects", lambda local, acc: [failed_row])
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="oplm.fold.eval.tasks"):
+        _task(fixture_dataset_early_cutoff).evaluate(
+            tiny_folder(), SimpleNamespace(process_index=1, num_processes=2)
+        )
+    assert not caplog.records
+
+
 def _ok_row(entry: str) -> TargetScore:
     return TargetScore(
         target_set="three",

@@ -6,6 +6,7 @@ In training the Trainer passes the live model (never the EMA copy) every ``every
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
     from oplm.config import EvalDatasetEntry, OplmConfig
     from oplm.fold.eval.targets import EvalTarget
     from oplm.fold.modeling_fold import OplmForFolding
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["FoldMonomerTask", "FoldMonomerTaskConfig"]
 
@@ -96,7 +99,17 @@ class FoldMonomerTask(EvalTask["OplmForFolding"]):
         self._targets: list[EvalTarget] | None = None
 
     def evaluate(self, model: OplmForFolding, accelerator: Accelerator) -> dict[str, float]:
-        """Score this rank's share of the targets, gather every row, return the means."""
+        """Score this rank's share of the targets, gather every row, return the means.
+
+        Rank 0 logs a warning for each target that failed, with its error.
+
+        Args:
+            model: The live folding model (never the EMA copy), in eval mode.
+            accelerator: The Accelerator; ranks take every ``num_processes``-th target.
+
+        Returns:
+            The metrics named by the entry (``tm_score``, ``targets``, ``failed``, ...).
+        """
         if self._targets is None:
             max_length = self.tcfg.max_length or model.config.lm_max_chain_length
             self._targets, _ = load_targets(
@@ -104,5 +117,17 @@ class FoldMonomerTask(EvalTask["OplmForFolding"]):
             )
         share = self._targets[accelerator.process_index :: accelerator.num_processes]
         local = [score_target(model, target, self.tcfg.sampling) for target in share]
-        summary = summarize(gather_objects(local, accelerator))
+        rows = gather_objects(local, accelerator)
+        if accelerator.process_index == 0:
+            for row in rows:
+                if row.status != "ok":
+                    logger.warning(
+                        "fold_monomer %s: %s/%s_%s failed: %s",
+                        self.name,
+                        row.target_set,
+                        row.entry_id,
+                        row.chain_id,
+                        row.error,
+                    )
+        summary = summarize(rows)
         return {k: v for k, v in summary.items() if k in self.metrics}
