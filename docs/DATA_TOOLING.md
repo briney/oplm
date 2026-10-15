@@ -85,6 +85,12 @@ Every sequence batch (train and eval) has exactly three keys:
 `T` is the batch-max length, capped at `model.max_position_embeddings`.
 `masking_weights`, when used, are consumed inside the collator and never emitted.
 
+With `data.pack_sequences: true` (training only), the collator masks as above and
+then packs the rows: each batch's sequences go back to back into as few rows of
+at most `model.max_position_embeddings` tokens as first-fit-decreasing finds. The
+batch then has `R ≤ B` rows and two more keys: `segment_ids` `(R, T)` long (`1..n`
+for the sequences in a row, `0` at pads) and `num_sequences` (a plain `int`, `B`).
+
 ## MLM masking scheme
 
 Masking is **dynamic** (RoBERTa-style): masks are regenerated every time an
@@ -148,11 +154,11 @@ vs `build_sequence_eval_dataloader` in `src/oplm/data/sequence/loaders.py`).
   tokenization.
 - **Padding** — batches pad to the batch-max length with `<pad>`; the emitted
   `attention_mask` marks real vs pad positions.
-- **Packing** — sequence packing (concatenating multiple short sequences into one
-  fixed-length row) is **not implemented**; it is deferred. Sequences are
-  truncated and padded, never packed. (Canon's depthwise convolution would leak
-  across packed-sequence boundaries, which is the open blocker — see the project
-  notes.)
+- **Packing** — opt-in for training batches (`data.pack_sequences`, see
+  [TRAIN.md §14](TRAIN.md)). The model keeps packed sequences apart: a
+  block-diagonal attention mask, and Canon taps that would cross a sequence
+  boundary contribute zero. Each sequence's logits and loss match its own padded
+  row. Evaluation batches are never packed.
 - **Length grouping / bucketing** — not implemented; the iterable dataset uses
   straightforward streaming with per-epoch shuffling.
 
@@ -197,6 +203,7 @@ Backed by `oplm.config.DataConfig`; defaults live in
 | `data.shuffle_shards` | `bool` | `true` | Shuffle shard order per epoch. |
 | `data.shuffle_rows` | `bool` | `true` | Shuffle within-shard row order per epoch. |
 | `data.reshuffle_on_refill` | `bool` | `true` | Give each refill of an oversampled mixed source its own order (`false` replays the epoch's order every pass, as runs before October 2026 did). |
+| `data.pack_sequences` | `bool` | `false` | Pack each training batch's sequences into as few max-length rows as fit (see above). Incompatible with `model.mask_dropout`. |
 | `data.drop_last` | `bool` | `true` | Equal rows per `(rank, worker)` stream and no partial batches, so every rank runs the same number of full batches per epoch (`false` is the earlier behavior). |
 
 `__post_init__` validates that `mask_token_prob + random_token_prob ≤ 1.0`.

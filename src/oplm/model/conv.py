@@ -80,8 +80,14 @@ class CanonConv(nn.Module):
             bias=False,
         )
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # (B, T, D) -> (B, T, D)
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor,
+        segment_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # (B, T, D) -> (B, T, D). With `segment_ids` (packed rows: 1..n per sequence, 0 at pads), a
+        # tap that would read a token of a neighboring sequence contributes zero instead.
         device_type = x.device.type
         if torch.is_autocast_enabled(device_type):
             out_dtype = torch.get_autocast_dtype(device_type)
@@ -93,9 +99,18 @@ class CanonConv(nn.Module):
         padded = F.pad(x, (0, 0, left, k - 1 - left)).float()  # pad the time axis
         weight = self.conv.weight.squeeze(1).float()  # (D, k) cross-correlation taps
         length = x.shape[1]
+        keep = None  # packed rows: per tap, whether it stays inside the output's sequence
+        if segment_ids is not None:
+            seg = F.pad(segment_ids, (left, k - 1 - left), value=-1)
+            keep = [seg[:, i : i + length].eq(segment_ids).unsqueeze(-1) for i in range(k)]
         out = padded[:, :length] * weight[:, 0]
+        if keep is not None:
+            out = out * keep[0]
         for i in range(1, k):
-            out = out + padded[:, i : i + length] * weight[:, i]
+            tap = padded[:, i : i + length] * weight[:, i]
+            if keep is not None:
+                tap = tap * keep[i]
+            out = out + tap
         out = out.to(out_dtype)
         if self._activation is not None:
             out = self._activation(out)

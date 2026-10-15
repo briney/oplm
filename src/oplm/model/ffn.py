@@ -21,6 +21,7 @@ def _apply_canon_d(
     conv_d: CanonConv | None,
     canon_residual: bool,
     attention_mask: torch.Tensor | None,
+    segment_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply Canon-D to an FFN activation branch (no-op when `conv_d is None`).
 
@@ -36,6 +37,7 @@ def _apply_canon_d(
         canon_residual: Add the conv output back to the branch when `True`.
         attention_mask: `(B, T)` pad mask, required when `conv_d` is set so pad
             positions are zeroed before the kernel runs.
+        segment_ids: `(B, T)` segment ids of a packed batch, or `None`; see `CanonConv`.
 
     Returns:
         The (optionally) convolved branch, same shape as `branch`.
@@ -44,7 +46,7 @@ def _apply_canon_d(
         return branch
     if attention_mask is None:
         raise ValueError("Canon-D requires an attention_mask to zero pad positions.")
-    convolved = conv_d(branch, attention_mask)
+    convolved = conv_d(branch, attention_mask, segment_ids)
     return branch + convolved if canon_residual else convolved
 
 
@@ -79,9 +81,16 @@ class SwiGLU(nn.Module):
         # OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling (§15.1).
         self.down_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # (B, T, D) -> (B, T, F) -> (B, T, D)
-        gate = _apply_canon_d(self.gate_proj(x), self.conv_d, self.canon_residual, attention_mask)
+        gate = _apply_canon_d(
+            self.gate_proj(x), self.conv_d, self.canon_residual, attention_mask, segment_ids
+        )
         return self.down_proj(F.silu(gate) * self.up_proj(x))
 
 
@@ -117,9 +126,16 @@ class GEGLU(nn.Module):
         # OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling (§15.1).
         self.down_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # (B, T, D) -> (B, T, F) -> (B, T, D)
-        gate = _apply_canon_d(self.gate_proj(x), self.conv_d, self.canon_residual, attention_mask)
+        gate = _apply_canon_d(
+            self.gate_proj(x), self.conv_d, self.canon_residual, attention_mask, segment_ids
+        )
         return self.down_proj(F.gelu(gate) * self.up_proj(x))
 
 
@@ -155,9 +171,16 @@ class SquaredReLU(nn.Module):
         # OplmPreTrainedModel._init_weights for the 1/sqrt(2L) scaling (§15.1).
         self.down_proj._is_residual_writer = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # (B, T, D) -> (B, T, F) -> (B, T, D)
-        hidden = _apply_canon_d(self.up_proj(x), self.conv_d, self.canon_residual, attention_mask)
+        hidden = _apply_canon_d(
+            self.up_proj(x), self.conv_d, self.canon_residual, attention_mask, segment_ids
+        )
         return self.down_proj(F.relu(hidden).square())
 
 

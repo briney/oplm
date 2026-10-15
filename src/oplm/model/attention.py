@@ -10,6 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .conv import CanonConv
+from .masking import segment_attention_mask
 from .norm import make_norm
 from .rope import RotaryEmbedding
 
@@ -258,6 +259,7 @@ class OplmAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attention_mask: torch.Tensor,
+        segment_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply the per-stream Canon-B depthwise conv to Q/K/V.
 
@@ -272,7 +274,7 @@ class OplmAttention(nn.Module):
         def conv(t: torch.Tensor, layer: CanonConv) -> torch.Tensor:
             # (B, H, T, d) -> (B, T, D) -> conv -> (B, H, T, d)
             merged = t.transpose(1, 2).reshape(batch, seq_len, self.hidden_size)
-            convolved = layer(merged, attention_mask)
+            convolved = layer(merged, attention_mask, segment_ids)
             merged = merged + convolved if self.canon_residual else convolved
             return merged.view(batch, seq_len, heads, head_dim).transpose(1, 2)
 
@@ -306,6 +308,7 @@ class OplmAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attention_mask: torch.Tensor,
+        segment_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Scaled-dot-product attention via `F.scaled_dot_product_attention`.
 
@@ -316,8 +319,15 @@ class OplmAttention(nn.Module):
         the kernel during training only. The explicit `scale=self.attn_scale`
         matches the manual path (`1/sqrt(d_head)` in channel/disabled modes, `1.0`
         in L2 mode where the scale is folded into `qk_l2_scale`).
+
+        A packed batch (`segment_ids` given) uses the block-diagonal `(B, 1, T, T)` mask
+        from `segment_attention_mask` instead, so each token attends only within its own
+        sequence.
         """
-        attn_mask = (attention_mask == 1)[:, None, None, :]  # (B, 1, 1, T) bool
+        if segment_ids is not None:
+            attn_mask = segment_attention_mask(segment_ids)
+        else:
+            attn_mask = (attention_mask == 1)[:, None, None, :]  # (B, 1, 1, T) bool
         dropout_p = self.attention_dropout if self.training else 0.0
         return F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=self.attn_scale
@@ -329,11 +339,15 @@ class OplmAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attention_mask: torch.Tensor,
+        segment_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Manual scaled-dot-product attention. Returns `(out, attn_fp32)`."""
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.attn_scale  # (B, H, T, T)
-        # Pad positions: mask is (B, T) with 1 for real tokens; broadcast as KV mask.
-        mask = (attention_mask == 0)[:, None, None, :]
+        if segment_ids is not None:
+            mask = ~segment_attention_mask(segment_ids)  # block-diagonal, as in the SDPA path
+        else:
+            # Pad positions: mask is (B, T) with 1 for real tokens; broadcast as KV mask.
+            mask = (attention_mask == 0)[:, None, None, :]
         scores = scores.masked_fill(mask, float("-inf"))
         attn = F.softmax(scores, dim=-1, dtype=torch.float32)
         attn_dropped = F.dropout(attn, p=self.attention_dropout, training=self.training)
@@ -350,6 +364,7 @@ class OplmAttention(nn.Module):
         attention_mask: torch.Tensor,
         output_attentions: bool = False,
         value_residual: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
@@ -364,6 +379,9 @@ class OplmAttention(nn.Module):
             value_residual: `(B, H, T, d_head)` layer-0 values v1 to blend into
                 this layer's values (`value_residual != "none"` and
                 `layer_idx > 0` only); `None` disables the blend.
+            segment_ids: `(B, T)` segment ids of a packed batch (several sequences per row:
+                `1..n` per sequence, `0` at pads), or `None`. Attention and Canon-B then stay
+                within each sequence.
 
         Returns:
             A `(output, attn_weights_or_None)` tuple. `output` has shape
@@ -379,7 +397,7 @@ class OplmAttention(nn.Module):
         # Applied before the value residual so layer 0 exposes (and later layers
         # blend toward) the conv'd values.
         if self.canon_b_enabled:
-            q, k, v = self._apply_canon_b(q, k, v, attention_mask)
+            q, k, v = self._apply_canon_b(q, k, v, attention_mask, segment_ids)
         # ResFormer: physical layer 0 always bypasses mixing, including revisits.
         # Other layers blend toward its first execution's values.
         if self.layer_idx > 0 and value_residual is not None:
@@ -388,9 +406,9 @@ class OplmAttention(nn.Module):
         q, k = self._apply_rope(q, k)
 
         if output_attentions:
-            out, attn = self._manual_attention(q, k, v, attention_mask)
+            out, attn = self._manual_attention(q, k, v, attention_mask, segment_ids)
         else:
-            out = self._sdpa_attention(q, k, v, attention_mask)
+            out = self._sdpa_attention(q, k, v, attention_mask, segment_ids)
             attn = None
 
         out = self._output_projection(out, x)

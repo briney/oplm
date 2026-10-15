@@ -229,6 +229,7 @@ class OplmBlock(nn.Module):
         attention_mask: torch.Tensor,
         output_attentions: bool,
         value_residual: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
@@ -243,11 +244,15 @@ class OplmBlock(nn.Module):
         # Canon-B (the conv on Q/K/V) is applied inside the attention module.
         attn_in = attn_base
         if hasattr(self, "conv_a"):
-            conv_a = self.conv_a(attn_base, attention_mask)
+            conv_a = self.conv_a(attn_base, attention_mask, segment_ids)
             attn_in = attn_base + conv_a if self.canon_residual else conv_a
 
         attn_result = self.attention(
-            attn_in, attention_mask, output_attentions, value_residual=value_residual
+            attn_in,
+            attention_mask,
+            output_attentions,
+            value_residual=value_residual,
+            segment_ids=segment_ids,
         )
         if self.value_residual_enabled:
             attn_out, attn_weights, v1 = attn_result
@@ -266,9 +271,9 @@ class OplmBlock(nn.Module):
         # width and is applied by the FFN module itself.
         mlp_in = h_norm
         if hasattr(self, "conv_c"):
-            conv_c = self.conv_c(h_norm, attention_mask)
+            conv_c = self.conv_c(h_norm, attention_mask, segment_ids)
             mlp_in = h_norm + conv_c if self.canon_residual else conv_c
-        ffn_out = self.ffn(mlp_in, attention_mask)
+        ffn_out = self.ffn(mlp_in, attention_mask, segment_ids)
 
         if self.norm_strategy == "sandwich":
             ffn_out = self.ffn_post_norm(ffn_out)
@@ -289,6 +294,7 @@ class OplmBlock(nn.Module):
         attention_mask: torch.Tensor,
         output_attentions: bool = False,
         value_residual: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
@@ -302,6 +308,7 @@ class OplmBlock(nn.Module):
                 weights from `OplmAttention` (forces the SDPA fallback).
             value_residual: `(B, H, T, d_head)` layer-0 values v1 for the
                 ResFormer value residual (later layers only); `None` otherwise.
+            segment_ids: `(B, T)` segment ids of a packed batch, or `None` (see `OplmAttention`).
 
         Returns:
             `(y, attn_weights_or_None)` — `y` has shape `(B, T, D)`;
@@ -326,6 +333,7 @@ class OplmBlock(nn.Module):
                     attention_mask,
                     output_attentions,
                     value_residual,
+                    segment_ids,
                     use_reentrant=False,
                     context_fn=context_fn,
                 )
@@ -336,9 +344,10 @@ class OplmBlock(nn.Module):
                 attention_mask,
                 output_attentions,
                 value_residual,
+                segment_ids,
                 use_reentrant=False,
             )
-        return self._forward_impl(x, attention_mask, output_attentions, value_residual)
+        return self._forward_impl(x, attention_mask, output_attentions, value_residual, segment_ids)
 
 
 class OplmStack(nn.Module):
@@ -404,6 +413,7 @@ class OplmStack(nn.Module):
         output_hidden_states: bool = False,
         output_attentions: bool = False,
         inputs_embeds: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         tuple[torch.Tensor, ...] | None,
@@ -439,7 +449,9 @@ class OplmStack(nn.Module):
         v1: torch.Tensor | None = None
         for layer_index in self.layer_execution_order:
             block = self.layers[layer_index]
-            result = block(x, attention_mask, output_attentions, value_residual=v1)
+            result = block(
+                x, attention_mask, output_attentions, value_residual=v1, segment_ids=segment_ids
+            )
             if self.value_residual_enabled:
                 x, attn, v = result
                 if v1 is None:

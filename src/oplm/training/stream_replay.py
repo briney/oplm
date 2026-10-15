@@ -10,6 +10,7 @@ mix can be split per ``data.train`` entry. See docs/LATE_LOSS_INVESTIGATION.md.
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 from typing import TYPE_CHECKING, Any, cast
@@ -103,6 +104,10 @@ class StreamReplay:
     ) -> None:
         from oplm.data import build_train_dataloader
 
+        # Rows are tagged and scored one sequence per row. Packing happens after masking,
+        # so an unpacked replay of a packed run serves the same sequences and masks.
+        cfg = copy.deepcopy(cfg)
+        cfg.data.pack_sequences = False
         template = build_train_dataloader(cfg)
         dataset: Any = template.dataset
         if isinstance(dataset, InterleavedDataset):

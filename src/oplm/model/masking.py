@@ -4,7 +4,18 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["prepare_attention_mask", "zero_pad_positions"]
+__all__ = ["prepare_attention_mask", "segment_attention_mask", "zero_pad_positions"]
+
+
+def segment_attention_mask(segment_ids: torch.Tensor) -> torch.Tensor:
+    """Block-diagonal `(B, 1, T, T)` attend mask for a packed batch (several sequences per row).
+
+    `segment_ids` is `(B, T)`: `1..n` for the sequences packed back to back in a row, `0` at
+    pads. A query attends only to keys of its own segment; the pad run is a segment of its
+    own, so pad queries attend to pad keys and no row is empty. RoPE positions need no reset:
+    attention scores depend only on query-key offsets, which never cross a segment.
+    """
+    return (segment_ids[:, :, None] == segment_ids[:, None, :])[:, None]
 
 
 def prepare_attention_mask(

@@ -124,11 +124,12 @@ class MLMTask:
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             labels=batch["labels"],
+            segment_ids=batch.get("segment_ids"),  # packed batches only
         )
         return StepResult(
             loss=outputs["loss"],
             tokens=int(batch["attention_mask"].sum().item()),
-            samples=len(batch["input_ids"]),
+            samples=batch.get("num_sequences", len(batch["input_ids"])),
         )
 
     def flops_per_token(self, cfg: OplmConfig) -> int | None:

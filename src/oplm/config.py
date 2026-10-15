@@ -452,6 +452,13 @@ class DataConfig:
     # regimes (dynamic=False) to reduce unique shapes and improve throughput.
     pad_to_multiple_of: int | None = None
 
+    # Training batches only: pack each batch's sequences back to back into as few rows of
+    # at most model.max_position_embeddings tokens as fit, instead of one padded row per
+    # sequence. The model keeps sequences apart (block-diagonal attention mask, Canon taps
+    # stop at sequence boundaries), so the loss is the same; fewer pad tokens are computed.
+    # Batch size still counts sequences. Evaluation batches are never packed.
+    pack_sequences: bool = False
+
     # DataLoader settings
     num_workers: int = 4
     pin_memory: bool = True

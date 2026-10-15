@@ -541,3 +541,42 @@ def test_collator_pad_to_multiple_none_matches_default(tokenizer) -> None:
     out_default = collator_default(_batch(_SEQUENCES))
     for key in ("input_ids", "attention_mask", "labels"):
         assert torch.equal(out_none[key], out_default[key]), f"key={key} differs"
+
+
+@pytest.mark.parametrize("pad_to_multiple_of", [None, 8])
+def test_packing_moves_each_masked_sequence_intact_into_fewer_rows(
+    tokenizer, pad_to_multiple_of: int | None
+) -> None:
+    """A packed batch holds exactly the unpacked batch's masked sequences, back to back."""
+    max_length = 64
+    sequences = [s[: max_length - 2] for s in _SEQUENCES] * 3
+    kwargs = dict(
+        max_length=max_length, deterministic=True, seed=7, pad_to_multiple_of=pad_to_multiple_of
+    )
+    ref = MLMCollator(tokenizer, **kwargs)(_batch(sequences))
+    out = MLMCollator(tokenizer, pack_sequences=True, **kwargs)(_batch(sequences))
+
+    assert out["num_sequences"] == len(sequences)
+    assert out["input_ids"].shape[0] < len(sequences)
+    assert out["input_ids"].shape[1] <= max_length
+    if pad_to_multiple_of:
+        assert out["input_ids"].shape[1] % pad_to_multiple_of == 0
+    assert torch.equal(out["attention_mask"].bool(), out["segment_ids"] > 0)
+
+    def pieces(batch: dict, rows_are_segments: bool) -> list[tuple]:
+        found = []
+        for r in range(batch["input_ids"].shape[0]):
+            seg = batch["segment_ids"][r] if rows_are_segments else batch["attention_mask"][r]
+            for s in seg.unique().tolist():
+                if s == 0:
+                    continue
+                cols = seg == s
+                assert cols.nonzero().flatten().diff().eq(1).all()  # contiguous
+                ids, labels = batch["input_ids"][r, cols], batch["labels"][r, cols]
+                found.append((ids.tolist(), labels.tolist()))
+        return sorted(found)
+
+    assert pieces(out, True) == pieces(ref, False)
+    pad = out["attention_mask"] == 0
+    assert (out["labels"][pad] == -100).all()
+    assert (out["input_ids"][pad] == tokenizer.pad_token_id).all()

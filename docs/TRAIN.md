@@ -588,6 +588,36 @@ data:
   pad_to_multiple_of: 128
 ```
 
+### Sequence packing (`data.pack_sequences`)
+
+Padding every sequence to the batch's longest wastes most of a step on short
+proteins: at 512 tokens, a typical 128-sequence batch holds about 22.6k real
+tokens in 65.5k slots. `data.pack_sequences: true` packs each training batch's
+sequences back to back into as few rows of at most `max_position_embeddings`
+tokens as fit (first-fit decreasing, after masking). The batch still holds
+`train.batch_size` sequences, so the optimization is unchanged; only fewer pad
+tokens get computed.
+
+The model keeps sequences apart. Attention uses a block-diagonal mask, so a
+token attends only within its own sequence. Canon taps that would reach into a
+neighboring sequence contribute zero. RoPE positions need no reset, because
+attention scores depend only on query–key offsets within a sequence. Each
+sequence's logits, loss and gradients match its own padded row (the tests check
+this).
+
+Costs and limits:
+
+- Attention gets a dense block-diagonal `(rows, 1, T, T)` mask instead of a
+  key-padding mask. (FlashAttention is out either way: it takes no mask at all.)
+  If cuDNN's attention does not accept that mask, PyTorch falls back to the
+  memory-efficient backend for packed batches. If the result is slower than the
+  padding saved, turn packing off: the off path is unchanged.
+- It is incompatible with `model.mask_dropout`, which rescales by each row's
+  masked fraction. The loader refuses that combination.
+- Evaluation batches are never packed, so eval numbers stay comparable.
+- `oplm stream-replay` replays a packed run unpacked: packing happens after
+  masking, so it serves the same sequences and masks.
+
 ---
 
 ## 15. Throughput logging
