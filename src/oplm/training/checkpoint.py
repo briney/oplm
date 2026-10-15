@@ -722,16 +722,19 @@ def save_checkpoint(
         state_path = tmp_dir / "trainer_state.json"
         state_path.write_text(json.dumps(state, indent=2))
 
-        # Save config (model is the HF OplmConfig; train/data are dataclasses)
-        config_path = tmp_dir / "config.yaml"
-        config_path.write_text(serialize_config(cfg))
-
-        # HuggingFace export for from_pretrained-style downstream loading
-        hf_dir = tmp_dir / "hf"
         # Keeping the compile wrapper makes Accelerate replace its live _orig_mod
         # with the unwrapped model. On rank zero that removes DDP mid-training and
         # desynchronizes the next backward/accumulation collectives from other ranks.
         unwrapped = accelerator.unwrap_model(model, keep_torch_compile=False)
+
+        # Save config (model is the HF OplmConfig; train/data are dataclasses). The live
+        # model's checkpointing setting: transformers deleted the flag from cfg.model.
+        config_path = tmp_dir / "config.yaml"
+        checkpointing = getattr(unwrapped, "is_gradient_checkpointing", None)
+        config_path.write_text(serialize_config(cfg, gradient_checkpointing=checkpointing))
+
+        # HuggingFace export for from_pretrained-style downstream loading
+        hf_dir = tmp_dir / "hf"
         # config.json + model.safetensors. hf_state_dict is None unless the model is
         # FSDP2-sharded, in which case it carries the gathered full tensors (the module's
         # own state_dict would hand safetensors DTensors, which it cannot serialize).

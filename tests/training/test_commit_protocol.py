@@ -675,3 +675,30 @@ def test_second_checkpoints_config_yaml_round_trips_through_load_config(tmp_path
     reloaded = load_config(["--config", str(second_config_path)])
     assert reloaded.model.hidden_size == cfg.model.hidden_size
     assert reloaded.model.num_hidden_layers == cfg.model.num_hidden_layers
+
+
+def test_checkpoint_config_yaml_keeps_gradient_checkpointing(tmp_path: Path) -> None:
+    """transformers deletes ``gradient_checkpointing`` from ``cfg.model`` when it builds the
+    model; the checkpoint's ``config.yaml`` must still record the run's setting."""
+    from oplm.config import load_config
+
+    cfg = _cfg()
+    cfg.model.gradient_checkpointing = True
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    assert not hasattr(cfg.model, "gradient_checkpointing")  # what transformers does
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=4,
+        epoch=1,
+        samples_seen=16,
+        tokens_seen=160,
+    )
+    reloaded = load_config(["--config", str(tmp_path / "checkpoint-4" / "config.yaml")])
+    assert reloaded.model.gradient_checkpointing is True
+    hf_config = (tmp_path / "checkpoint-4" / "hf" / "config.json").read_text()
+    assert '"gradient_checkpointing": true' not in hf_config  # the HF export is unchanged

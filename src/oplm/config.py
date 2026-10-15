@@ -854,13 +854,17 @@ def load_config(argv: list[str]) -> OplmConfig:
     return cfg
 
 
-def serialize_config(cfg: OplmConfig) -> str:
+def serialize_config(cfg: OplmConfig, *, gradient_checkpointing: bool | None = None) -> str:
     """Serialize a resolved :class:`OplmConfig` to reloadable YAML text.
 
     The ``model`` subtree is an HF ``OplmConfig`` (serialized via ``to_dict``);
     ``train``, ``data``, and ``fold`` (when present) are dataclasses. The result
     round-trips through ``load_config(["--config", <path>])``. Shared by the
     top-level run config dump and the per-checkpoint ``config.yaml``.
+
+    ``gradient_checkpointing``, when given, overrides ``model.gradient_checkpointing``: once
+    a model is built, transformers has deleted that flag from the shared ``cfg.model``, so
+    a checkpoint passes the live model's setting instead.
     """
     from dataclasses import asdict
 
@@ -878,6 +882,8 @@ def serialize_config(cfg: OplmConfig) -> str:
     # constructed default instance's own `to_dict()` never has it either, since it
     # is only ever added by `save_pretrained`, not by construction).
     model_dict.pop("auto_map", None)
+    if gradient_checkpointing is not None:
+        model_dict["gradient_checkpointing"] = gradient_checkpointing
 
     config_dict = {
         "model": model_dict,
