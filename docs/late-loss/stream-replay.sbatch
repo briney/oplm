@@ -52,11 +52,15 @@ python -m pip install --quiet "oplm[train] @ git+https://github.com/briney/oplm@
 python -m pip freeze | grep -i -E '^(oplm|torch|transformers)' > "$RESULTS/pip-freeze.txt"
 
 # Evenly spaced window starts over [first, last], as repeated --step options.
+# The replication trained before data.reshuffle_on_refill / data.drop_last existed.
+LEGACY_LOADER="--set data.reshuffle_on_refill=false --set data.drop_last=false"
+
 steps() { python -c "import sys; a, b, n = map(int, sys.argv[1:]); print(' '.join(f'--step {a + i * (b - a) // (n - 1)}' for i in range(n)))" "$@"; }
 
 run() {  # name first last
   # shellcheck disable=SC2046
   oplm stream-replay "$CHECKPOINT" --world-size "$WORLD_SIZE_RUN" --batches "$BATCHES" \
+    $LEGACY_LOADER \
     $(steps "$2" "$3" "$WINDOWS") --out "$RESULTS/$1.csv" 2>&1 | tee "$RESULTS/$1.log"
 }
 run control 450000 479000     # mid-epoch reference span, same length

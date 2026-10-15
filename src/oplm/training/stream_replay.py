@@ -39,8 +39,10 @@ __all__ = [
 class _SourceTagged(InterleavedDataset):
     """:class:`InterleavedDataset` whose rows carry ``"source"``: their source's index."""
 
-    def _next_or_refill(self, iters: list[Iterator[dict[str, object]]], source_idx: int) -> object:
-        item = super()._next_or_refill(iters, source_idx)
+    def _next_or_refill(
+        self, iters: list[Iterator[dict[str, object]]], passes: list[int], source_idx: int
+    ) -> object:
+        item = super()._next_or_refill(iters, passes, source_idx)
         return {**item, "source": source_idx} if isinstance(item, dict) else item
 
 
@@ -58,14 +60,24 @@ class _TaggingCollator:
 
 
 def steps_per_epoch(
-    n_samples: int, *, rank: int, world_size: int, num_workers: int, batch_size: int
+    n_samples: int,
+    *,
+    rank: int,
+    world_size: int,
+    num_workers: int,
+    batch_size: int,
+    drop_last: bool = False,
 ) -> int:
-    """Batches one rank's DataLoader yields per epoch (each worker ends on a partial batch).
+    """Batches one rank's DataLoader yields per epoch.
 
-    Rows are striped over the joint ``(rank, worker)`` index, so worker ``w`` serves
-    ``len(range(rank * num_workers + w, n_samples, world_size * num_workers))`` rows.
+    Rows are striped over the joint ``(rank, worker)`` index. Without ``drop_last``
+    worker ``w`` serves ``len(range(rank * num_workers + w, n_samples, world_size *
+    num_workers))`` rows and ends on a partial batch; with it every worker serves
+    ``n_samples // (world_size * num_workers)`` rows in full batches only.
     """
     stride = world_size * num_workers
+    if drop_last:
+        return num_workers * ((n_samples // stride) // batch_size)
     return sum(
         math.ceil(len(range(rank * num_workers + w, n_samples, stride)) / batch_size)
         for w in range(num_workers)
@@ -95,7 +107,12 @@ class StreamReplay:
         dataset: Any = template.dataset
         if isinstance(dataset, InterleavedDataset):
             dataset = _SourceTagged(
-                dataset._datasets, dataset._fractions, num_samples=len(dataset), seed=dataset._seed
+                dataset._datasets,
+                dataset._fractions,
+                num_samples=len(dataset),
+                seed=dataset._seed,
+                reshuffle_on_refill=dataset._reshuffle_on_refill,
+                drop_remainder=dataset._drop_remainder,
             )
         self.cfg, self.rank, self.world_size = cfg, rank, world_size
         self.dataset = dataset
@@ -107,14 +124,20 @@ class StreamReplay:
             world_size=world_size,
             num_workers=self.num_workers,
             batch_size=cfg.train.batch_size,
+            drop_last=cfg.data.drop_last,
         )
         stride = world_size * self.num_workers
         rows = [
             len(range(rank * self.num_workers + w, len(dataset), stride))
             for w in range(self.num_workers)
         ]
-        # Each worker's last batch of an epoch: the short steps that close every epoch.
-        self.partial_sizes = [n % cfg.train.batch_size for n in rows if n % cfg.train.batch_size]
+        # Each worker's last batch of an epoch: the short steps that close every epoch
+        # (none with drop_last, which serves only full batches).
+        self.partial_sizes = [
+            n % cfg.train.batch_size
+            for n in rows
+            if n % cfg.train.batch_size and not cfg.data.drop_last
+        ]
         # A process group in this process would override the RANK/WORLD_SIZE the stream reads;
         # spawned (not forked) workers do not inherit it.
         self.multiprocessing_context = "spawn" if spawn_workers else None
@@ -139,6 +162,7 @@ class StreamReplay:
             num_workers=workers,
             prefetch_factor=self.cfg.data.prefetch_factor if workers > 0 else None,
             multiprocessing_context=self.multiprocessing_context if workers > 0 else None,
+            drop_last=self.cfg.data.drop_last,
         )
         # With no process group the stream reads rank and world size from the environment
         # (DataLoader workers inherit it when they start); restored once iteration ends.

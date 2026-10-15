@@ -55,6 +55,9 @@ python -m pip install --quiet "oplm[train] @ git+https://github.com/briney/oplm@
 python -m pip freeze | grep -i -E '^(oplm|torch|transformers)' > "$RESULTS/pip-freeze.txt"
 export TORCH_LOGS=recompiles
 
+# The replication trained before data.reshuffle_on_refill / data.drop_last existed.
+LEGACY_LOADER="--set data.reshuffle_on_refill=false --set data.drop_last=false"
+
 steps() { python -c "import sys; a, b, n = map(int, sys.argv[1:]); print(' '.join(f'--step {a + i * (b - a) // (n - 1)}' for i in range(n)))" "$@"; }
 RECENT=$(steps 597000 599700 10)
 FAR=$(steps 640000 669000 15)
@@ -63,6 +66,7 @@ run() {  # name, extra flags...
   local name=$1; shift
   # shellcheck disable=SC2086
   oplm stream-replay "$CHECKPOINT" --world-size "$WORLD_SIZE_RUN" --batches "$BATCHES" \
+    $LEGACY_LOADER \
     --compiled --partial-after 25 "$@" $RECENT $FAR $FAR --out "$RESULTS/$name.csv" \
     > "$RESULTS/$name.log" 2>&1 || echo "$name failed: $?" >> "$RESULTS/status.txt"
 }

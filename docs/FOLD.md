@@ -370,7 +370,7 @@ normalized to an ISO date, and `checksums.txt` is written with paths relative to
 `StructureDataset(path, split="train", crop_size=384, contiguous_prob=0.5,
 max_chain_length=1024, ...)` subclasses `ShardedProteinDataset`: rank/worker striping, per-epoch
 shuffling, `InterleavedDataset` mixing and the data-exact resume contract (`set_resume_skip`,
-`_arm_sample_skip`) are inherited. It strides over the index-eligible rows of each shard and
+`_iter_pass`) are inherited. It strides over the index-eligible rows of each shard and
 yields exactly one example per row: a generator seeded from `(seed, epoch, shard, row)` picks
 one eligible chain uniformly, crops it (`crop_chain`: contiguous window or spatial crop around
 a resolved center; unresolved tokens fill a spatial crop last, by index) and featurizes it

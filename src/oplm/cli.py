@@ -207,6 +207,14 @@ def stream_replay(
         typer.Option(help="With --compiled: after this many windows, run the epoch-end batches"),
     ] = None,
     out: Annotated[Path | None, typer.Option(help="Write the table as CSV")] = None,
+    sets: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set",
+            help="Override the checkpoint's config, KEY=VALUE (repeatable). Runs trained "
+            "before data.reshuffle_on_refill / data.drop_last existed need both =false.",
+        ),
+    ] = None,
 ) -> None:
     """Rebuild the exact batches a run trained on at given steps; score the frozen model.
 
@@ -236,7 +244,7 @@ def stream_replay(
         raise typer.BadParameter(
             "--ddp and --partial-after need --compiled, and --compiled --score"
         )
-    cfg = load_config(["--config", str(checkpoint / "config.yaml")])
+    cfg = load_config(["--config", str(checkpoint / "config.yaml"), *(sets or [])])
     names = [e.name for e in parse_train_configs(cfg.data.train)] or ["train"]
     model = None
     if score:

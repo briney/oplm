@@ -119,6 +119,7 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
             shuffle_rows=cfg.data.shuffle_rows,
             seed=cfg.train.seed,
             load_masking_weights=cfg.data.weighted_masking,
+            drop_remainder=cfg.data.drop_last,
         )
         for entry in entries
     ]
@@ -129,6 +130,8 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
             sources,
             [entry.fraction for entry in entries],
             seed=cfg.train.seed,
+            reshuffle_on_refill=cfg.data.reshuffle_on_refill,
+            drop_remainder=cfg.data.drop_last,
         )
     else:
         dataset = sources[0]
@@ -144,7 +147,7 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
         seed=cfg.train.seed,
         pad_to_multiple_of=cfg.data.pad_to_multiple_of,
     )
-    return _build_dataloader(dataset, collator, cfg)
+    return _build_dataloader(dataset, collator, cfg, drop_last=cfg.data.drop_last)
 
 
 def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
@@ -209,6 +212,7 @@ def _build_dataloader(
     cfg: OplmConfig,
     *,
     loader_cls: type[DataLoader] = DataLoader,  # generic param set by return type
+    drop_last: bool = False,
 ) -> DataLoader[dict[str, Tensor]]:
     """Wrap a dataset + collator in a DataLoader using ``cfg``'s worker settings.
 
@@ -216,6 +220,8 @@ def _build_dataloader(
     a positive value with no worker processes), so it is gated accordingly.
     ``loader_cls`` lets the eval builder substitute a determinism-preserving
     subclass while training uses the plain :class:`~torch.utils.data.DataLoader`.
+    ``drop_last`` drops each worker's partial final batch (training only; evaluation
+    must score every row).
     """
     num_workers = cfg.data.num_workers
     return loader_cls(
@@ -225,4 +231,5 @@ def _build_dataloader(
         num_workers=num_workers,
         pin_memory=cfg.data.pin_memory,
         prefetch_factor=cfg.data.prefetch_factor if num_workers > 0 else None,
+        drop_last=drop_last,
     )

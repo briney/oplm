@@ -48,6 +48,16 @@ def _epoch_seed(base: int, epoch: int) -> int:
     return ((_PHI ^ base) + epoch * _PRIME) & _MASK32
 
 
+def _pass_seed(epoch_seed: int, pass_index: int) -> int:
+    """Seed of a refilled source's ``pass_index``-th pass within one epoch (pass 0 is the epoch's).
+
+    Mixed so that no (epoch, pass) seed coincides with another epoch's pass-0 seed.
+    """
+    if pass_index == 0:
+        return epoch_seed
+    return ((epoch_seed ^ (pass_index * 0x85EB_CA6B)) + pass_index * 0xC2B2_AE35) & _MASK32
+
+
 def _shard_row_seed(epoch_seed: int, s: int) -> int:
     """Derive a per-shard row-shuffle seed so different shards permute differently."""
     return (epoch_seed + 1009 + s) & _MASK32
@@ -185,6 +195,10 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         load_masking_weights: Read the optional ``masking_weights`` column and
             attach it to each row (``None`` for a row/shard without weights). When
             ``False``, the column is never read, even if present.
+        drop_remainder: Give every ``(rank, worker)`` stream the same row count,
+            ``total_rows // (world_size * num_workers)``, dropping the epoch's last
+            few rows (fewer than one per stream) instead of handing some streams one
+            extra row. Uneven streams make ranks finish an epoch at different steps.
 
     Raises:
         FileNotFoundError: If ``path`` is neither a parquet file nor a directory
@@ -199,6 +213,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         shuffle_rows: bool = True,
         seed: int = 0,
         load_masking_weights: bool = False,
+        drop_remainder: bool = False,
     ) -> None:
         super().__init__()
         self._path = Path(path)
@@ -206,6 +221,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._shuffle_rows = shuffle_rows
         self._seed = seed
         self._load_masking_weights = load_masking_weights
+        self._drop_remainder = drop_remainder
         self._epoch = 0
 
         # Armed resume skip (Task 3.1): plain instance state, so it pickles into
@@ -274,6 +290,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         via :func:`_joint_stripe`.
         """
         joint_index, stride = _joint_stripe()
+        if self._drop_remainder:
+            return self._total_rows // stride
         return len(range(joint_index, self._total_rows, stride))
 
     def set_resume_skip(self, batches_in_epoch: int, per_rank_batch: int, num_workers: int) -> None:
@@ -334,29 +352,6 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             self.stream_length(),
         )
 
-    def _arm_sample_skip(self, n: int) -> Iterator[dict[str, object]]:
-        """Return a fresh, one-shot stream over this dataset, skipping ``n`` samples.
-
-        Reduces ``n`` modulo :meth:`stream_length`: as one source of an
-        :class:`InterleavedDataset`, this stream refills deterministically within one
-        epoch (see :meth:`InterleavedDataset._next_or_refill`), so a full wrap is the
-        identity there. This is the sample-count-based arming path of
-        :class:`InterleavedDataset`, which computes a per-source *sample* count
-        directly from its own ``choices`` draws and arms this source's first pass
-        only — bypassing :meth:`set_resume_skip`, whose batch-based arithmetic assumes
-        this dataset is iterated standalone by a DataLoader, not as one source among
-        several in a mix. A top-level iteration (:meth:`__iter__`) does not go through
-        here: it must not wrap, see :func:`_resolve_sample_skip`.
-
-        Args:
-            n: Number of samples to skip.
-
-        Returns:
-            An iterator over this stream, starting ``n`` (mod :meth:`stream_length`)
-            samples in.
-        """
-        return self._iter_stream(n % max(self.stream_length(), 1))
-
     def _shard_order(self, epoch_seed: int) -> list[int]:
         """Return shard indices in this epoch's (optionally shuffled) order."""
         n = len(self._shards)
@@ -375,11 +370,21 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         return torch.randperm(n_rows, generator=generator).tolist()
 
     def __iter__(self) -> Iterator[dict[str, object]]:
-        # Straight to the stream, not `_arm_sample_skip`: a skip equal to the stream length
-        # (checkpoint taken on the epoch boundary) must stay an empty stream, not wrap to 0.
+        # Straight to the stream, unlike a mixed source's per-pass arming: a skip equal to the
+        # stream length (checkpoint taken on the epoch boundary) must stay an empty stream,
+        # not wrap to the next pass.
         yield from self._iter_stream(self._resolved_skip())
 
-    def _iter_stream(self, skip: int) -> Iterator[dict[str, object]]:
+    def _iter_pass(self, pass_index: int, skip: int = 0) -> Iterator[dict[str, object]]:
+        """This stream's ``pass_index``-th pass of the epoch, in that pass's own order.
+
+        A source sampled above its row share in an :class:`InterleavedDataset` runs
+        out mid-epoch and is read again; each pass gets a fresh shard and row order
+        (pass 0 is the epoch's ordinary order), so repeats do not replay one sequence.
+        """
+        return self._iter_stream(skip, pass_index=pass_index)
+
+    def _iter_stream(self, skip: int, *, pass_index: int = 0) -> Iterator[dict[str, object]]:
         """Yield this (rank, worker) stream, skipping its first ``skip`` selected rows.
 
         Walks the shard order computing each shard's selected-row COUNT from index
@@ -389,9 +394,13 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         remainder of the skip to that shard's (already-shuffled) selection only;
         every later shard is read in full, exactly as when unarmed. With
         ``skip=0`` this is behavior-identical to the pre-refactor ``__iter__``.
+        The stream stops after :meth:`stream_length` rows (which only binds with
+        ``drop_remainder``). ``pass_index`` selects the order of a refilled pass.
         """
-        epoch_seed = _epoch_seed(self._seed, self._epoch)
+        epoch_seed = _pass_seed(_epoch_seed(self._seed, self._epoch), pass_index)
         joint_index, stride = _joint_stripe()
+        limit = self.stream_length()
+        consumed = 0  # selected rows passed so far, skipped or served
 
         # `global_idx` runs across all shards in iteration order; a row is served
         # to this (rank, worker) iff its global index is congruent to joint_index
@@ -408,9 +417,12 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             # i.e. o ≡ (joint_index - base) (mod stride); the selected-row count for
             # this shard follows without materializing row_order or reading it.
             first_hit_offset = (joint_index - base) % stride
-            shard_count = len(range(first_hit_offset, n_rows, stride))
+            shard_count = min(len(range(first_hit_offset, n_rows, stride)), limit - consumed)
+            if consumed >= limit:
+                return  # drop_remainder: this stream has served its equal share
             if shard_count == 0:
                 continue  # no rows in this shard belong to this (rank, worker)
+            consumed += shard_count
 
             if remaining_skip >= shard_count:
                 remaining_skip -= shard_count
@@ -421,7 +433,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                 row_idx
                 for offset, row_idx in enumerate(row_order)
                 if (base + offset) % stride == joint_index
-            ]
+            ][:shard_count]
             if remaining_skip:
                 selected = selected[remaining_skip:]
                 remaining_skip = 0
@@ -472,6 +484,13 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         num_samples: Nominal samples per (full) epoch. Defaults to the sum of the
             sources' ``len()`` when available, else ``0``.
         seed: Base seed for deterministic source selection.
+        reshuffle_on_refill: Read each refill of an exhausted source in a fresh order
+            (sources that support it, e.g. :class:`ShardedProteinDataset`). Off, every
+            pass within an epoch replays the epoch's order, so an oversampled source is
+            seen as the same sequence of rows again and again.
+        drop_remainder: Give every ``(rank, worker)`` stream the same number of draws,
+            ``num_samples // (world_size * num_workers)``, so all ranks run the same
+            number of batches per epoch.
 
     Raises:
         ValueError: If ``datasets`` is empty, ``datasets``/``fractions`` lengths
@@ -486,6 +505,8 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         *,
         num_samples: int | None = None,
         seed: int = 0,
+        reshuffle_on_refill: bool = False,
+        drop_remainder: bool = False,
     ) -> None:
         super().__init__()
         if not datasets:
@@ -499,6 +520,8 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         self._datasets = list(datasets)
         self._fractions = _normalize_fractions(fractions)
         self._seed = seed
+        self._reshuffle_on_refill = reshuffle_on_refill
+        self._drop_remainder = drop_remainder
         self._epoch = 0
         self._num_samples = self._default_num_samples() if num_samples is None else int(num_samples)
 
@@ -577,30 +600,33 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         """
         self._resume_batches_in_epoch = None
 
-    def _arm_source_skip(self, source_idx: int, n_samples: int) -> Iterator[dict[str, object]]:
-        """Return a one-shot iterator over source ``source_idx``, skipping ``n_samples``.
+    def _arm_source_skip(
+        self, source_idx: int, n_samples: int
+    ) -> tuple[Iterator[dict[str, object]], int]:
+        """Return ``(iterator, pass_index)`` for source ``source_idx``, ``n_samples`` in.
 
-        Arms the skip directly via the source's internal sample-skip path
-        (:meth:`ShardedProteinDataset._arm_sample_skip`), never via the source's own
-        :meth:`~ShardedProteinDataset.set_resume_skip` — that does its own batch-based
-        arithmetic tied to the source being iterated standalone by a DataLoader, which
-        is irrelevant here since ``n_samples`` was already computed as a sample count
-        from this worker's own ``choices`` draws. Applies only to this, the first, pass
-        over the source: :meth:`_next_or_refill` re-iterates an exhausted source via
-        plain ``iter(source)``, which is unskipped, so the one-shot skip is never
-        reapplied on refill. Sources without sample-skip support (anything other than
-        :class:`ShardedProteinDataset`) fall back to a fresh, unskipped iterator — data
-        exactness degrades to a restart-from-0 for that source, logged via
-        :data:`logger`.
+        ``n_samples`` counts this worker's draws of the source before the interruption,
+        across however many passes (refills) it had already made this epoch. With
+        ``reshuffle_on_refill`` each pass has its own order, so the source resumes at pass
+        ``n_samples // stream_length``, offset ``n_samples % stream_length``, and later
+        refills continue from the following pass; without it every pass is the epoch's
+        order and only the offset matters. Applies to the first iterator only:
+        :meth:`_next_or_refill` starts later passes unskipped. Sources without
+        ``_iter_pass`` (anything but :class:`ShardedProteinDataset`) restart from position
+        0 instead, logged via :data:`logger`, since data-exact resume is unavailable there.
 
         Args:
             source_idx: Index into ``self._datasets``.
-            n_samples: Number of samples to skip.
+            n_samples: Number of this source's samples already consumed this epoch.
         """
         source = self._datasets[source_idx]
-        arm = getattr(source, "_arm_sample_skip", None)
-        if callable(arm):
-            return arm(n_samples)
+        iter_pass = getattr(source, "_iter_pass", None)
+        if callable(iter_pass):
+            length = source.stream_length()  # ty: ignore[unresolved-attribute]  # duck-typed with _iter_pass
+            pass_index, offset = divmod(n_samples, length) if length > 0 else (0, 0)
+            if not self._reshuffle_on_refill:
+                pass_index = 0
+            return iter_pass(pass_index, offset), pass_index
         if n_samples > 0:
             logger.warning(
                 "InterleavedDataset resume skip: source %d (%s) has no sample-skip "
@@ -610,6 +636,14 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
                 type(source).__name__,
                 n_samples,
             )
+        return iter(source), 0
+
+    def _refill(self, source_idx: int, pass_index: int) -> Iterator[dict[str, object]]:
+        """A fresh pass over source ``source_idx`` (reshuffled when enabled and supported)."""
+        source = self._datasets[source_idx]
+        iter_pass = getattr(source, "_iter_pass", None)
+        if self._reshuffle_on_refill and callable(iter_pass):
+            return iter_pass(pass_index)
         return iter(source)
 
     def __iter__(self) -> Iterator[dict[str, object]]:
@@ -622,7 +656,10 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         generator = torch.Generator()
         generator.manual_seed((_epoch_seed(self._seed, self._epoch) + joint_index) & _MASK32)
 
-        n_steps = len(range(joint_index, self._num_samples, stride))
+        if self._drop_remainder:
+            n_steps = self._num_samples // stride
+        else:
+            n_steps = len(range(joint_index, self._num_samples, stride))
         weights = torch.tensor(self._fractions, dtype=torch.float64)
         choices = torch.multinomial(weights, n_steps, replacement=True, generator=generator)
 
@@ -637,31 +674,37 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
             # interruption; each count is a sample count for that source alone, so
             # `_arm_source_skip` reduces it modulo that source's own stream length.
             counts = torch.bincount(choices[:skip], minlength=len(self._datasets))
-            iters = [
+            armed = [
                 self._arm_source_skip(idx, int(counts[idx].item()))
                 for idx in range(len(self._datasets))
             ]
+            iters = [it for it, _ in armed]
+            passes = [pass_index for _, pass_index in armed]
             choices = choices[skip:]
         else:
             iters = [iter(ds) for ds in self._datasets]
+            passes = [0] * len(self._datasets)
 
         for source_idx in choices.tolist():
-            item = self._next_or_refill(iters, source_idx)
+            item = self._next_or_refill(iters, passes, source_idx)
             if item is _EXHAUSTED:
                 continue  # source produced nothing for this (rank, worker)
             yield item  # ty: ignore[invalid-yield]  # _EXHAUSTED sentinel filtered above
 
-    def _next_or_refill(self, iters: list[Iterator[dict[str, object]]], source_idx: int) -> object:
-        """Pull the next item from a source, re-iterating once if exhausted.
+    def _next_or_refill(
+        self, iters: list[Iterator[dict[str, object]]], passes: list[int], source_idx: int
+    ) -> object:
+        """Pull the next item from a source, starting its next pass once if exhausted.
 
         Returns :data:`_EXHAUSTED` if the source yields nothing even after a fresh
-        ``iter()`` (e.g. it serves no rows to this ``(rank, worker)``), avoiding a
+        pass (e.g. it serves no rows to this ``(rank, worker)``), avoiding a
         ``StopIteration`` escaping the generator (PEP 479).
         """
         try:
             return next(iters[source_idx])
         except StopIteration:
-            iters[source_idx] = iter(self._datasets[source_idx])
+            passes[source_idx] += 1
+            iters[source_idx] = self._refill(source_idx, passes[source_idx])
             try:
                 return next(iters[source_idx])
             except StopIteration:

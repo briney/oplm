@@ -228,3 +228,60 @@ Read the result like this:
 The comparison is biased toward an easier post-boundary side: the 600k checkpoint never saw the
 pre-boundary rows, but saw about 77 % of the post-boundary `deepclust70` shards once. A jump
 despite that bias is strong evidence.
+
+Replaying a run trained before October 2026 needs `--set data.reshuffle_on_refill=false --set
+data.drop_last=false`. Its checkpoint's `config.yaml` predates those options, so they would
+otherwise default to the current loader behavior. Both sbatch scripts here already set them.
+`--compiled` also scores every batch through `torch.compile` in train mode with a backward
+pass, the trainer's step, and reports `compiled_minus_eager`;
+`docs/late-loss/compile-replay.sbatch` runs that check.
+
+### What the replays and a shard profile showed
+
+- **The second epoch's data is not harder.** The frozen 600k model scores the same before and
+  after the boundary: +0.006 ± 0.017, or −0.001 ± 0.013 after adjusting for length. The source
+  mix and lengths match too.
+- **The train-loss jump is on the training side.** Compared with that fixed reference, the
+  logged train loss rises about 0.06 at the boundary in both models.
+- **Compilation is not the cause.** Compiled and eager agree to about 1e-4 on identical
+  batches, with and without DDP. The epoch's closing batches (three 1-row batches on rank 0)
+  change nothing.
+- **The logged train loss is flattered by recency.** On the same batches it agrees with the
+  frozen checkpoint within about 1.5k steps of it, is about 0.04 lower 3k steps away, and
+  0.06–0.09 lower farther off. The live model is better on the stretch of stream it is reading
+  than a copy of itself a few thousand steps away, even one that trained on those very batches.
+  This is also most of the long-standing gap between train and eval loss.
+- **`deepclust70` was written in the original DeepClust family order.** A profile of the files
+  found:
+  - all 155 sampled multi-member families sit in a single shard;
+  - adjacent rows are homologs 22 % of the time;
+  - same-shard homologs are 11.5 times as likely as other-shard ones;
+  - per-shard length heterogeneity is 204 times random.
+
+  Every rank reads the same shard at once, so each global batch held a block of related
+  families for 50–80 steps. The model adapted to them and then forgot them. `uniref70` was close
+  to mixed: 1.8 times random, with no homolog concentration.
+- **Why the epoch boundary matters.** Each worker draws its own source sequence, so the 256
+  rank-and-worker streams drift apart through an epoch: the spread of `deepclust70` positions
+  reaches 0.28 shards (sd) at 50k steps, 0.84 at 450k and 1.03 at the epoch's end. The rollover
+  puts them all back on one shard. The flattery tracked the spread: −0.056 at 450k, −0.09
+  before the boundary, −0.03 after it. The slow climb in eval loss after the boundary is
+  plausibly the same cause, since post-rollover updates are the most block-biased. That part is
+  unconfirmed; a shuffled-data run tests it.
+- **Ranks had unequal epochs.** 5,482,872,835 rows over 256 streams leaves a remainder of 3, so
+  rank 0 had 669,299 batches per epoch, including three 1-row batches, while ranks 1–63 had
+  669,296.
+
+### Fixes
+
+- **Globally shuffled data.** `deepclust70` and `uniref70` were shuffled across shards into
+  `train_shuffled/` directories, with the same layout. Every row was kept, as verified by
+  fingerprints, and each manifest records the seed. Afterwards both sources' per-shard
+  heterogeneity is about 1.0 times random, the same-shard homolog ratio is 1.02, and the lag-1
+  length autocorrelation is about 0.
+- **`data.reshuffle_on_refill`** (default `true`). Each refill of an oversampled source is read
+  in a fresh order; before this, `uniref70` replayed one order about 10.6 times per epoch.
+- **`data.drop_last`** (default `true`). Every rank and worker gets the same rows per epoch and
+  partial batches are dropped.
+- **Judge such runs by eval.** Expect train loss to jump up when a run switches to shuffled
+  data, by roughly the flattery it loses; that is not a regression.
