@@ -450,6 +450,15 @@ class DataConfig:
     # Shard iteration behavior (only affects sharded parquet directories)
     shuffle_shards: bool = True
     shuffle_rows: bool = True
+    # A mixed source sampled above its row share runs out mid-epoch and is read again:
+    # True gives each such pass its own order; False replays the epoch's order every pass
+    # (the behavior before October 2026, kept for replaying older runs' data streams).
+    reshuffle_on_refill: bool = True
+    # True gives every (rank, worker) stream the same number of rows per epoch (dropping
+    # the remainder, fewer than world_size * num_workers rows) and drops each worker's
+    # partial last batch, so every rank runs the same number of full batches per epoch.
+    # False is the earlier behavior: up to one extra row per stream and short tail batches.
+    drop_last: bool = True
 
     def __post_init__(self) -> None:
         """Validate the masking-split probabilities and padding config."""

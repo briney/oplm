@@ -91,6 +91,7 @@ def _originals_in_order(batches: list[dict[str, Tensor]]) -> list[tuple[int, ...
 def test_train_batch_contract(sequence_shards: Path) -> None:
     """Train batches expose exactly the §4.7 keys/shapes/dtypes; T ≤ max_seq_len."""
     cfg = _make_config(str(sequence_shards))
+    cfg.data.drop_last = False  # every row exactly once; drop_last trims the tail
     loader = build_train_dataloader(cfg)
     pad_id = pad_token_id()
 
@@ -161,6 +162,7 @@ def test_eval_preserves_natural_order(sequence_shards: Path) -> None:
 def test_train_differs_across_epochs(sequence_shards: Path) -> None:
     """Row order changes between epochs while the underlying data is unchanged."""
     cfg = _make_config(str(sequence_shards))
+    cfg.data.drop_last = False  # every row exactly once; drop_last trims the tail
     loader = build_train_dataloader(cfg)
     dataset = loader.dataset
 

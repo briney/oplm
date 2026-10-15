@@ -179,6 +179,142 @@ def weight_rms(
     console.print(table)
 
 
+@app.command(name="stream-replay")
+def stream_replay(
+    checkpoint: Annotated[
+        Path, typer.Argument(help="Checkpoint directory (holds config.yaml and hf/)")
+    ],
+    world_size: Annotated[
+        int, typer.Option("--world-size", help="The run's world size (global batch / batch_size)")
+    ],
+    steps: Annotated[
+        list[int], typer.Option("--step", help="Global step to replay from (repeatable)")
+    ],
+    batches: Annotated[int, typer.Option(help="Batches per step window")] = 50,
+    rank: Annotated[int, typer.Option(help="Rank whose stream to rebuild")] = 0,
+    score: Annotated[
+        bool, typer.Option(help="Score the checkpoint's frozen model (else data stats only)")
+    ] = True,
+    device: Annotated[str, typer.Option(help="cuda, cpu or auto")] = "auto",
+    compiled: Annotated[
+        bool, typer.Option(help="Also score each batch through the trainer's compiled step")
+    ] = False,
+    ddp: Annotated[
+        bool, typer.Option(help="With --compiled: compile a single-process DDP wrapper")
+    ] = False,
+    partial_after: Annotated[
+        int | None,
+        typer.Option(help="With --compiled: after this many windows, run the epoch-end batches"),
+    ] = None,
+    out: Annotated[Path | None, typer.Option(help="Write the table as CSV")] = None,
+    sets: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set",
+            help="Override the checkpoint's config, KEY=VALUE (repeatable). Runs trained "
+            "before data.reshuffle_on_refill / data.drop_last existed need both =false.",
+        ),
+    ] = None,
+) -> None:
+    """Rebuild the exact batches a run trained on at given steps; score the frozen model.
+
+    Per window: rows, mean sequence length, source mix, and (with --score) masked-token
+    loss overall and per data.train source. Comparing windows before and after a loss jump
+    separates harder data from a worse model (docs/LATE_LOSS_INVESTIGATION.md). --compiled
+    adds the loss of the same batches through ``torch.compile`` in train mode with a backward
+    pass (the trainer's step, weights untouched) and its difference from eager; --partial-after
+    feeds the short batches that end an epoch through that compiled step mid-run.
+    """
+    import csv
+
+    import torch
+
+    from oplm.data.config import parse_train_configs
+    from oplm.training.stream_replay import (
+        StreamReplay,
+        compile_like_trainer,
+        compiled_step_loss,
+        score_batch,
+        trim_batch,
+    )
+
+    if not (checkpoint / "config.yaml").is_file():
+        raise typer.BadParameter(f"{checkpoint} has no config.yaml")
+    if (compiled or ddp or partial_after is not None) and not (score and compiled):
+        raise typer.BadParameter(
+            "--ddp and --partial-after need --compiled, and --compiled --score"
+        )
+    cfg = load_config(["--config", str(checkpoint / "config.yaml"), *(sets or [])])
+    names = [e.name for e in parse_train_configs(cfg.data.train)] or ["train"]
+    model = None
+    if score:
+        from oplm.model import OplmForMaskedLM
+
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = OplmForMaskedLM.from_pretrained(checkpoint / "hf").to(device).eval()
+
+    step_module = compile_like_trainer(model, cfg, ddp=ddp) if compiled and model else None
+
+    torch.manual_seed(0)  # the training collator masks with each worker's global RNG
+    replay = StreamReplay(cfg, rank=rank, world_size=world_size, spawn_workers=ddp)
+    console.print(f"{replay.steps_per_epoch} steps per epoch for rank {rank} of {world_size}")
+    rows_out: list[dict[str, object]] = []
+    for window, step in enumerate(steps, 1):
+        epoch, in_epoch = replay.position(step)
+        totals = torch.zeros(len(names), 4, dtype=torch.float64)
+        compiled_sum = compiled_masked = 0.0
+        batch: dict[str, torch.Tensor] = {}
+        for batch in replay.batches(step, batches):
+            totals += score_batch(batch, len(names), model)
+            if step_module is not None and model is not None:
+                c_sum, c_masked = compiled_step_loss(step_module, model, batch)
+                compiled_sum, compiled_masked = compiled_sum + c_sum, compiled_masked + c_masked
+        if step_module is not None and model is not None and window == partial_after and batch:
+            for size in replay.partial_sizes:  # the epoch's closing steps, then back to full
+                short = trim_batch(batch, size)
+                c_sum, c_masked = compiled_step_loss(step_module, model, short)
+                e_loss = score_batch(short, len(names), model)[:, 0].sum() / max(c_masked, 1)
+                console.print(
+                    f"epoch-end batch of {size} rows: compiled {c_sum / max(c_masked, 1):.4f}, "
+                    f"eager {float(e_loss):.4f}"
+                )
+        loss_sum, masked, n_rows, tokens = totals.sum(0).tolist()
+        row: dict[str, object] = {
+            "step": step,
+            "epoch": epoch,
+            "batches_in_epoch": in_epoch,
+            "rows": int(n_rows),
+            "mean_seq_len": tokens / max(n_rows, 1),
+            "loss": loss_sum / masked if model is not None and masked else float("nan"),
+        }
+        for name, (s_loss, s_masked, s_rows, s_tokens) in zip(names, totals.tolist(), strict=True):
+            row[f"frac_{name}"] = s_rows / max(n_rows, 1)
+            row[f"seq_len_{name}"] = s_tokens / s_rows if s_rows else float("nan")
+            scored = model is not None and s_masked > 0
+            row[f"loss_{name}"] = s_loss / s_masked if scored else float("nan")
+        if step_module is not None:
+            loss_compiled = compiled_sum / compiled_masked if compiled_masked else float("nan")
+            row["loss_compiled"] = loss_compiled
+            row["compiled_minus_eager"] = loss_compiled - loss_sum / max(masked, 1)
+        rows_out.append(row)
+
+    table = Table(title=f"stream replay: {checkpoint.name}, rank {rank} of {world_size}")
+    for key in rows_out[0]:
+        table.add_column(key, justify="right")
+    for row in rows_out:
+        table.add_row(*(f"{v:.4f}" if isinstance(v, float) else str(v) for v in row.values()))
+    console.print(table)
+    if out is not None:
+        with out.open("w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(rows_out[0]))
+            writer.writeheader()
+            writer.writerows(rows_out)
+        console.print(f"wrote {out}")
+    if ddp and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
 @app.command()
 def info(
     overrides: OverridesArg = None,

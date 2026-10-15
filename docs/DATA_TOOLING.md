@@ -31,7 +31,18 @@ granularities (shard order and within-shard row order), and stripes rows across
 the joint `(world_rank, worker_id)` index so every rank/worker sees a disjoint,
 gap-free slice independent of launcher behavior. `InterleavedDataset` mixes
 multiple sources by sampling fraction (normalized to 1.0); exhausted sources
-re-initialize so unequal sizes keep mixing at the target ratio.
+re-initialize so unequal sizes keep mixing at the target ratio. With
+`data.reshuffle_on_refill` (the default) each such refill reads the source in a fresh
+order, so an oversampled source is not replayed as the same sequence of rows. With
+`data.drop_last` (the default) every `(rank, worker)` stream gets the same number of
+rows per epoch and partial batches are dropped, so all ranks run the same number of
+full batches per epoch.
+
+Shuffling here is per shard: every rank and worker reads the same shard at the same
+time, so each training batch comes from one shard per source for many consecutive steps.
+That is only iid if each shard is a random sample of its source. Data written in a
+sorted or clustered order (for example, by cluster) must be shuffled globally across
+shards before training; see docs/LATE_LOSS_INVESTIGATION.md §4.
 
 ## Tokenizer
 
@@ -185,6 +196,8 @@ Backed by `oplm.config.DataConfig`; defaults live in
 | `data.prefetch_factor` | `int` | `4` | DataLoader prefetch buffer per worker. |
 | `data.shuffle_shards` | `bool` | `true` | Shuffle shard order per epoch. |
 | `data.shuffle_rows` | `bool` | `true` | Shuffle within-shard row order per epoch. |
+| `data.reshuffle_on_refill` | `bool` | `true` | Give each refill of an oversampled mixed source its own order (`false` replays the epoch's order every pass, as runs before October 2026 did). |
+| `data.drop_last` | `bool` | `true` | Equal rows per `(rank, worker)` stream and no partial batches, so every rank runs the same number of full batches per epoch (`false` is the earlier behavior). |
 
 `__post_init__` validates that `mask_token_prob + random_token_prob ≤ 1.0`.
 `data.max_length` was **removed**; use `model.max_position_embeddings` for the
