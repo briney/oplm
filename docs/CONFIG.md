@@ -276,6 +276,8 @@ Backed by `oplm.config.TrainConfig`.
 | `train.mup_depth_lr_exponent` | `float` | `0.5` | Repeated-block LR exponent; finite and `>= 0`. Zero is a no-op; the run default `0.5` is the sweep-verified correction (no-op at the 24-layer reference depth). Dataclass fallback `0.0`. |
 | `train.mup_depth_reference_layers` | `int` | `24` | Reference layer count in `(reference/L)^exponent`; must be `>= 1`. |
 | `train.adamw_lr_mult` | `float` | `1.0` | Multiplier on the AdamW-side LR only (under Muon: embeddings, head, norms, biases, residual gates, Canon kernels; under `adamw`: every group). Muon matrices are untouched. Must be finite and `> 0`. |
+| `train.embedding_weight_decay` | `float` | `0.0` | Decoupled weight decay on the token embedding, toward 0 (`0`: undecayed). Finite and `>= 0`. |
+| `train.weight_decay_to_init` | `float` | `0.0` | Decoupled weight decay toward each parameter's initial value: norm gains toward 1, residual gates toward `model.residual_gate_init`, biases toward 0 (`0`: undecayed). Value-residual lambdas and L2 QK scales are never decayed. Finite and `>= 0`. Turning this or `embedding_weight_decay` on or off changes the AdamW param groups, so a resume or branch must keep the setting (on or off) its checkpoint was saved with; changing a nonzero value is fine. |
 | `train.max_grad_norm` | `float` | `1.0` | Set `0` to disable clipping. |
 | `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, or `wsd_cosine`. |
 | `train.warmup_steps` | `int` | `5_000` | Must be `≥ 0`. |

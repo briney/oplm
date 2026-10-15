@@ -206,3 +206,27 @@ def test_grad_clipping_is_wired(
     )
     Trainer(cfg_off).train()
     assert clip_calls == []
+
+
+def test_decay_to_init_trains_and_survives_resume(training_parquet: Path, tmp_path: Path) -> None:
+    """Both decay knobs on: training runs, and a resume restores the target-aware groups."""
+    from oplm.training.optim import AdamW
+    from oplm.training.trainer import Trainer
+
+    def cfg_for(max_steps: int, resume_from: str | None = None):
+        cfg = tiny_train_cfg(
+            tmp_path, training_parquet, max_steps=max_steps, save_every=2, resume_from=resume_from
+        )
+        cfg.train.embedding_weight_decay, cfg.train.weight_decay_to_init = 0.1, 0.1
+        return cfg
+
+    first = Trainer(cfg_for(2))
+    first.train()
+    adamw = first.optimizers[-1]
+    adamw = getattr(adamw, "optimizer", adamw)
+    assert isinstance(adamw, AdamW)
+    assert {g["decay_target"] for g in adamw.param_groups} == {0.0, 1.0}
+
+    resumed = Trainer(cfg_for(4, resume_from=str(tmp_path / "checkpoint-2")))
+    resumed.train()
+    assert resumed.global_step == 4
