@@ -399,8 +399,10 @@ the previous log): `train/loss_mean` (mean loss over the window, versus the
 single-step `train/loss`), `train/grad_norm` / `train/grad_norm_max` (pre-clip
 global gradient norm, mean and max) and `train/clip_frac` (fraction of steps where
 clipping fired; all three only when `max_grad_norm > 0`), `train/mean_seq_len`
-(tokens per sample), and under Muon `train/lr_adamw` (the auxiliary AdamW
-optimizer's first group — `train/lr` is the Muon LR).
+(tokens per sample), `train/data_wait_s` (seconds per optimizer step the main
+process spent blocked on the DataLoader; near 0 unless data loading starves the GPU),
+and under Muon `train/lr_adamw` (the auxiliary AdamW optimizer's first group —
+`train/lr` is the Muon LR).
 
 **Weight-norm diagnostics** (`train.weight_diag_every=N`, off by default): every N
 optimizer steps, `diag/weight_rms/<group>` (pooled RMS of the group's weights) and
@@ -413,6 +415,22 @@ can be backfilled from existing checkpoints' `hf/` exports:
 ```bash
 oplm weight-rms /runs/170M/checkpoint-100000 /runs/170M/checkpoint-400000
 ```
+
+**Profiling** (`train.profile_start=S`, off by default; `train.profile_steps=N`,
+default 20). It writes everything to `<output_dir>/profile/`:
+
+- **At train start:** all-reduces of 16, 128 and 512 MB on the run's process group, with
+  bus bandwidth logged. Set `slurm.nccl_debug: INFO` to see which transport NCCL chose.
+- **Steps `S` to `S+N−1`:** each phase of the step is timed with a CUDA synchronize on
+  both sides: `data_wait`, `forward`, `backward` (which includes DDP's overlapped
+  gradient all-reduce), `clip`, `optimizer` and `sync`. Each rank writes its medians to
+  `summary_rank<r>.json`.
+- **The next `N` steps:** these run under `torch.profiler` without synchronizing. Rank 0
+  writes `trace_rank0.json` (open it in Perfetto or `chrome://tracing`) and the top
+  operators by GPU and CPU time.
+
+Comparing one node with two at the same per-GPU batch separates communication cost
+from compute.
 
 ---
 
@@ -569,6 +587,36 @@ train:
 data:
   pad_to_multiple_of: 128
 ```
+
+### Sequence packing (`data.pack_sequences`)
+
+Padding every sequence to the batch's longest wastes most of a step on short
+proteins: at 512 tokens, a typical 128-sequence batch holds about 22.6k real
+tokens in 65.5k slots. `data.pack_sequences: true` packs each training batch's
+sequences back to back into as few rows of at most `max_position_embeddings`
+tokens as fit (first-fit decreasing, after masking). The batch still holds
+`train.batch_size` sequences, so the optimization is unchanged; only fewer pad
+tokens get computed.
+
+The model keeps sequences apart. Attention uses a block-diagonal mask, so a
+token attends only within its own sequence. Canon taps that would reach into a
+neighboring sequence contribute zero. RoPE positions need no reset, because
+attention scores depend only on query–key offsets within a sequence. Each
+sequence's logits, loss and gradients match its own padded row (the tests check
+this).
+
+Costs and limits:
+
+- Attention gets a dense block-diagonal `(rows, 1, T, T)` mask instead of a
+  key-padding mask. (FlashAttention is out either way: it takes no mask at all.)
+  If cuDNN's attention does not accept that mask, PyTorch falls back to the
+  memory-efficient backend for packed batches. If the result is slower than the
+  padding saved, turn packing off: the off path is unchanged.
+- It is incompatible with `model.mask_dropout`, which rescales by each row's
+  masked fraction. The loader refuses that combination.
+- Evaluation batches are never packed, so eval numbers stay comparable.
+- `oplm stream-replay` replays a packed run unpacked: packing happens after
+  masking, so it serves the same sequences and masks.
 
 ---
 

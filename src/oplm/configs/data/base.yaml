@@ -30,6 +30,9 @@ data:
 
   # Collation padding: null = pad to batch-longest; N = pad to smallest multiple of N >= batch-longest.
   pad_to_multiple_of: null
+  # Training only: pack each batch's sequences into as few max-length rows as fit
+  # (block-diagonal attention, Canon stops at sequence boundaries). See docs/TRAIN.md §14.
+  pack_sequences: false
 
   # Sequence masking (see docs/DATA_TOOLING.md §4.5). Probabilities in [0, 1];
   # mask_token_prob + random_token_prob <= 1 (the remainder keeps the original token).

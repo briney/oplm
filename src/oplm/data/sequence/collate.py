@@ -25,6 +25,7 @@ from oplm.data.tokenizer import (
     canonical_amino_acid_ids,
     mask_token_id,
     non_maskable_ids,
+    pad_token_id,
 )
 
 if TYPE_CHECKING:
@@ -185,6 +186,11 @@ class MLMCollator:
             (excluded from tensor collation). Off by default; used by tests and
             tooling that need to trace which rows a dataloader actually served
             (e.g. the double-sharding verification test) rather than by training.
+        pack_sequences: After masking, pack the batch's sequences back to back into as
+            few rows of at most ``max_length`` tokens as first-fit-decreasing finds, and
+            add ``"segment_ids"`` ``(rows, T)`` (``1..n`` per sequence in a row, ``0`` at
+            pads) and ``"num_sequences"`` (a plain ``int``, the batch size before packing).
+            Masks and labels are those the unpacked batch would get.
 
     Raises:
         ValueError: If any probability is outside ``[0, 1]`` or
@@ -204,6 +210,7 @@ class MLMCollator:
         seed: int = 0,
         pad_to_multiple_of: int | None = None,
         keep_sequence_ids: bool = False,
+        pack_sequences: bool = False,
     ) -> None:
         _validate_probs(mask_prob, mask_token_prob, random_token_prob)
         self._tokenizer = tokenizer
@@ -216,9 +223,11 @@ class MLMCollator:
         self._seed = seed
         self._pad_to_multiple_of = pad_to_multiple_of
         self._keep_sequence_ids = keep_sequence_ids
+        self._pack_sequences = pack_sequences
 
         # Derived id constants (computed once from the tokenizer, never hardcoded).
         self._mask_token_id = mask_token_id(tokenizer)
+        self._pad_token_id = pad_token_id(tokenizer)
         self._canonical_ids = canonical_amino_acid_ids(tokenizer)  # (20,) long
         self._non_maskable = torch.tensor(sorted(non_maskable_ids(tokenizer)), dtype=torch.long)
 
@@ -227,7 +236,7 @@ class MLMCollator:
 
     def __call__(
         self, batch: Sequence[Mapping[str, object] | str]
-    ) -> dict[str, Tensor | list[str]]:
+    ) -> dict[str, Tensor | list[str] | int]:
         """Collate ``batch`` into ``{input_ids, attention_mask, labels}``.
 
         Also carries ``"sequence_ids"`` (a plain ``list[str]``, not collated into a
@@ -259,14 +268,52 @@ class MLMCollator:
         weights = weights.masked_fill(~eligible, 0.0)
 
         self._mask_batch(input_ids, labels, eligible, weights, generator)
-        out: dict[str, Tensor | list[str]] = {
+        out: dict[str, Tensor | list[str] | int] = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
         }
+        if self._pack_sequences:
+            out = self._pack(input_ids, attention_mask, labels)
         if self._keep_sequence_ids:
             out["sequence_ids"] = self._collect_sequence_ids(batch)
         return out
+
+    def _pack(
+        self, input_ids: Tensor, attention_mask: Tensor, labels: Tensor
+    ) -> dict[str, Tensor | list[str] | int]:
+        """Pack right-padded rows back to back into rows of at most ``max_length`` tokens."""
+        lengths = attention_mask.sum(1).tolist()
+        rows: list[list[int]] = []  # batch indices per packed row
+        free: list[int] = []
+        for i in sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True):
+            fit = next((r for r, room in enumerate(free) if lengths[i] <= room), None)
+            if fit is None:
+                rows.append([i])
+                free.append(self._max_length - lengths[i])
+            else:
+                rows[fit].append(i)
+                free[fit] -= lengths[i]
+        width = self._max_length - min(free)
+        if self._pad_to_multiple_of:
+            width = -(-width // self._pad_to_multiple_of) * self._pad_to_multiple_of
+        shape = (len(rows), width)
+        packed = {
+            "input_ids": input_ids.new_full(shape, self._pad_token_id),
+            "attention_mask": attention_mask.new_zeros(shape),
+            "labels": labels.new_full(shape, _IGNORE_INDEX),
+            "segment_ids": attention_mask.new_zeros(shape),
+        }
+        for r, members in enumerate(rows):
+            start = 0
+            for segment, i in enumerate(members, start=1):
+                end = start + lengths[i]
+                packed["input_ids"][r, start:end] = input_ids[i, : lengths[i]]
+                packed["attention_mask"][r, start:end] = 1
+                packed["labels"][r, start:end] = labels[i, : lengths[i]]
+                packed["segment_ids"][r, start:end] = segment
+                start = end
+        return {**packed, "num_sequences": len(lengths)}
 
     def _collect_sequence_ids(self, batch: Sequence[Mapping[str, object] | str]) -> list[str]:
         """Pull each row's ``sequence_id`` from the batch, in row order.

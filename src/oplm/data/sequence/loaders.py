@@ -136,6 +136,10 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
     else:
         dataset = sources[0]
 
+    if cfg.data.pack_sequences and getattr(cfg.model, "mask_dropout", False):
+        # Mask dropout rescales by each row's masked fraction, which packing would pool
+        # across the sequences sharing a row.
+        raise ValueError("data.pack_sequences is incompatible with model.mask_dropout.")
     collator = MLMCollator(
         get_tokenizer(),
         max_length=cfg.model.max_position_embeddings,
@@ -146,6 +150,7 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
         deterministic=False,
         seed=cfg.train.seed,
         pad_to_multiple_of=cfg.data.pad_to_multiple_of,
+        pack_sequences=cfg.data.pack_sequences,
     )
     return _build_dataloader(dataset, collator, cfg, drop_last=cfg.data.drop_last)
 

@@ -194,6 +194,12 @@ class TrainConfig:
     # oplm.training.diagnostics). 0 disables. Should be a multiple of log_every.
     # DDP only (main process reads replicated weights; no collectives).
     weight_diag_every: int = 0
+    # Opt-in profiling (oplm.training.profiling): with profile_start set, time all-reduces
+    # at train start, CUDA-sync-time each phase of steps [profile_start, +profile_steps),
+    # then torch.profiler-trace the next profile_steps steps; results go to
+    # <output_dir>/profile/. None disables.
+    profile_start: int | None = None
+    profile_steps: int = 20
 
     def __post_init__(self) -> None:
         """Validate training configuration."""
@@ -255,6 +261,10 @@ class TrainConfig:
             )
         if self.weight_diag_every < 0:
             raise ValueError(f"weight_diag_every must be >= 0, got {self.weight_diag_every}")
+        if self.profile_start is not None and self.profile_start < 1:
+            raise ValueError(f"profile_start must be >= 1, got {self.profile_start}")
+        if self.profile_steps < 1:
+            raise ValueError(f"profile_steps must be >= 1, got {self.profile_steps}")
         if not math.isfinite(self.adamw_lr_mult) or self.adamw_lr_mult <= 0:
             raise ValueError(f"adamw_lr_mult must be finite and > 0, got {self.adamw_lr_mult}")
         if self.branch_from is not None and (
@@ -441,6 +451,13 @@ class DataConfig:
     # smallest multiple of N that is >= batch-longest. Useful for compile+static
     # regimes (dynamic=False) to reduce unique shapes and improve throughput.
     pad_to_multiple_of: int | None = None
+
+    # Training batches only: pack each batch's sequences back to back into as few rows of
+    # at most model.max_position_embeddings tokens as fit, instead of one padded row per
+    # sequence. The model keeps sequences apart (block-diagonal attention mask, Canon taps
+    # stop at sequence boundaries), so the loss is the same; fewer pad tokens are computed.
+    # Batch size still counts sequences. Evaluation batches are never packed.
+    pack_sequences: bool = False
 
     # DataLoader settings
     num_workers: int = 4
@@ -837,13 +854,17 @@ def load_config(argv: list[str]) -> OplmConfig:
     return cfg
 
 
-def serialize_config(cfg: OplmConfig) -> str:
+def serialize_config(cfg: OplmConfig, *, gradient_checkpointing: bool | None = None) -> str:
     """Serialize a resolved :class:`OplmConfig` to reloadable YAML text.
 
     The ``model`` subtree is an HF ``OplmConfig`` (serialized via ``to_dict``);
     ``train``, ``data``, and ``fold`` (when present) are dataclasses. The result
     round-trips through ``load_config(["--config", <path>])``. Shared by the
     top-level run config dump and the per-checkpoint ``config.yaml``.
+
+    ``gradient_checkpointing``, when given, overrides ``model.gradient_checkpointing``: once
+    a model is built, transformers has deleted that flag from the shared ``cfg.model``, so
+    a checkpoint passes the live model's setting instead.
     """
     from dataclasses import asdict
 
@@ -861,6 +882,8 @@ def serialize_config(cfg: OplmConfig) -> str:
     # constructed default instance's own `to_dict()` never has it either, since it
     # is only ever added by `save_pretrained`, not by construction).
     model_dict.pop("auto_map", None)
+    if gradient_checkpointing is not None:
+        model_dict["gradient_checkpointing"] = gradient_checkpointing
 
     config_dict = {
         "model": model_dict,
