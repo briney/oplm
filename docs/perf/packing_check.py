@@ -115,8 +115,10 @@ def main() -> None:
     print(torch.__version__, torch.cuda.get_device_name())
     cfg = load_config(["--config", str(args.checkpoint / "config.yaml")])
     model = OplmForMaskedLM.from_pretrained(args.checkpoint / "hf").cuda().train()
-    if model.config.gradient_checkpointing:
+    # As the trainer does: transformers strips the flag off the HF config when it builds the model.
+    if getattr(cfg.model, "gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
+    print(f"activation checkpointing: {model.oplm.backbone.gradient_checkpointing}")
     params = list(model.parameters())
     compiled = compile_like_trainer(model, cfg, ddp=False)
     size = cfg.train.batch_size
