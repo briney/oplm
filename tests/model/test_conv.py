@@ -227,3 +227,39 @@ def test_resolve_rejects_bool():
     # doesn't silently become an all-1s or all-0s kernel schedule.
     with pytest.raises(ValueError, match="bool"):
         resolve_canon_kernel_sizes(True, num_hidden_layers=3)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("kernel_size", [2, 3, 4, 7])
+def test_canon_conv_matches_the_depthwise_conv1d_it_replaces(kernel_size: int):
+    """Shifted multiply-adds reproduce nn.Conv1d(groups=D) exactly, values and gradients."""
+    torch.manual_seed(kernel_size)
+    conv = CanonConv(channels=6, kernel_size=kernel_size)
+    x = torch.randn(3, 11, 6, requires_grad=True)
+    mask = torch.ones(3, 11, dtype=torch.long)
+    mask[1, 8:] = 0  # a padded row
+
+    def reference(inp: torch.Tensor) -> torch.Tensor:
+        h = (inp * mask.unsqueeze(-1)).transpose(1, 2)
+        if kernel_size % 2 == 0:
+            h = torch.nn.functional.pad(h, (kernel_size // 2, kernel_size // 2 - 1))
+        return conv.conv(h).transpose(1, 2)
+
+    upstream = torch.randn(3, 11, 6)
+    out = conv(x, mask)
+    (out * upstream).sum().backward()
+    grads = (x.grad.clone(), conv.conv.weight.grad.clone())
+    x.grad, conv.conv.weight.grad = None, None
+    expected = reference(x)
+    (expected * upstream).sum().backward()
+    assert torch.allclose(out, expected, atol=1e-5)
+    assert torch.allclose(grads[0], x.grad, atol=1e-5)
+    assert torch.allclose(grads[1], conv.conv.weight.grad, atol=1e-5)
+
+
+def test_canon_conv_output_dtype_follows_autocast():
+    conv = CanonConv(channels=4, kernel_size=3)
+    x = torch.randn(2, 5, 4)
+    mask = torch.ones(2, 5, dtype=torch.long)
+    assert conv(x, mask).dtype == torch.float32
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert conv(x, mask).dtype == torch.bfloat16

@@ -38,6 +38,14 @@ class CanonConv(nn.Module):
     to `0` and the input is asymmetrically padded `(k//2, k//2 - 1)` on the
     time axis before the conv runs — this preserves the same-length output
     while keeping the bias of the receptive field consistent across layers.
+
+    The forward computes that convolution as `kernel_size` shifted multiply-adds in the
+    `(B, T, D)` layout instead of calling `self.conv`: the same cross-correlation, but
+    `torch.compile` fuses it into one memory-bound kernel, where `nn.Conv1d(groups=D)`
+    dispatches to PyTorch's slow native depthwise kernel and needs two transposes (it took
+    about 45 % of a 170M training step on B200s). `self.conv` still owns the weight, so
+    checkpoints and initialization are unchanged. Accumulation is in fp32; the output has
+    the dtype autocast would give a convolution (`x`'s dtype when autocast is off).
     """
 
     def __init__(
@@ -74,16 +82,24 @@ class CanonConv(nn.Module):
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         # (B, T, D) -> (B, T, D)
+        device_type = x.device.type
+        if torch.is_autocast_enabled(device_type):
+            out_dtype = torch.get_autocast_dtype(device_type)
+        else:
+            out_dtype = x.dtype
         x = zero_pad_positions(x, attention_mask)
-        x = x.transpose(1, 2)  # (B, T, D) -> (B, D, T)
-        if self._even_kernel:
-            # Asymmetric pad keeps output length == input length for even k.
-            x = F.pad(x, (self.kernel_size // 2, self.kernel_size // 2 - 1))
-        x = self.conv(x)
-        x = x.transpose(1, 2)  # (B, D, T) -> (B, T, D)
+        k = self.kernel_size
+        left = k // 2  # odd k: k//2 on both sides; even k: (k//2, k//2 - 1), as above
+        padded = F.pad(x, (0, 0, left, k - 1 - left)).float()  # pad the time axis
+        weight = self.conv.weight.squeeze(1).float()  # (D, k) cross-correlation taps
+        length = x.shape[1]
+        out = padded[:, :length] * weight[:, 0]
+        for i in range(1, k):
+            out = out + padded[:, i : i + length] * weight[:, i]
+        out = out.to(out_dtype)
         if self._activation is not None:
-            x = self._activation(x)
-        return x
+            out = self._activation(out)
+        return out
 
 
 def resolve_canon_kernel_sizes(spec: Any, num_hidden_layers: int) -> list[int]:
