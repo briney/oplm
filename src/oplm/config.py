@@ -194,6 +194,12 @@ class TrainConfig:
     # oplm.training.diagnostics). 0 disables. Should be a multiple of log_every.
     # DDP only (main process reads replicated weights; no collectives).
     weight_diag_every: int = 0
+    # Opt-in profiling (oplm.training.profiling): with profile_start set, time all-reduces
+    # at train start, CUDA-sync-time each phase of steps [profile_start, +profile_steps),
+    # then torch.profiler-trace the next profile_steps steps; results go to
+    # <output_dir>/profile/. None disables.
+    profile_start: int | None = None
+    profile_steps: int = 20
 
     def __post_init__(self) -> None:
         """Validate training configuration."""
@@ -255,6 +261,10 @@ class TrainConfig:
             )
         if self.weight_diag_every < 0:
             raise ValueError(f"weight_diag_every must be >= 0, got {self.weight_diag_every}")
+        if self.profile_start is not None and self.profile_start < 1:
+            raise ValueError(f"profile_start must be >= 1, got {self.profile_start}")
+        if self.profile_steps < 1:
+            raise ValueError(f"profile_steps must be >= 1, got {self.profile_steps}")
         if not math.isfinite(self.adamw_lr_mult) or self.adamw_lr_mult <= 0:
             raise ValueError(f"adamw_lr_mult must be finite and > 0, got {self.adamw_lr_mult}")
         if self.branch_from is not None and (

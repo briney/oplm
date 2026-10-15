@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -42,6 +43,12 @@ if TYPE_CHECKING:
     from oplm.training.task import TrainTask
 
 logger = logging.getLogger(__name__)
+
+
+def _no_phase(name: str) -> contextlib.nullcontext[None]:
+    """Phase timer stand-in when profiling is off."""
+    return contextlib.nullcontext()
+
 
 # Wall-clock margin (seconds) before SLURM_JOB_END_TIME at which the env drain
 # clock starts reporting requested=True. Fixed module constant for now; may
@@ -806,6 +813,7 @@ class Trainer:
         self._window_grad_norm_sum = 0.0
         self._window_grad_norm_max = 0.0
         self._window_clipped = 0
+        self._window_data_wait = 0.0  # seconds blocked on the DataLoader (no GPU sync)
         self._window_tokens_start = 0
         self._window_samples_start = 0
         # Task-reported per-micro-batch metrics, window-averaged in _log_step.
@@ -857,6 +865,25 @@ class Trainer:
 
         self._emit_train_start()
         self.model.train()
+        profiler = None
+        if cfg.profile_start is not None:
+            from oplm.training.profiling import StepProfiler, allreduce_benchmark
+
+            profiler = StepProfiler(
+                self.accelerator, cfg.output_dir, cfg.profile_start, cfg.profile_steps
+            )
+            profiler.comm = allreduce_benchmark(self.accelerator)
+            if self.accelerator.is_main_process:
+                for row in profiler.comm:
+                    logger.info(
+                        "profile: all-reduce %d MB over %d ranks: %.1f ms, bus bandwidth %.1f GB/s",
+                        row["size_mb"],
+                        self.accelerator.num_processes,
+                        row["ms"],
+                        row["busbw_gbs"],
+                    )
+        phase = profiler.phase if profiler is not None else _no_phase
+        step_open = False  # an optimizer step's first micro-batch has been fetched
         data_iter = iter(self.dataloader)
         current_loss = float("nan")
         step_loss_sum = 0.0
@@ -864,49 +891,60 @@ class Trainer:
 
         try:
             while self.global_step < self.total_steps:
+                if profiler is not None and not step_open:
+                    profiler.begin_step(self.global_step)
+                step_open = True
                 # Get next batch, handle epoch boundaries
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    self.epoch += 1
-                    self._set_dataset_epoch(self.epoch)
-                    # Data-cursor state (Task 3.3): a new epoch starts a fresh count of
-                    # batches, and any resume skip armed for the epoch that just ended
-                    # must not linger and get (incorrectly) reapplied to this new one --
-                    # see ShardedProteinDataset.set_resume_skip's docstring on why the
-                    # skip is one-epoch-scoped and must be explicitly cleared.
-                    self._batches_in_epoch = 0
-                    self._clear_dataset_resume_skip()
-                    data_iter = iter(self.dataloader)
-                    batch = next(data_iter)
+                data_t0 = time.perf_counter()
+                with phase("data_wait"):
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        self.epoch += 1
+                        self._set_dataset_epoch(self.epoch)
+                        # Data-cursor state (Task 3.3): a new epoch starts a fresh count of
+                        # batches, and any resume skip armed for the epoch that just ended
+                        # must not linger and get (incorrectly) reapplied to this new one --
+                        # see ShardedProteinDataset.set_resume_skip's docstring on why the
+                        # skip is one-epoch-scoped and must be explicitly cleared.
+                        self._batches_in_epoch = 0
+                        self._clear_dataset_resume_skip()
+                        data_iter = iter(self.dataloader)
+                        batch = next(data_iter)
+                self._window_data_wait += time.perf_counter() - data_t0
 
                 # Forward + backward inside accumulation context
                 with self.accelerator.accumulate(self.model):
-                    result = self.task.step(self.model, batch)
+                    with phase("forward"):
+                        result = self.task.step(self.model, batch)
                     loss = result.loss
-                    self.accelerator.backward(loss)
+                    with phase("backward"):
+                        self.accelerator.backward(loss)
 
                     if cfg.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        # Retain the pre-clip total norm so StabilityDiagnosticsCallback
-                        # can log it (grads are zeroed before the log step fires).
-                        self._last_grad_norm = self.accelerator.clip_grad_norm_(
-                            self.model.parameters(),
-                            cfg.max_grad_norm,
-                        )
-                        # Window stats for _log_step. float() syncs, but the per-step
-                        # loss.item() below already does; no extra cost.
-                        grad_norm = float(self._last_grad_norm)
+                        with phase("clip"):
+                            # Retain the pre-clip total norm so StabilityDiagnosticsCallback
+                            # can log it (grads are zeroed before the log step fires).
+                            self._last_grad_norm = self.accelerator.clip_grad_norm_(
+                                self.model.parameters(),
+                                cfg.max_grad_norm,
+                            )
+                            # Window stats for _log_step. float() syncs, but the per-step
+                            # loss.item() below already does; no extra cost.
+                            grad_norm = float(self._last_grad_norm)
                         self._window_grad_norm_sum += grad_norm
                         self._window_grad_norm_max = max(self._window_grad_norm_max, grad_norm)
                         self._window_clipped += int(grad_norm > cfg.max_grad_norm)
 
-                    for optimizer in self.optimizers:
-                        optimizer.step()
-                        optimizer.zero_grad()
+                    with phase("optimizer"):
+                        for optimizer in self.optimizers:
+                            optimizer.step()
+                            optimizer.zero_grad()
 
                 # Accumulate the per-micro-batch loss so logging reports the mean
                 # across the optimizer step, not just the final micro-batch.
-                step_loss_sum += loss.detach().item()
+                with phase("sync"):
+                    step_loss_sum += loss.detach().item()
 
                 # Track tokens (local; reduced across ranks on the opt-step boundary
                 # below), samples, and the data cursor's micro-batch count (Task 3.3 --
@@ -944,15 +982,20 @@ class Trainer:
                 # diverge on ragged batches.
                 local_tokens = self._step_local_tokens
                 self._step_local_tokens = 0
-                flags = self._reduce_step_flags(
-                    local_tokens,
-                    drain=self._drain_signal.requested,
-                    nonfinite=not math.isfinite(current_loss),
-                    save_due=self._save_timer_due(),
-                    pending_done=(
-                        self._pending_save is not None and self._pending_save.handle.future.done()
-                    ),
-                )
+                with phase("sync"):
+                    flags = self._reduce_step_flags(
+                        local_tokens,
+                        drain=self._drain_signal.requested,
+                        nonfinite=not math.isfinite(current_loss),
+                        save_due=self._save_timer_due(),
+                        pending_done=(
+                            self._pending_save is not None
+                            and self._pending_save.handle.future.done()
+                        ),
+                    )
+                if profiler is not None:
+                    profiler.end_step(local_tokens)
+                step_open = False
                 tokens_delta = flags.tokens_delta
                 self.tokens_seen += tokens_delta
 
@@ -1358,6 +1401,8 @@ class Trainer:
                 metrics["train/grad_norm"] = self._window_grad_norm_sum / self._window_steps
                 metrics["train/grad_norm_max"] = self._window_grad_norm_max
                 metrics["train/clip_frac"] = self._window_clipped / self._window_steps
+            # Seconds per optimizer step blocked on the DataLoader; ~0 unless it starves the GPU.
+            metrics["train/data_wait_s"] = self._window_data_wait / self._window_steps
         samples_delta = self._samples_seen - self._window_samples_start
         if samples_delta > 0:
             tokens_delta = self.tokens_seen - self._window_tokens_start
@@ -1367,6 +1412,7 @@ class Trainer:
         self._window_grad_norm_sum = 0.0
         self._window_grad_norm_max = 0.0
         self._window_clipped = 0
+        self._window_data_wait = 0.0
         self._window_tokens_start = self.tokens_seen
         self._window_samples_start = self._samples_seen
 

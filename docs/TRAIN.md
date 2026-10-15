@@ -399,8 +399,10 @@ the previous log): `train/loss_mean` (mean loss over the window, versus the
 single-step `train/loss`), `train/grad_norm` / `train/grad_norm_max` (pre-clip
 global gradient norm, mean and max) and `train/clip_frac` (fraction of steps where
 clipping fired; all three only when `max_grad_norm > 0`), `train/mean_seq_len`
-(tokens per sample), and under Muon `train/lr_adamw` (the auxiliary AdamW
-optimizer's first group — `train/lr` is the Muon LR).
+(tokens per sample), `train/data_wait_s` (seconds per optimizer step the main
+process spent blocked on the DataLoader; near 0 unless data loading starves the GPU),
+and under Muon `train/lr_adamw` (the auxiliary AdamW optimizer's first group —
+`train/lr` is the Muon LR).
 
 **Weight-norm diagnostics** (`train.weight_diag_every=N`, off by default): every N
 optimizer steps, `diag/weight_rms/<group>` (pooled RMS of the group's weights) and
@@ -413,6 +415,22 @@ can be backfilled from existing checkpoints' `hf/` exports:
 ```bash
 oplm weight-rms /runs/170M/checkpoint-100000 /runs/170M/checkpoint-400000
 ```
+
+**Profiling** (`train.profile_start=S`, off by default; `train.profile_steps=N`,
+default 20). It writes everything to `<output_dir>/profile/`:
+
+- **At train start:** all-reduces of 16, 128 and 512 MB on the run's process group, with
+  bus bandwidth logged. Set `slurm.nccl_debug: INFO` to see which transport NCCL chose.
+- **Steps `S` to `S+N−1`:** each phase of the step is timed with a CUDA synchronize on
+  both sides: `data_wait`, `forward`, `backward` (which includes DDP's overlapped
+  gradient all-reduce), `clip`, `optimizer` and `sync`. Each rank writes its medians to
+  `summary_rank<r>.json`.
+- **The next `N` steps:** these run under `torch.profiler` without synchronizing. Rank 0
+  writes `trace_rank0.json` (open it in Perfetto or `chrome://tracing`) and the top
+  operators by GPU and CPU time.
+
+Comparing one node with two at the same per-GPU batch separates communication cost
+from compute.
 
 ---
 
