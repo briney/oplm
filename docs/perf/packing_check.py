@@ -4,7 +4,7 @@ The CPU tests (tests/model/test_packing.py) show that a packed row computes what
 sequence's own padded row computes, with PyTorch's reference attention in fp32. On a GPU the
 packed path runs cuDNN's fused attention with a block-diagonal mask instead, under bf16
 autocast and torch.compile. This runs a real checkpoint on real training sequences at
-training shapes (train mode, activation checkpointing as configured) and compares the
+training shapes (train mode, activation checkpointing on) and compares the
 logits at every real token, each sequence's masked-token loss, and the parameter gradients:
 
   cudnn      packed vs padded, attention forced to cuDNN in both (the eager training path)
@@ -115,10 +115,10 @@ def main() -> None:
     print(torch.__version__, torch.cuda.get_device_name())
     cfg = load_config(["--config", str(args.checkpoint / "config.yaml")])
     model = OplmForMaskedLM.from_pretrained(args.checkpoint / "hf").cuda().train()
-    # As the trainer does: transformers strips the flag off the HF config when it builds the model.
-    if getattr(cfg.model, "gradient_checkpointing", False):
-        model.gradient_checkpointing_enable()
-    print(f"activation checkpointing: {model.oplm.backbone.gradient_checkpointing}")
+    # Training checkpoints activations (a padded batch does not fit a B200 without it). Neither
+    # saved config records that: transformers deletes the flag from the config it builds with.
+    model.gradient_checkpointing_enable()
+    print(f"activation checkpointing: {model.oplm.backbone.layers[0].gradient_checkpointing}")
     params = list(model.parameters())
     compiled = compile_like_trainer(model, cfg, ddp=False)
     size = cfg.train.batch_size
