@@ -618,11 +618,16 @@ this).
 
 Costs and limits:
 
-- Attention gets a dense block-diagonal `(rows, 1, T, T)` mask instead of a
-  key-padding mask. (FlashAttention is out either way: it takes no mask at all.)
-  If cuDNN's attention does not accept that mask, PyTorch falls back to the
-  memory-efficient backend for packed batches. If the result is slower than the
-  padding saved, turn packing off: the off path is unchanged.
+- With the default `model.packed_attention: sdpa`, attention gets a dense block-diagonal
+  `(rows, 1, T, T)` mask instead of a key-padding mask, and computes every score of a row: its
+  cost grows with the row width, not with the sequences' lengths. (FlashAttention is out
+  either way: it takes no mask at all.)
+- `model.packed_attention: flex` runs packed batches through FlexAttention with a block mask
+  built once per forward from `segment_ids`, skipping every 128×128 block between sequences, so
+  attention cost follows each sequence's own length and wide rows (2048) cost about what narrow
+  ones do. It is fast only under `train.compile`, has no attention dropout, and has no backward
+  on CPU. `docs/perf/packing_check.py` checks it against padded rows at the bf16 floor and
+  `docs/perf/attention_width_bench.py` times it against `sdpa` by row width.
 - It is incompatible with `model.mask_dropout`, which rescales by each row's
   masked fraction. The loader refuses that combination.
 - Evaluation batches are never packed, so eval numbers stay comparable.
