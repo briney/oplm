@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.attention.flex_attention as flex_mod
 
 import oplm.model.transformer as transformer_mod
 from oplm import OplmConfig, OplmForMaskedLM
@@ -116,24 +117,50 @@ def test_without_segment_ids_a_single_sequence_row_is_unchanged() -> None:
     torch.testing.assert_close(got[mask], ref[mask], rtol=1e-5, atol=1e-6)
 
 
+def _spy_flex_kernel(monkeypatch: pytest.MonkeyPatch) -> list[tuple[torch.dtype, ...]]:
+    """Record the q/k/v dtypes of every real FlexAttention kernel call (one per block).
+
+    Parity alone cannot tell flex from a silent SDPA fallback: both compute the same thing.
+    """
+    calls: list[tuple[torch.dtype, ...]] = []
+    real = flex_mod.flex_attention
+
+    def spy(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        calls.append((q.dtype, k.dtype, v.dtype))
+        return real(q, k, v, *args, **kwargs)
+
+    monkeypatch.setattr(flex_mod, "flex_attention", spy)
+    return calls
+
+
 @pytest.mark.parametrize("checkpointing", [None, "full", "selective"])
-def test_flex_packed_logits_match_sdpa(checkpointing: str | None) -> None:
+def test_flex_packed_logits_match_sdpa(
+    checkpointing: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Same weights, same packed batch: flex and the dense-mask SDPA path agree (forward only:
-    FlexAttention has no CPU backward). Train mode so checkpointing wraps each block."""
+    FlexAttention has no CPU backward). Train mode so checkpointing wraps each block. The spy
+    proves the flex kernel really ran (once per block) through each checkpointing wrapper."""
+    calls = _spy_flex_kernel(monkeypatch)
     _, packed = _batches()
     with torch.no_grad():
         ref = _model(checkpointing, "sdpa")(**packed).logits
-        got = _model(checkpointing, "flex")(**packed).logits
+        assert calls == []
+        flex_model = _model(checkpointing, "flex")
+        got = flex_model(**packed).logits
+    assert len(calls) == flex_model.config.num_hidden_layers
     mask = packed["attention_mask"].bool()
     torch.testing.assert_close(got[mask], ref[mask], rtol=1e-4, atol=1e-5)
 
 
-def test_flex_packed_logits_match_padded_rows() -> None:
+def test_flex_packed_logits_match_padded_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _spy_flex_kernel(monkeypatch)
     padded, packed = _batches()
     model = _model(None, "flex").eval()
     with torch.no_grad():
         ref = model(**padded).logits
+        assert calls == []  # no segment_ids: the padded batch never takes the flex path
         out = model(**packed).logits
+    assert len(calls) == model.config.num_hidden_layers
     for row, got in enumerate(_unpack(out)):
         torch.testing.assert_close(got, ref[row, : LENGTHS[row]], rtol=1e-4, atol=1e-5)
 
@@ -160,11 +187,13 @@ def test_flex_block_mask_is_built_once_per_forward(monkeypatch: pytest.MonkeyPat
 
 def test_flex_config_without_segment_ids_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _count_block_masks(monkeypatch)
+    flex_calls = _spy_flex_kernel(monkeypatch)
     padded, _ = _batches()
     with torch.no_grad():
         ref = _model(None, "sdpa").eval()(**padded).logits
         got = _model(None, "flex").eval()(**padded).logits
     assert calls[0] == 0
+    assert flex_calls == []
     torch.testing.assert_close(got, ref, rtol=0, atol=0)
 
 
@@ -172,19 +201,26 @@ def test_flex_config_keeps_manual_path_for_attention_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _count_block_masks(monkeypatch)
+    flex_calls = _spy_flex_kernel(monkeypatch)
     _, packed = _batches()
     with torch.no_grad():
         out = _model(None, "flex").eval()(**packed, output_attentions=True)
     assert calls[0] == 0
+    assert flex_calls == []
     assert out.attentions is not None and all(a is not None for a in out.attentions)
 
 
-def test_flex_matches_sdpa_under_bf16_autocast() -> None:
+def test_flex_matches_sdpa_under_bf16_autocast(monkeypatch: pytest.MonkeyPatch) -> None:
     """Channel QK-norm returns fp32 q/k under autocast while v is bf16; flex must cast like SDPA."""
+    calls = _spy_flex_kernel(monkeypatch)
     _, packed = _batches()
     with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
         ref = _model(None, "sdpa").eval()(**packed).logits
-        got = _model(None, "flex").eval()(**packed).logits
+        assert calls == []
+        flex_model = _model(None, "flex").eval()
+        got = flex_model(**packed).logits
+    # The kernel ran once per block and saw q, k and v all cast to bf16.
+    assert calls == [(torch.bfloat16,) * 3] * flex_model.config.num_hidden_layers
     mask = packed["attention_mask"].bool()
     assert torch.isfinite(got[mask]).all()
     torch.testing.assert_close(got[mask], ref[mask], rtol=5e-2, atol=5e-2)
