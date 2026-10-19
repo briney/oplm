@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import oplm.model.transformer as transformer_mod
 from oplm import OplmConfig, OplmForMaskedLM
 from oplm.model.masking import segment_attention_mask
 
@@ -18,7 +19,7 @@ def test_segment_mask_is_block_diagonal_with_no_empty_rows() -> None:
     assert mask[7].tolist() == [False] * 6 + [True, True]
 
 
-def _model(checkpointing: str | None) -> OplmForMaskedLM:
+def _model(checkpointing: str | None, packed_attention: str = "sdpa") -> OplmForMaskedLM:
     torch.manual_seed(0)
     cfg = OplmConfig(
         hidden_size=32,
@@ -34,6 +35,7 @@ def _model(checkpointing: str | None) -> OplmForMaskedLM:
         canon_enabled=True,
         canon_positions=["A", "B", "C", "D"],
         canon_kernel_sizes=[3, 4, 7],  # odd and even kernels, one wider than a sequence
+        packed_attention=packed_attention,
     )
     model = OplmForMaskedLM(cfg)
     if checkpointing is not None:
@@ -112,3 +114,77 @@ def test_without_segment_ids_a_single_sequence_row_is_unchanged() -> None:
         got = model(**padded, segment_ids=seg).logits
     mask = padded["attention_mask"].bool()
     torch.testing.assert_close(got[mask], ref[mask], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("checkpointing", [None, "full", "selective"])
+def test_flex_packed_logits_match_sdpa(checkpointing: str | None) -> None:
+    """Same weights, same packed batch: flex and the dense-mask SDPA path agree (forward only:
+    FlexAttention has no CPU backward). Train mode so checkpointing wraps each block."""
+    _, packed = _batches()
+    with torch.no_grad():
+        ref = _model(checkpointing, "sdpa")(**packed).logits
+        got = _model(checkpointing, "flex")(**packed).logits
+    mask = packed["attention_mask"].bool()
+    torch.testing.assert_close(got[mask], ref[mask], rtol=1e-4, atol=1e-5)
+
+
+def test_flex_packed_logits_match_padded_rows() -> None:
+    padded, packed = _batches()
+    model = _model(None, "flex").eval()
+    with torch.no_grad():
+        ref = model(**padded).logits
+        out = model(**packed).logits
+    for row, got in enumerate(_unpack(out)):
+        torch.testing.assert_close(got, ref[row, : LENGTHS[row]], rtol=1e-4, atol=1e-5)
+
+
+def _count_block_masks(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls = [0]
+    real = transformer_mod.segment_block_mask
+
+    def counting(segment_ids: torch.Tensor):  # noqa: ANN202 — returns BlockMask
+        calls[0] += 1
+        return real(segment_ids)
+
+    monkeypatch.setattr(transformer_mod, "segment_block_mask", counting)
+    return calls
+
+
+def test_flex_block_mask_is_built_once_per_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _count_block_masks(monkeypatch)
+    _, packed = _batches()
+    with torch.no_grad():
+        _model(None, "flex").eval()(**packed)  # 3 layers
+    assert calls[0] == 1
+
+
+def test_flex_config_without_segment_ids_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _count_block_masks(monkeypatch)
+    padded, _ = _batches()
+    with torch.no_grad():
+        ref = _model(None, "sdpa").eval()(**padded).logits
+        got = _model(None, "flex").eval()(**padded).logits
+    assert calls[0] == 0
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+
+def test_flex_config_keeps_manual_path_for_attention_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _count_block_masks(monkeypatch)
+    _, packed = _batches()
+    with torch.no_grad():
+        out = _model(None, "flex").eval()(**packed, output_attentions=True)
+    assert calls[0] == 0
+    assert out.attentions is not None and all(a is not None for a in out.attentions)
+
+
+def test_flex_matches_sdpa_under_bf16_autocast() -> None:
+    """Channel QK-norm returns fp32 q/k under autocast while v is bf16; flex must cast like SDPA."""
+    _, packed = _batches()
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        ref = _model(None, "sdpa").eval()(**packed).logits
+        got = _model(None, "flex").eval()(**packed).logits
+    mask = packed["attention_mask"].bool()
+    assert torch.isfinite(got[mask]).all()
+    torch.testing.assert_close(got[mask], ref[mask], rtol=5e-2, atol=5e-2)

@@ -15,6 +15,8 @@ from .norm import make_norm
 from .rope import RotaryEmbedding
 
 if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
+
     from .configuration_oplm import OplmConfig
 
 __all__ = ["OplmAttention"]
@@ -333,6 +335,24 @@ class OplmAttention(nn.Module):
             q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=self.attn_scale
         )
 
+    def _flex_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_mask: BlockMask
+    ) -> torch.Tensor:
+        """FlexAttention over a packed batch's block mask (`segment_block_mask`).
+
+        Unlike SDPA, FlexAttention does not cast its inputs under autocast, and channel QK-norm
+        returns fp32 q/k while v is in the autocast dtype; cast all three as SDPA would. No
+        dropout (rejected by config validation).
+        """
+        from torch.nn.attention.flex_attention import flex_attention
+
+        device_type = q.device.type
+        if torch.is_autocast_enabled(device_type):
+            dtype = torch.get_autocast_dtype(device_type)
+            q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+        # Tensor-only: the union return covers return_lse / return_aux, which we don't request.
+        return flex_attention(q, k, v, block_mask=block_mask, scale=self.attn_scale)  # ty: ignore[invalid-return-type]
+
     def _manual_attention(
         self,
         q: torch.Tensor,
@@ -365,6 +385,7 @@ class OplmAttention(nn.Module):
         output_attentions: bool = False,
         value_residual: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
@@ -382,6 +403,9 @@ class OplmAttention(nn.Module):
             segment_ids: `(B, T)` segment ids of a packed batch (several sequences per row:
                 `1..n` per sequence, `0` at pads), or `None`. Attention and Canon-B then stay
                 within each sequence.
+            block_mask: FlexAttention block mask of a packed batch, built once per forward by
+                OplmStack when `config.packed_attention == "flex"`; replaces the dense segment
+                mask in the SDPA path.
 
         Returns:
             A `(output, attn_weights_or_None)` tuple. `output` has shape
@@ -407,6 +431,9 @@ class OplmAttention(nn.Module):
 
         if output_attentions:
             out, attn = self._manual_attention(q, k, v, attention_mask, segment_ids)
+        elif block_mask is not None:
+            out = self._flex_attention(q, k, v, block_mask)
+            attn = None
         else:
             out = self._sdpa_attention(q, k, v, attention_mask, segment_ids)
             attn = None

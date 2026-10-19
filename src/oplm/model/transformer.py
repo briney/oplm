@@ -15,10 +15,12 @@ from .conv import CanonConv
 from .embedding import OplmEmbedding
 from .ffn import make_ffn
 from .looping import resolve_layer_execution_order
-from .masking import prepare_attention_mask
+from .masking import prepare_attention_mask, segment_block_mask
 from .norm import make_norm
 
 if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
+
     from .configuration_oplm import OplmConfig
 
 __all__ = ["OplmBlock", "OplmStack"]
@@ -230,6 +232,7 @@ class OplmBlock(nn.Module):
         output_attentions: bool,
         value_residual: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
@@ -253,6 +256,7 @@ class OplmBlock(nn.Module):
             output_attentions,
             value_residual=value_residual,
             segment_ids=segment_ids,
+            block_mask=block_mask,
         )
         if self.value_residual_enabled:
             attn_out, attn_weights, v1 = attn_result
@@ -295,6 +299,7 @@ class OplmBlock(nn.Module):
         output_attentions: bool = False,
         value_residual: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
@@ -309,6 +314,7 @@ class OplmBlock(nn.Module):
             value_residual: `(B, H, T, d_head)` layer-0 values v1 for the
                 ResFormer value residual (later layers only); `None` otherwise.
             segment_ids: `(B, T)` segment ids of a packed batch, or `None` (see `OplmAttention`).
+            block_mask: FlexAttention block mask shared by every block of this forward, or `None`.
 
         Returns:
             `(y, attn_weights_or_None)` — `y` has shape `(B, T, D)`;
@@ -334,6 +340,7 @@ class OplmBlock(nn.Module):
                     output_attentions,
                     value_residual,
                     segment_ids,
+                    block_mask,
                     use_reentrant=False,
                     context_fn=context_fn,
                 )
@@ -345,9 +352,12 @@ class OplmBlock(nn.Module):
                 output_attentions,
                 value_residual,
                 segment_ids,
+                block_mask,
                 use_reentrant=False,
             )
-        return self._forward_impl(x, attention_mask, output_attentions, value_residual, segment_ids)
+        return self._forward_impl(
+            x, attention_mask, output_attentions, value_residual, segment_ids, block_mask
+        )
 
 
 class OplmStack(nn.Module):
@@ -447,10 +457,24 @@ class OplmStack(nn.Module):
         # reference, including when that physical block is revisited.
         # Stays None (and unused) when disabled.
         v1: torch.Tensor | None = None
+        # One FlexAttention block mask per forward, shared by every block (and every loop
+        # revisit); read from config at call time so tools can switch kernels on a live model.
+        block_mask = None
+        if (
+            segment_ids is not None
+            and not output_attentions
+            and getattr(self.config, "packed_attention", "sdpa") == "flex"
+        ):
+            block_mask = segment_block_mask(segment_ids)
         for layer_index in self.layer_execution_order:
             block = self.layers[layer_index]
             result = block(
-                x, attention_mask, output_attentions, value_residual=v1, segment_ids=segment_ids
+                x,
+                attention_mask,
+                output_attentions,
+                value_residual=v1,
+                segment_ids=segment_ids,
+                block_mask=block_mask,
             )
             if self.value_residual_enabled:
                 x, attn, v = result
