@@ -20,6 +20,7 @@ _IGNORED_INITIALIZATION_FIELDS = frozenset(
         "loop_end",
         "gradient_checkpointing",
         "gradient_checkpointing_mode",
+        "packed_attention",
         "initializer_range",
         "init_scale_output_projections",
         "residual_gate_init",
