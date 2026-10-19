@@ -8,6 +8,9 @@
 #   OPLM_CONFIG=<yaml>      REQUIRED: a training YAML whose data.train supplies sequence lengths
 #   OPLM_PRESETS="170M 1B"  presets to time (default below)
 #   OPLM_GIT_REF=<commit>   oplm version to install (default below)
+#   OPLM_BENCH_ARGS="..."   extra attention_width_bench.py arguments, e.g.
+#                           "--checkpointing --shapes 84x512,21x2048" (checkpointing otherwise
+#                           follows the run config's model.gradient_checkpointing)
 #   OPLM_RESULTS=/mnt/home/<you>/oplm-perf/attention-width/<jobid>
 #
 #SBATCH --job-name=oplm-attention-width
@@ -29,7 +32,8 @@ CONTAINER="${OPLM_CONTAINER:-/mnt/data/containers/deeplearning_v2026-05-26.sqsh}
 GIT_REF="${OPLM_GIT_REF:-main}"
 PRESETS="${OPLM_PRESETS:-170M 1B}"
 RESULTS="${OPLM_RESULTS:-/mnt/home/${SLURM_JOB_USER}/oplm-perf/attention-width/${SLURM_JOB_ID}}"
-export GIT_REF RESULTS PRESETS OPLM_CONFIG
+OPLM_BENCH_ARGS="${OPLM_BENCH_ARGS:-}"
+export GIT_REF RESULTS PRESETS OPLM_CONFIG OPLM_BENCH_ARGS
 
 source "$ENV_FILE"  # creates JOB_WORK_DIR
 mkdir -p "$RESULTS" "$JOB_WORK_DIR"
@@ -45,8 +49,9 @@ done
 python -m pip freeze | grep -i -E '^(oplm|torch|triton)' > "$RESULTS/pip-freeze.txt"
 nvidia-smi > "$RESULTS/nvidia-smi.txt" 2>&1 || true
 for preset in $PRESETS; do
+  # shellcheck disable=SC2086  # OPLM_BENCH_ARGS is intentionally word-split
   python "$RESULTS/attention_width_bench.py" --config "$OPLM_CONFIG" --preset "$preset" \
-    2>&1 | tee "$RESULTS/bench-$preset.txt"
+    $OPLM_BENCH_ARGS 2>&1 | tee "$RESULTS/bench-$preset.txt"
 done
 EOF
 

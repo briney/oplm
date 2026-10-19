@@ -9,6 +9,9 @@ the run's data.train sources by their fractions, as docs/perf/packing_memory.py 
 from the same directory). The model is a fresh preset (weights do not affect timing).
 
     python docs/perf/attention_width_bench.py --config <run.yaml> --preset 170M
+
+Activation checkpointing follows the run config's model.gradient_checkpointing, as the trainer
+does, unless --checkpointing / --no-checkpointing overrides it.
 """
 
 from __future__ import annotations
@@ -64,25 +67,36 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--shards-per-source", type=int, default=4)
-    parser.add_argument("--checkpointing", action="store_true", help="activation checkpointing")
+    parser.add_argument(
+        "--checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="activation checkpointing (default: the run config's model.gradient_checkpointing)",
+    )
     args = parser.parse_args()
     print(torch.__version__, torch.cuda.get_device_name())
 
     shapes = parse_shapes(args.shapes)
     cfg = load_config(["--config", str(args.config), "--preset", args.preset])
     cfg.model.max_position_embeddings = max(width for _, width in shapes)
+    # Read before building the model: transformers deletes the flag from the config it builds with.
+    checkpointing = (
+        bool(getattr(cfg.model, "gradient_checkpointing", False))
+        if args.checkpointing is None
+        else args.checkpointing
+    )
     sources = token_lengths(cfg, args.shards_per_source)
     vocab = canonical_amino_acid_ids(get_tokenizer())
     rng = np.random.default_rng(0)
     batches = {shape: packed_batch(sources, rng, *shape, vocab) for shape in shapes}
 
     model = OplmForMaskedLM(cfg.model).cuda().train()
-    if args.checkpointing:
+    if checkpointing:
         model.gradient_checkpointing_enable()
     else:
         model.gradient_checkpointing_disable()
     params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"{args.preset}: {params:.0f}M params, checkpointing={args.checkpointing}")
+    print(f"{args.preset}: {params:.0f}M params, checkpointing={checkpointing}")
     print(f"{'kernel':>6s} {'rows x width':>13s} {'real tokens':>12s} {'ms':>8s} {'GiB':>7s}")
 
     results: dict[tuple[str, tuple[int, int]], float] = {}
