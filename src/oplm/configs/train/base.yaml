@@ -45,6 +45,10 @@ train:
   # Multiplier on the AdamW-side LR only (embeddings, head, norms, biases, gates,
   # Canon kernels). Muon matrices are untouched. 1.0 = AdamW groups inherit `lr`.
   adamw_lr_mult: 1.0
+  # Decoupled decay for what weight_decay skips (0 = off): the token embedding toward 0, and
+  # norm gains / residual gates / biases toward their initial values. See docs/TRAIN.md §7.
+  embedding_weight_decay: 0.0
+  weight_decay_to_init: 0.0
   max_grad_norm: 1.0
 
   # Scheduler

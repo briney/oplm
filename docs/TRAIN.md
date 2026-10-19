@@ -246,6 +246,17 @@ see [OVERVIEW.md](OVERVIEW.md) Part IV.
 - `adamw`: a single AdamW. 2-D weights get `weight_decay`; biases, norms, and
   embeddings are no-decay.
 
+**Weight decay on the vector parameters and embeddings** (both off by default). With
+`weight_decay` alone, the token embedding, norm gains, residual gates and biases are never
+decayed. Under Adam's roughly fixed-size updates they random-walk, growing about linearly
+with steps (in the 170M replication, norm-gain RMS grew from 1.5 to 7.8 over the run).
+`train.embedding_weight_decay` pulls the embedding toward 0. `train.weight_decay_to_init`
+pulls norm gains toward 1, residual gates toward `model.residual_gate_init` and biases toward
+0, i.e. toward their initial values, so they stay free to move but no longer drift. Each step
+moves a parameter `lr * wd` of the way to its target, with `lr` its AdamW group's LR (so
+`adamw_lr_mult` scales the decay too). Under Adam noise of size about `lr` per step, this
+holds a parameter within about `sqrt(lr / (2 * wd))` of its target.
+
 **Schedule** — `train.scheduler`: `warmup_linear` (default), `warmup_cosine`,
 `wsd_linear`, or `wsd_cosine`. All warm up linearly over `train.warmup_steps`;
 WSD variants then hold peak LR for `train.stable_steps` before decaying. Decay

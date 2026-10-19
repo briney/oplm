@@ -65,6 +65,13 @@ class TrainConfig:
     # Canon kernels under Muon; every group under optimizer=adamw). Muon groups are
     # untouched. 1.0 keeps today's behavior, where the AdamW groups inherit `lr`.
     adamw_lr_mult: float = 1.0
+    # Decoupled weight decay on the AdamW-side params that `weight_decay` skips (0 keeps them
+    # undecayed). `embedding_weight_decay` pulls the token embedding toward 0;
+    # `weight_decay_to_init` pulls norm gains toward 1, residual gates toward
+    # model.residual_gate_init and biases toward 0. Value-residual lambdas and L2 QK scales are
+    # never decayed. Each step moves a param lr * wd of the way to its target (lr: its group's).
+    embedding_weight_decay: float = 0.0
+    weight_decay_to_init: float = 0.0
     max_grad_norm: float = 1.0
 
     # Scheduler
@@ -267,6 +274,10 @@ class TrainConfig:
             raise ValueError(f"profile_steps must be >= 1, got {self.profile_steps}")
         if not math.isfinite(self.adamw_lr_mult) or self.adamw_lr_mult <= 0:
             raise ValueError(f"adamw_lr_mult must be finite and > 0, got {self.adamw_lr_mult}")
+        for name in ("embedding_weight_decay", "weight_decay_to_init"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and >= 0, got {value}")
         if self.branch_from is not None and (
             self.resume_from is not None or self.init_from is not None
         ):

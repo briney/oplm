@@ -22,11 +22,15 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class AdamwParamGroup:
-    """AdamW parameters sharing a ``(weight_decay, width/depth LR multiplier)`` pair."""
+    """AdamW parameters sharing weight decay, its target, and a width/depth LR multiplier.
+
+    ``decay_target`` is the value weight decay pulls toward (``0.0``: ordinary decay).
+    """
 
     params: list[torch.nn.Parameter]
     weight_decay: float
     lr_mult: float
+    decay_target: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -46,10 +50,10 @@ class OptimizerParamGroups:
     group with multiplier ``1.0``.
 
     AdamW params are split into one :class:`AdamwParamGroup` per distinct
-    ``(weight_decay, composed width/depth LR multiplier)``. With μP off (or at
-    the base width) and depth exponent zero every multiplier is ``1.0``, so there
-    are at most the usual two groups (decay + no-decay) and the optimizer is
-    identical to the pre-μP path.
+    ``(decay knob, decay_target, composed width/depth LR multiplier)``. With μP off (or
+    at the base width), depth exponent zero, and ``embedding_weight_decay`` and
+    ``weight_decay_to_init`` at 0, there are at most the usual two groups (decay +
+    no-decay) and the optimizer is identical to the pre-μP path.
     """
 
     muon_groups: list[MuonParamGroup]
@@ -62,13 +66,19 @@ class OptimizerParamGroups:
 
     @property
     def adamw_no_decay_params(self) -> list[torch.nn.Parameter]:
-        """Every no-weight-decay AdamW param (norms, biases, embeddings)."""
+        """Every no-weight-decay AdamW param (by default norms, biases, gates, embeddings)."""
         return [p for g in self.adamw_groups if g.weight_decay == 0.0 for p in g.params]
 
 
-def _uses_no_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
-    """Return whether a parameter should follow the no-decay AdamW rules."""
-    return param.ndim <= 1 or "embed" in name
+def _init_value(name: str, model_config: OplmConfig) -> float | None:
+    """The initial value ``weight_decay_to_init`` pulls a 1-D param back to (None: never)."""
+    if name.endswith(".bias"):
+        return 0.0
+    if name.endswith("norm.weight"):  # every norm module's attribute name ends in "norm"
+        return 1.0
+    if name.endswith(("attn_gate", "ffn_gate")):
+        return float(getattr(model_config, "residual_gate_init", 1.0))
+    return None  # value-residual lambdas, L2 QK scales
 
 
 def _depth_lr_multiplier(name: str, model_config: OplmConfig, cfg: TrainConfig) -> float:
@@ -107,30 +117,43 @@ def partition_optimizer_params(model: nn.Module, cfg: TrainConfig) -> OptimizerP
 
     # Preserve first-seen order of multiplier keys for determinism.
     muon_buckets: dict[float, list[torch.nn.Parameter]] = {}
-    adamw_buckets: dict[tuple[float, float], list[torch.nn.Parameter]] = {}
+    # Keyed by the TrainConfig field supplying the decay ("": none), not its value, so the
+    # group structure (which checkpoints must match) depends only on which knobs are on.
+    adamw_buckets: dict[tuple[str, float, float], list[torch.nn.Parameter]] = {}
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
         depth_mult = _depth_lr_multiplier(name, model_config, cfg)
-        if _uses_no_weight_decay(name, param):
-            weight_decay = 0.0
+        source, target = "", 0.0
+        if param.ndim <= 1:  # norm gains and biases, residual gates, lambdas, scales
+            init = _init_value(name, model_config)
+            if init is not None and cfg.weight_decay_to_init:
+                source, target = "weight_decay_to_init", init
+        elif "embed" in name:
+            if cfg.embedding_weight_decay:
+                source = "embedding_weight_decay"
         elif cfg.optimizer == "muon" and param.ndim == 2 and not name.startswith("lm_head."):
             muon_buckets.setdefault(depth_mult, []).append(param)
             continue
-        else:
-            weight_decay = cfg.weight_decay
+        elif cfg.weight_decay:
+            source = "weight_decay"
 
         lr_mult = mup_lr_multiplier(name, param, model_config) * depth_mult
-        adamw_buckets.setdefault((weight_decay, lr_mult), []).append(param)
+        adamw_buckets.setdefault((source, target, lr_mult), []).append(param)
 
     muon_groups = [
         MuonParamGroup(params=params, lr_mult=mult) for mult, params in muon_buckets.items()
     ]
     adamw_groups = [
-        AdamwParamGroup(params=params, weight_decay=wd, lr_mult=mult)
-        for (wd, mult), params in adamw_buckets.items()
+        AdamwParamGroup(
+            params=params,
+            weight_decay=getattr(cfg, source) if source else 0.0,
+            lr_mult=mult,
+            decay_target=target,
+        )
+        for (source, target, mult), params in adamw_buckets.items()
     ]
 
     grouped = [
@@ -149,6 +172,31 @@ def partition_optimizer_params(model: nn.Module, cfg: TrainConfig) -> OptimizerP
     return OptimizerParamGroups(muon_groups=muon_groups, adamw_groups=adamw_groups)
 
 
+class AdamW(torch.optim.AdamW):
+    """``torch.optim.AdamW`` whose param groups may decay toward ``decay_target``, not 0.
+
+    Decoupled decay toward ``c`` is decay toward 0 of ``p - c``, and Adam's update reads only
+    gradients and its own state. So shifting a group's params by ``-c`` around the base step
+    gives exactly ``p <- c + (p - c) * (1 - lr * wd) - lr * update``.
+    """
+
+    @torch.no_grad()
+    def step(self, closure=None):  # untyped like torch.optim.Adam.step (overloaded in Optimizer)
+        if closure is not None:
+            raise NotImplementedError("closures would see the shifted params")
+        shifted = [
+            (group["params"], group["decay_target"])
+            for group in self.param_groups
+            if group.get("decay_target", 0.0) and group["weight_decay"]
+        ]
+        for params, target in shifted:
+            torch._foreach_sub_(params, target)
+        super().step()
+        for params, target in shifted:
+            torch._foreach_add_(params, target)
+        return None
+
+
 def _build_adamw_optimizer(
     adamw_groups: Sequence[AdamwParamGroup],
     cfg: TrainConfig,
@@ -163,10 +211,15 @@ def _build_adamw_optimizer(
     """
     base_lr = cfg.lr * cfg.adamw_lr_mult
     param_groups = [
-        {"params": list(g.params), "weight_decay": g.weight_decay, "lr": base_lr * g.lr_mult}
+        {
+            "params": list(g.params),
+            "weight_decay": g.weight_decay,
+            "lr": base_lr * g.lr_mult,
+            "decay_target": g.decay_target,
+        }
         for g in adamw_groups
     ]
-    return torch.optim.AdamW(
+    return AdamW(
         param_groups,
         lr=base_lr,
         betas=(cfg.adam_beta1, cfg.adam_beta2),
