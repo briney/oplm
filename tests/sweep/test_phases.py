@@ -1642,3 +1642,55 @@ def test_scale_token_mode_needs_a_cap_for_every_preset(tmp_path: Path) -> None:
     output = plain(result.output)
     assert "max_batch_tokens" in output
     assert "400M" in output
+
+
+def test_token_mode_base_config_requires_global_tokens(tmp_path: Path) -> None:
+    """A token-mode base config must not yield half-sequence, half-token cells."""
+    config_path = _token_scale_config(tmp_path)
+    result = runner.invoke(
+        phases.app,
+        ["coarse", "--config", str(config_path), "--out", str(tmp_path / "c"), "--lrs", "0.0016"],
+    )
+    assert result.exit_code != 0
+    assert "pass --global-tokens" in plain(result.output)
+    ok = runner.invoke(
+        phases.app,
+        [
+            "coarse",
+            "--config",
+            str(config_path),
+            "--out",
+            str(tmp_path / "t"),
+            "--lrs",
+            "0.0016",
+            "--global-tokens",
+            "1048576",
+        ],
+    )
+    assert ok.exit_code == 0, ok.output
+
+
+def test_confirm_from_a_source_without_batch_mult_is_a_clean_error(
+    base_config: Path, tmp_path: Path
+) -> None:
+    """Skipping bridge: a transfer winner lacks batch_mult, so confirm must say so, not KeyError."""
+    source = _write_selected_phase(
+        tmp_path, "transfer", [{"lr": 0.004, "output_mult": 1.0, "depth_exponent": 0.5}]
+    )
+    result = runner.invoke(
+        phases.app,
+        [
+            "confirm",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(tmp_path / "confirm"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, KeyError)
+    output = plain(result.output)
+    assert "batch_mult" in output
+    assert "--candidates" in output

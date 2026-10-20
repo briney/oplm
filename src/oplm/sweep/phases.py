@@ -297,6 +297,14 @@ def _input_candidates(source: Path, raw: str | None, names: tuple[str, ...]) -> 
         raise ValueError(
             f"source phase {source} has no selected candidates; analyze it or pass --candidates"
         )
+    missing = sorted({name for candidate in selected for name in names if name not in candidate})
+    if missing:
+        # E.g. confirm straight from transfer (bridge skipped): no batch_mult was ever selected.
+        hint = " (batch_mult is 1 when the bridge was skipped)" if "batch_mult" in missing else ""
+        raise ValueError(
+            f"source phase {source}'s selected candidates lack {', '.join(missing)}; pass "
+            f"--candidates as {':'.join(names)}{hint}"
+        )
     return [dict(candidate) for candidate in selected]
 
 
@@ -488,8 +496,10 @@ def _generate_phase(
     accelerate_config = accelerate_config.resolve() if accelerate_config is not None else None
     out.mkdir(parents=True, exist_ok=True)
     slurm: SlurmConfig = load_slurm_config(base_config)
+    base = load_config(["--config", str(base_config)])
     # Row width of a token-mode micro-batch (each device holds whole rows of this many tokens).
-    width = int(load_config(["--config", str(base_config)]).model.max_position_embeddings)
+    width = int(base.model.max_position_embeddings)
+    base_token_mode = base.train.tokens_per_step is not None
     runs: list[RunSpec] = []
     commands: list[list[str]] = []
     for params in cells:
@@ -502,6 +512,13 @@ def _generate_phase(
         # cell is planned for 4 nodes; on 8 local processes that is 512, not 2048) and break
         # every cross-cell comparison.
         world_size = num_processes if local else nodes * slurm.gpus_per_node
+        if base_token_mode and "global_tokens" not in params:
+            # A sequence cell would inherit the base's token fields and train in token mode at an
+            # unplanned budget while phase.json described a sequence batch.
+            raise ValueError(
+                f"{base_config} is a token-mode config (train.tokens_per_step is set); pass "
+                "--global-tokens so every cell plans a token budget"
+            )
         plan: BatchPlan | TokenPlan
         if "global_tokens" in params:
             plan = resolve_token_plan(
