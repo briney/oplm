@@ -410,7 +410,7 @@ the previous log): `train/loss_mean` (mean loss over the window, versus the
 single-step `train/loss`), `train/grad_norm` / `train/grad_norm_max` (pre-clip
 global gradient norm, mean and max) and `train/clip_frac` (fraction of steps where
 clipping fired; all three only when `max_grad_norm > 0`), `train/mean_seq_len`
-(tokens per sample), `train/data_wait_s` (seconds per optimizer step the main
+(tokens per sample), `train/batch_fill` (token mode: real tokens over capacity), `train/data_wait_s` (seconds per optimizer step the main
 process spent blocked on the DataLoader; near 0 unless data loading starves the GPU),
 and under Muon `train/lr_adamw` (the auxiliary AdamW optimizer's first group —
 `train/lr` is the Muon LR).
@@ -638,6 +638,31 @@ Costs and limits:
 - Evaluation batches are never packed, so eval numbers stay comparable.
 - `oplm stream-replay` replays a packed run unpacked: packing happens after
   masking, so it serves the same sequences and masks.
+
+### Token-budget batching (`train.tokens_per_step`, `train.batch_tokens`)
+
+Counting a batch in sequences makes its real size depend on the data: the same 8192 sequences
+hold about 1.1M tokens at a deepclust-heavy mix and 1.9M at a uniref-heavy one, and far fewer
+than `batch_size × max_position_embeddings` once packed. Token mode fixes the token count instead.
+
+- `train.tokens_per_step` is the global capacity per optimizer step and `train.batch_tokens`
+  each process's micro-batch capacity (`rows × model.max_position_embeddings`). Accumulation is
+  derived: `tokens_per_step / (batch_tokens × processes)`, which must be a whole number. The same
+  `tokens_per_step` therefore works at any node count and model size.
+- Each data worker fills `rows` rows first-fit in stream order and closes a batch at the first
+  sequence that fits nowhere; that sequence starts the next batch. Batches are exactly
+  `(rows, width)`, so shapes never change, and real tokens are 97–99% of capacity
+  (`train/batch_fill`). Masking is unchanged.
+- Each GPU rolls over to its next epoch on its own, since sequences per batch vary.
+  `train/epoch` is rank 0's.
+- Resume is data-exact per worker: the checkpoint cursor records each rank's epoch and the rows
+  each worker had emitted. Only the world size, worker count and seed must match, so
+  `tokens_per_step` and `batch_tokens` can change at a resume or branch without losing the
+  position. Resuming between token and sequence mode needs `train.resume_data_position=false`.
+- The worker-cycle save alignment is off in token mode; after a resume only the order in which
+  a GPU's workers' batches interleave can shift within one cycle.
+- Requires `data.pack_sequences: true` and `train.max_steps`. `oplm stream-replay` does not
+  support token-mode runs.
 
 ---
 

@@ -261,7 +261,9 @@ Backed by `oplm.config.TrainConfig`.
 | --- | --- | --- | --- |
 | `train.max_steps` | `int` | `50_000` | Step budget; used when `max_epochs` is unset. |
 | `train.max_epochs` | `int \| null` | `null` | Optional epoch-based stop. |
-| `train.batch_size` | `int` | `32` | Per-process batch size, before accumulation. |
+| `train.batch_size` | `int` | `32` | Per-process batch size, before accumulation (eval batch size in token mode). |
+| `train.tokens_per_step` | `int \| null` | `null` | Token mode, with `train.batch_tokens`: global token capacity per optimizer step. Must be a multiple of `batch_tokens` × processes; the quotient becomes `gradient_accumulation_steps` at startup. Needs `max_steps` (not `max_epochs`) and `data.pack_sequences: true`. |
+| `train.batch_tokens` | `int \| null` | `null` | Token mode: each process's micro-batch capacity, a multiple of `model.max_position_embeddings` (rows × width). Every micro-batch is exactly that shape. `train.batch_size` then only sizes eval batches. |
 | `train.gradient_accumulation_steps` | `int` | `1` | Must be `≥ 1`. |
 | `train.optimizer` | `str` | `muon` | `adamw` or `muon` (hybrid Muon + AdamW). Run default `muon` (dataclass fallback `adamw`). |
 | `train.lr` | `float` | `0.0035` | Peak learning rate. With μP on (the default) this is the **μP base LR** (LR-sweep confirm winner, Aug 2026) — it transfers across width, so do not retune per size; retune only if μP is disabled. Dataclass fallback `1e-4`. |
