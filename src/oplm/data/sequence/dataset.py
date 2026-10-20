@@ -166,17 +166,21 @@ def _resolve_rows_skip(rows_per_worker: Sequence[int], stream_length: int) -> in
 class DataCursor:
     """Position of the training stream, plus the layout it is only valid under.
 
-    Captured at checkpoint time (one per run, not per rank — ranks step in lockstep
-    so ``batches_in_epoch`` is the same value everywhere) and replayed on resume via
-    :meth:`ShardedProteinDataset.set_resume_skip`. The layout fields
+    Captured at checkpoint time (one per run, not per rank — in sequence mode ranks step in
+    lockstep so ``batches_in_epoch`` is the same value everywhere; token mode adds the
+    per-rank ``rank_epochs`` and ``worker_rows`` tables) and replayed on resume via
+    :meth:`ShardedProteinDataset.set_resume_skip` (sequence mode) or ``set_resume_rows``
+    (token mode). A sequence-mode cursor can resume a token-mode run (its position maps onto
+    per-worker rows); a token-mode cursor cannot resume a sequence-mode run. The layout fields
     (``world_size``, ``num_workers``, ``per_rank_batch``, ``seed``) let the
     resuming run detect a changed layout before trusting ``batches_in_epoch`` — see
     Task 3.3's guard.
 
     Attributes:
         epoch: Epoch index the cursor was captured in.
-        batches_in_epoch: Count of batches consumed so far this epoch (per rank;
-            identical across ranks since training steps in lockstep).
+        batches_in_epoch: Count of batches consumed so far this epoch (per rank; identical
+            across ranks in sequence mode, where training steps in lockstep; the rank-0
+            count, informational only, in token mode).
         world_size: Number of ranks the interrupted run used.
         num_workers: DataLoader ``num_workers`` the interrupted run used.
         per_rank_batch: Samples per batch contributed by one (rank, worker) stream; 0 in

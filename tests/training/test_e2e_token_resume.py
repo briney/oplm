@@ -119,21 +119,54 @@ def test_token_resume_matches_control_across_an_epoch(
     assert rec1.flat() + rec2.flat() == control_rec.flat()
 
 
-def test_resume_across_batching_modes_raises(training_parquet: Path, tmp_path: Path) -> None:
+def test_sequence_cursor_resumes_into_token_mode(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_keep_sequence_ids(monkeypatch)
+    sequence = dict(batch_size=4, **TOKEN)
+    _, control_rec = _run(
+        tiny_train_cfg(
+            tmp_path / "control", training_parquet, max_steps=24, save_final=False, **sequence
+        )
+    )
+    run_dir = tmp_path / "run"
+    run1, rec1 = _run(
+        tiny_train_cfg(
+            run_dir, training_parquet, max_steps=3, save_every=3, save_final=False, **sequence
+        )
+    )
+    state = json.loads((run_dir / "checkpoint-3" / "trainer_state.json").read_text())
+    assert state["cursor"].get("worker_rows") is None and run1.epoch == 0
+    _, rec2 = _run(
+        tiny_train_cfg(
+            run_dir,
+            training_parquet,
+            max_steps=9,
+            save_final=False,
+            auto_resume=True,
+            tokens_per_step=256,
+            batch_tokens=256,
+            **TOKEN,
+        )
+    )
+    combined = rec1.flat() + rec2.flat()
+    assert len(rec1.flat()) == 12 and rec2.flat()
+    # One worker: any batching serves the stream in order, so the 12 rows sequence mode had
+    # consumed plus the token-mode rows that follow are a prefix of the sequence-mode control.
+    assert len(combined) <= len(control_rec.flat())
+    assert combined == control_rec.flat()[: len(combined)]
+
+
+def test_resume_token_cursor_into_sequence_mode_raises(
+    training_parquet: Path, tmp_path: Path
+) -> None:
     from oplm.training.trainer import Trainer
 
     run_dir = tmp_path / "run"
-    Trainer(tiny_train_cfg(run_dir, training_parquet, max_steps=2), callbacks=[]).train()
-    resumed = tiny_train_cfg(
-        run_dir,
-        training_parquet,
-        max_steps=4,
-        auto_resume=True,
-        tokens_per_step=256,
-        batch_tokens=256,
-        **TOKEN,
-    )
-    with pytest.raises(ValueError, match="resume_data_position=false"):
+    budget = dict(tokens_per_step=256, batch_tokens=256, **TOKEN)
+    Trainer(tiny_train_cfg(run_dir, training_parquet, max_steps=2, **budget), callbacks=[]).train()
+    resumed = tiny_train_cfg(run_dir, training_parquet, max_steps=4, auto_resume=True)
+    with pytest.raises(ValueError, match=r"token-mode run.*resume_data_position=false"):
         Trainer(resumed, callbacks=[])
 
 

@@ -660,9 +660,14 @@ than `batch_size × max_position_embeddings` once packed. Token mode fixes the t
 - Resume is data-exact per worker: the checkpoint cursor records each rank's epoch and the rows
   each worker had emitted. Only the world size, worker count and seed must match, so
   `tokens_per_step` and `batch_tokens` can change at a resume or branch without losing the
-  position. Resuming between token and sequence mode needs `train.resume_data_position=false`.
+  position. A sequence-mode checkpoint resumes or branches into token mode at its exact position
+  (same world size, workers and seed); the reverse, token to sequence, needs
+  `train.resume_data_position=false`.
 - The worker-cycle save alignment is off in token mode; after a resume only the order in which
   a GPU's workers' batches interleave can shift within one cycle.
+- Token mode often derives accumulation above 1, and the CUDA-graph compile modes
+  (`train.compile_mode: max-autotune` or `reduce-overhead`) are incompatible with gradient
+  accumulation (see the CUDA-graph note in section 13); use `compile_mode: default` there.
 - Requires `data.pack_sequences: true` and `train.max_steps`. `oplm stream-replay` does not
   support token-mode runs.
 
