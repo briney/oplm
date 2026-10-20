@@ -24,7 +24,7 @@ set -euo pipefail
 
 ENV_FILE="${OPLM_ENV_FILE:-/mnt/home/${SLURM_JOB_USER}/.env}"
 CONTAINER="${OPLM_CONTAINER:-/mnt/data/containers/deeplearning_v2026-05-26.sqsh}"
-GIT_REF="${OPLM_GIT_REF:-perf/profile-mode}"
+GIT_REF="${OPLM_GIT_REF:-main}"
 CHECKPOINT="${OPLM_CHECKPOINT:-/mnt/home/${SLURM_JOB_USER}/projects/oplm/scaling/170M/checkpoint-450000}"
 RESULTS="${OPLM_RESULTS:-/mnt/home/${SLURM_JOB_USER}/oplm-perf/packing-check/${SLURM_JOB_ID}}"
 export GIT_REF RESULTS CHECKPOINT

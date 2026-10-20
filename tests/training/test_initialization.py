@@ -144,6 +144,20 @@ def test_ignored_and_inactive_settings_do_not_block_loading() -> None:
     validate_initialization_config(source, target)
 
 
+def test_packed_attention_kernel_choice_is_ignored_for_initialization() -> None:
+    """packed_attention selects the execution kernel, not model semantics."""
+    source = _config(packed_attention="sdpa")
+    target = _config(packed_attention="flex")
+    validate_initialization_config(source, target)
+
+
+def test_packed_attention_reverse_kernel_choice_is_ignored() -> None:
+    """Verify the reverse direction: flex source, sdpa target."""
+    source = _config(packed_attention="flex")
+    target = _config(packed_attention="sdpa")
+    validate_initialization_config(source, target)
+
+
 def test_active_canon_position_order_is_semantically_equivalent() -> None:
     a = _config(canon_enabled=True, canon_positions=["A", "C"], canon_kernel_sizes=3)
     b = _config(canon_enabled=True, canon_positions=["C", "A"], canon_kernel_sizes=[3, 3, 3])

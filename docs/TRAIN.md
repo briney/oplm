@@ -618,11 +618,21 @@ this).
 
 Costs and limits:
 
-- Attention gets a dense block-diagonal `(rows, 1, T, T)` mask instead of a
-  key-padding mask. (FlashAttention is out either way: it takes no mask at all.)
-  If cuDNN's attention does not accept that mask, PyTorch falls back to the
-  memory-efficient backend for packed batches. If the result is slower than the
-  padding saved, turn packing off: the off path is unchanged.
+- With the default `model.packed_attention: sdpa`, attention gets a dense block-diagonal
+  `(rows, 1, T, T)` mask instead of a key-padding mask, and computes every score of a row: its
+  cost grows with the row width, not with the sequences' lengths. (FlashAttention is out
+  either way: it takes no mask at all.) If the result is slower than the padding saved, turn
+  packing off: the off path is unchanged.
+- `model.packed_attention: flex` runs packed batches through FlexAttention with a block mask
+  built once per forward from `segment_ids`, skipping every 128×128 block between sequences.
+  The intent is that attention cost follows each sequence's own length, so wide rows (2048)
+  cost about what narrow ones do; `docs/perf/attention_width_bench.py` measures that against
+  `sdpa` by row width, and `docs/perf/packing_check.py` checks its numbers against padded rows
+  at the bf16 floor. It is fast only under `train.compile` (the trainer warns on CUDA without
+  it), has no attention dropout, and has no backward on CPU (the tests enable PyTorch's
+  reference backward to check its gradients against `sdpa`). With sequence-count packing, rows
+  and width vary per batch, so a compiled run with `train.compile_dynamic: false` recompiles
+  flex for every new shape; the default `compile_dynamic: true` avoids that.
 - It is incompatible with `model.mask_dropout`, which rescales by each row's
   masked fraction. The loader refuses that combination.
 - Evaluation batches are never packed, so eval numbers stay comparable.

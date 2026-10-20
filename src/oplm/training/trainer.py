@@ -729,6 +729,11 @@ class Trainer:
                     self.model, dynamic=cfg.train.compile_dynamic, mode=cfg.train.compile_mode
                 ),
             )
+        elif cfg.model.packed_attention == "flex" and self.accelerator.device.type == "cuda":
+            logger.warning(
+                "model.packed_attention='flex' without train.compile: FlexAttention runs "
+                "unfused and materializes the full scores matrix. Set train.compile=true."
+            )
         self.optimizers = list(prepared[1 : 1 + num_optimizers])
         self.optimizer = self.optimizers[0]
         self.dataloader = DeviceDataLoader(dataloader, self.accelerator.device)

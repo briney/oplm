@@ -141,3 +141,18 @@ def test_sac_peak_memory_between_none_and_full() -> None:
     slack = 1.05
     assert peak_full <= peak_selective * slack
     assert peak_selective <= peak_none * slack
+
+
+def test_selective_policy_saves_attention_kernels() -> None:
+    """FlexAttention (a higher-order op) and the cuDNN SDPA overload must be MUST_SAVE, or
+    selective checkpointing re-runs every layer's attention in backward."""
+    from torch.utils.checkpoint import CheckpointPolicy
+
+    from oplm.model.transformer import _sac_policy_fn
+
+    ops = [torch.ops.higher_order.flex_attention]
+    cudnn = getattr(torch.ops.aten, "_scaled_dot_product_cudnn_attention", None)
+    if cudnn is not None:
+        ops.append(cudnn.default)
+    for op in ops:
+        assert _sac_policy_fn(None, op) is CheckpointPolicy.MUST_SAVE, op

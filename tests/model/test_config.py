@@ -484,3 +484,28 @@ def test_save_pretrained_writes_token_ids(tmp_path: Path):
     assert on_disk["pad_token_id"] == 1
     assert on_disk["bos_token_id"] == 0
     assert on_disk["eos_token_id"] == 2
+
+
+def test_packed_attention_defaults_to_sdpa() -> None:
+    assert OplmConfig().packed_attention == "sdpa"
+
+
+def test_packed_attention_defaults_to_sdpa_for_old_configs() -> None:
+    saved = OplmConfig().to_dict()
+    del saved["packed_attention"]  # an hf/config.json written before the field existed
+    assert OplmConfig.from_dict(saved).packed_attention == "sdpa"
+
+
+def test_packed_attention_flex_round_trips() -> None:
+    cfg = OplmConfig(packed_attention="flex")
+    assert OplmConfig.from_dict(cfg.to_dict()).packed_attention == "flex"
+
+
+def test_packed_attention_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="packed_attention must be one of"):
+        OplmConfig(packed_attention="flash")
+
+
+def test_packed_attention_flex_rejects_attention_dropout() -> None:
+    with pytest.raises(ValueError, match="no attention dropout"):
+        OplmConfig(packed_attention="flex", attention_dropout=0.1)

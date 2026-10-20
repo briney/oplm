@@ -37,6 +37,7 @@ _VALID_CANON_ACTIVATIONS = ("none", "silu", "gelu")
 _VALID_CLASSIFIER_POOLS = ("mean", "cls")
 _VALID_CANON_POSITIONS = frozenset({"A", "B", "C", "D"})
 _VALID_GRADIENT_CHECKPOINTING_MODES = ("full", "selective")
+_VALID_PACKED_ATTENTIONS = ("sdpa", "flex")
 
 _DEFAULT_VOCAB_SIZE = 33
 
@@ -88,6 +89,7 @@ class OplmConfig(PretrainedConfig):
         ffn_bias: bool = False,
         attention_dropout: float = 0.0,
         hidden_dropout: float = 0.0,
+        packed_attention: str = "sdpa",
         tie_word_embeddings: bool = False,
         mlm_head_activation: str = "gelu",
         canon_enabled: bool = False,
@@ -153,6 +155,7 @@ class OplmConfig(PretrainedConfig):
         self.ffn_bias = bool(ffn_bias)
         self.attention_dropout = float(attention_dropout)
         self.hidden_dropout = float(hidden_dropout)
+        self.packed_attention = str(packed_attention)
         self.mlm_head_activation = mlm_head_activation
         self.canon_enabled = bool(canon_enabled)
         self.canon_residual = bool(canon_residual)
@@ -338,6 +341,16 @@ class OplmConfig(PretrainedConfig):
                 f"gradient_checkpointing_mode must be one of "
                 f"{_VALID_GRADIENT_CHECKPOINTING_MODES}; "
                 f"got {self.gradient_checkpointing_mode!r}."
+            )
+        if self.packed_attention not in _VALID_PACKED_ATTENTIONS:
+            raise ValueError(
+                f"packed_attention must be one of {_VALID_PACKED_ATTENTIONS}; "
+                f"got {self.packed_attention!r}."
+            )
+        if self.packed_attention == "flex" and self.attention_dropout > 0:
+            raise ValueError(
+                "packed_attention='flex' has no attention dropout; set attention_dropout=0.0 "
+                f"(got {self.attention_dropout}) or use packed_attention='sdpa'."
             )
 
         if self.mup_base_width < 1:

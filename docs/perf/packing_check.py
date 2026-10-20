@@ -10,6 +10,8 @@ logits at every real token, each sequence's masked-token loss, and the parameter
   cudnn      packed vs padded, attention forced to cuDNN in both (the eager training path)
   efficient  packed vs padded, packed attention forced to the memory-efficient kernel
   compiled   compiled packed vs eager packed (the trainer's torch.compile settings)
+  flex       compiled packed rows through FlexAttention (model.packed_attention="flex") vs
+             padded rows through cuDNN
   floor      padded bf16 vs padded fp32: how far bf16 alone moves the same numbers
 
 A masking bug shows up far above the floor (a leak between sequences moves logits by about
@@ -115,12 +117,17 @@ def main() -> None:
     print(torch.__version__, torch.cuda.get_device_name())
     cfg = load_config(["--config", str(args.checkpoint / "config.yaml")])
     model = OplmForMaskedLM.from_pretrained(args.checkpoint / "hf").cuda().train()
+    # The cudnn/efficient/compiled modes are about the dense-mask path whatever the checkpoint
+    # was trained with; only the flex run switches kernels (and restores this).
+    model.config.packed_attention = "sdpa"
     # Training checkpoints activations (a padded batch does not fit a B200 without it). Neither
     # saved config records that: transformers deletes the flag from the config it builds with.
     model.gradient_checkpointing_enable()
     print(f"activation checkpointing: {model.oplm.backbone.layers[0].gradient_checkpointing}")
     params = list(model.parameters())
-    compiled = compile_like_trainer(model, cfg, ddp=False)
+    # The trainer compiles the DDP-wrapped model; DDPOptimizer splits the graph even at world
+    # size 1, so flex's backward across those split points is exercised here too.
+    compiled = compile_like_trainer(model, cfg, ddp=True)
     size = cfg.train.batch_size
     kwargs = dict(
         max_length=cfg.model.max_position_embeddings,
@@ -146,6 +153,13 @@ def main() -> None:
             pack_efficient = run(model, params, pack)
         pad_fp32 = run(model, params, pad, fp32=True)
         pack_compiled = run(compiled, params, pack)
+        # Same compiled module, other kernel: OplmStack reads packed_attention per forward
+        # (Dynamo recompiles once for the changed attribute).
+        model.config.packed_attention = "flex"
+        try:
+            pack_flex = run(compiled, params, pack)
+        finally:
+            model.config.packed_attention = "sdpa"
         print(
             f"batch {i}: {size} sequences, padded {tuple(pad['input_ids'].shape)}, "
             f"packed {tuple(pack['input_ids'].shape)}, "
@@ -155,6 +169,7 @@ def main() -> None:
             ("cudnn", pad_bf16, pack_cudnn),
             ("efficient", pad_bf16, pack_efficient),
             ("compiled", pack_cudnn, pack_compiled),
+            ("flex", pad_bf16, pack_flex),
             ("floor", pad_fp32, pad_bf16),
         ):
             for key, value in compare(ref, got).items():
@@ -167,7 +182,7 @@ def main() -> None:
     for name, row in worst.items():
         print(f"{name:10s}" + "".join(f"{row[k]:14.3e}" for k in keys))
     floor = worst["floor"]
-    for name in ("cudnn", "efficient", "compiled"):
+    for name in ("cudnn", "efficient", "compiled", "flex"):
         ratio = max(worst[name][k] / floor[k] for k in ("logits_rel", "grad_rel", "seq_loss_max"))
         verdict = "PASS" if ratio <= 2 else "CHECK"
         print(f"{name}: {verdict} (worst difference = {ratio:.2f}x the bf16 floor)")

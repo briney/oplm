@@ -259,7 +259,8 @@ def compile_like_trainer(model: nn.Module, cfg: OplmConfig, *, ddp: bool) -> nn.
 
     The trainer compiles the DDP-wrapped model (``torch.compile(model, dynamic=...,
     mode=...)``), and Dynamo splits a DDP module's graph at gradient-bucket boundaries. With
-    ``ddp`` this sets up a single-process group so the compiled graph has that structure too.
+    ``ddp`` this sets up a single-process group (once: a group that already exists is reused,
+    so callers can wrap repeatedly) so the compiled graph has that structure too.
     """
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
@@ -268,16 +269,17 @@ def compile_like_trainer(model: nn.Module, cfg: OplmConfig, *, ddp: bool) -> nn.
     if ddp:
         import socket
 
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
         device = next(model.parameters()).device
-        dist.init_process_group(
-            "nccl" if device.type == "cuda" else "gloo",
-            init_method=f"tcp://127.0.0.1:{port}",
-            rank=0,
-            world_size=1,
-        )
+        if not dist.is_initialized():
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            dist.init_process_group(
+                "nccl" if device.type == "cuda" else "gloo",
+                init_method=f"tcp://127.0.0.1:{port}",
+                rank=0,
+                world_size=1,
+            )
         target = DistributedDataParallel(
             model, device_ids=[device.index] if device.type == "cuda" else None
         )

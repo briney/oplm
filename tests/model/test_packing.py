@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.attention.flex_attention as flex_mod
 
+import oplm.model.transformer as transformer_mod
 from oplm import OplmConfig, OplmForMaskedLM
 from oplm.model.masking import segment_attention_mask
 
@@ -18,7 +20,9 @@ def test_segment_mask_is_block_diagonal_with_no_empty_rows() -> None:
     assert mask[7].tolist() == [False] * 6 + [True, True]
 
 
-def _model(checkpointing: str | None) -> OplmForMaskedLM:
+def _model(
+    checkpointing: str | None, packed_attention: str = "sdpa", num_loops: int = 1
+) -> OplmForMaskedLM:
     torch.manual_seed(0)
     cfg = OplmConfig(
         hidden_size=32,
@@ -34,6 +38,8 @@ def _model(checkpointing: str | None) -> OplmForMaskedLM:
         canon_enabled=True,
         canon_positions=["A", "B", "C", "D"],
         canon_kernel_sizes=[3, 4, 7],  # odd and even kernels, one wider than a sequence
+        packed_attention=packed_attention,
+        num_loops=num_loops,
     )
     model = OplmForMaskedLM(cfg)
     if checkpointing is not None:
@@ -112,3 +118,160 @@ def test_without_segment_ids_a_single_sequence_row_is_unchanged() -> None:
         got = model(**padded, segment_ids=seg).logits
     mask = padded["attention_mask"].bool()
     torch.testing.assert_close(got[mask], ref[mask], rtol=1e-5, atol=1e-6)
+
+
+def _spy_flex_kernel(monkeypatch: pytest.MonkeyPatch) -> list[tuple[torch.dtype, ...]]:
+    """Record the q/k/v dtypes of every real FlexAttention kernel call (one per block).
+
+    Parity alone cannot tell flex from a silent SDPA fallback: both compute the same thing.
+    """
+    calls: list[tuple[torch.dtype, ...]] = []
+    real = flex_mod.flex_attention
+
+    def spy(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        calls.append((q.dtype, k.dtype, v.dtype))
+        return real(q, k, v, *args, **kwargs)
+
+    monkeypatch.setattr(flex_mod, "flex_attention", spy)
+    return calls
+
+
+@pytest.mark.parametrize("checkpointing", [None, "full", "selective"])
+def test_flex_packed_logits_match_sdpa(
+    checkpointing: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same weights, same packed batch: flex and the dense-mask SDPA path agree (forward only:
+    FlexAttention has no CPU backward). Train mode so checkpointing wraps each block. The spy
+    proves the flex kernel really ran (once per block) through each checkpointing wrapper."""
+    calls = _spy_flex_kernel(monkeypatch)
+    _, packed = _batches()
+    with torch.no_grad():
+        ref = _model(checkpointing, "sdpa")(**packed).logits
+        assert calls == []
+        flex_model = _model(checkpointing, "flex")
+        got = flex_model(**packed).logits
+    assert len(calls) == flex_model.config.num_hidden_layers
+    mask = packed["attention_mask"].bool()
+    torch.testing.assert_close(got[mask], ref[mask], rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("checkpointing", [None, "full", "selective"])
+def test_flex_packed_gradients_match_sdpa(
+    checkpointing: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same weights, same packed batch: every parameter gradient through flex matches the
+    dense-mask SDPA path, through each checkpointing wrapper (so a dropped block mask or a
+    broken recompute in backward shows up here)."""
+    # FlexAttention has no CPU backward: the public wrapper refuses it via this private torch
+    # function, though the reference (math) backward runs once it is a no-op. Skip, rather than
+    # silently pass, if a torch upgrade removes it.
+    if not hasattr(flex_mod, "_validate_device"):
+        pytest.skip("torch.nn.attention.flex_attention._validate_device is gone")
+    monkeypatch.setattr(flex_mod, "_validate_device", lambda *args, **kwargs: None)
+    calls = _spy_flex_kernel(monkeypatch)
+    _, packed = _batches()
+    grads = []
+    for backend in ("sdpa", "flex"):
+        model = _model(checkpointing, backend)
+        model(**packed).loss.backward()
+        grads.append({n: p.grad for n, p in model.named_parameters() if p.grad is not None})
+    # One call per block in the forward, and again per block when backward recomputes it.
+    assert len(calls) == model.config.num_hidden_layers * (1 if checkpointing is None else 2)
+    assert grads[0].keys() == grads[1].keys()
+    for name, ref in grads[0].items():
+        torch.testing.assert_close(grads[1][name], ref, rtol=1e-4, atol=1e-6, msg=name)
+
+
+def test_flex_packed_logits_match_padded_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _spy_flex_kernel(monkeypatch)
+    padded, packed = _batches()
+    model = _model(None, "flex").eval()
+    with torch.no_grad():
+        ref = model(**padded).logits
+        assert calls == []  # no segment_ids: the padded batch never takes the flex path
+        out = model(**packed).logits
+    assert len(calls) == model.config.num_hidden_layers
+    for row, got in enumerate(_unpack(out)):
+        torch.testing.assert_close(got, ref[row, : LENGTHS[row]], rtol=1e-4, atol=1e-5)
+
+
+def _count_block_masks(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls = [0]
+    real = transformer_mod.segment_block_mask
+
+    def counting(segment_ids: torch.Tensor):  # noqa: ANN202 — returns BlockMask
+        calls[0] += 1
+        return real(segment_ids)
+
+    monkeypatch.setattr(transformer_mod, "segment_block_mask", counting)
+    return calls
+
+
+def test_flex_block_mask_is_built_once_per_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _count_block_masks(monkeypatch)
+    _, packed = _batches()
+    with torch.no_grad():
+        _model(None, "flex").eval()(**packed)  # 3 layers
+    assert calls[0] == 1
+
+
+def test_flex_switched_on_a_live_looped_model_builds_one_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kernel is read from the live config per forward (docs/perf/packing_check.py flips it
+    on a compiled model): one block mask per forward, one flex call per executed layer, which
+    with looping is more than the number of physical blocks."""
+    masks = _count_block_masks(monkeypatch)
+    flex_calls = _spy_flex_kernel(monkeypatch)
+    _, packed = _batches()
+    model = _model(None, "sdpa", num_loops=2).eval()
+    with torch.no_grad():
+        model(**packed)
+        assert masks[0] == 0 and flex_calls == []
+        model.config.packed_attention = "flex"
+        model(**packed)
+    depth = len(model.oplm.backbone.layer_execution_order)
+    assert depth == 2 * model.config.num_hidden_layers
+    assert masks[0] == 1
+    assert len(flex_calls) == depth
+
+
+def test_flex_config_without_segment_ids_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _count_block_masks(monkeypatch)
+    flex_calls = _spy_flex_kernel(monkeypatch)
+    padded, _ = _batches()
+    with torch.no_grad():
+        ref = _model(None, "sdpa").eval()(**padded).logits
+        got = _model(None, "flex").eval()(**padded).logits
+    assert calls[0] == 0
+    assert flex_calls == []
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+
+def test_flex_config_keeps_manual_path_for_attention_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _count_block_masks(monkeypatch)
+    flex_calls = _spy_flex_kernel(monkeypatch)
+    _, packed = _batches()
+    with torch.no_grad():
+        out = _model(None, "flex").eval()(**packed, output_attentions=True)
+    assert calls[0] == 0
+    assert flex_calls == []
+    assert out.attentions is not None and all(a is not None for a in out.attentions)
+
+
+def test_flex_matches_sdpa_under_bf16_autocast(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Channel QK-norm returns fp32 q/k under autocast while v is bf16; flex must cast like SDPA."""
+    calls = _spy_flex_kernel(monkeypatch)
+    _, packed = _batches()
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        ref = _model(None, "sdpa").eval()(**packed).logits
+        assert calls == []
+        flex_model = _model(None, "flex").eval()
+        got = flex_model(**packed).logits
+    # The kernel ran once per block and saw q, k and v all cast to bf16.
+    assert calls == [(torch.bfloat16,) * 3] * flex_model.config.num_hidden_layers
+    mask = packed["attention_mask"].bool()
+    assert torch.isfinite(got[mask]).all()
+    torch.testing.assert_close(got[mask], ref[mask], rtol=5e-2, atol=5e-2)

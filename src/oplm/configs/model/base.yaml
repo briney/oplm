@@ -51,6 +51,10 @@ model:
   attention_dropout: 0.0
   hidden_dropout: 0.0
 
+  # Attention kernel for packed batches (data.pack_sequences): sdpa (dense block-diagonal mask,
+  # cost grows with row width) | flex (FlexAttention block mask, skips blocks between sequences)
+  packed_attention: sdpa
+
   # Embeddings / head
   tie_word_embeddings: false
   mlm_head_activation: gelu # gelu | silu | relu

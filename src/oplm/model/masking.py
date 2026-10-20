@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
-__all__ = ["prepare_attention_mask", "segment_attention_mask", "zero_pad_positions"]
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
+
+__all__ = [
+    "prepare_attention_mask",
+    "segment_attention_mask",
+    "segment_block_mask",
+    "zero_pad_positions",
+]
 
 
 def segment_attention_mask(segment_ids: torch.Tensor) -> torch.Tensor:
@@ -16,6 +26,25 @@ def segment_attention_mask(segment_ids: torch.Tensor) -> torch.Tensor:
     attention scores depend only on query-key offsets, which never cross a segment.
     """
     return (segment_ids[:, :, None] == segment_ids[:, None, :])[:, None]
+
+
+def segment_block_mask(segment_ids: torch.Tensor) -> BlockMask:
+    """FlexAttention block mask for a packed batch: each token attends only within its segment.
+
+    The same pattern as :func:`segment_attention_mask`, as a block-sparse mask that lets
+    FlexAttention skip every 128x128 block between different sequences, so attention cost follows
+    the sequences' own lengths rather than the row width. Pads (segment 0) attend only to each
+    other, so no query row is empty.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def same_segment(b, h, q_idx, kv_idx):  # noqa: ANN001, ANN202 — FlexAttention mask_mod
+        return segment_ids[b, q_idx] == segment_ids[b, kv_idx]
+
+    rows, width = segment_ids.shape
+    return create_block_mask(
+        same_segment, B=rows, H=None, Q_LEN=width, KV_LEN=width, device=segment_ids.device
+    )
 
 
 def prepare_attention_mask(
