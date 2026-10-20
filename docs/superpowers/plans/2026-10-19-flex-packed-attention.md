@@ -18,7 +18,7 @@
 - `"flex"` with `attention_dropout > 0` is a config error (FlexAttention has no dropout).
 - The block mask is built **once per forward**, not once per layer.
 - Unchanged paths: `output_attentions=True` (manual), batches without `segment_ids` (eval), `"sdpa"`.
-- FlexAttention has **no backward on CPU** in torch 2.11 (verified: `NotImplementedError: FlexAttention does not support backward on CPU`). CPU tests check forward only; gradient parity is checked on GPU by `packing_check.py` (Task 3).
+- FlexAttention has **no backward on CPU** in torch 2.11 (verified: `NotImplementedError: FlexAttention does not support backward on CPU`). CPU tests check forward only; gradient parity is checked on GPU by `packing_check.py` (Task 3). (Final review: the error comes only from the public wrapper's `_validate_device`; with that patched to a no-op the reference backward runs on CPU, so `test_flex_packed_gradients_match_sdpa` also checks gradients against `sdpa` in fp32, through each checkpointing mode.)
 - Comments and docstrings match the surrounding code's density; commit messages use the repo's `type(scope): summary` style and end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Review Focus
@@ -26,7 +26,7 @@
 1. **bf16 autocast with mixed q/k/v dtypes.** Under autocast, channel QK-norm (LayerNorm) returns fp32 q/k while v is bf16; SDPA's autocast casts all three, FlexAttention does not. Expect flex to cast q/k/v to the autocast dtype and match SDPA to bf16 tolerance. Pinned by `test_flex_matches_sdpa_under_bf16_autocast` (Task 2).
 2. **`output_attentions=True` with flex configured.** Expect the manual path (weights returned) and no block mask built. Pinned by `test_flex_config_keeps_manual_path_for_attention_weights` (Task 2).
 3. **Padded batch (no `segment_ids`) with flex configured.** Expect output identical to `"sdpa"` and no block mask built. Pinned by `test_flex_config_without_segment_ids_is_unchanged` (Task 2).
-4. **Activation checkpointing (full and selective) with flex.** The block mask must survive the `torch_checkpoint.checkpoint` argument list. Pinned by parametrizing `test_flex_packed_logits_match_sdpa` over checkpointing modes (Task 2); backward on GPU by Task 3.
+4. **Activation checkpointing (full and selective) with flex.** The block mask must survive the `torch_checkpoint.checkpoint` argument list. Pinned by parametrizing `test_flex_packed_logits_match_sdpa` over checkpointing modes (Task 2); backward on GPU by Task 3 and on CPU by `test_flex_packed_gradients_match_sdpa`.
 5. **Configs saved before this change** (`hf/config.json` without `packed_attention`) load as `"sdpa"`. Pinned by `test_packed_attention_defaults_to_sdpa_for_old_configs` (Task 1).
 
 ---
