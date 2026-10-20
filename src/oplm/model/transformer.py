@@ -44,11 +44,11 @@ except ImportError:  # torch < 2.4
 # RoPE, softmax, dropout, residual scaling, reshapes) is recomputed to free
 # memory. See docs/TRAIN.md for the memory/compute tradeoff rationale.
 def _build_sac_save_ops() -> frozenset:
-    """Collect the aten overloads SAC keeps in memory (matmuls + SDPA backends).
+    """Collect the ops SAC keeps in memory (matmuls, SDPA backends, FlexAttention).
 
-    Built lazily through getattr so a missing SDPA overload on an older torch
-    simply drops out of the set (those ops then fall to PREFER_RECOMPUTE) rather
-    than raising at import time.
+    Built lazily through getattr so a missing SDPA overload (or a torch without
+    FlexAttention's higher-order op) simply drops out of the set (those ops then
+    fall to PREFER_RECOMPUTE) rather than raising at import time.
     """
     aten = torch.ops.aten
     candidates = (
@@ -57,6 +57,7 @@ def _build_sac_save_ops() -> frozenset:
         "bmm",  # batched matmul (manual-attention path)
         "_scaled_dot_product_efficient_attention",
         "_scaled_dot_product_flash_attention",
+        "_scaled_dot_product_cudnn_attention",
         "_scaled_dot_product_attention_math",  # CPU / math backend
     )
     ops = set()
@@ -64,6 +65,11 @@ def _build_sac_save_ops() -> frozenset:
         overload_packet = getattr(aten, name, None)
         if overload_packet is not None:
             ops.add(overload_packet.default)
+    # FlexAttention runs as a higher-order op, not an aten overload: without it here every
+    # layer's attention is recomputed in backward (torchtitan's SAC list adds it the same way).
+    flex = getattr(torch.ops.higher_order, "flex_attention", None)
+    if flex is not None:
+        ops.add(flex)
     return frozenset(ops)
 
 
@@ -71,7 +77,7 @@ _SAC_SAVE_OPS = _build_sac_save_ops()
 
 
 def _sac_policy_fn(ctx, op, *args, **kwargs):
-    """SAC policy: keep matmul/SDPA outputs, recompute everything else.
+    """SAC policy: keep matmul/attention-kernel outputs, recompute everything else.
 
     Defined at module level (not a per-call closure) so torch.compile/Dynamo can
     trace it as a constant global when composed with the checkpoint higher-order
