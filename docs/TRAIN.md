@@ -651,10 +651,12 @@ than `batch_size × max_position_embeddings` once packed. Token mode fixes the t
   `tokens_per_step` therefore works at any node count and model size.
 - Each data worker fills `rows` rows first-fit in stream order and closes a batch at the first
   sequence that fits nowhere; that sequence starts the next batch. Batches are exactly
-  `(rows, width)`, so shapes never change, and real tokens are 97–99% of capacity
-  (`train/batch_fill`). Masking is unchanged.
+  `(rows, width)`, so shapes never change. In simulation, real tokens fill about 97–99% of capacity
+  for 2048-wide rows (more with more rows per GPU) and less for narrow, few-row shapes; `train/batch_fill`
+  reports the actual value. Masking is unchanged.
 - Each GPU rolls over to its next epoch on its own, since sequences per batch vary.
-  `train/epoch` is rank 0's.
+  `train/epoch` stays the global fractional epoch (samples seen across all GPUs over the dataset size);
+  the integer epoch saved in checkpoint state is rank 0's.
 - Resume is data-exact per worker: the checkpoint cursor records each rank's epoch and the rows
   each worker had emitted. Only the world size, worker count and seed must match, so
   `tokens_per_step` and `batch_tokens` can change at a resume or branch without losing the
