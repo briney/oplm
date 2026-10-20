@@ -47,6 +47,7 @@ Every field, its type, and its default (`SlurmConfig` in `src/oplm/slurm/config.
 | `time_limit` | scalar or table | *required* | Wall-clock limit(s). Four accepted forms — §3. |
 | `nodes` | scalar or table | *required* | Node count(s). Same four forms — §3. |
 | `max_batch_size` | map of preset → int | `{}` | Per-preset memory cap on per-device batch, consumed by the batch-plan derivation (§4). |
+| `max_batch_tokens` | map of preset → int | `{}` | Per-preset memory cap on a device's token micro-batch, consumed by the token-mode plan (`resolve_token_plan`, §4). Only token-mode sweeps and token-mode `scale` read it. |
 | `log_dir` | path | *required* | Directory for `--output`/`--error` logs. |
 | `env_file` | path | *required* | Shell script `source`d at job start; creates the job's node-local `$JOB_WORK_DIR` and exports object-storage / W&B credentials. |
 | `container_image` | path | *required* | Enroot/Pyxis `.sqsh` container image (`--container-image`). |
@@ -175,6 +176,14 @@ sets its own per-device batch directly, the ordinary way (see [TRAIN.md](TRAIN.m
 uses to plan `train.batch_size`/`train.gradient_accumulation_steps` *before* writing each job's
 config — the μP sweep's phase generator is the current example (see [LR_SWEEP.md](LR_SWEEP.md));
 both fields are part of the general schema so any similar tool can reuse the same derivation.
+
+`oplm.slurm.config.resolve_token_plan(*, global_tokens, world_size, max_batch_tokens, width)` is
+the token-mode counterpart (`train.tokens_per_step` / `train.batch_tokens`; see TRAIN.md
+"Token-budget batching"). A device's micro-batch is a whole number of `width`-token rows
+(`model.max_position_embeddings`). The budget must split into whole rows per replica, and the
+smallest accumulation that keeps a device at or under `max_batch_tokens` wins. For example,
+4,194,304 tokens over 32 GPUs at width 2048 with a 65,536 cap gives `batch_tokens=65536`,
+accumulation 2.
 
 ---
 
