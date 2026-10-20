@@ -41,7 +41,7 @@ _IGNORE_INDEX = -100
 # Per-residue masking-weight field carried on row dicts (see dataset.py).
 _WEIGHTS_KEY = "masking_weights"
 
-__all__ = ["MLMCollator", "tokenize_and_pad"]
+__all__ = ["MLMCollator", "RowFiller", "first_fit", "token_length", "tokenize_and_pad"]
 
 
 def _sequence_of(item: Mapping[str, object] | str) -> str:
@@ -152,6 +152,39 @@ def tokenize_and_pad(
     return out
 
 
+class RowFiller:
+    """First-fit placement of token lengths, in order, into ``rows`` rows of ``width`` tokens.
+
+    The token batcher (:class:`~oplm.data.sequence.batching.TokenBatcher`) and the collator's
+    fixed-shape packing both place sequences through this class, so they cannot disagree about
+    where a batch closes or which row a sequence lands in.
+    """
+
+    def __init__(self, rows: int, width: int) -> None:
+        self._free = [width] * rows
+        self.placement: list[int] = []
+
+    def place(self, length: int) -> bool:
+        """Put ``length`` in the first row with room; return ``False``, placing nothing, if none."""
+        for row, room in enumerate(self._free):
+            if length <= room:
+                self._free[row] -= length
+                self.placement.append(row)
+                return True
+        return False
+
+
+def first_fit(lengths: Sequence[int], rows: int, width: int) -> list[int] | None:
+    """Each length's row under :class:`RowFiller`, or ``None`` if one fits in no row."""
+    filler = RowFiller(rows, width)
+    return filler.placement if all(filler.place(n) for n in lengths) else None
+
+
+def token_length(sequence: str, width: int) -> int:
+    """Tokens a sequence takes in a row of ``width``: up to ``width - 2`` residues + 2 specials."""
+    return min(len(sequence), width - 2) + 2
+
+
 class MLMCollator:
     """Masked-language-model collator: tokenize/pad, then mask.
 
@@ -187,14 +220,20 @@ class MLMCollator:
             tooling that need to trace which rows a dataloader actually served
             (e.g. the double-sharding verification test) rather than by training.
         pack_sequences: After masking, pack the batch's sequences back to back into as
-            few rows of at most ``max_length`` tokens as first-fit-decreasing finds, and
-            add ``"segment_ids"`` ``(rows, T)`` (``1..n`` per sequence in a row, ``0`` at
-            pads) and ``"num_sequences"`` (a plain ``int``, the batch size before packing).
-            Masks and labels are those the unpacked batch would get.
+            few rows of at most ``max_length`` tokens as first-fit-decreasing finds (or
+            exactly ``pack_rows`` rows, see below), and add ``"segment_ids"`` ``(rows, T)``
+            (``1..n`` per sequence in a row, ``0`` at pads) and ``"num_sequences"`` (a plain
+            ``int``, the batch size before packing). Masks and labels are those the
+            unpacked batch would get.
+        pack_rows: With ``pack_sequences``: pack into exactly this many rows of
+            ``max_length`` (token mode), laid out by :func:`first_fit` in input order;
+            raises if the sequences do not fit. ``None`` keeps first-fit-decreasing into
+            as few rows as needed.
 
     Raises:
-        ValueError: If any probability is outside ``[0, 1]`` or
-            ``mask_token_prob + random_token_prob > 1``.
+        ValueError: If any probability is outside ``[0, 1]``,
+            ``mask_token_prob + random_token_prob > 1``, or ``pack_rows`` is set without
+            ``pack_sequences`` or below 1.
     """
 
     def __init__(
@@ -211,8 +250,13 @@ class MLMCollator:
         pad_to_multiple_of: int | None = None,
         keep_sequence_ids: bool = False,
         pack_sequences: bool = False,
+        pack_rows: int | None = None,
     ) -> None:
         _validate_probs(mask_prob, mask_token_prob, random_token_prob)
+        if pack_rows is not None and (not pack_sequences or pack_rows < 1):
+            raise ValueError(
+                f"pack_rows requires pack_sequences=True and pack_rows >= 1, got {pack_rows}"
+            )
         self._tokenizer = tokenizer
         self._max_length = max_length
         self._mask_prob = mask_prob
@@ -224,6 +268,7 @@ class MLMCollator:
         self._pad_to_multiple_of = pad_to_multiple_of
         self._keep_sequence_ids = keep_sequence_ids
         self._pack_sequences = pack_sequences
+        self._pack_rows = pack_rows
 
         # Derived id constants (computed once from the tokenizer, never hardcoded).
         self._mask_token_id = mask_token_id(tokenizer)
@@ -274,6 +319,13 @@ class MLMCollator:
             "labels": labels,
         }
         if self._pack_sequences:
+            if self._pack_rows is not None:
+                expected = [token_length(_sequence_of(item), self._max_length) for item in batch]
+                if attention_mask.sum(1).tolist() != expected:
+                    raise ValueError(
+                        "tokenized lengths differ from token_length(); the token batcher's "
+                        "placement no longer matches the batch"
+                    )
             out = self._pack(input_ids, attention_mask, labels)
         if self._keep_sequence_ids:
             out["sequence_ids"] = self._collect_sequence_ids(batch)
@@ -282,21 +334,39 @@ class MLMCollator:
     def _pack(
         self, input_ids: Tensor, attention_mask: Tensor, labels: Tensor
     ) -> dict[str, Tensor | list[str] | int]:
-        """Pack right-padded rows back to back into rows of at most ``max_length`` tokens."""
+        """Pack right-padded rows back to back into rows of at most ``max_length`` tokens.
+
+        Without ``pack_rows``: first-fit-decreasing into as few rows as needed, trimmed to
+        the longest row. With it: :func:`first_fit` in input order into exactly
+        ``(pack_rows, max_length)``.
+        """
         lengths = attention_mask.sum(1).tolist()
-        rows: list[list[int]] = []  # batch indices per packed row
-        free: list[int] = []
-        for i in sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True):
-            fit = next((r for r, room in enumerate(free) if lengths[i] <= room), None)
-            if fit is None:
-                rows.append([i])
-                free.append(self._max_length - lengths[i])
-            else:
-                rows[fit].append(i)
-                free[fit] -= lengths[i]
-        width = self._max_length - min(free)
-        if self._pad_to_multiple_of:
-            width = -(-width // self._pad_to_multiple_of) * self._pad_to_multiple_of
+        rows: list[list[int]]  # batch indices per packed row
+        if self._pack_rows is not None:
+            placement = first_fit(lengths, self._pack_rows, self._max_length)
+            if placement is None:
+                raise ValueError(
+                    f"{len(lengths)} sequences ({sum(lengths)} tokens) do not fit "
+                    f"{self._pack_rows} rows of {self._max_length}"
+                )
+            rows = [
+                [i for i, r in enumerate(placement) if r == row] for row in range(self._pack_rows)
+            ]
+            width = self._max_length
+        else:
+            rows = []
+            free: list[int] = []
+            for i in sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True):
+                fit = next((r for r, room in enumerate(free) if lengths[i] <= room), None)
+                if fit is None:
+                    rows.append([i])
+                    free.append(self._max_length - lengths[i])
+                else:
+                    rows[fit].append(i)
+                    free[fit] -= lengths[i]
+            width = self._max_length - min(free)
+            if self._pad_to_multiple_of:
+                width = -(-width // self._pad_to_multiple_of) * self._pad_to_multiple_of
         shape = (len(rows), width)
         packed = {
             "input_ids": input_ids.new_full(shape, self._pad_token_id),

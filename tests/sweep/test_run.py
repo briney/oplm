@@ -40,6 +40,7 @@ def test_mup_run_writes_validation_result(training_parquet: Path, tmp_path: Path
     payload = json.loads(result_json.read_text())
     assert payload["steps"] == 2
     assert payload["global_batch"] == 4
+    assert payload["global_batch_unit"] == "sequences"
     assert payload["eval"]["eval/heldout/loss"] > 0
     assert payload["oplm_version"] == version("oplm")
 

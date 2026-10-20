@@ -253,8 +253,8 @@ class SweepMetricsCallback(TrainerCallback):
     ``trainer_state.json`` carries no loss, so the LR sweep relies on this
     callback. It EMA-smooths the train loss across ``on_log`` events, keeps the
     last value per ``eval/*`` key from ``on_eval_end``, and writes
-    ``{final_train_loss, eval, lr, width, steps, global_batch, oplm_version}``
-    on ``on_train_end``.
+    ``{final_train_loss, eval, lr, width, steps, global_batch, global_batch_unit,
+    oplm_version}`` on ``on_train_end``.
     """
 
     def __init__(self, path: str | Path, *, ema_decay: float = 0.9) -> None:
@@ -279,14 +279,12 @@ class SweepMetricsCallback(TrainerCallback):
                 self._eval[key] = float(value)
 
     def on_train_end(self, trainer: Trainer) -> None:
-        # Record the global batch (batch_size × grad_accum × num_processes) for
-        # provenance: μP transfers LR across width *at a fixed batch*, so a sweep
-        # is only valid if every width shared one batch — this makes that auditable.
-        global_batch = int(
-            trainer.cfg.train.batch_size
-            * trainer.cfg.train.gradient_accumulation_steps
-            * trainer.accelerator.num_processes
-        )
+        # Record the global batch for provenance: μP transfers LR across width *at a
+        # fixed batch*, so a sweep is only valid if every width shared one batch — this
+        # makes that auditable. Sequences (batch_size × grad_accum × num_processes), or
+        # tokens_per_step in token mode, where batch_size only sizes eval batches.
+        global_batch = trainer._global_effective_batch_size()
+        global_batch_unit = "tokens" if trainer._token_mode else "sequences"
         # Record the installed distribution version. Generated sweep scripts install oplm
         # unpinned, so this is what makes version drift across a multi-week sweep
         # detectable after the fact instead of invisible.
@@ -301,6 +299,7 @@ class SweepMetricsCallback(TrainerCallback):
             "width": trainer.cfg.model.hidden_size,
             "steps": getattr(trainer, "total_steps", trainer.cfg.train.max_steps),
             "global_batch": global_batch,
+            "global_batch_unit": global_batch_unit,
             "oplm_version": oplm_version,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)

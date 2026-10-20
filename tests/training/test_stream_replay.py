@@ -139,3 +139,15 @@ def test_compiled_comparison_scores_identical_tensors(
     for r in csv.DictReader(out.open()):
         assert abs(float(r["compiled_minus_eager"])) < 1e-5
     assert not torch.distributed.is_initialized()
+
+
+def test_stream_replay_rejects_token_mode(tmp_path: Path) -> None:
+    cfg = tiny_train_cfg(
+        tmp_path,
+        tmp_path / "unused.parquet",
+        tokens_per_step=256,
+        batch_tokens=256,
+        pack_sequences=True,
+    )
+    with pytest.raises(ValueError, match="token-mode"):
+        StreamReplay(cfg, rank=0, world_size=1)

@@ -84,6 +84,20 @@ def test_recovery_report_requires_restored_state_and_online_history() -> None:
     assert assess(manifest, events, None)["status"] == "incomplete"
 
 
+def test_recovery_report_compares_batches_only_when_the_run_records_them() -> None:
+    from oplm.slurm.recovery.checks import assess
+
+    manifest, events, history = evidence()
+    restart = next(e for e in events if e["kind"] == "start" and e["attempt"] == 1)
+    restart["batches"] = 0
+    assert assess(manifest, events, history)["status"] == "failed"
+    # Token mode records no batch counter (it is informational there), on both sides.
+    for event in events:
+        if "batches" in event:
+            event["batches"] = None
+    assert assess(manifest, events, history)["status"] == "passed"
+
+
 @pytest.mark.parametrize(
     "mutation", ["no_injection", "no_rank", "wrong_checkpoint", "no_restart", "no_metrics"]
 )
@@ -182,11 +196,20 @@ def test_node_drill_requires_a_replacement_node() -> None:
     assert assess(manifest, events, history)["status"] == "passed"
 
 
-@pytest.mark.parametrize("mode", ["graceful_drain", "rank_kill", "checkpoint_write", "crash_loop"])
+@pytest.mark.parametrize(
+    ("mode", "token_mode"),
+    [
+        ("graceful_drain", False),
+        ("rank_kill", False),
+        ("checkpoint_write", False),
+        ("crash_loop", False),
+        ("rank_kill", True),
+    ],
+)
 @pytest.mark.parametrize("world_size", [1, 2])
 @pytest.mark.slow
 def test_real_worker_kills_then_restores_checkpoint(
-    mode: str, world_size: int, training_parquet: Path, tmp_path: Path
+    mode: str, token_mode: bool, world_size: int, training_parquet: Path, tmp_path: Path
 ) -> None:
     """Real CPU subprocesses prove the injection executes and the real Trainer restores state."""
     from oplm.config import serialize_config
@@ -195,8 +218,18 @@ def test_real_worker_kills_then_restores_checkpoint(
     from tests.training.conftest import tiny_train_cfg
 
     (tmp_path / "events").mkdir()
+    token_budget = (
+        dict(tokens_per_step=256 * world_size, batch_tokens=256, pack_sequences=True)
+        if token_mode
+        else {}
+    )
     cfg = tiny_train_cfg(
-        tmp_path / "training", training_parquet, max_steps=8, save_every=2, auto_resume=True
+        tmp_path / "training",
+        training_parquet,
+        max_steps=8,
+        save_every=2,
+        auto_resume=True,
+        **token_budget,
     )
     (tmp_path / "train.yaml").write_text(serialize_config(cfg))
     manifest = dict(

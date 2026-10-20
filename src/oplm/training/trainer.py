@@ -8,7 +8,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -119,7 +119,8 @@ class _StepFlags:
     observed a drain signal, whether its own loss was non-finite, whether its
     own ``save_every_minutes`` timer fired, whether its own pending async save's
     local write is done) and :meth:`Trainer._reduce_step_flags` sum-reduces them
-    into one rank-identical bundle: token counts add up normally, and any boolean
+    into one rank-identical bundle: token counts add up normally (sequence counts
+    too: GPUs differ in sequences per batch in token mode), and any boolean
     flag true on *any* rank becomes true on *every* rank (sum > 0). This is the
     single rank-synchronization point later resilience features plug into — the
     drain signal (Task 1.5) and the non-finite-loss guardrail (Task 1.8) only
@@ -134,6 +135,7 @@ class _StepFlags:
     """
 
     tokens_delta: int
+    samples_delta: int
     drain: bool
     nonfinite: bool
     save_due: bool
@@ -177,8 +179,11 @@ class _SaveDeferral:
     (periodic step-cadence, ``save_every_minutes``, or drain) across at most
     ``num_workers - 1`` extra optimizer steps, looking for the first step where
     ``batches_in_epoch`` lands back on that boundary, before saving anyway. Rank-safe by
-    construction: every input (``batches_in_epoch``, ``num_workers``, ``global_step``) is
-    rank-identical, so every rank reaches the same decision without a new collective.
+    construction in sequence mode: every input (``batches_in_epoch``, ``num_workers``,
+    ``global_step``) is rank-identical, so every rank reaches the same decision without a
+    new collective. In token mode ``batches_in_epoch`` is per-rank (each GPU rolls over on
+    its own), so the trainer passes ``num_workers=1`` and the deferral never fires
+    (:meth:`Trainer._alignment_workers`).
 
     A deferral budget exists because some ``(gradient_accumulation_steps, num_workers)``
     combinations never realign: ``batches_in_epoch`` advances by
@@ -209,8 +214,10 @@ class _SaveDeferral:
                 in flight -- the pending save is owed regardless of whether the original
                 per-step trigger condition still holds.
             batches_in_epoch: The trainer's current ``self._batches_in_epoch``
-                (rank-identical).
-            num_workers: ``cfg.data.num_workers`` (rank-identical, from config).
+                (rank-identical in sequence mode; per-rank in token mode, where the
+                deferral is disabled).
+            num_workers: The alignment worker count (rank-identical, from config; 1 in
+                token mode).
             global_step: The trainer's current ``self.global_step``, used to bound the
                 deferral window to ``num_workers - 1`` extra steps.
 
@@ -251,7 +258,7 @@ class Trainer:
         from accelerate.utils import DataLoaderConfiguration, InitProcessGroupKwargs, set_seed
         from rich.console import Console
 
-        from oplm.config import validate_parallelism_compat
+        from oplm.config import validate_parallelism_compat, validate_token_batching
         from oplm.data import DeviceDataLoader
         from oplm.training.optim import build_optimizers, build_schedulers
         from oplm.training.preflight import run_preflight
@@ -268,6 +275,7 @@ class Trainer:
         # load_config's copy of this check. Currently refuses hsdp + configured eval --
         # see validate_parallelism_compat for the deadlock it prevents.
         validate_parallelism_compat(cfg)
+        validate_token_batching(cfg)
 
         # Drain trigger (Task 1.5): SIGUSR1/SIGTERM handlers plus the Slurm
         # SLURM_JOB_END_TIME wall-clock margin. Installed immediately so a signal
@@ -314,6 +322,16 @@ class Trainer:
                 InitProcessGroupKwargs(timeout=timedelta(minutes=cfg.train.dist_timeout_minutes))
             ],
         )
+        # Token mode: the global token budget fixes accumulation for this world size. Written
+        # into the config and the accelerator before anything reads it, so the loop, the
+        # total-step math and the saved config.yaml all see the value in use.
+        self._token_mode = cfg.train.batch_tokens is not None
+        if self._token_mode:
+            from oplm.config import resolve_token_accumulation
+
+            accumulation = resolve_token_accumulation(cfg.train, self.accelerator.num_processes)
+            cfg.train.gradient_accumulation_steps = accumulation
+            self.accelerator.gradient_accumulation_steps = accumulation
 
         # Preflight (Task 1.8): allocate + matmul on every rank, right after the
         # Accelerator exists and BEFORE anything below touches checkpoints or data. A
@@ -759,13 +777,28 @@ class Trainer:
         self._step_local_tokens = 0  # local tokens accumulated across the current opt step
 
         # Data-cursor state (Task 3.3): count of micro-batches (DataLoader batch pulls,
-        # not optimizer steps) consumed so far this epoch, rank-identical since every
-        # rank pulls exactly one batch per micro-step. Reset to 0 -- and the top-level
+        # not optimizer steps) consumed so far this epoch. Rank-identical in sequence mode
+        # (every rank pulls exactly one batch per micro-step); per-rank and informational in
+        # token mode, where each GPU rolls over on its own and resume uses `_worker_rows`
+        # instead. Reset to 0 -- and the top-level
         # dataset's armed resume skip cleared -- on every epoch rollover (the
         # StopIteration branch in `train`). Snapshotted into a DataCursor at every
         # checkpoint trigger (`_save_checkpoint`) and, on a layout-compatible resume,
         # restored from the checkpoint's cursor (`_resume_from_checkpoint`).
         self._batches_in_epoch = 0
+
+        # Token mode (spec §6.1): rows each DataLoader worker had emitted this epoch, as of the
+        # last batch the loop consumed (its stream_position). The per-worker resume position.
+        self._worker_rows = [0] * self._effective_num_workers()
+        self._step_local_samples = 0  # local sequences accumulated across the current opt step
+        if self._token_mode:
+            logger.info(
+                "Token mode: %d tokens per step, %d per micro-batch, accumulation %d; "
+                "worker-cycle save alignment is off (each GPU rolls over epochs on its own)",
+                cfg.train.tokens_per_step,
+                cfg.train.batch_tokens,
+                cfg.train.gradient_accumulation_steps,
+            )
 
         # Worker-cycle save-alignment deferral (Task 3.3 controller addition): one
         # `_SaveDeferral` per cadence so periodic saves and drain never share or starve
@@ -914,9 +947,20 @@ class Trainer:
                         # skip is one-epoch-scoped and must be explicitly cleared.
                         self._batches_in_epoch = 0
                         self._clear_dataset_resume_skip()
+                        self._worker_rows = [0] * self._effective_num_workers()
                         data_iter = iter(self.dataloader)
-                        batch = next(data_iter)
+                        try:
+                            batch = next(data_iter)
+                        except StopIteration:
+                            raise RuntimeError(
+                                f"the training stream produced no batch in epoch {self.epoch}: too "
+                                "little data for one batch per rank and worker (in token mode, "
+                                "lower train.batch_tokens or set data.drop_last=false)"
+                            ) from None
                 self._window_data_wait += time.perf_counter() - data_t0
+                if self._token_mode:
+                    worker_id, rows_emitted = batch["stream_position"]
+                    self._worker_rows[int(worker_id)] = int(rows_emitted)
 
                 # Forward + backward inside accumulation context
                 with self.accelerator.accumulate(self.model):
@@ -951,12 +995,13 @@ class Trainer:
                 with phase("sync"):
                     step_loss_sum += loss.detach().item()
 
-                # Track tokens (local; reduced across ranks on the opt-step boundary
-                # below), samples, and the data cursor's micro-batch count (Task 3.3 --
+                # Track tokens and samples (local; reduced across ranks on the opt-step
+                # boundary below) and the data cursor's micro-batch count (Task 3.3 --
                 # every rank pulls exactly one DataLoader batch per micro-step, so this
-                # stays rank-identical without a reduce).
+                # stays rank-identical without a reduce in sequence mode; in token mode it
+                # is a per-rank count, informational only).
                 self._step_local_tokens += result.tokens
-                self._samples_seen += result.samples * self.accelerator.num_processes
+                self._step_local_samples += result.samples
                 self._batches_in_epoch += 1
                 for key, value in result.metrics.items():
                     self._window_metric_sums[key] = self._window_metric_sums.get(key, 0.0) + value
@@ -980,16 +1025,19 @@ class Trainer:
                 self._window_steps += 1
 
                 # Rank-sync the control bundle for this optimizer step in a single
-                # reduce: tokens (so tokens_seen / tokens_delta are rank-identical —
+                # reduce: tokens and samples (so tokens_seen / tokens_delta are rank-identical —
                 # the EvalContext rank-sync invariant; see design §3.2) plus the
                 # drain, non-finite, and time-based-save flags later resilience
                 # tasks plug into. Unconditional: a per-rank token estimate would
                 # diverge on ragged batches.
                 local_tokens = self._step_local_tokens
                 self._step_local_tokens = 0
+                local_samples = self._step_local_samples
+                self._step_local_samples = 0
                 with phase("sync"):
                     flags = self._reduce_step_flags(
                         local_tokens,
+                        local_samples=local_samples,
                         drain=self._drain_signal.requested,
                         nonfinite=not math.isfinite(current_loss),
                         save_due=self._save_timer_due(),
@@ -1003,6 +1051,7 @@ class Trainer:
                 step_open = False
                 tokens_delta = flags.tokens_delta
                 self.tokens_seen += tokens_delta
+                self._samples_seen += flags.samples_delta
 
                 # Opportunistically commit a pending async save (Task 2.3) once every
                 # rank's local write has actually finished, not merely started --
@@ -1064,7 +1113,7 @@ class Trainer:
                     drain_ready = self._drain_save_deferral.decide(
                         triggered=True,
                         batches_in_epoch=self._batches_in_epoch,
-                        num_workers=self._effective_num_workers(),
+                        num_workers=self._alignment_workers(),
                         global_step=self.global_step,
                     )
                     if drain_ready:
@@ -1132,7 +1181,7 @@ class Trainer:
                 last_step_did_save = self._periodic_save_deferral.decide(
                     triggered=step_saved or flags.save_due,
                     batches_in_epoch=self._batches_in_epoch,
-                    num_workers=self._effective_num_workers(),
+                    num_workers=self._alignment_workers(),
                     global_step=self.global_step,
                 )
                 if last_step_did_save:
@@ -1207,7 +1256,12 @@ class Trainer:
             self.accelerator.end_training()
 
     def _build_eval_context(self, tokens_delta: int) -> EvalContext:
-        """Build a rank-identical EvalContext for the current optimizer step."""
+        """Build the EvalContext for the current optimizer step.
+
+        Rank-identical in sequence mode. In token mode ``epoch`` and ``epoch_delta`` are
+        per-rank (each GPU rolls over on its own); no eval cadence reads them yet, so a
+        future epoch-cadenced task would have to reduce them first.
+        """
         from oplm.eval.context import EvalContext
 
         epoch_delta = self.epoch - self._epoch_at_last_opt_step
@@ -1225,7 +1279,8 @@ class Trainer:
     def _run_eval(self, tokens_delta: int) -> dict[str, float]:
         """Run all due evaluations for the current optimizer step.
 
-        Builds a rank-identical :class:`~oplm.eval.context.EvalContext` and delegates
+        Builds the :class:`~oplm.eval.context.EvalContext` (see :meth:`_build_eval_context`
+        for its rank-identity caveat in token mode) and delegates
         to :meth:`~oplm.eval.Evaluator.run_due`, which handles per-task scheduling and
         unwraps the (wrapped) model only when a task is due. Returns an empty dict when
         no evaluator is configured or nothing is due.
@@ -1239,6 +1294,7 @@ class Trainer:
         self,
         local_tokens: int,
         *,
+        local_samples: int = 0,
         drain: bool = False,
         nonfinite: bool = False,
         save_due: bool = False,
@@ -1246,9 +1302,9 @@ class Trainer:
     ) -> _StepFlags:
         """Rank-sync the control bundle for this optimizer step in one reduce.
 
-        Packs ``[local_tokens, drain, nonfinite, save_due, pending_done]`` into a
-        single 5-element long tensor and sum-reduces it across ranks: the token count
-        accumulates normally, ``drain``/``nonfinite``/``save_due`` each become True
+        Packs ``[local_tokens, local_samples, drain, nonfinite, save_due, pending_done]``
+        into a single 6-element long tensor and sum-reduces it across ranks: the token and
+        sample counts accumulate normally, ``drain``/``nonfinite``/``save_due`` each become True
         everywhere if True on *any* rank (sum > 0), and ``pending_done`` is instead
         returned as the raw sum (see :class:`_StepFlags`'s docstring for why it alone
         needs the exact count rather than any-rank-trips-it semantics). Per-rank clock
@@ -1258,6 +1314,8 @@ class Trainer:
         Args:
             local_tokens: This rank's token count for the just-completed optimizer
                 step.
+            local_samples: This rank's sequence count for the just-completed optimizer
+                step (ranks differ in sequences per batch in token mode).
             drain: This rank's local drain signal (SIGUSR1/SIGTERM/SLURM end-time
                 margin), from :attr:`_drain_signal` (Task 1.5).
             nonfinite: This rank's local non-finite-loss signal, i.e.
@@ -1272,16 +1330,24 @@ class Trainer:
             A rank-identical :class:`_StepFlags`.
         """
         bundle = torch.tensor(
-            [int(local_tokens), int(drain), int(nonfinite), int(save_due), int(pending_done)],
+            [
+                int(local_tokens),
+                int(local_samples),
+                int(drain),
+                int(nonfinite),
+                int(save_due),
+                int(pending_done),
+            ],
             device=self.accelerator.device,
             dtype=torch.long,
         )
         reduced = self.accelerator.reduce(bundle, reduction="sum").tolist()
-        tokens_delta, drain_sum, nonfinite_sum, save_due_sum, pending_done_sum = (
+        tokens_delta, samples_delta, drain_sum, nonfinite_sum, save_due_sum, pending_done_sum = (
             int(x) for x in reduced
         )
         return _StepFlags(
             tokens_delta=tokens_delta,
+            samples_delta=samples_delta,
             drain=drain_sum > 0,
             nonfinite=nonfinite_sum > 0,
             save_due=save_due_sum > 0,
@@ -1353,6 +1419,17 @@ class Trainer:
         """
         return max(self.cfg.data.num_workers, 1)
 
+    def _alignment_workers(self) -> int:
+        """Worker count for :class:`_SaveDeferral`; 1 (no deferral) in token mode.
+
+        The deferral assumes ``batches_in_epoch`` is identical on every rank (the per-rank
+        count is informational in token mode, not a shared position). In token mode each
+        GPU rolls over to its next epoch on its own, so ranks could disagree on whether to defer
+        and enter a save apart, which deadlocks. Each worker's resume position is exact without
+        it; only the interleaving of a GPU's workers can shift within one cycle (spec §6.4).
+        """
+        return 1 if self._token_mode else self._effective_num_workers()
+
     def _top_level_dataset(self) -> object:
         """Return the top-level training dataset (Task 3.3's cursor arm/clear target).
 
@@ -1412,6 +1489,11 @@ class Trainer:
         if samples_delta > 0:
             tokens_delta = self.tokens_seen - self._window_tokens_start
             metrics["train/mean_seq_len"] = tokens_delta / samples_delta
+            if self._token_mode and self._window_steps > 0:
+                # Real tokens over capacity: what the packing leaves empty (spec §5.5).
+                tokens_per_step = self.cfg.train.tokens_per_step
+                assert tokens_per_step is not None
+                metrics["train/batch_fill"] = tokens_delta / (self._window_steps * tokens_per_step)
         self._window_loss_sum = 0.0
         self._window_steps = 0
         self._window_grad_norm_sum = 0.0
@@ -1506,7 +1588,9 @@ class Trainer:
         dict is built and handed to ``save_checkpoint`` before ``dcp.async_save`` stages
         anything, and ``trainer_state.json`` (which the cursor lands in, under the
         ``"cursor"`` key) is one of the synchronous sidecars written before this call
-        returns -- never deferred to :meth:`_finalize_pending_save`.
+        returns -- never deferred to :meth:`_finalize_pending_save`. In token mode the cursor
+        also carries every rank's epoch and per-worker row counts (``rank_epochs``,
+        ``worker_rows``), gathered here, so every rank must enter this method together.
 
         Args:
             blocking: When ``True`` (default), calls ``save_checkpoint(...,
@@ -1530,13 +1614,25 @@ class Trainer:
 
         checkpoint_dir = Path(self.cfg.train.output_dir) / f"checkpoint-{self.global_step}"
 
+        rank_epochs: list[int] | None = None
+        worker_rows: list[list[int]] | None = None
+        if self._token_mode:
+            # Every rank enters this save at the same step (each trigger is rank-reduced, and
+            # _SaveDeferral is off in token mode), so the gather cannot strand a rank.
+            from accelerate.utils import gather_object
+
+            gathered = gather_object([(self.epoch, list(self._worker_rows))])
+            rank_epochs = [int(epoch) for epoch, _ in gathered]
+            worker_rows = [[int(n) for n in rows] for _, rows in gathered]
         cursor = DataCursor(
             epoch=self.epoch,
             batches_in_epoch=self._batches_in_epoch,
             world_size=self.accelerator.num_processes,
             num_workers=self._effective_num_workers(),
-            per_rank_batch=self.cfg.train.batch_size,
+            per_rank_batch=0 if self._token_mode else self.cfg.train.batch_size,
             seed=self.cfg.train.seed,
+            rank_epochs=rank_epochs,
+            worker_rows=worker_rows,
         )
 
         should_mark_permanent = False
@@ -1730,6 +1826,7 @@ class Trainer:
         # half-open crossing test neither re-fires at the resumed step nor skips a multiple.
         self._epoch_at_last_opt_step = self.epoch
         self._step_local_tokens = 0
+        self._step_local_samples = 0
 
         logger.info(
             "Resumed from checkpoint %s (step=%d, epoch=%d, samples=%d, tokens=%d)",
@@ -1793,6 +1890,7 @@ class Trainer:
         self._set_dataset_epoch(self.epoch)
         self._epoch_at_last_opt_step = self.epoch
         self._step_local_tokens = 0
+        self._step_local_samples = 0
 
         config_path = checkpoint_dir / "config.yaml"
         if config_path.is_file():
@@ -1844,6 +1942,16 @@ class Trainer:
           a full worker-cycle boundary -- see the worker-cycle save-alignment deferral
           in :meth:`train`), a WARNING notes that global batch interleaving may be
           window-shifted, though each worker's own data content stays exact.
+        - Token mode (``train.batch_tokens`` set): the layout check drops ``per_rank_batch``
+          (rows per worker do not depend on the batch size, so the token budget may change at
+          a resume), then this rank's epoch is restored from ``cursor.rank_epochs`` and its
+          per-worker row counts from ``cursor.worker_rows``, armed via the top-level
+          dataset's ``set_resume_rows``. A sequence-mode cursor (no ``worker_rows``) maps
+          exactly onto per-worker rows (worker ``w`` has served ``len(range(w,
+          batches_in_epoch, num_workers)) * per_rank_batch`` rows, every rank in the cursor's
+          epoch) and resumes at its exact position; a token-mode cursor in a sequence-mode run
+          raises ``ValueError`` (per-worker counts are not batch multiples and ranks may be in
+          different epochs).
 
         Args:
             state: The trainer state dict returned by
@@ -1853,8 +1961,8 @@ class Trainer:
                 message only).
 
         Raises:
-            ValueError: The cursor's layout disagrees with the live run and
-                ``resume_data_position`` is true.
+            ValueError: The cursor's layout disagrees with the live run, or it is a token-mode
+                cursor in a sequence-mode run, and ``resume_data_position`` is true.
         """
         from oplm.data import DataCursor
 
@@ -1879,12 +1987,23 @@ class Trainer:
             return
 
         cursor = DataCursor(**cursor_dict)
-        live_layout = {
+        if cursor.worker_rows is not None and not self._token_mode:
+            raise ValueError(
+                f"Checkpoint {checkpoint_dir}'s data cursor is from a token-mode run, but this "
+                "run is in sequence mode (train.batch_tokens unset); each worker's row count is "
+                "not a whole number of batches, so its position cannot be mapped onto batches. "
+                "To resume anyway (restarting the epoch's data position from row 0), set "
+                "train.resume_data_position=false."
+            )
+        # Rows per worker depend only on the striping (world size, workers, seed); in token mode
+        # the batch size can change at a resume without moving the position.
+        live_layout: dict[str, int] = {
             "world_size": self.accelerator.num_processes,
             "num_workers": self._effective_num_workers(),
-            "per_rank_batch": self.cfg.train.batch_size,
             "seed": self.cfg.train.seed,
         }
+        if not self._token_mode:
+            live_layout["per_rank_batch"] = self.cfg.train.batch_size
         mismatches = [
             f"{attr} (checkpoint={getattr(cursor, attr)!r}, live={live_value!r})"
             for attr, live_value in live_layout.items()
@@ -1898,6 +2017,38 @@ class Trainer:
                 "anyway (restarting the epoch's data position from row 0 instead of "
                 "resuming it), set train.resume_data_position=false."
             )
+
+        if self._token_mode:
+            if cursor.worker_rows is None:
+                # A sequence-mode cursor maps exactly: worker w of every rank has served its
+                # round-robin share of the epoch's batches (what _resolve_sample_skip computes),
+                # and every rank is in the cursor's epoch (ranks step in lockstep there).
+                rows = [
+                    len(range(w, cursor.batches_in_epoch, cursor.num_workers))
+                    * cursor.per_rank_batch
+                    for w in range(cursor.num_workers)
+                ]
+                cursor = replace(
+                    cursor,
+                    rank_epochs=[cursor.epoch] * cursor.world_size,
+                    worker_rows=[rows] * cursor.world_size,
+                )
+                logger.info(
+                    "Checkpoint %s has a sequence-mode data cursor; mapped it to per-worker "
+                    "row counts %s (batches_in_epoch=%d, per_rank_batch=%d).",
+                    checkpoint_dir,
+                    rows,
+                    cursor.batches_in_epoch,
+                    cursor.per_rank_batch,
+                )
+            assert cursor.rank_epochs is not None and cursor.worker_rows is not None
+            rank = self.accelerator.process_index
+            self.epoch = cursor.rank_epochs[rank]
+            self._set_dataset_epoch(self.epoch)
+            self._epoch_at_last_opt_step = self.epoch
+            self._worker_rows = list(cursor.worker_rows[rank])
+            self._top_level_dataset().set_resume_rows(cursor.worker_rows[rank])  # ty: ignore[unresolved-attribute]
+            return
 
         self._batches_in_epoch = cursor.batches_in_epoch
         set_resume_skip = getattr(self._top_level_dataset(), "set_resume_skip", None)
@@ -1918,7 +2069,10 @@ class Trainer:
             )
 
     def _global_effective_batch_size(self) -> int:
-        """Return the batch size represented by one optimizer step."""
+        """Return the batch size of one optimizer step; tokens per step in token mode."""
+        if self._token_mode:
+            assert self.cfg.train.tokens_per_step is not None
+            return self.cfg.train.tokens_per_step
         return int(
             self.cfg.train.batch_size
             * self.cfg.train.gradient_accumulation_steps

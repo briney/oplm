@@ -143,25 +143,53 @@ def _resolve_sample_skip(
     return min(skip, max(stream_length, 0))
 
 
+def _resolve_rows_skip(rows_per_worker: Sequence[int], stream_length: int) -> int:
+    """This worker's entry of an armed per-worker row-count skip, clamped to its stream.
+
+    Token-mode resume (:meth:`ShardedProteinDataset.set_resume_rows`): the checkpoint records how
+    many rows each worker had emitted, so no batch-count arithmetic is involved. Clamped, never
+    wrapped, for the reason given in :func:`_resolve_sample_skip`.
+
+    Raises:
+        ValueError: ``rows_per_worker`` does not have one entry per DataLoader worker.
+    """
+    _, _, worker_id, num_workers = _resolve_distributed_context()
+    if len(rows_per_worker) != num_workers:
+        raise ValueError(
+            f"resume rows have {len(rows_per_worker)} entries for {num_workers} DataLoader "
+            "workers; the checkpoint's worker count must match data.num_workers"
+        )
+    return min(int(rows_per_worker[worker_id]), max(stream_length, 0))
+
+
 @dataclass(frozen=True)
 class DataCursor:
     """Position of the training stream, plus the layout it is only valid under.
 
-    Captured at checkpoint time (one per run, not per rank — ranks step in lockstep
-    so ``batches_in_epoch`` is the same value everywhere) and replayed on resume via
-    :meth:`ShardedProteinDataset.set_resume_skip`. The layout fields
+    Captured at checkpoint time (one per run, not per rank — in sequence mode ranks step in
+    lockstep so ``batches_in_epoch`` is the same value everywhere; token mode adds the
+    per-rank ``rank_epochs`` and ``worker_rows`` tables) and replayed on resume via
+    :meth:`ShardedProteinDataset.set_resume_skip` (sequence mode) or ``set_resume_rows``
+    (token mode). A sequence-mode cursor can resume a token-mode run (its position maps onto
+    per-worker rows); a token-mode cursor cannot resume a sequence-mode run. The layout fields
     (``world_size``, ``num_workers``, ``per_rank_batch``, ``seed``) let the
     resuming run detect a changed layout before trusting ``batches_in_epoch`` — see
     Task 3.3's guard.
 
     Attributes:
         epoch: Epoch index the cursor was captured in.
-        batches_in_epoch: Count of batches consumed so far this epoch (per rank;
-            identical across ranks since training steps in lockstep).
+        batches_in_epoch: Count of batches consumed so far this epoch (per rank; identical
+            across ranks in sequence mode, where training steps in lockstep; the rank-0
+            count, informational only, in token mode).
         world_size: Number of ranks the interrupted run used.
         num_workers: DataLoader ``num_workers`` the interrupted run used.
-        per_rank_batch: Samples per batch contributed by one (rank, worker) stream.
+        per_rank_batch: Samples per batch contributed by one (rank, worker) stream; 0 in
+            token mode.
         seed: Base dataset seed the interrupted run used.
+        rank_epochs: Token mode only: each rank's epoch at the save (ranks roll over on their
+            own).
+        worker_rows: Token mode only: a ranks x workers table of the rows each worker had
+            emitted this epoch, the exact position whatever the batch size.
     """
 
     epoch: int
@@ -170,6 +198,8 @@ class DataCursor:
     num_workers: int
     per_rank_batch: int
     seed: int
+    rank_epochs: list[int] | None = None
+    worker_rows: list[list[int]] | None = None
 
 
 class ShardedProteinDataset(IterableDataset[dict[str, object]]):
@@ -232,6 +262,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._resume_batches_in_epoch: int | None = None
         self._resume_per_rank_batch = 0
         self._resume_num_workers = 1
+        # Token-mode resume skip: rows already emitted, one entry per DataLoader worker.
+        self._resume_rows: list[int] | None = None
 
         shard_paths = self._discover_shards(self._path)
 
@@ -331,12 +363,22 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._resume_per_rank_batch = per_rank_batch
         self._resume_num_workers = num_workers
 
+    def set_resume_rows(self, rows_per_worker: Sequence[int]) -> None:
+        """Arm a one-epoch skip of ``rows_per_worker[worker_id]`` rows in each worker's stream.
+
+        The token-mode counterpart of :meth:`set_resume_skip`: batches hold a varying number of
+        rows, so the cursor records rows per worker directly. Pickles into workers the same way;
+        cleared by :meth:`clear_resume_skip`.
+        """
+        self._resume_rows = list(rows_per_worker)
+
     def clear_resume_skip(self) -> None:
-        """Disarm the resume skip; the next ``__iter__`` starts each stream at row 0."""
+        """Disarm both resume skips; the next ``__iter__`` starts each stream at row 0."""
         self._resume_batches_in_epoch = None
+        self._resume_rows = None
 
     def _resolved_skip(self) -> int:
-        """Resolve the armed batch-count skip into this stream's sample-offset skip.
+        """Resolve the armed batch-count (or per-worker row-count) skip into a sample-offset skip.
 
         Must be called in-context (inside a DataLoader worker, or single-process):
         delegates to :func:`_resolve_sample_skip`, which uses the current worker's
@@ -345,6 +387,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         DataLoader's round-robin batch assignment across workers. Returns ``0`` when
         unarmed.
         """
+        if self._resume_rows is not None:
+            return _resolve_rows_skip(self._resume_rows, self.stream_length())
         return _resolve_sample_skip(
             self._resume_batches_in_epoch,
             self._resume_per_rank_batch,
@@ -532,6 +576,8 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         self._resume_batches_in_epoch: int | None = None
         self._resume_per_rank_batch = 0
         self._resume_num_workers = 1
+        # Token-mode resume skip: rows already emitted, one entry per DataLoader worker.
+        self._resume_rows: list[int] | None = None
 
     def _default_num_samples(self) -> int:
         """Sum of source lengths, or 0 if any source has no defined length."""
@@ -591,14 +637,24 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         self._resume_per_rank_batch = per_rank_batch
         self._resume_num_workers = num_workers
 
+    def set_resume_rows(self, rows_per_worker: Sequence[int]) -> None:
+        """Arm a one-epoch skip of ``rows_per_worker[worker_id]`` rows in each worker's stream.
+
+        The token-mode counterpart of :meth:`set_resume_skip`. A worker's rows are draws from
+        the mix, so the count resolves through :meth:`_arm_source_skip` exactly like the
+        batch-count skip. Cleared by :meth:`clear_resume_skip`.
+        """
+        self._resume_rows = list(rows_per_worker)
+
     def clear_resume_skip(self) -> None:
-        """Disarm the resume skip; the next ``__iter__`` starts each stream at step 0.
+        """Disarm both resume skips; the next ``__iter__`` starts each stream at step 0.
 
         Since per-source sample skips are computed fresh inside ``__iter__`` from the
         (now-unarmed) skip rather than stored on the sub-datasets, this also implicitly
         clears any per-source arming — there is nothing further to undo.
         """
         self._resume_batches_in_epoch = None
+        self._resume_rows = None
 
     def _arm_source_skip(
         self, source_idx: int, n_samples: int
@@ -663,12 +719,15 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         weights = torch.tensor(self._fractions, dtype=torch.float64)
         choices = torch.multinomial(weights, n_steps, replacement=True, generator=generator)
 
-        skip = _resolve_sample_skip(
-            self._resume_batches_in_epoch,
-            self._resume_per_rank_batch,
-            self._resume_num_workers,
-            n_steps,
-        )
+        if self._resume_rows is not None:
+            skip = _resolve_rows_skip(self._resume_rows, n_steps)
+        else:
+            skip = _resolve_sample_skip(
+                self._resume_batches_in_epoch,
+                self._resume_per_rank_batch,
+                self._resume_num_workers,
+                n_steps,
+            )
         if skip:
             # Per-source draw counts among the choices already consumed before the
             # interruption; each count is a sample count for that source alone, so

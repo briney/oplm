@@ -282,8 +282,11 @@ fields. The table is small: 512 GPUs × 8 workers is 4k integers.
 - **Layout check.** Which rows a worker serves depends only on the world size, worker count and
   seed. In token mode the cursor's layout check compares those three fields.
   - Changing `tokens_per_step` or `batch_tokens` at a resume or branch keeps the exact position.
-  - A cursor from the other mode (sequence mode into token mode, or the reverse) raises, naming the
-    existing `train.resume_data_position=false` escape hatch.
+  - A sequence-mode cursor maps exactly onto token mode: worker `w` of every rank has served
+    `len(range(w, batches_in_epoch, num_workers)) * per_rank_batch` rows, all ranks in the cursor's
+    epoch, so it resumes or branches at its exact position. A token-mode cursor in a sequence-mode
+    run raises, naming the existing `train.resume_data_position=false` escape hatch (per-worker
+    counts are not batch multiples and ranks may be in different epochs).
 - `train.branch_from` restores the cursor through the same path, so it inherits all of this.
 
 ### 6.4 Per-GPU epochs
@@ -308,7 +311,8 @@ contains no collective, so nothing waits on another GPU.
 - **Batcher level:** with 2 workers, serve N batches, record positions, rebuild with
   `set_resume_rows`, and continue; the sequence ids served match an uninterrupted run.
 - **Cursor:** token mode accepts a changed token budget; rejects a changed world size, worker count
-  or seed; a cursor from the other mode raises; `_SaveDeferral` is off in token mode.
+  or seed; a sequence-mode cursor resumes into token mode at its exact position while a
+  token-mode cursor in a sequence-mode run raises; `_SaveDeferral` is off in token mode.
 - **Two-GPU CPU run** (gloo, on the harness in `tests/training/test_e2e_dcp.py`) in token mode,
   with streams sized so the two GPUs roll over at different steps: nothing hangs; checkpointing
   mid-epoch, resuming and continuing serves the same sequence ids per GPU as an uninterrupted run.

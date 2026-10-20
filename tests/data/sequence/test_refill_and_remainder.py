@@ -60,6 +60,15 @@ def test_resume_across_reshuffled_refills_is_the_baseline_suffix(tmp_path: Path)
         assert _ids(resumed) == baseline[skip:], skip
 
 
+def test_resume_rows_across_reshuffled_refills_is_the_baseline_suffix(tmp_path: Path) -> None:
+    sources = _sources(tmp_path)
+    baseline = _ids(_mix(sources, reshuffle=True))
+    for skip in (3, 10, 27, 61, len(baseline) - 1):  # lands in the first and later passes
+        resumed = _mix(sources, reshuffle=True)
+        resumed.set_resume_rows([skip])
+        assert _ids(resumed) == baseline[skip:], skip
+
+
 def test_drop_remainder_gives_every_rank_the_same_full_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

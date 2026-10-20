@@ -27,6 +27,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from oplm.data.config import parse_train_configs
+from oplm.data.sequence.batching import TokenBatcher
 from oplm.data.sequence.collate import MLMCollator
 from oplm.data.sequence.dataset import InterleavedDataset, ShardedProteinDataset
 from oplm.data.tokenizer import get_tokenizer
@@ -103,7 +104,9 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
 
     Returns:
         A :class:`~torch.utils.data.DataLoader` yielding the §4.7 batch contract
-        (``input_ids`` / ``attention_mask`` / ``labels``).
+        (``input_ids`` / ``attention_mask`` / ``labels``). In token mode
+        (``train.batch_tokens`` set) it yields :class:`TokenBatcher`'s fixed
+        ``(rows, max_position_embeddings)`` batches instead, with no DataLoader batching.
 
     Raises:
         ValueError: If ``cfg.data.train`` resolves to no datasets.
@@ -140,9 +143,11 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
         # Mask dropout rescales by each row's masked fraction, which packing would pool
         # across the sequences sharing a row.
         raise ValueError("data.pack_sequences is incompatible with model.mask_dropout.")
+    width = cfg.model.max_position_embeddings
+    rows = cfg.train.batch_tokens // width if cfg.train.batch_tokens is not None else None
     collator = MLMCollator(
         get_tokenizer(),
-        max_length=cfg.model.max_position_embeddings,
+        max_length=width,
         mask_prob=cfg.data.mask_prob,
         mask_token_prob=cfg.data.mask_token_prob,
         random_token_prob=cfg.data.random_token_prob,
@@ -151,8 +156,17 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
         seed=cfg.train.seed,
         pad_to_multiple_of=cfg.data.pad_to_multiple_of,
         pack_sequences=cfg.data.pack_sequences,
+        pack_rows=rows,
     )
-    return _build_dataloader(dataset, collator, cfg, drop_last=cfg.data.drop_last)
+    if rows is not None:
+        # Token mode: each worker builds whole (rows, width) batches; no DataLoader batching.
+        batcher = TokenBatcher(
+            dataset, collator, rows=rows, width=width, drop_last=cfg.data.drop_last
+        )
+        return _build_dataloader(batcher, None, cfg, batch_size=None)
+    return _build_dataloader(
+        dataset, collator, cfg, batch_size=cfg.train.batch_size, drop_last=cfg.data.drop_last
+    )
 
 
 def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
@@ -190,7 +204,9 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
         seed=_EVAL_SEED,
         pad_to_multiple_of=cfg.data.pad_to_multiple_of,
     )
-    return _build_dataloader(dataset, collator, cfg, loader_cls=_ResettingDataLoader)
+    return _build_dataloader(
+        dataset, collator, cfg, batch_size=cfg.train.batch_size, loader_cls=_ResettingDataLoader
+    )
 
 
 class _ResettingDataLoader(DataLoader):  # generic param set at call sites
@@ -213,9 +229,10 @@ class _ResettingDataLoader(DataLoader):  # generic param set at call sites
 
 def _build_dataloader(
     dataset: IterableDataset[dict[str, object]],
-    collator: MLMCollator,
+    collator: MLMCollator | None,
     cfg: OplmConfig,
     *,
+    batch_size: int | None,
     loader_cls: type[DataLoader] = DataLoader,  # generic param set by return type
     drop_last: bool = False,
 ) -> DataLoader[dict[str, Tensor]]:
@@ -226,12 +243,14 @@ def _build_dataloader(
     ``loader_cls`` lets the eval builder substitute a determinism-preserving
     subclass while training uses the plain :class:`~torch.utils.data.DataLoader`.
     ``drop_last`` drops each worker's partial final batch (training only; evaluation
-    must score every row).
+    must score every row). ``batch_size=None`` disables DataLoader batching for a dataset
+    that yields whole batches (:class:`TokenBatcher`, with ``collator=None``); ``drop_last``
+    must then stay False.
     """
     num_workers = cfg.data.num_workers
     return loader_cls(
         dataset,
-        batch_size=cfg.train.batch_size,
+        batch_size=batch_size,
         collate_fn=collator,
         num_workers=num_workers,
         pin_memory=cfg.data.pin_memory,

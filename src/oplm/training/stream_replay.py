@@ -102,6 +102,11 @@ class StreamReplay:
     def __init__(
         self, cfg: OplmConfig, *, rank: int, world_size: int, spawn_workers: bool = False
     ) -> None:
+        if cfg.train.batch_tokens is not None:
+            raise ValueError(
+                "oplm stream-replay does not support token-mode runs (train.batch_tokens): their "
+                "batches hold a varying number of sequences, so a step has no fixed stream offset"
+            )
         from oplm.data import build_train_dataloader
 
         # Rows are tagged and scored one sequence per row. Packing happens after masking,

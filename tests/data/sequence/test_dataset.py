@@ -12,13 +12,16 @@ contexts deterministically in a single process.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 import pytest
 
 import oplm.data.sequence.dataset as dataset_mod
+from oplm.data import DataCursor
 from oplm.data.sequence.dataset import InterleavedDataset, ShardedProteinDataset
+from tests.data.conftest import write_sequence_shards
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -264,3 +267,78 @@ class _ListDataset:
 
     def __len__(self) -> int:
         return len(self._items)
+
+
+# --------------------------------------------------------------------------- #
+# Token-mode resume: per-worker row counts
+# --------------------------------------------------------------------------- #
+
+
+def _rows_dataset(tmp_path: Path) -> ShardedProteinDataset:
+    shard_dir = tmp_path / "rows"
+    shard_dir.mkdir()
+    records = [(f"{i}", "ACDEFGHIKL"[: 3 + i % 7]) for i in range(40)]
+    return ShardedProteinDataset(write_sequence_shards(shard_dir, records, n_shards=3), seed=0)
+
+
+def test_set_resume_rows_skips_each_workers_own_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds = _rows_dataset(tmp_path)
+    baseline = {}
+    for worker in range(2):
+        _set_context(monkeypatch, 0, 1, worker, 2)
+        baseline[worker] = _ids(ds)
+    ds.set_resume_rows([3, 7])
+    for worker, skip in enumerate((3, 7)):
+        _set_context(monkeypatch, 0, 1, worker, 2)
+        assert _ids(ds) == baseline[worker][skip:]
+    ds.clear_resume_skip()
+    _set_context(monkeypatch, 0, 1, 1, 2)
+    assert _ids(ds) == baseline[1]
+
+
+def test_set_resume_rows_clamps_to_the_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds = _rows_dataset(tmp_path)
+    ds.set_resume_rows([1000, 0])
+    _set_context(monkeypatch, 0, 1, 0, 2)
+    assert _ids(ds) == []
+
+
+def test_set_resume_rows_needs_one_entry_per_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds = _rows_dataset(tmp_path)
+    ds.set_resume_rows([1, 2, 3])
+    _set_context(monkeypatch, 0, 1, 0, 2)
+    with pytest.raises(ValueError, match="3 entries for 2 DataLoader workers"):
+        _ids(ds)
+
+
+def test_data_cursor_loads_old_dicts() -> None:
+    old = {
+        "epoch": 1,
+        "batches_in_epoch": 5,
+        "world_size": 2,
+        "num_workers": 1,
+        "per_rank_batch": 4,
+        "seed": 0,
+    }
+    cursor = DataCursor(**old)
+    assert cursor.rank_epochs is None and cursor.worker_rows is None
+
+
+def test_data_cursor_round_trips_token_fields() -> None:
+    cursor = DataCursor(
+        epoch=0,
+        batches_in_epoch=3,
+        world_size=2,
+        num_workers=2,
+        per_rank_batch=0,
+        seed=0,
+        rank_epochs=[0, 1],
+        worker_rows=[[4, 5], [0, 2]],
+    )
+    assert DataCursor(**asdict(cursor)) == cursor

@@ -43,7 +43,8 @@ class DrillTrainer(Trainer):
             epoch=self.epoch,
             samples=self._samples_seen,
             tokens=self.tokens_seen,
-            batches=self._batches_in_epoch,
+            # Informational per-rank count in token mode; the restore does not rebuild it.
+            batches=None if self._token_mode else self._batches_in_epoch,
             lr=[s.get_last_lr() for s in self.schedulers],
             world_size=self.accelerator.num_processes,
             global_batch=self._global_effective_batch_size(),

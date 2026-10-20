@@ -15,7 +15,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from oplm.data.sequence.collate import MLMCollator, tokenize_and_pad
+import oplm.data.sequence.collate as collate_mod
+from oplm.data.sequence.collate import (
+    MLMCollator,
+    RowFiller,
+    first_fit,
+    token_length,
+    tokenize_and_pad,
+)
 from oplm.data.tokenizer import (
     canonical_amino_acid_ids,
     get_tokenizer,
@@ -580,3 +587,75 @@ def test_packing_moves_each_masked_sequence_intact_into_fewer_rows(
     pad = out["attention_mask"] == 0
     assert (out["labels"][pad] == -100).all()
     assert (out["input_ids"][pad] == tokenizer.pad_token_id).all()
+
+
+def test_token_length_counts_specials_and_truncates() -> None:
+    assert token_length("ACDE", 16) == 6
+    assert token_length("A" * 14, 16) == 16
+    assert token_length("A" * 40, 16) == 16
+
+
+def test_first_fit_places_in_order_into_the_first_row_with_room() -> None:
+    assert first_fit([12, 12, 4, 3], rows=2, width=16) == [0, 1, 0, 1]
+    assert first_fit([16, 16], rows=2, width=16) == [0, 1]
+    assert first_fit([12, 12, 7], rows=2, width=16) is None
+
+
+def test_row_filler_refuses_without_placing() -> None:
+    filler = RowFiller(1, 10)
+    assert filler.place(6) and not filler.place(5) and filler.place(4)
+    assert filler.placement == [0, 0]
+
+
+def _seqs() -> list[dict[str, str]]:
+    lengths = (10, 3, 12, 5, 1)
+    return [
+        {"sequence_id": f"s{i}", "sequence": "ACDEFGHIKLMNPQ"[:n]} for i, n in enumerate(lengths)
+    ]
+
+
+def test_fixed_shape_pack_is_exactly_rows_by_width(tokenizer) -> None:
+    collator = MLMCollator(tokenizer, max_length=16, pack_sequences=True, pack_rows=4)
+    out = collator(_seqs())
+    assert out["input_ids"].shape == out["segment_ids"].shape == (4, 16)
+    assert out["num_sequences"] == 5
+    lengths = [token_length(s["sequence"], 16) for s in _seqs()]  # 12, 5, 14, 7, 3
+    placement = first_fit(lengths, 4, 16)
+    assert placement == [0, 1, 2, 1, 0]
+    for row in range(4):
+        expected = sum(n for n, r in zip(lengths, placement, strict=True) if r == row)
+        assert int(out["attention_mask"][row].sum()) == expected
+
+
+def test_fixed_shape_pack_keeps_the_unpacked_masks(tokenizer) -> None:
+    kwargs = dict(max_length=16, deterministic=True, seed=3)
+    plain = MLMCollator(tokenizer, **kwargs)(_seqs())
+    packed = MLMCollator(tokenizer, pack_sequences=True, pack_rows=4, **kwargs)(_seqs())
+    lengths = plain["attention_mask"].sum(1).tolist()
+    placement = first_fit(lengths, 4, 16)
+    offsets = [0] * 4
+    for i, (n, row) in enumerate(zip(lengths, placement, strict=True)):
+        start = offsets[row]
+        for key in ("input_ids", "labels"):
+            assert packed[key][row, start : start + n].tolist() == plain[key][i, :n].tolist()
+        offsets[row] += n
+
+
+def test_fixed_shape_pack_raises_when_sequences_do_not_fit(tokenizer) -> None:
+    collator = MLMCollator(tokenizer, max_length=16, pack_sequences=True, pack_rows=1)
+    with pytest.raises(ValueError, match="do not fit"):
+        collator(_seqs())
+
+
+def test_pack_rows_requires_pack_sequences(tokenizer) -> None:
+    with pytest.raises(ValueError, match="pack_rows requires pack_sequences"):
+        MLMCollator(tokenizer, max_length=16, pack_rows=2)
+
+
+def test_fixed_shape_pack_checks_token_lengths(
+    tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(collate_mod, "token_length", lambda seq, width: 1)
+    collator = MLMCollator(tokenizer, max_length=16, pack_sequences=True, pack_rows=4)
+    with pytest.raises(ValueError, match="token_length"):
+        collator(_seqs())
