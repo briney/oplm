@@ -179,8 +179,13 @@ class DataCursor:
             identical across ranks since training steps in lockstep).
         world_size: Number of ranks the interrupted run used.
         num_workers: DataLoader ``num_workers`` the interrupted run used.
-        per_rank_batch: Samples per batch contributed by one (rank, worker) stream.
+        per_rank_batch: Samples per batch contributed by one (rank, worker) stream; 0 in
+            token mode.
         seed: Base dataset seed the interrupted run used.
+        rank_epochs: Token mode only: each rank's epoch at the save (ranks roll over on their
+            own).
+        worker_rows: Token mode only: a ranks x workers table of the rows each worker had
+            emitted this epoch, the exact position whatever the batch size.
     """
 
     epoch: int
@@ -189,6 +194,8 @@ class DataCursor:
     num_workers: int
     per_rank_batch: int
     seed: int
+    rank_epochs: list[int] | None = None
+    worker_rows: list[list[int]] | None = None
 
 
 class ShardedProteinDataset(IterableDataset[dict[str, object]]):

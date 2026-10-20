@@ -1573,7 +1573,9 @@ class Trainer:
         dict is built and handed to ``save_checkpoint`` before ``dcp.async_save`` stages
         anything, and ``trainer_state.json`` (which the cursor lands in, under the
         ``"cursor"`` key) is one of the synchronous sidecars written before this call
-        returns -- never deferred to :meth:`_finalize_pending_save`.
+        returns -- never deferred to :meth:`_finalize_pending_save`. In token mode the cursor
+        also carries every rank's epoch and per-worker row counts (``rank_epochs``,
+        ``worker_rows``), gathered here, so every rank must enter this method together.
 
         Args:
             blocking: When ``True`` (default), calls ``save_checkpoint(...,
@@ -1597,13 +1599,25 @@ class Trainer:
 
         checkpoint_dir = Path(self.cfg.train.output_dir) / f"checkpoint-{self.global_step}"
 
+        rank_epochs: list[int] | None = None
+        worker_rows: list[list[int]] | None = None
+        if self._token_mode:
+            # Every rank enters this save at the same step (each trigger is rank-reduced, and
+            # _SaveDeferral is off in token mode), so the gather cannot strand a rank.
+            from accelerate.utils import gather_object
+
+            gathered = gather_object([(self.epoch, list(self._worker_rows))])
+            rank_epochs = [int(epoch) for epoch, _ in gathered]
+            worker_rows = [[int(n) for n in rows] for _, rows in gathered]
         cursor = DataCursor(
             epoch=self.epoch,
             batches_in_epoch=self._batches_in_epoch,
             world_size=self.accelerator.num_processes,
             num_workers=self._effective_num_workers(),
-            per_rank_batch=self.cfg.train.batch_size,
+            per_rank_batch=0 if self._token_mode else self.cfg.train.batch_size,
             seed=self.cfg.train.seed,
+            rank_epochs=rank_epochs,
+            worker_rows=worker_rows,
         )
 
         should_mark_permanent = False
@@ -1913,6 +1927,12 @@ class Trainer:
           a full worker-cycle boundary -- see the worker-cycle save-alignment deferral
           in :meth:`train`), a WARNING notes that global batch interleaving may be
           window-shifted, though each worker's own data content stays exact.
+        - Token mode (``train.batch_tokens`` set): the layout check drops ``per_rank_batch``
+          (rows per worker do not depend on the batch size, so the token budget may change at
+          a resume), then this rank's epoch is restored from ``cursor.rank_epochs`` and its
+          per-worker row counts from ``cursor.worker_rows``, armed via the top-level
+          dataset's ``set_resume_rows``. A cursor from the other batching mode raises
+          ``ValueError`` (its position cannot be mapped).
 
         Args:
             state: The trainer state dict returned by
@@ -1922,7 +1942,7 @@ class Trainer:
                 message only).
 
         Raises:
-            ValueError: The cursor's layout disagrees with the live run and
+            ValueError: The cursor's layout or batching mode disagrees with the live run and
                 ``resume_data_position`` is true.
         """
         from oplm.data import DataCursor
@@ -1948,12 +1968,25 @@ class Trainer:
             return
 
         cursor = DataCursor(**cursor_dict)
-        live_layout = {
+        if (cursor.worker_rows is not None) != self._token_mode:
+            saved, live = (
+                ("token", "sequence") if cursor.worker_rows is not None else ("sequence", "token")
+            )
+            raise ValueError(
+                f"Checkpoint {checkpoint_dir}'s data cursor is from a {saved}-mode run, but this "
+                f"run is in {live} mode (train.batch_tokens); its position cannot be mapped. To "
+                "resume anyway (restarting the epoch's data position from row 0), set "
+                "train.resume_data_position=false."
+            )
+        # Rows per worker depend only on the striping (world size, workers, seed); in token mode
+        # the batch size can change at a resume without moving the position.
+        live_layout: dict[str, int] = {
             "world_size": self.accelerator.num_processes,
             "num_workers": self._effective_num_workers(),
-            "per_rank_batch": self.cfg.train.batch_size,
             "seed": self.cfg.train.seed,
         }
+        if not self._token_mode:
+            live_layout["per_rank_batch"] = self.cfg.train.batch_size
         mismatches = [
             f"{attr} (checkpoint={getattr(cursor, attr)!r}, live={live_value!r})"
             for attr, live_value in live_layout.items()
@@ -1967,6 +2000,16 @@ class Trainer:
                 "anyway (restarting the epoch's data position from row 0 instead of "
                 "resuming it), set train.resume_data_position=false."
             )
+
+        if self._token_mode:
+            assert cursor.rank_epochs is not None and cursor.worker_rows is not None
+            rank = self.accelerator.process_index
+            self.epoch = cursor.rank_epochs[rank]
+            self._set_dataset_epoch(self.epoch)
+            self._epoch_at_last_opt_step = self.epoch
+            self._worker_rows = list(cursor.worker_rows[rank])
+            self._top_level_dataset().set_resume_rows(cursor.worker_rows[rank])  # ty: ignore[unresolved-attribute]
+            return
 
         self._batches_in_epoch = cursor.batches_in_epoch
         set_resume_skip = getattr(self._top_level_dataset(), "set_resume_skip", None)

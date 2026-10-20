@@ -12,12 +12,14 @@ contexts deterministically in a single process.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 import pytest
 
 import oplm.data.sequence.dataset as dataset_mod
+from oplm.data import DataCursor
 from oplm.data.sequence.dataset import InterleavedDataset, ShardedProteinDataset
 from tests.data.conftest import write_sequence_shards
 
@@ -313,3 +315,30 @@ def test_set_resume_rows_needs_one_entry_per_worker(
     _set_context(monkeypatch, 0, 1, 0, 2)
     with pytest.raises(ValueError, match="3 entries for 2 DataLoader workers"):
         _ids(ds)
+
+
+def test_data_cursor_loads_old_dicts() -> None:
+    old = {
+        "epoch": 1,
+        "batches_in_epoch": 5,
+        "world_size": 2,
+        "num_workers": 1,
+        "per_rank_batch": 4,
+        "seed": 0,
+    }
+    cursor = DataCursor(**old)
+    assert cursor.rank_epochs is None and cursor.worker_rows is None
+
+
+def test_data_cursor_round_trips_token_fields() -> None:
+    cursor = DataCursor(
+        epoch=0,
+        batches_in_epoch=3,
+        world_size=2,
+        num_workers=2,
+        per_rank_batch=0,
+        seed=0,
+        rank_epochs=[0, 1],
+        worker_rows=[[4, 5], [0, 2]],
+    )
+    assert DataCursor(**asdict(cursor)) == cursor
