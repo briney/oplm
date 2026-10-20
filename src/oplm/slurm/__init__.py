@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from oplm.slurm.config import BatchPlan, SlurmConfig, load_slurm_config, resolve_batch_plan
+from oplm.slurm.config import (
+    BatchPlan,
+    SlurmConfig,
+    TokenPlan,
+    load_slurm_config,
+    resolve_batch_plan,
+    resolve_token_plan,
+)
 from oplm.slurm.render import (
     JobSpec,
     SubmitEntry,
@@ -17,11 +24,13 @@ __all__ = [
     "JobSpec",
     "SlurmConfig",
     "SubmitEntry",
+    "TokenPlan",
     "accelerate_command",
     "load_slurm_config",
     "render_job",
     "render_submit_script",
     "resolve_batch_plan",
+    "resolve_token_plan",
     "running_job_ids",
     "submit_all",
     "submit_job",

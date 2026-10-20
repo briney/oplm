@@ -9,7 +9,7 @@ per-cell ``run.yaml`` never carries cluster settings.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -129,6 +129,20 @@ def _coerce_positive_int(value: Any, description: str) -> int:
     return coerced
 
 
+def _preset_caps(raw: Mapping[str, Any], key: str) -> dict[str, int]:
+    """Parse an optional ``{preset: positive int}`` table, naming every bad entry at once."""
+    caps: dict[str, int] = {}
+    bad: list[str] = []
+    for preset, value in dict(raw.get(key, {})).items():
+        try:
+            caps[str(preset)] = _coerce_positive_int(value, f"slurm config {key}[{preset!r}]")
+        except ValueError as exc:
+            bad.append(str(exc))
+    if bad:
+        raise ValueError("; ".join(bad))
+    return caps
+
+
 @dataclass(frozen=True)
 class SlurmConfig:
     """Validated ``slurm:`` block."""
@@ -153,6 +167,9 @@ class SlurmConfig:
     max_requeues: int = 20
     # Rendered as the job script's `NCCL_DEBUG` export (see `oplm.slurm.render.render_job`).
     nccl_debug: str = "WARN"
+    # Per-preset cap on a device's token micro-batch, for token-mode sweeps and scaling jobs
+    # (`resolve_token_plan`). Optional: only token-mode generation reads it.
+    max_batch_tokens: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> SlurmConfig:
@@ -161,17 +178,7 @@ class SlurmConfig:
         Raises:
             ValueError: On a missing required field or an out-of-range value.
         """
-        max_batch: dict[str, int] = {}
-        bad: list[str] = []
-        for preset, value in dict(raw.get("max_batch_size", {})).items():
-            try:
-                max_batch[str(preset)] = _coerce_positive_int(
-                    value, f"slurm config max_batch_size[{preset!r}]"
-                )
-            except ValueError as exc:
-                bad.append(str(exc))
-        if bad:
-            raise ValueError("; ".join(bad))
+        max_batch = _preset_caps(raw, "max_batch_size")
         return cls(
             partition=str(_require(raw, "partition")),
             time_limit=PhaseTable.from_value(_require(raw, "time_limit"), name="time_limit"),
@@ -190,6 +197,7 @@ class SlurmConfig:
             account=str(raw["account"]) if raw.get("account") is not None else None,
             max_requeues=_positive_int(raw, "max_requeues", 20),
             nccl_debug=str(raw.get("nccl_debug", "WARN")),
+            max_batch_tokens=_preset_caps(raw, "max_batch_tokens"),
         )
 
 
@@ -252,6 +260,71 @@ def resolve_batch_plan(*, global_examples: int, world_size: int, max_batch_size:
     )
     return BatchPlan(
         per_device_batch=base // accum,
+        gradient_accumulation_steps=accum,
+        world_size=world_size,
+    )
+
+
+@dataclass(frozen=True)
+class TokenPlan:
+    """Per-device token micro-batch and accumulation for one token-mode training job."""
+
+    batch_tokens: int
+    gradient_accumulation_steps: int
+    world_size: int
+
+
+def resolve_token_plan(
+    *, global_tokens: int, world_size: int, max_batch_tokens: int, width: int
+) -> TokenPlan:
+    """Derive each device's token micro-batch and the accumulation for a global token budget.
+
+    The token-mode counterpart of :func:`resolve_batch_plan`. A device's micro-batch is a whole
+    number of ``width``-token rows (``model.max_position_embeddings``), so the budget must split
+    into whole rows per replica. The smallest accumulation that brings a device to at most
+    ``max_batch_tokens`` wins. An infeasible combination is an error, never a silently adjusted
+    budget.
+
+    Args:
+        global_tokens: Token capacity per optimizer step (``train.tokens_per_step``).
+        world_size: Total training processes.
+        max_batch_tokens: Memory cap on one device's micro-batch, in tokens, for this preset.
+        width: Tokens per row (``model.max_position_embeddings``).
+
+    Returns:
+        The resolved plan; ``batch_tokens * gradient_accumulation_steps * world_size`` equals
+        ``global_tokens``.
+
+    Raises:
+        ValueError: A non-positive or ``bool`` argument, a cap smaller than one row, or a budget
+            that is not a whole number of rows per replica.
+    """
+    named = {
+        "global_tokens": global_tokens,
+        "world_size": world_size,
+        "max_batch_tokens": max_batch_tokens,
+        "width": width,
+    }
+    for name, value in named.items():
+        _reject_bool(value, f"resolve_token_plan {name}")
+    if min(named.values()) < 1:
+        raise ValueError(f"resolve_token_plan arguments must all be >= 1; got {named}")
+    if max_batch_tokens < width:
+        raise ValueError(
+            f"max_batch_tokens {max_batch_tokens} is smaller than one {width}-token row"
+        )
+    if global_tokens % (world_size * width):
+        raise ValueError(
+            f"global token budget {global_tokens} is not a whole number of {width}-token rows "
+            f"per replica at world size {world_size} (it must be a multiple of "
+            f"{world_size * width})"
+        )
+    rows = global_tokens // (world_size * width)
+    max_rows = max_batch_tokens // width
+    # accum == rows (one row per device) always divides and always fits, since max_rows >= 1.
+    accum = next(a for a in range(1, rows + 1) if rows % a == 0 and rows // a <= max_rows)
+    return TokenPlan(
+        batch_tokens=rows // accum * width,
         gradient_accumulation_steps=accum,
         world_size=world_size,
     )
