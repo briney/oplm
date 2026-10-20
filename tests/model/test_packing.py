@@ -20,7 +20,9 @@ def test_segment_mask_is_block_diagonal_with_no_empty_rows() -> None:
     assert mask[7].tolist() == [False] * 6 + [True, True]
 
 
-def _model(checkpointing: str | None, packed_attention: str = "sdpa") -> OplmForMaskedLM:
+def _model(
+    checkpointing: str | None, packed_attention: str = "sdpa", num_loops: int = 1
+) -> OplmForMaskedLM:
     torch.manual_seed(0)
     cfg = OplmConfig(
         hidden_size=32,
@@ -37,6 +39,7 @@ def _model(checkpointing: str | None, packed_attention: str = "sdpa") -> OplmFor
         canon_positions=["A", "B", "C", "D"],
         canon_kernel_sizes=[3, 4, 7],  # odd and even kernels, one wider than a sequence
         packed_attention=packed_attention,
+        num_loops=num_loops,
     )
     model = OplmForMaskedLM(cfg)
     if checkpointing is not None:
@@ -152,6 +155,33 @@ def test_flex_packed_logits_match_sdpa(
     torch.testing.assert_close(got[mask], ref[mask], rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.parametrize("checkpointing", [None, "full", "selective"])
+def test_flex_packed_gradients_match_sdpa(
+    checkpointing: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same weights, same packed batch: every parameter gradient through flex matches the
+    dense-mask SDPA path, through each checkpointing wrapper (so a dropped block mask or a
+    broken recompute in backward shows up here)."""
+    # FlexAttention has no CPU backward: the public wrapper refuses it via this private torch
+    # function, though the reference (math) backward runs once it is a no-op. Skip, rather than
+    # silently pass, if a torch upgrade removes it.
+    if not hasattr(flex_mod, "_validate_device"):
+        pytest.skip("torch.nn.attention.flex_attention._validate_device is gone")
+    monkeypatch.setattr(flex_mod, "_validate_device", lambda *args, **kwargs: None)
+    calls = _spy_flex_kernel(monkeypatch)
+    _, packed = _batches()
+    grads = []
+    for backend in ("sdpa", "flex"):
+        model = _model(checkpointing, backend)
+        model(**packed).loss.backward()
+        grads.append({n: p.grad for n, p in model.named_parameters() if p.grad is not None})
+    # One call per block in the forward, and again per block when backward recomputes it.
+    assert len(calls) == model.config.num_hidden_layers * (1 if checkpointing is None else 2)
+    assert grads[0].keys() == grads[1].keys()
+    for name, ref in grads[0].items():
+        torch.testing.assert_close(grads[1][name], ref, rtol=1e-4, atol=1e-6, msg=name)
+
+
 def test_flex_packed_logits_match_padded_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _spy_flex_kernel(monkeypatch)
     padded, packed = _batches()
@@ -183,6 +213,27 @@ def test_flex_block_mask_is_built_once_per_forward(monkeypatch: pytest.MonkeyPat
     with torch.no_grad():
         _model(None, "flex").eval()(**packed)  # 3 layers
     assert calls[0] == 1
+
+
+def test_flex_switched_on_a_live_looped_model_builds_one_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kernel is read from the live config per forward (docs/perf/packing_check.py flips it
+    on a compiled model): one block mask per forward, one flex call per executed layer, which
+    with looping is more than the number of physical blocks."""
+    masks = _count_block_masks(monkeypatch)
+    flex_calls = _spy_flex_kernel(monkeypatch)
+    _, packed = _batches()
+    model = _model(None, "sdpa", num_loops=2).eval()
+    with torch.no_grad():
+        model(**packed)
+        assert masks[0] == 0 and flex_calls == []
+        model.config.packed_attention = "flex"
+        model(**packed)
+    depth = len(model.oplm.backbone.layer_execution_order)
+    assert depth == 2 * model.config.num_hidden_layers
+    assert masks[0] == 1
+    assert len(flex_calls) == depth
 
 
 def test_flex_config_without_segment_ids_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:

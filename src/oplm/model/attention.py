@@ -340,9 +340,10 @@ class OplmAttention(nn.Module):
     ) -> torch.Tensor:
         """FlexAttention over a packed batch's block mask (`segment_block_mask`).
 
-        Unlike SDPA, FlexAttention does not cast its inputs under autocast, and channel QK-norm
-        returns fp32 q/k while v is in the autocast dtype; cast all three as SDPA would. No
-        dropout (rejected by config validation).
+        Channel QK-norm returns fp32 q/k while v is in the autocast dtype. torch 2.11's
+        FlexAttention casts its inputs under autocast itself; older torch does not, so cast all
+        three here as SDPA would and the kernel sees one dtype either way. No dropout (rejected
+        by config validation).
         """
         from torch.nn.attention.flex_attention import flex_attention
 
