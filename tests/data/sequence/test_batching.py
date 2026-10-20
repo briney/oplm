@@ -13,6 +13,7 @@ from oplm.data.sequence.collate import MLMCollator, token_length
 from oplm.data.sequence.dataset import ShardedProteinDataset
 from oplm.data.tokenizer import get_tokenizer
 from tests.data.conftest import write_sequence_shards
+from tests.data.sequence.test_refill_and_remainder import _mix, _sources
 from tests.training.conftest import tiny_train_cfg
 
 if TYPE_CHECKING:
@@ -85,30 +86,45 @@ def test_long_sequence_takes_a_whole_row(tmp_path: Path) -> None:
     assert int(batches[0]["attention_mask"].sum()) == WIDTH
 
 
-def test_resume_rows_continue_each_worker_exactly(tmp_path: Path) -> None:
-    lengths = [(i * 5) % 13 + 1 for i in range(200)]
-    dataset = _dataset(tmp_path, lengths, shuffle=True)
-
+def _assert_resume_rows_continue_each_worker(dataset, *, num_workers: int) -> None:
     def run(batcher: TokenBatcher) -> list[tuple[int, int, list[str]]]:
-        loader = DataLoader(batcher, batch_size=None, num_workers=2)
+        loader = DataLoader(batcher, batch_size=None, num_workers=num_workers)
         return [
             (int(b["stream_position"][0]), int(b["stream_position"][1]), list(b["sequence_ids"]))
             for b in loader
         ]
 
     baseline = run(_batcher(dataset))
-    cut = 7  # batches consumed before the "checkpoint"
-    rows = [0, 0]
+    cut = len(baseline) // 2  # batches consumed before the "checkpoint"
+    rows = [0] * num_workers
     for worker, emitted, _ in baseline[:cut]:
         rows[worker] = emitted
     resumed_batcher = _batcher(dataset)
     resumed_batcher.set_resume_rows(rows)
     resumed = run(resumed_batcher)
-    for worker in range(2):
+    for worker in range(num_workers):
         before = [ids for w, _, ids in baseline[:cut] if w == worker]
-        after = [ids for w, _, ids in baseline[cut:] if w == worker]
+        after = [(n, ids) for w, n, ids in baseline[cut:] if w == worker]
+        assert before and after
         assert sum(len(ids) for ids in before) == rows[worker]
-        assert [ids for w, _, ids in resumed if w == worker] == after
+        # The resumed counts continue from the recorded rows, not from zero.
+        assert [(n, ids) for w, n, ids in resumed if w == worker] == after
+
+
+def test_resume_rows_continue_each_worker_exactly(tmp_path: Path) -> None:
+    lengths = [(i * 5) % 13 + 1 for i in range(200)]
+    dataset = _dataset(tmp_path, lengths, shuffle=True)
+    _assert_resume_rows_continue_each_worker(dataset, num_workers=2)
+
+
+@pytest.mark.parametrize("num_workers", [2, 3])
+def test_resume_rows_continue_each_worker_through_a_reshuffled_mix(
+    tmp_path: Path, num_workers: int
+) -> None:
+    # The production data path: two sources, the small one refilling (and reshuffling) several
+    # times per worker before the cut, so the resume lands inside a later pass.
+    dataset = _mix(_sources(tmp_path), reshuffle=True)
+    _assert_resume_rows_continue_each_worker(dataset, num_workers=num_workers)
 
 
 def test_build_train_dataloader_in_token_mode(training_parquet: Path, tmp_path: Path) -> None:
