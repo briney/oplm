@@ -1347,10 +1347,12 @@ def test_local_execution_is_sequential_and_stops_on_failure(
     assert seen == commands[:2]
 
 
-def _generate_token_cell(tmp_path: Path, *, extra: list[str] | None = None) -> Path:
+def _generate_token_cell(
+    tmp_path: Path, *, extra: list[str] | None = None, config_text: str | None = None
+) -> Path:
     """One coarse cell at a 1M-token budget (170M: 1 node x 8 GPUs, width 1024 by default)."""
     config_path = tmp_path / "base.yaml"
-    config_path.write_text(_base_config_text())
+    config_path.write_text(_base_config_text() if config_text is None else config_text)
     out = tmp_path / "coarse"
     result = runner.invoke(
         phases.app,
@@ -1385,6 +1387,20 @@ def test_token_cell_pins_token_mode_in_run_yaml(tmp_path: Path) -> None:
     assert cfg.train.gradient_accumulation_steps == 2
     assert cfg.data.pack_sequences is True
     assert cfg.train.batch_size == 32  # the base config's eval batch size, untouched
+
+
+def test_token_cell_keeps_the_config_checkpointing(tmp_path: Path) -> None:
+    # The max_batch_tokens cap bounds memory in token mode, so the full-checkpointing pin
+    # (sequence mode only) would just add recompute.
+    text = _base_config_text().replace(
+        "model:\n",
+        "model:\n  gradient_checkpointing: true\n  gradient_checkpointing_mode: selective\n",
+        1,
+    )
+    out = _generate_token_cell(tmp_path, config_text=text)
+    cfg = load_config(["--config", str(out / load_phase(out / "phase.json").runs[0].config)])
+    assert cfg.model.gradient_checkpointing is True
+    assert cfg.model.gradient_checkpointing_mode == "selective"
 
 
 def test_token_cell_records_its_plan_in_phase_json(tmp_path: Path) -> None:

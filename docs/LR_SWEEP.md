@@ -353,8 +353,12 @@ at a fixed batch and sequence length, so the proxy phases should run at that bud
     example 2048), and preferably `model.packed_attention: flex` and `train.compile_dynamic:
     false`.
   - The `slurm:` block needs a `max_batch_tokens` entry for every preset you generate, sized
-    under full activation checkpointing (sweep cells pin it). `docs/perf/attention_width_bench.py`
-    measures peak memory per shape.
+    under the config's own checkpointing setting. `docs/perf/attention_width_bench.py`
+    measures peak memory per shape (forward and backward only; add optimizer state).
+  - Token cells take `model.gradient_checkpointing` and its mode from the config. Sequence cells
+    pin full checkpointing, but in token mode the cap already bounds memory, so the pin would
+    only add recompute. `transfer` cells use the `170M` entry at up to 48 layers, so size
+    that entry for depth 48 if you run `transfer`.
 - **What each cell's `run.yaml` pins:**
   - `train.tokens_per_step` and `train.batch_tokens`;
   - the derived `train.gradient_accumulation_steps`;

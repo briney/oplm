@@ -191,6 +191,19 @@ def _batch_overrides(params: Params, plan: BatchPlan | TokenPlan) -> list[str]:
     ]
 
 
+def _checkpointing_overrides(plan: BatchPlan | TokenPlan) -> list[str]:
+    """Pin full checkpointing for sequence cells; token cells keep the base config's.
+
+    Full checkpointing is what makes the derived per-device batches fit at 400M+. Both keys are
+    pinned so a change to packaged defaults cannot alter the memory profile mid-sweep. In token
+    mode the ``max_batch_tokens`` cap already bounds memory (sized under the config's own
+    checkpointing), so the pin would only add recompute.
+    """
+    if isinstance(plan, TokenPlan):
+        return []
+    return ["model.gradient_checkpointing=true", "model.gradient_checkpointing_mode=full"]
+
+
 def _write_run_config(
     base_config: Path,
     run_dir: Path,
@@ -240,11 +253,7 @@ def _write_run_config(
         "model.mup_enable=true",
         "model.mup_base_width=768",
         f"model.mup_output_mult={params['output_mult']}",
-        # Full checkpointing is what makes the derived per-device batches fit at 400M+. Both
-        # keys are pinned so a change to packaged defaults cannot alter the memory profile
-        # mid-sweep.
-        "model.gradient_checkpointing=true",
-        "model.gradient_checkpointing_mode=full",
+        *_checkpointing_overrides(plan),
         f"train.lr={params['lr']}",
         f"train.mup_depth_lr_exponent={params['depth_exponent']}",
         f"train.mup_depth_reference_layers={DEPTH_REFERENCE_LAYERS}",
