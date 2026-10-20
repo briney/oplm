@@ -15,7 +15,14 @@ from rich.console import Console
 from rich.table import Table
 
 from oplm.config import get_preset_config, load_config, serialize_config
-from oplm.slurm.config import BatchPlan, SlurmConfig, load_slurm_config, resolve_batch_plan
+from oplm.slurm.config import (
+    BatchPlan,
+    SlurmConfig,
+    TokenPlan,
+    load_slurm_config,
+    resolve_batch_plan,
+    resolve_token_plan,
+)
 from oplm.slurm.render import (
     JobSpec,
     SubmitEntry,
@@ -112,24 +119,31 @@ def _cell(
     output_mult: float,
     depth_exponent: float,
     seed: int,
-    global_examples: int,
     max_steps: int,
     warmup_steps: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
     batch_mult: float | None = None,
     layers: int | None = None,
     lr_mult: float | None = None,
     base_lr: float | None = None,
 ) -> Params:
+    if (global_examples is None) == (global_tokens is None):
+        raise ValueError("a sweep cell needs exactly one of global_examples or global_tokens")
     params: Params = {
         "preset": preset,
         "lr": lr,
         "output_mult": output_mult,
         "depth_exponent": depth_exponent,
         "seed": seed,
-        "global_examples": global_examples,
         "max_steps": max_steps,
         "warmup_steps": warmup_steps,
     }
+    # One budget per cell: global examples (sequence batches) or a token budget (token mode).
+    if global_tokens is not None:
+        params["global_tokens"] = global_tokens
+    else:
+        params["global_examples"] = global_examples
     if batch_mult is not None:
         params["batch_mult"] = batch_mult
     # Depth-ray cells override the preset's layer count and record the bracket position:
@@ -143,13 +157,47 @@ def _cell(
     return params
 
 
+def _batch_budget(
+    global_examples: int | None, global_tokens: int | None, *, default_examples: int
+) -> dict[str, int]:
+    """A phase's cell budget: ``--global-tokens`` (token mode), else ``--global-examples``.
+
+    The example count's default lives here rather than in the Typer option so the two flags can
+    be checked for mutual exclusion.
+    """
+    if global_examples is not None and global_tokens is not None:
+        raise ValueError("pass --global-examples or --global-tokens, not both")
+    if global_tokens is not None:
+        return {"global_tokens": global_tokens}
+    return {"global_examples": default_examples if global_examples is None else global_examples}
+
+
+def _batch_overrides(params: Params, plan: BatchPlan | TokenPlan) -> list[str]:
+    """Config overrides that pin a cell's batch: sequences per device, or token mode."""
+    if isinstance(plan, TokenPlan):
+        return [
+            f"train.tokens_per_step={_as_int(params['global_tokens'])}",
+            f"train.batch_tokens={plan.batch_tokens}",
+            # The derived value, which the trainer re-derives and accepts; a launch at another
+            # world size then fails at startup instead of training on a different budget.
+            f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+            # Token mode packs whole sequences into fixed rows. train.batch_size keeps the base
+            # config's value, which in token mode sizes eval batches only.
+            "data.pack_sequences=true",
+        ]
+    return [
+        f"train.batch_size={plan.per_device_batch}",
+        f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+    ]
+
+
 def _write_run_config(
     base_config: Path,
     run_dir: Path,
     params: Params,
     *,
     phase: str,
-    plan: BatchPlan,
+    plan: BatchPlan | TokenPlan,
     diagnostics: bool = False,
 ) -> Path:
     max_steps = _as_int(params["max_steps"])
@@ -201,8 +249,7 @@ def _write_run_config(
         f"train.mup_depth_lr_exponent={params['depth_exponent']}",
         f"train.mup_depth_reference_layers={DEPTH_REFERENCE_LAYERS}",
         f"train.seed={params['seed']}",
-        f"train.batch_size={plan.per_device_batch}",
-        f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+        *_batch_overrides(params, plan),
         f"train.max_steps={params['max_steps']}",
         "train.max_epochs=null",
         f"train.warmup_steps={params['warmup_steps']}",
@@ -290,21 +337,28 @@ def _resolve_nodes(slurm: SlurmConfig, *, phase: str, preset: str) -> int:
         ) from exc
 
 
-def _resolve_max_batch_size(slurm: SlurmConfig, preset: str) -> int:
-    """Resolve the max_batch_size cap for `preset`, with an actionable error if missing.
+def _resolve_preset_cap(table: dict[str, int], *, table_name: str, preset: str) -> int:
+    """Look up a per-preset cap, with an actionable error if the preset is missing.
 
-    Mirrors `_resolve_nodes`: a plain `slurm.max_batch_size[preset]` raises a bare `KeyError`
-    with no context, which would surface as an uncaught traceback instead of the clean
-    `typer.BadParameter` every other validation failure produces.
+    Mirrors `_resolve_nodes`: a bare `KeyError` would surface as an uncaught traceback instead of
+    the clean `typer.BadParameter` every other validation failure produces.
     """
     try:
-        return slurm.max_batch_size[preset]
+        return table[preset]
     except KeyError as exc:
-        defined = sorted(slurm.max_batch_size)
+        defined = sorted(table)
         raise ValueError(
-            f"preset {preset!r} has no entry in the slurm `max_batch_size` table; "
+            f"preset {preset!r} has no entry in the slurm `{table_name}` table; "
             f"defined presets: {', '.join(defined) if defined else '(none)'}"
         ) from exc
+
+
+def _resolve_max_batch_size(slurm: SlurmConfig, preset: str) -> int:
+    return _resolve_preset_cap(slurm.max_batch_size, table_name="max_batch_size", preset=preset)
+
+
+def _resolve_max_batch_tokens(slurm: SlurmConfig, preset: str) -> int:
+    return _resolve_preset_cap(slurm.max_batch_tokens, table_name="max_batch_tokens", preset=preset)
 
 
 def _preset_sort_key(preset: str) -> tuple[float, str]:
@@ -434,6 +488,8 @@ def _generate_phase(
     accelerate_config = accelerate_config.resolve() if accelerate_config is not None else None
     out.mkdir(parents=True, exist_ok=True)
     slurm: SlurmConfig = load_slurm_config(base_config)
+    # Row width of a token-mode micro-batch (each device holds whole rows of this many tokens).
+    width = int(load_config(["--config", str(base_config)]).model.max_position_embeddings)
     runs: list[RunSpec] = []
     commands: list[list[str]] = []
     for params in cells:
@@ -446,11 +502,22 @@ def _generate_phase(
         # cell is planned for 4 nodes; on 8 local processes that is 512, not 2048) and break
         # every cross-cell comparison.
         world_size = num_processes if local else nodes * slurm.gpus_per_node
-        plan = resolve_batch_plan(
-            global_examples=_as_int(params["global_examples"]),
-            world_size=world_size,
-            max_batch_size=_resolve_max_batch_size(slurm, preset),
-        )
+        plan: BatchPlan | TokenPlan
+        if "global_tokens" in params:
+            plan = resolve_token_plan(
+                global_tokens=_as_int(params["global_tokens"]),
+                world_size=world_size,
+                max_batch_tokens=_resolve_max_batch_tokens(slurm, preset),
+                width=width,
+            )
+            audit: Params = {"batch_tokens": plan.batch_tokens}
+        else:
+            plan = resolve_batch_plan(
+                global_examples=_as_int(params["global_examples"]),
+                world_size=world_size,
+                max_batch_size=_resolve_max_batch_size(slurm, preset),
+            )
+            audit = {"per_device_batch": plan.per_device_batch}
         config = _write_run_config(
             base_config, run_dir, params, phase=name, plan=plan, diagnostics=diagnostics
         )
@@ -463,7 +530,7 @@ def _generate_phase(
                 {
                     **params,
                     "nodes": nodes,
-                    "per_device_batch": plan.per_device_batch,
+                    **audit,
                     "gradient_accumulation_steps": plan.gradient_accumulation_steps,
                 },
             )
@@ -474,7 +541,7 @@ def _generate_phase(
                 result=result,
                 # `plan.world_size` is the cell's true world size: equal to `num_processes` under
                 # --local, but `nodes * gpus_per_node` otherwise -- so commands.txt always agrees
-                # with run.yaml's batch_size/gradient_accumulation_steps on the same global batch.
+                # with run.yaml's batch keys on the same global batch.
                 num_processes=plan.world_size,
                 accelerate_config=accelerate_config,
             )
@@ -502,7 +569,13 @@ def _generate_phase(
 
 
 def _smoke_cells(
-    lrs: list[float], global_examples: int, seed: int, steps: int, warmup: int
+    lrs: list[float],
+    *,
+    seed: int,
+    steps: int,
+    warmup: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
 ) -> list[Params]:
     return [
         _cell(
@@ -512,6 +585,7 @@ def _smoke_cells(
             depth_exponent=0.0,
             seed=seed,
             global_examples=global_examples,
+            global_tokens=global_tokens,
             max_steps=steps,
             warmup_steps=warmup,
         )
@@ -520,9 +594,22 @@ def _smoke_cells(
 
 
 def _coarse_cells(
-    lrs: list[float], global_examples: int, seed: int, steps: int, warmup: int
+    lrs: list[float],
+    *,
+    seed: int,
+    steps: int,
+    warmup: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
 ) -> list[Params]:
-    return _smoke_cells(lrs, global_examples, seed, steps, warmup)
+    return _smoke_cells(
+        lrs,
+        seed=seed,
+        steps=steps,
+        warmup=warmup,
+        global_examples=global_examples,
+        global_tokens=global_tokens,
+    )
 
 
 def _refine_cells(
@@ -1122,7 +1209,11 @@ def smoke(
             metric=metric,
             source=None,
             cells=_smoke_cells(
-                parse_floats(lrs, name="--lrs"), global_examples, seed, steps, warmup
+                parse_floats(lrs, name="--lrs"),
+                global_examples=global_examples,
+                seed=seed,
+                steps=steps,
+                warmup=warmup,
             ),
             num_processes=num_processes,
             local=local,
@@ -1144,7 +1235,8 @@ def coarse(
     source: Annotated[Path | None, typer.Option("--from", exists=True, dir_okay=False)] = None,
     metric: Annotated[str | None, typer.Option("--metric")] = None,
     lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(COARSE_LRS),
-    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
     warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k coarse run
@@ -1167,7 +1259,13 @@ def coarse(
             out=out,
             metric=metric,
             source=source,
-            cells=_coarse_cells(lr_values, global_examples, seed, steps, warmup),
+            cells=_coarse_cells(
+                lr_values,
+                seed=seed,
+                steps=steps,
+                warmup=warmup,
+                **_batch_budget(global_examples, global_tokens, default_examples=2048),
+            ),
             num_processes=num_processes,
             local=local,
             accelerate_config=accelerate_config,
