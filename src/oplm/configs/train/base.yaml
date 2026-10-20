@@ -14,6 +14,10 @@ train:
   # Batch
   batch_size: 32
   gradient_accumulation_steps: 1
+  # Token mode: set both (global tokens per optimizer step; per-process micro-batch tokens,
+  # a multiple of model.max_position_embeddings). Needs data.pack_sequences: true.
+  tokens_per_step: null
+  batch_tokens: null
 
   # Optimizer — μP + Muon is the default recipe (disable via configs/train/vanilla_esm-c.yaml).
   optimizer: muon             # adamw | muon

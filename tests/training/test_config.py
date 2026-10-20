@@ -11,8 +11,17 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from omegaconf import OmegaConf
 
-from oplm.config import AVAILABLE_PRESETS, DataConfig, TrainConfig, load_config, serialize_config
+from oplm.config import (
+    AVAILABLE_PRESETS,
+    DataConfig,
+    TrainConfig,
+    load_config,
+    resolve_token_accumulation,
+    serialize_config,
+    validate_token_batching,
+)
 from oplm.model import OplmConfig as OplmModelConfig
+from tests.training.conftest import tiny_train_cfg
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -748,3 +757,61 @@ def test_fold_block_validates_its_fields() -> None:
             FoldRunConfig(loss_confidence=bad)
     with pytest.raises(ValueError, match="lm"):
         FoldRunConfig(lm="")
+
+
+# --- token mode (train.tokens_per_step / train.batch_tokens) ---------------------
+
+
+def test_token_mode_needs_both_fields() -> None:
+    with pytest.raises(ValueError, match="set together"):
+        TrainConfig(tokens_per_step=4096)
+    with pytest.raises(ValueError, match="set together"):
+        TrainConfig(batch_tokens=4096)
+
+
+def test_token_mode_rejects_non_positive_budgets() -> None:
+    with pytest.raises(ValueError, match="must be >= 1"):
+        TrainConfig(tokens_per_step=0, batch_tokens=4096)
+
+
+def test_token_mode_tokens_per_step_must_be_a_multiple_of_batch_tokens() -> None:
+    with pytest.raises(ValueError, match="multiple of train.batch_tokens"):
+        TrainConfig(tokens_per_step=6000, batch_tokens=4096)
+
+
+def test_token_mode_rejects_max_epochs() -> None:
+    with pytest.raises(ValueError, match="max_steps"):
+        TrainConfig(tokens_per_step=8192, batch_tokens=4096, max_epochs=1)
+
+
+def test_validate_token_batching(tmp_path: Path) -> None:
+    data = tmp_path / "unused.parquet"
+    ok = tiny_train_cfg(tmp_path, data, tokens_per_step=256, batch_tokens=256, pack_sequences=True)
+    validate_token_batching(ok)  # max_position_embeddings is 64 in tiny_train_cfg
+    validate_token_batching(tiny_train_cfg(tmp_path, data))  # sequence mode: nothing to check
+    bad_width = tiny_train_cfg(
+        tmp_path, data, tokens_per_step=400, batch_tokens=200, pack_sequences=True
+    )
+    with pytest.raises(ValueError, match="multiple of model.max_position_embeddings"):
+        validate_token_batching(bad_width)
+    unpacked = tiny_train_cfg(tmp_path, data, tokens_per_step=256, batch_tokens=256)
+    with pytest.raises(ValueError, match="data.pack_sequences"):
+        validate_token_batching(unpacked)
+
+
+def test_resolve_token_accumulation() -> None:
+    train = TrainConfig(tokens_per_step=4 * 8192, batch_tokens=8192)
+    assert resolve_token_accumulation(train, 1) == 4
+    assert resolve_token_accumulation(train, 2) == 2
+    assert resolve_token_accumulation(train, 4) == 1
+    for world_size in (3, 8):  # not a divisor; more capacity per step than the budget
+        with pytest.raises(ValueError, match="multiple of train.batch_tokens x world size"):
+            resolve_token_accumulation(train, world_size)
+
+
+def test_resolve_token_accumulation_accepts_saved_value_and_rejects_others() -> None:
+    # A token-mode run's saved config.yaml records the derived accumulation (2 at world size 2).
+    saved = TrainConfig(tokens_per_step=4 * 8192, batch_tokens=8192, gradient_accumulation_steps=2)
+    assert resolve_token_accumulation(saved, 2) == 2
+    with pytest.raises(ValueError, match="leave it at 1"):
+        resolve_token_accumulation(saved, 1)  # derived 4 here, so the saved 2 is stale

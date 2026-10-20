@@ -251,7 +251,7 @@ class Trainer:
         from accelerate.utils import DataLoaderConfiguration, InitProcessGroupKwargs, set_seed
         from rich.console import Console
 
-        from oplm.config import validate_parallelism_compat
+        from oplm.config import validate_parallelism_compat, validate_token_batching
         from oplm.data import DeviceDataLoader
         from oplm.training.optim import build_optimizers, build_schedulers
         from oplm.training.preflight import run_preflight
@@ -268,6 +268,7 @@ class Trainer:
         # load_config's copy of this check. Currently refuses hsdp + configured eval --
         # see validate_parallelism_compat for the deadlock it prevents.
         validate_parallelism_compat(cfg)
+        validate_token_batching(cfg)
 
         # Drain trigger (Task 1.5): SIGUSR1/SIGTERM handlers plus the Slurm
         # SLURM_JOB_END_TIME wall-clock margin. Installed immediately so a signal

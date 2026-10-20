@@ -43,6 +43,12 @@ class TrainConfig:
     # Batch
     batch_size: int = 32
     gradient_accumulation_steps: int = 1
+    # Token mode (set both, or neither): global token capacity per optimizer step, and each
+    # process's micro-batch capacity (rows x model.max_position_embeddings). Micro-batches are
+    # then fixed (rows, width) packed batches and gradient_accumulation_steps is derived at
+    # startup from the world size. train.batch_size still sizes eval batches.
+    tokens_per_step: int | None = None
+    batch_tokens: int | None = None
 
     # Optimizer.
     # NOTE: these are conservative *library* fallbacks for bare TrainConfig() /
@@ -248,6 +254,28 @@ class TrainConfig:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
             )
+        if (self.tokens_per_step is None) != (self.batch_tokens is None):
+            raise ValueError(
+                "train.tokens_per_step and train.batch_tokens must be set together (token mode) "
+                f"or both left unset; got tokens_per_step={self.tokens_per_step}, "
+                f"batch_tokens={self.batch_tokens}"
+            )
+        if self.tokens_per_step is not None and self.batch_tokens is not None:
+            if self.tokens_per_step < 1 or self.batch_tokens < 1:
+                raise ValueError(
+                    "train.tokens_per_step and train.batch_tokens must be >= 1, got "
+                    f"{self.tokens_per_step} and {self.batch_tokens}"
+                )
+            if self.tokens_per_step % self.batch_tokens:
+                raise ValueError(
+                    f"train.tokens_per_step ({self.tokens_per_step}) must be a multiple of "
+                    f"train.batch_tokens ({self.batch_tokens})"
+                )
+            if self.max_epochs is not None:
+                raise ValueError(
+                    "token mode (train.batch_tokens) needs train.max_steps: sequences per step "
+                    "vary, so train.max_epochs cannot be converted to steps"
+                )
         if self.throughput_warmup_steps < 0:
             raise ValueError(
                 f"throughput_warmup_steps must be >= 0, got {self.throughput_warmup_steps}"
@@ -632,6 +660,59 @@ def validate_parallelism_compat(cfg: OplmConfig) -> None:
         )
 
 
+def validate_token_batching(cfg: OplmConfig) -> None:
+    """Reject token-mode configs whose train, data and model sections disagree.
+
+    ``TrainConfig.__post_init__`` checks the train-only rules; these need ``cfg.model`` and
+    ``cfg.data`` too. Called from :func:`load_config` and again in ``Trainer.__init__``, like
+    :func:`validate_parallelism_compat`. A no-op outside token mode.
+
+    Raises:
+        ValueError: ``train.batch_tokens`` is not a multiple of ``model.max_position_embeddings``,
+            or ``data.pack_sequences`` is off.
+    """
+    if cfg.train.batch_tokens is None:
+        return
+    width = int(cfg.model.max_position_embeddings)
+    if cfg.train.batch_tokens % width:
+        raise ValueError(
+            f"train.batch_tokens ({cfg.train.batch_tokens}) must be a multiple of "
+            f"model.max_position_embeddings ({width}): each micro-batch is "
+            "batch_tokens / max_position_embeddings rows of that width"
+        )
+    if not cfg.data.pack_sequences:
+        raise ValueError("token mode (train.batch_tokens) requires data.pack_sequences=true")
+
+
+def resolve_token_accumulation(train: TrainConfig, world_size: int) -> int:
+    """Gradient accumulation that makes ``batch_tokens x world_size x accumulation`` equal
+    ``tokens_per_step``.
+
+    Accepts a configured ``gradient_accumulation_steps`` of 1 or of the derived value (a token
+    run's saved ``config.yaml`` records the value it used), and rejects anything else.
+
+    Raises:
+        ValueError: ``tokens_per_step`` is not a multiple of ``batch_tokens x world_size``, or the
+            configured accumulation is neither 1 nor the derived value.
+    """
+    assert train.tokens_per_step is not None and train.batch_tokens is not None
+    per_step = train.batch_tokens * world_size
+    if train.tokens_per_step % per_step:
+        raise ValueError(
+            f"train.tokens_per_step ({train.tokens_per_step}) must be a multiple of "
+            f"train.batch_tokens x world size ({train.batch_tokens} x {world_size} = {per_step}); "
+            "change tokens_per_step, batch_tokens or the number of processes"
+        )
+    accumulation = train.tokens_per_step // per_step
+    if train.gradient_accumulation_steps not in (1, accumulation):
+        raise ValueError(
+            "token mode derives train.gradient_accumulation_steps "
+            f"({accumulation} = tokens_per_step / (batch_tokens x world size)); leave it at 1 "
+            f"(got {train.gradient_accumulation_steps})"
+        )
+    return accumulation
+
+
 def get_preset_config(preset: str) -> DictConfig:
     """Load a model size preset by name.
 
@@ -851,6 +932,7 @@ def load_config(argv: list[str]) -> OplmConfig:
     # Cross-section compatibility (train.parallelism vs data.eval); also re-checked at
     # Trainer.__init__ for configs built without load_config.
     validate_parallelism_compat(cfg)
+    validate_token_batching(cfg)
 
     cfg.train.config_path = config_path
 
