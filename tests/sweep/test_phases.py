@@ -1509,3 +1509,64 @@ def test_multinode_token_cell_matches_commands_txt(base_config: Path, tmp_path: 
     assert (
         cfg.train.batch_tokens * cfg.train.gradient_accumulation_steps * num_processes == 1_048_576
     )
+
+
+@pytest.mark.parametrize(
+    ("command", "extra"),
+    [
+        ("smoke", []),
+        ("refine", ["--candidates", "0.0016:1"]),
+        ("transfer", ["--candidates", "0.0016:1"]),
+        ("bridge", ["--candidates", "0.0016:1:0"]),
+        ("confirm", ["--candidates", "0.0016:1:0:1"]),
+    ],
+)
+def test_every_phase_accepts_a_token_budget(tmp_path: Path, command: str, extra: list[str]) -> None:
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(_base_config_text())
+    out = tmp_path / command
+    args = [command, "--config", str(config_path), "--out", str(out), "--global-tokens", "1048576"]
+    if command != "smoke":
+        # --candidates replaces the source's selection; --from must still name a phase file.
+        args += ["--from", str(_write_selected_phase(tmp_path, "source", []))]
+    result = runner.invoke(phases.app, [*args, *extra])
+    assert result.exit_code == 0, result.output
+    runs = load_phase(out / "phase.json").runs
+    assert runs
+    for run in runs:
+        assert run.params["global_tokens"] == 1_048_576
+        cfg = load_config(["--config", str(out / run.config)])
+        assert cfg.train.tokens_per_step == 1_048_576
+
+
+def test_replicate_keeps_the_token_budget(tmp_path: Path) -> None:
+    coarse = load_phase(_generate_token_cell(tmp_path) / "phase.json")
+    source_run = coarse.runs[0]
+    source = _write_selected_phase(
+        tmp_path,
+        "selected",
+        [{"lr": source_run.params["lr"], "output_mult": source_run.params["output_mult"]}],
+        runs=coarse.runs,
+    )
+    out = tmp_path / "replicate"
+    result = runner.invoke(
+        phases.app,
+        [
+            "replicate",
+            "--config",
+            str(tmp_path / "base.yaml"),
+            "--from",
+            str(source),
+            "--out",
+            str(out),
+            "--seeds",
+            "42,43",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    run = load_phase(out / "phase.json").runs[0]
+    assert run.params["global_tokens"] == 1_048_576
+    assert run.params["seed"] == 43
+    cfg = load_config(["--config", str(out / run.config)])
+    assert cfg.train.tokens_per_step == 1_048_576
+    assert cfg.train.batch_tokens == 65_536
