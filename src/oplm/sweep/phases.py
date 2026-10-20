@@ -15,7 +15,14 @@ from rich.console import Console
 from rich.table import Table
 
 from oplm.config import get_preset_config, load_config, serialize_config
-from oplm.slurm.config import BatchPlan, SlurmConfig, load_slurm_config, resolve_batch_plan
+from oplm.slurm.config import (
+    BatchPlan,
+    SlurmConfig,
+    TokenPlan,
+    load_slurm_config,
+    resolve_batch_plan,
+    resolve_token_plan,
+)
 from oplm.slurm.render import (
     JobSpec,
     SubmitEntry,
@@ -112,24 +119,31 @@ def _cell(
     output_mult: float,
     depth_exponent: float,
     seed: int,
-    global_examples: int,
     max_steps: int,
     warmup_steps: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
     batch_mult: float | None = None,
     layers: int | None = None,
     lr_mult: float | None = None,
     base_lr: float | None = None,
 ) -> Params:
+    if (global_examples is None) == (global_tokens is None):
+        raise ValueError("a sweep cell needs exactly one of global_examples or global_tokens")
     params: Params = {
         "preset": preset,
         "lr": lr,
         "output_mult": output_mult,
         "depth_exponent": depth_exponent,
         "seed": seed,
-        "global_examples": global_examples,
         "max_steps": max_steps,
         "warmup_steps": warmup_steps,
     }
+    # One budget per cell: global examples (sequence batches) or a token budget (token mode).
+    if global_tokens is not None:
+        params["global_tokens"] = global_tokens
+    else:
+        params["global_examples"] = global_examples
     if batch_mult is not None:
         params["batch_mult"] = batch_mult
     # Depth-ray cells override the preset's layer count and record the bracket position:
@@ -143,13 +157,47 @@ def _cell(
     return params
 
 
+def _batch_budget(
+    global_examples: int | None, global_tokens: int | None, *, default_examples: int
+) -> dict[str, int]:
+    """A phase's cell budget: ``--global-tokens`` (token mode), else ``--global-examples``.
+
+    The example count's default lives here rather than in the Typer option so the two flags can
+    be checked for mutual exclusion.
+    """
+    if global_examples is not None and global_tokens is not None:
+        raise ValueError("pass --global-examples or --global-tokens, not both")
+    if global_tokens is not None:
+        return {"global_tokens": global_tokens}
+    return {"global_examples": default_examples if global_examples is None else global_examples}
+
+
+def _batch_overrides(params: Params, plan: BatchPlan | TokenPlan) -> list[str]:
+    """Config overrides that pin a cell's batch: sequences per device, or token mode."""
+    if isinstance(plan, TokenPlan):
+        return [
+            f"train.tokens_per_step={_as_int(params['global_tokens'])}",
+            f"train.batch_tokens={plan.batch_tokens}",
+            # The derived value, which the trainer re-derives and accepts; a launch at another
+            # world size then fails at startup instead of training on a different budget.
+            f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+            # Token mode packs whole sequences into fixed rows. train.batch_size keeps the base
+            # config's value, which in token mode sizes eval batches only.
+            "data.pack_sequences=true",
+        ]
+    return [
+        f"train.batch_size={plan.per_device_batch}",
+        f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+    ]
+
+
 def _write_run_config(
     base_config: Path,
     run_dir: Path,
     params: Params,
     *,
     phase: str,
-    plan: BatchPlan,
+    plan: BatchPlan | TokenPlan,
     diagnostics: bool = False,
 ) -> Path:
     max_steps = _as_int(params["max_steps"])
@@ -201,8 +249,7 @@ def _write_run_config(
         f"train.mup_depth_lr_exponent={params['depth_exponent']}",
         f"train.mup_depth_reference_layers={DEPTH_REFERENCE_LAYERS}",
         f"train.seed={params['seed']}",
-        f"train.batch_size={plan.per_device_batch}",
-        f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+        *_batch_overrides(params, plan),
         f"train.max_steps={params['max_steps']}",
         "train.max_epochs=null",
         f"train.warmup_steps={params['warmup_steps']}",
@@ -250,6 +297,14 @@ def _input_candidates(source: Path, raw: str | None, names: tuple[str, ...]) -> 
         raise ValueError(
             f"source phase {source} has no selected candidates; analyze it or pass --candidates"
         )
+    missing = sorted({name for candidate in selected for name in names if name not in candidate})
+    if missing:
+        # E.g. confirm straight from transfer (bridge skipped): no batch_mult was ever selected.
+        hint = " (batch_mult is 1 when the bridge was skipped)" if "batch_mult" in missing else ""
+        raise ValueError(
+            f"source phase {source}'s selected candidates lack {', '.join(missing)}; pass "
+            f"--candidates as {':'.join(names)}{hint}"
+        )
     return [dict(candidate) for candidate in selected]
 
 
@@ -290,21 +345,28 @@ def _resolve_nodes(slurm: SlurmConfig, *, phase: str, preset: str) -> int:
         ) from exc
 
 
-def _resolve_max_batch_size(slurm: SlurmConfig, preset: str) -> int:
-    """Resolve the max_batch_size cap for `preset`, with an actionable error if missing.
+def _resolve_preset_cap(table: dict[str, int], *, table_name: str, preset: str) -> int:
+    """Look up a per-preset cap, with an actionable error if the preset is missing.
 
-    Mirrors `_resolve_nodes`: a plain `slurm.max_batch_size[preset]` raises a bare `KeyError`
-    with no context, which would surface as an uncaught traceback instead of the clean
-    `typer.BadParameter` every other validation failure produces.
+    Mirrors `_resolve_nodes`: a bare `KeyError` would surface as an uncaught traceback instead of
+    the clean `typer.BadParameter` every other validation failure produces.
     """
     try:
-        return slurm.max_batch_size[preset]
+        return table[preset]
     except KeyError as exc:
-        defined = sorted(slurm.max_batch_size)
+        defined = sorted(table)
         raise ValueError(
-            f"preset {preset!r} has no entry in the slurm `max_batch_size` table; "
+            f"preset {preset!r} has no entry in the slurm `{table_name}` table; "
             f"defined presets: {', '.join(defined) if defined else '(none)'}"
         ) from exc
+
+
+def _resolve_max_batch_size(slurm: SlurmConfig, preset: str) -> int:
+    return _resolve_preset_cap(slurm.max_batch_size, table_name="max_batch_size", preset=preset)
+
+
+def _resolve_max_batch_tokens(slurm: SlurmConfig, preset: str) -> int:
+    return _resolve_preset_cap(slurm.max_batch_tokens, table_name="max_batch_tokens", preset=preset)
 
 
 def _preset_sort_key(preset: str) -> tuple[float, str]:
@@ -434,6 +496,10 @@ def _generate_phase(
     accelerate_config = accelerate_config.resolve() if accelerate_config is not None else None
     out.mkdir(parents=True, exist_ok=True)
     slurm: SlurmConfig = load_slurm_config(base_config)
+    base = load_config(["--config", str(base_config)])
+    # Row width of a token-mode micro-batch (each device holds whole rows of this many tokens).
+    width = int(base.model.max_position_embeddings)
+    base_token_mode = base.train.tokens_per_step is not None
     runs: list[RunSpec] = []
     commands: list[list[str]] = []
     for params in cells:
@@ -446,11 +512,29 @@ def _generate_phase(
         # cell is planned for 4 nodes; on 8 local processes that is 512, not 2048) and break
         # every cross-cell comparison.
         world_size = num_processes if local else nodes * slurm.gpus_per_node
-        plan = resolve_batch_plan(
-            global_examples=_as_int(params["global_examples"]),
-            world_size=world_size,
-            max_batch_size=_resolve_max_batch_size(slurm, preset),
-        )
+        if base_token_mode and "global_tokens" not in params:
+            # A sequence cell would inherit the base's token fields and train in token mode at an
+            # unplanned budget while phase.json described a sequence batch.
+            raise ValueError(
+                f"{base_config} is a token-mode config (train.tokens_per_step is set); pass "
+                "--global-tokens so every cell plans a token budget"
+            )
+        plan: BatchPlan | TokenPlan
+        if "global_tokens" in params:
+            plan = resolve_token_plan(
+                global_tokens=_as_int(params["global_tokens"]),
+                world_size=world_size,
+                max_batch_tokens=_resolve_max_batch_tokens(slurm, preset),
+                width=width,
+            )
+            audit: Params = {"batch_tokens": plan.batch_tokens}
+        else:
+            plan = resolve_batch_plan(
+                global_examples=_as_int(params["global_examples"]),
+                world_size=world_size,
+                max_batch_size=_resolve_max_batch_size(slurm, preset),
+            )
+            audit = {"per_device_batch": plan.per_device_batch}
         config = _write_run_config(
             base_config, run_dir, params, phase=name, plan=plan, diagnostics=diagnostics
         )
@@ -463,7 +547,7 @@ def _generate_phase(
                 {
                     **params,
                     "nodes": nodes,
-                    "per_device_batch": plan.per_device_batch,
+                    **audit,
                     "gradient_accumulation_steps": plan.gradient_accumulation_steps,
                 },
             )
@@ -474,7 +558,7 @@ def _generate_phase(
                 result=result,
                 # `plan.world_size` is the cell's true world size: equal to `num_processes` under
                 # --local, but `nodes * gpus_per_node` otherwise -- so commands.txt always agrees
-                # with run.yaml's batch_size/gradient_accumulation_steps on the same global batch.
+                # with run.yaml's batch keys on the same global batch.
                 num_processes=plan.world_size,
                 accelerate_config=accelerate_config,
             )
@@ -502,7 +586,13 @@ def _generate_phase(
 
 
 def _smoke_cells(
-    lrs: list[float], global_examples: int, seed: int, steps: int, warmup: int
+    lrs: list[float],
+    *,
+    seed: int,
+    steps: int,
+    warmup: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
 ) -> list[Params]:
     return [
         _cell(
@@ -512,6 +602,7 @@ def _smoke_cells(
             depth_exponent=0.0,
             seed=seed,
             global_examples=global_examples,
+            global_tokens=global_tokens,
             max_steps=steps,
             warmup_steps=warmup,
         )
@@ -520,18 +611,33 @@ def _smoke_cells(
 
 
 def _coarse_cells(
-    lrs: list[float], global_examples: int, seed: int, steps: int, warmup: int
+    lrs: list[float],
+    *,
+    seed: int,
+    steps: int,
+    warmup: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
 ) -> list[Params]:
-    return _smoke_cells(lrs, global_examples, seed, steps, warmup)
+    return _smoke_cells(
+        lrs,
+        seed=seed,
+        steps=steps,
+        warmup=warmup,
+        global_examples=global_examples,
+        global_tokens=global_tokens,
+    )
 
 
 def _refine_cells(
     candidates: list[Params],
     output_mults: list[float],
-    global_examples: int,
+    *,
     seed: int,
     steps: int,
     warmup: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
 ) -> list[Params]:
     return [
         _cell(
@@ -541,6 +647,7 @@ def _refine_cells(
             depth_exponent=0.0,
             seed=seed,
             global_examples=global_examples,
+            global_tokens=global_tokens,
             max_steps=steps,
             warmup_steps=warmup,
         )
@@ -576,7 +683,8 @@ def _transfer_cells(
     depths: list[int],
     lr_mults: list[float],
     exponent: float,
-    global_examples: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
     seed: int,
     steps: int,
     warmup: int,
@@ -603,6 +711,7 @@ def _transfer_cells(
             depth_exponent=exponent,
             seed=seed,
             global_examples=global_examples,
+            global_tokens=global_tokens,
             max_steps=steps,
             warmup_steps=warmup,
             layers=depth,
@@ -619,7 +728,8 @@ def _bridge_cells(
     candidates: list[Params],
     *,
     multipliers: list[float],
-    global_examples: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
     seed: int,
     steps: int,
     warmup: int,
@@ -633,6 +743,7 @@ def _bridge_cells(
             depth_exponent=_as_float(candidate["depth_exponent"]),
             seed=seed,
             global_examples=global_examples,
+            global_tokens=global_tokens,
             max_steps=steps,
             warmup_steps=warmup,
             batch_mult=multiplier,
@@ -644,7 +755,8 @@ def _bridge_cells(
 def _confirm_cells(
     candidates: list[Params],
     *,
-    global_examples: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
     seed: int,
     steps: int,
     warmup: int,
@@ -657,6 +769,7 @@ def _confirm_cells(
             depth_exponent=_as_float(candidate["depth_exponent"]),
             seed=seed,
             global_examples=global_examples,
+            global_tokens=global_tokens,
             max_steps=steps,
             warmup_steps=warmup,
             batch_mult=_as_float(candidate["batch_mult"]),
@@ -1101,7 +1214,8 @@ def smoke(
     out: Annotated[Path, typer.Option("--out", file_okay=False)],
     metric: Annotated[str | None, typer.Option("--metric")] = None,
     lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(SMOKE_LRS),
-    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 1000,
     warmup: Annotated[int, typer.Option("--warmup")] = 100,
@@ -1122,7 +1236,11 @@ def smoke(
             metric=metric,
             source=None,
             cells=_smoke_cells(
-                parse_floats(lrs, name="--lrs"), global_examples, seed, steps, warmup
+                parse_floats(lrs, name="--lrs"),
+                seed=seed,
+                steps=steps,
+                warmup=warmup,
+                **_batch_budget(global_examples, global_tokens, default_examples=2048),
             ),
             num_processes=num_processes,
             local=local,
@@ -1144,7 +1262,8 @@ def coarse(
     source: Annotated[Path | None, typer.Option("--from", exists=True, dir_okay=False)] = None,
     metric: Annotated[str | None, typer.Option("--metric")] = None,
     lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(COARSE_LRS),
-    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
     warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k coarse run
@@ -1167,7 +1286,13 @@ def coarse(
             out=out,
             metric=metric,
             source=source,
-            cells=_coarse_cells(lr_values, global_examples, seed, steps, warmup),
+            cells=_coarse_cells(
+                lr_values,
+                seed=seed,
+                steps=steps,
+                warmup=warmup,
+                **_batch_budget(global_examples, global_tokens, default_examples=2048),
+            ),
             num_processes=num_processes,
             local=local,
             accelerate_config=accelerate_config,
@@ -1189,7 +1314,8 @@ def refine(
     metric: Annotated[str | None, typer.Option("--metric")] = None,
     candidates: Annotated[str | None, typer.Option("--candidates")] = None,
     output_mults: Annotated[str, typer.Option("--output-mults")] = "0.5,1,2",
-    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 20000,
     warmup: Annotated[int, typer.Option("--warmup")] = 2000,  # 10% of the 20k refine run
@@ -1206,10 +1332,10 @@ def refine(
         cells = _refine_cells(
             _input_candidates(source, candidates, ("lr", "output_mult")),
             parse_floats(output_mults, name="--output-mults"),
-            global_examples,
-            seed,
-            steps,
-            warmup,
+            seed=seed,
+            steps=steps,
+            warmup=warmup,
+            **_batch_budget(global_examples, global_tokens, default_examples=2048),
         )
         phase_path, commands = _generate_phase(
             name="refine",
@@ -1285,7 +1411,8 @@ def transfer(
     depths: Annotated[str, typer.Option("--depths")] = _grid_default(TRANSFER_DEPTHS),
     lr_mults: Annotated[str, typer.Option("--lr-mults")] = _grid_default(TRANSFER_LR_MULTS),
     exponent: Annotated[float, typer.Option("--exponent")] = TRANSFER_DEPTH_EXPONENT,
-    global_examples: Annotated[int, typer.Option("--global-examples")] = 2048,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
     warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k transfer cells
@@ -1310,7 +1437,7 @@ def transfer(
             depths=_parse_ints(depths, name="--depths"),
             lr_mults=parse_floats(lr_mults, name="--lr-mults"),
             exponent=exponent,
-            global_examples=global_examples,
+            **_batch_budget(global_examples, global_tokens, default_examples=2048),
             seed=seed,
             steps=steps,
             warmup=warmup,
@@ -1343,7 +1470,8 @@ def bridge(
     metric: Annotated[str | None, typer.Option("--metric")] = None,
     candidates: Annotated[str | None, typer.Option("--candidates")] = None,
     multipliers: Annotated[str, typer.Option("--multipliers")] = "0.7,1,1.4,2",
-    global_examples: Annotated[int, typer.Option("--global-examples")] = 8192,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
     warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k bridge run
@@ -1364,7 +1492,7 @@ def bridge(
                 ("lr", "output_mult", "depth_exponent"),
             ),
             multipliers=parse_floats(multipliers, name="--multipliers"),
-            global_examples=global_examples,
+            **_batch_budget(global_examples, global_tokens, default_examples=8192),
             seed=seed,
             steps=steps,
             warmup=warmup,
@@ -1396,7 +1524,8 @@ def confirm(
     out: Annotated[Path, typer.Option("--out", file_okay=False)],
     metric: Annotated[str | None, typer.Option("--metric")] = None,
     candidates: Annotated[str | None, typer.Option("--candidates")] = None,
-    global_examples: Annotated[int, typer.Option("--global-examples")] = 8192,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
     seed: Annotated[int, typer.Option("--seed")] = 42,
     steps: Annotated[int, typer.Option("--steps")] = 10000,
     warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k confirm run
@@ -1416,7 +1545,7 @@ def confirm(
                 candidates,
                 ("lr", "output_mult", "depth_exponent", "batch_mult"),
             ),
-            global_examples=global_examples,
+            **_batch_budget(global_examples, global_tokens, default_examples=8192),
             seed=seed,
             steps=steps,
             warmup=warmup,
@@ -1463,6 +1592,10 @@ def scale(
     candidates carrying different batch corrections during ranking) but has no corresponding
     training config field: the ``bridge`` phase that produced it already folded the correction
     into the winner's ``lr``, so there is nothing left here to merge.
+
+    With a token-mode training config (``train.tokens_per_step`` set), each preset gets its own
+    ``train.batch_tokens`` and accumulation from its node count and the slurm
+    ``max_batch_tokens`` table, so one token budget holds across the whole series.
     """
     try:
         selected = load_phase(source).selected
@@ -1474,9 +1607,12 @@ def scale(
         out = out.resolve()
         jobs = out / "jobs"
         jobs.mkdir(parents=True, exist_ok=True)
+        base = load_config(["--config", str(config)])
+        token_mode = base.train.tokens_per_step is not None
         for preset in _parse_strings(presets, name="--presets"):
             run_dir = out / preset
             run_dir.mkdir(parents=True, exist_ok=True)
+            nodes = _resolve_nodes(slurm, phase="scale", preset=preset)
             overrides = [
                 f"model.mup_output_mult={_as_float(winner['output_mult'])}",
                 f"train.lr={_as_float(winner['lr'])}",
@@ -1488,13 +1624,31 @@ def scale(
                 # `--config run.yaml`, so this is the only place to set it).
                 "train.auto_resume=true",
             ]
+            if token_mode:
+                # One token budget for every preset; each preset's micro-batch and accumulation
+                # follow from its node count and memory cap.
+                width = int(
+                    load_config(
+                        ["--config", str(config), "--preset", preset]
+                    ).model.max_position_embeddings
+                )
+                plan = resolve_token_plan(
+                    global_tokens=int(base.train.tokens_per_step),
+                    world_size=nodes * slurm.gpus_per_node,
+                    max_batch_tokens=_resolve_max_batch_tokens(slurm, preset),
+                    width=width,
+                )
+                overrides += [
+                    f"train.batch_tokens={plan.batch_tokens}",
+                    f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+                ]
             cfg = load_config(["--config", str(config), "--preset", preset, *overrides])
             run_yaml = run_dir / "run.yaml"
             run_yaml.write_text(serialize_config(cfg))
             name = f"oplm-{preset}-scale"
             spec = JobSpec(
                 name=name,
-                nodes=_resolve_nodes(slurm, phase="scale", preset=preset),
+                nodes=nodes,
                 time_limit=_resolve_time_limit(slurm, phase="scale", preset=preset),
                 command=accelerate_command(
                     module="oplm.train",

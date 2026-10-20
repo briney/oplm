@@ -1345,3 +1345,352 @@ def test_local_execution_is_sequential_and_stops_on_failure(
     with pytest.raises(subprocess.CalledProcessError):
         phases._run_local(commands)
     assert seen == commands[:2]
+
+
+def _generate_token_cell(tmp_path: Path, *, extra: list[str] | None = None) -> Path:
+    """One coarse cell at a 1M-token budget (170M: 1 node x 8 GPUs, width 1024 by default)."""
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(_base_config_text())
+    out = tmp_path / "coarse"
+    result = runner.invoke(
+        phases.app,
+        [
+            "coarse",
+            "--config",
+            str(config_path),
+            "--out",
+            str(out),
+            "--lrs",
+            "0.0016",
+            "--global-tokens",
+            "1048576",
+            "--steps",
+            "1000",
+            "--warmup",
+            "100",
+            *(extra or []),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return out
+
+
+def test_token_cell_pins_token_mode_in_run_yaml(tmp_path: Path) -> None:
+    out = _generate_token_cell(tmp_path)
+    phase = load_phase(out / "phase.json")
+    cfg = load_config(["--config", str(out / phase.runs[0].config)])
+    # 1,048,576 / (8 GPUs x 1024) = 128 rows per replica; the 170M cap of 65,536 = 64 rows.
+    assert cfg.train.tokens_per_step == 1_048_576
+    assert cfg.train.batch_tokens == 65_536
+    assert cfg.train.gradient_accumulation_steps == 2
+    assert cfg.data.pack_sequences is True
+    assert cfg.train.batch_size == 32  # the base config's eval batch size, untouched
+
+
+def test_token_cell_records_its_plan_in_phase_json(tmp_path: Path) -> None:
+    run = load_phase(_generate_token_cell(tmp_path) / "phase.json").runs[0]
+    assert run.params["global_tokens"] == 1_048_576
+    assert "global_examples" not in run.params
+    assert "per_device_batch" not in run.params
+    assert run.params["batch_tokens"] == 65_536
+    assert run.params["gradient_accumulation_steps"] == 2
+
+
+def test_sequence_cells_carry_no_token_keys(tmp_path: Path) -> None:
+    run_yaml = _generate_one_cell(tmp_path)
+    cfg = load_config(["--config", str(run_yaml)])
+    assert cfg.train.tokens_per_step is None
+    assert cfg.train.batch_tokens is None
+
+
+def test_global_tokens_and_examples_are_exclusive(tmp_path: Path) -> None:
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(_base_config_text())
+    result = runner.invoke(
+        phases.app,
+        [
+            "coarse",
+            "--config",
+            str(config_path),
+            "--out",
+            str(tmp_path / "c"),
+            "--lrs",
+            "0.0016",
+            "--global-tokens",
+            "1048576",
+            "--global-examples",
+            "2048",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "pass --global-examples or --global-tokens, not both" in plain(result.output)
+
+
+def test_token_budget_must_split_into_whole_rows_per_replica(
+    base_config: Path, tmp_path: Path
+) -> None:
+    cell = phases._cell(
+        preset="170M",
+        lr=0.01,
+        output_mult=1.0,
+        depth_exponent=0.0,
+        seed=42,
+        global_tokens=1_048_576,
+        max_steps=1000,
+        warmup_steps=100,
+    )
+    with pytest.raises(ValueError, match="world size 6"):
+        phases._generate_phase(
+            name="grid",
+            base_config=base_config,
+            out=tmp_path / "grid",
+            metric=None,
+            source=None,
+            cells=[cell],
+            num_processes=6,
+            local=True,
+            accelerate_config=None,
+        )
+
+
+def test_token_cell_without_a_cap_is_a_clean_error(tmp_path: Path) -> None:
+    slurm_raw = {key: value for key, value in SLURM_RAW.items() if key != "max_batch_tokens"}
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(_base_config_text(slurm_raw))
+    result = runner.invoke(
+        phases.app,
+        [
+            "coarse",
+            "--config",
+            str(config_path),
+            "--out",
+            str(tmp_path / "c"),
+            "--lrs",
+            "0.0016",
+            "--global-tokens",
+            "1048576",
+        ],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, KeyError)
+    output = plain(result.output)
+    assert "max_batch_tokens" in output
+    assert "170M" in output
+
+
+def test_multinode_token_cell_matches_commands_txt(base_config: Path, tmp_path: Path) -> None:
+    cell = phases._cell(
+        preset="400M",
+        lr=0.01,
+        output_mult=1.0,
+        depth_exponent=0.0,
+        seed=42,
+        global_tokens=1_048_576,
+        max_steps=1000,
+        warmup_steps=100,
+    )
+    out = tmp_path / "grid"
+    phases._generate_phase(
+        name="grid",
+        base_config=base_config,
+        out=out,
+        metric=None,
+        source=None,
+        cells=[cell],
+        num_processes=8,
+        local=False,
+        accelerate_config=None,
+    )
+    run = load_phase(out / "phase.json").runs[0]
+    cfg = load_config(["--config", str(out / run.config)])
+    command = shlex.split((out / "commands.txt").read_text().splitlines()[0])
+    num_processes = int(command[command.index("--num_processes") + 1])
+    assert num_processes == 32  # 400M: 4 nodes x 8 GPUs
+    assert (
+        cfg.train.batch_tokens * cfg.train.gradient_accumulation_steps * num_processes == 1_048_576
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "extra"),
+    [
+        ("smoke", []),
+        ("refine", ["--candidates", "0.0016:1"]),
+        ("transfer", ["--candidates", "0.0016:1"]),
+        ("bridge", ["--candidates", "0.0016:1:0"]),
+        ("confirm", ["--candidates", "0.0016:1:0:1"]),
+    ],
+)
+def test_every_phase_accepts_a_token_budget(tmp_path: Path, command: str, extra: list[str]) -> None:
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(_base_config_text())
+    out = tmp_path / command
+    args = [command, "--config", str(config_path), "--out", str(out), "--global-tokens", "1048576"]
+    if command != "smoke":
+        # --candidates replaces the source's selection; --from must still name a phase file.
+        args += ["--from", str(_write_selected_phase(tmp_path, "source", []))]
+    result = runner.invoke(phases.app, [*args, *extra])
+    assert result.exit_code == 0, result.output
+    runs = load_phase(out / "phase.json").runs
+    assert runs
+    for run in runs:
+        assert run.params["global_tokens"] == 1_048_576
+        cfg = load_config(["--config", str(out / run.config)])
+        assert cfg.train.tokens_per_step == 1_048_576
+
+
+def test_replicate_keeps_the_token_budget(tmp_path: Path) -> None:
+    coarse = load_phase(_generate_token_cell(tmp_path) / "phase.json")
+    source_run = coarse.runs[0]
+    source = _write_selected_phase(
+        tmp_path,
+        "selected",
+        [{"lr": source_run.params["lr"], "output_mult": source_run.params["output_mult"]}],
+        runs=coarse.runs,
+    )
+    out = tmp_path / "replicate"
+    result = runner.invoke(
+        phases.app,
+        [
+            "replicate",
+            "--config",
+            str(tmp_path / "base.yaml"),
+            "--from",
+            str(source),
+            "--out",
+            str(out),
+            "--seeds",
+            "42,43",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    run = load_phase(out / "phase.json").runs[0]
+    assert run.params["global_tokens"] == 1_048_576
+    assert run.params["seed"] == 43
+    cfg = load_config(["--config", str(out / run.config)])
+    assert cfg.train.tokens_per_step == 1_048_576
+    assert cfg.train.batch_tokens == 65_536
+
+
+def _token_scale_config(tmp_path: Path, slurm_raw: Mapping[str, Any] | None = None) -> Path:
+    """A token-mode training config (1M tokens/step, width 1024) with the shared slurm block."""
+    path = tmp_path / "scaling.yaml"
+    text = _base_config_text(slurm_raw if slurm_raw is not None else SLURM_RAW)
+    assert "train:\n" in text and "data:\n" in text
+    text = text.replace(
+        "train:\n", "train:\n  tokens_per_step: 1048576\n  batch_tokens: 65536\n", 1
+    ).replace("data:\n", "data:\n  pack_sequences: true\n", 1)
+    path.write_text(text)
+    return path
+
+
+def _confirmed_winner(tmp_path: Path) -> Path:
+    return _write_selected_phase(
+        tmp_path,
+        "confirm",
+        [{"lr": 0.004, "output_mult": 1.0, "depth_exponent": 0.5, "batch_mult": 1.0}],
+    )
+
+
+def test_scale_token_mode_resolves_batch_tokens_per_preset(tmp_path: Path) -> None:
+    out = tmp_path / "scale"
+    result = runner.invoke(
+        phases.app,
+        [
+            "scale",
+            "--config",
+            str(_token_scale_config(tmp_path)),
+            "--from",
+            str(_confirmed_winner(tmp_path)),
+            "--out",
+            str(out),
+            "--presets",
+            "170M,400M,1B",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    expected = {  # nodes x 8 GPUs at width 1024 under the shared caps
+        "170M": (65_536, 2),  # 8 GPUs: 128 rows per replica, cap 64 rows
+        "400M": (32_768, 1),  # 32 GPUs: 32 rows, cap 32 rows
+        "1B": (16_384, 1),  # 64 GPUs: 16 rows, cap 16 rows
+    }
+    for preset, (batch_tokens, accumulation) in expected.items():
+        cfg = load_config(["--config", str(out / preset / "run.yaml")])
+        assert cfg.train.tokens_per_step == 1_048_576
+        assert cfg.train.batch_tokens == batch_tokens
+        assert cfg.train.gradient_accumulation_steps == accumulation
+
+
+def test_scale_token_mode_needs_a_cap_for_every_preset(tmp_path: Path) -> None:
+    slurm_raw = {**SLURM_RAW, "max_batch_tokens": {"170M": 65536}}
+    result = runner.invoke(
+        phases.app,
+        [
+            "scale",
+            "--config",
+            str(_token_scale_config(tmp_path, slurm_raw)),
+            "--from",
+            str(_confirmed_winner(tmp_path)),
+            "--out",
+            str(tmp_path / "scale"),
+            "--presets",
+            "170M,400M",
+        ],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, KeyError)
+    output = plain(result.output)
+    assert "max_batch_tokens" in output
+    assert "400M" in output
+
+
+def test_token_mode_base_config_requires_global_tokens(tmp_path: Path) -> None:
+    """A token-mode base config must not yield half-sequence, half-token cells."""
+    config_path = _token_scale_config(tmp_path)
+    result = runner.invoke(
+        phases.app,
+        ["coarse", "--config", str(config_path), "--out", str(tmp_path / "c"), "--lrs", "0.0016"],
+    )
+    assert result.exit_code != 0
+    assert "pass --global-tokens" in plain(result.output)
+    ok = runner.invoke(
+        phases.app,
+        [
+            "coarse",
+            "--config",
+            str(config_path),
+            "--out",
+            str(tmp_path / "t"),
+            "--lrs",
+            "0.0016",
+            "--global-tokens",
+            "1048576",
+        ],
+    )
+    assert ok.exit_code == 0, ok.output
+
+
+def test_confirm_from_a_source_without_batch_mult_is_a_clean_error(
+    base_config: Path, tmp_path: Path
+) -> None:
+    """Skipping bridge: a transfer winner lacks batch_mult, so confirm must say so, not KeyError."""
+    source = _write_selected_phase(
+        tmp_path, "transfer", [{"lr": 0.004, "output_mult": 1.0, "depth_exponent": 0.5}]
+    )
+    result = runner.invoke(
+        phases.app,
+        [
+            "confirm",
+            "--config",
+            str(base_config),
+            "--from",
+            str(source),
+            "--out",
+            str(tmp_path / "confirm"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, KeyError)
+    output = plain(result.output)
+    assert "batch_mult" in output
+    assert "--candidates" in output

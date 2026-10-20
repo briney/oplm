@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from oplm.slurm.config import BatchPlan, PhaseTable, SlurmConfig, resolve_batch_plan
+from oplm.slurm.config import (
+    BatchPlan,
+    PhaseTable,
+    SlurmConfig,
+    TokenPlan,
+    resolve_batch_plan,
+    resolve_token_plan,
+)
 
 RAW = {
     "partition": "hpc-mid",
@@ -24,6 +31,7 @@ RAW = {
         "confirm": {"800M": 8},
     },
     "max_batch_size": {"170M": 256, "400M": 256, "800M": 256, "1B": 128},
+    "max_batch_tokens": {"170M": 65536, "400M": 32768, "800M": 16384, "1B": 16384},
 }
 
 
@@ -234,3 +242,63 @@ def test_resolve_batch_plan_rejects_bool(field: str) -> None:
     kwargs[field] = True
     with pytest.raises(ValueError, match=field):
         resolve_batch_plan(**kwargs)
+
+
+def test_slurm_config_parses_max_batch_tokens() -> None:
+    cfg = SlurmConfig.from_mapping(RAW)
+    assert cfg.max_batch_tokens == {"170M": 65536, "400M": 32768, "800M": 16384, "1B": 16384}
+    without = {key: value for key, value in RAW.items() if key != "max_batch_tokens"}
+    assert SlurmConfig.from_mapping(without).max_batch_tokens == {}
+
+
+def test_slurm_config_rejects_a_bad_max_batch_tokens_entry() -> None:
+    with pytest.raises(ValueError, match=r"max_batch_tokens\['170M'\]"):
+        SlurmConfig.from_mapping({**RAW, "max_batch_tokens": {"170M": 0}})
+
+
+@pytest.mark.parametrize(
+    ("global_tokens", "world_size", "cap", "width", "expected"),
+    [
+        # 1M tokens over 8 GPUs at width 1024: 128 rows per replica; a 64-row cap forces accum 2.
+        (1_048_576, 8, 65_536, 1024, TokenPlan(65_536, 2, 8)),
+        # Over 32 GPUs: 32 rows per replica, under the 32-row cap at accum 1.
+        (1_048_576, 32, 32_768, 1024, TokenPlan(32_768, 1, 32)),
+        # The production shape: 4M tokens, 2048-token rows, 32 GPUs, a 64k cap -> 64k x 2.
+        (4_194_304, 32, 65_536, 2048, TokenPlan(65_536, 2, 32)),
+        # A cap that is not a whole number of rows rounds down to whole rows (3.5 rows -> 3; 6 rows
+        # per replica split as 3 x 2).
+        (98_304, 8, 7_168, 2048, TokenPlan(6_144, 2, 8)),
+    ],
+)
+def test_token_plan_examples(
+    global_tokens: int, world_size: int, cap: int, width: int, expected: TokenPlan
+) -> None:
+    plan = resolve_token_plan(
+        global_tokens=global_tokens, world_size=world_size, max_batch_tokens=cap, width=width
+    )
+    assert plan == expected
+    assert plan.batch_tokens * plan.gradient_accumulation_steps * plan.world_size == global_tokens
+
+
+def test_token_plan_needs_whole_rows_per_replica() -> None:
+    with pytest.raises(ValueError, match="whole number of 1024-token rows"):
+        resolve_token_plan(
+            global_tokens=1_000_000, world_size=8, max_batch_tokens=65_536, width=1024
+        )
+    with pytest.raises(ValueError, match="world size 6"):
+        resolve_token_plan(
+            global_tokens=1_048_576, world_size=6, max_batch_tokens=65_536, width=1024
+        )
+
+
+def test_token_plan_cap_below_one_row_raises() -> None:
+    with pytest.raises(ValueError, match="smaller than one 2048-token row"):
+        resolve_token_plan(
+            global_tokens=4_194_304, world_size=32, max_batch_tokens=1024, width=2048
+        )
+
+
+@pytest.mark.parametrize("bad", [0, -1, True])
+def test_token_plan_rejects_non_positive_and_bool(bad: int) -> None:
+    with pytest.raises(ValueError):
+        resolve_token_plan(global_tokens=bad, world_size=8, max_batch_tokens=65_536, width=1024)

@@ -73,6 +73,7 @@ slurm:
     replicate: {170M: 4}
     confirm: {800M: 8}
   max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
+  # max_batch_tokens: {170M: 65536, 400M: 32768, 800M: 16384, 1B: 16384}  # token mode only
 ```
 
 The file merges over the packaged defaults. Add any production-specific masking, precision,
@@ -338,6 +339,38 @@ memory headroom, and full gradient checkpointing is pinned in every cell besides
 Full gradient checkpointing is what makes the 800M-scale per-device batches above fit in memory;
 it costs roughly 30–40% more compute than selective checkpointing.
 
+### Token mode
+
+The production series fixes one token budget per optimizer step for every model size (about 4M
+tokens at 2048 context; see TRAIN.md "Token-budget batching"). μP transfers the learning rate only
+at a fixed batch and sequence length, so the proxy phases should run at that budget:
+
+- Pass `--global-tokens N` (for example `4194304`) to `smoke`, `coarse`, `refine`, `transfer`,
+  `bridge` and `confirm` in place of `--global-examples`. Passing both is an error. `replicate`
+  inherits its source cells' budget.
+- **Config requirements:**
+  - The production YAML must carry the production context (`model.max_position_embeddings`, for
+    example 2048), and preferably `model.packed_attention: flex` and `train.compile_dynamic:
+    false`.
+  - The `slurm:` block needs a `max_batch_tokens` entry for every preset you generate, sized
+    under full activation checkpointing (sweep cells pin it). `docs/perf/attention_width_bench.py`
+    measures peak memory per shape.
+- **What each cell's `run.yaml` pins:**
+  - `train.tokens_per_step` and `train.batch_tokens`;
+  - the derived `train.gradient_accumulation_steps`;
+  - `data.pack_sequences: true`.
+
+  `train.batch_size` keeps the base value, which sizes eval batches only. `phase.json` records
+  each cell's `batch_tokens` and accumulation.
+- **The bridge phase is optional.** When the proxy phases already run at the production token
+  budget, `bridge` has nothing to correct. Skip it and pass the transfer winner straight to
+  `confirm` with an explicit batch multiplier of 1:
+  `--candidates <lr>:<output_mult>:<depth_exponent>:1`.
+- **`scale`:** with a token-mode training config (`train.tokens_per_step` set), it gives each
+  preset its own `train.batch_tokens` and accumulation from that preset's node count and
+  `max_batch_tokens` entry.
+- The wall-time table above is for the sequence-mode defaults.
+
 ### Status and resubmission
 
 `oplm sweep status <phase.json>` reports each cell's state (`complete`, `non-finite`, `running`,
@@ -403,7 +436,7 @@ scripts yourself (see [SLURM.md](SLURM.md)).
 
 The proxy phases default to 2,048 global examples (roughly 1M tokens for the intended length
 distribution); bridge and later phases use 8,192 (roughly 4M). μP does not make batch size
-irrelevant, so the bridge measures this correction rather than assuming a scaling rule.
+irrelevant, so the bridge measures this correction rather than assuming a scaling rule. In token mode (`--global-tokens`, see "Token mode"), every phase runs at one token budget and the bridge is optional.
 
 Each cell warms up over ~10% of its own horizon: 1,000 steps for the 10k phases (smoke uses 100
 over 1k), 2,000 for the 20k `refine`, and 5,000 (~5%) for the 100k `scale` cells. Warmup
