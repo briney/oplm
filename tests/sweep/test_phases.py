@@ -1570,3 +1570,75 @@ def test_replicate_keeps_the_token_budget(tmp_path: Path) -> None:
     cfg = load_config(["--config", str(out / run.config)])
     assert cfg.train.tokens_per_step == 1_048_576
     assert cfg.train.batch_tokens == 65_536
+
+
+def _token_scale_config(tmp_path: Path, slurm_raw: Mapping[str, Any] | None = None) -> Path:
+    """A token-mode training config (1M tokens/step, width 1024) with the shared slurm block."""
+    path = tmp_path / "scaling.yaml"
+    text = _base_config_text(slurm_raw if slurm_raw is not None else SLURM_RAW)
+    assert "train:\n" in text and "data:\n" in text
+    text = text.replace(
+        "train:\n", "train:\n  tokens_per_step: 1048576\n  batch_tokens: 65536\n", 1
+    ).replace("data:\n", "data:\n  pack_sequences: true\n", 1)
+    path.write_text(text)
+    return path
+
+
+def _confirmed_winner(tmp_path: Path) -> Path:
+    return _write_selected_phase(
+        tmp_path,
+        "confirm",
+        [{"lr": 0.004, "output_mult": 1.0, "depth_exponent": 0.5, "batch_mult": 1.0}],
+    )
+
+
+def test_scale_token_mode_resolves_batch_tokens_per_preset(tmp_path: Path) -> None:
+    out = tmp_path / "scale"
+    result = runner.invoke(
+        phases.app,
+        [
+            "scale",
+            "--config",
+            str(_token_scale_config(tmp_path)),
+            "--from",
+            str(_confirmed_winner(tmp_path)),
+            "--out",
+            str(out),
+            "--presets",
+            "170M,400M,1B",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    expected = {  # nodes x 8 GPUs at width 1024 under the shared caps
+        "170M": (65_536, 2),  # 8 GPUs: 128 rows per replica, cap 64 rows
+        "400M": (32_768, 1),  # 32 GPUs: 32 rows, cap 32 rows
+        "1B": (16_384, 1),  # 64 GPUs: 16 rows, cap 16 rows
+    }
+    for preset, (batch_tokens, accumulation) in expected.items():
+        cfg = load_config(["--config", str(out / preset / "run.yaml")])
+        assert cfg.train.tokens_per_step == 1_048_576
+        assert cfg.train.batch_tokens == batch_tokens
+        assert cfg.train.gradient_accumulation_steps == accumulation
+
+
+def test_scale_token_mode_needs_a_cap_for_every_preset(tmp_path: Path) -> None:
+    slurm_raw = {**SLURM_RAW, "max_batch_tokens": {"170M": 65536}}
+    result = runner.invoke(
+        phases.app,
+        [
+            "scale",
+            "--config",
+            str(_token_scale_config(tmp_path, slurm_raw)),
+            "--from",
+            str(_confirmed_winner(tmp_path)),
+            "--out",
+            str(tmp_path / "scale"),
+            "--presets",
+            "170M,400M",
+        ],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, KeyError)
+    output = plain(result.output)
+    assert "max_batch_tokens" in output
+    assert "400M" in output

@@ -1575,6 +1575,10 @@ def scale(
     candidates carrying different batch corrections during ranking) but has no corresponding
     training config field: the ``bridge`` phase that produced it already folded the correction
     into the winner's ``lr``, so there is nothing left here to merge.
+
+    With a token-mode training config (``train.tokens_per_step`` set), each preset gets its own
+    ``train.batch_tokens`` and accumulation from its node count and the slurm
+    ``max_batch_tokens`` table, so one token budget holds across the whole series.
     """
     try:
         selected = load_phase(source).selected
@@ -1586,9 +1590,12 @@ def scale(
         out = out.resolve()
         jobs = out / "jobs"
         jobs.mkdir(parents=True, exist_ok=True)
+        base = load_config(["--config", str(config)])
+        token_mode = base.train.tokens_per_step is not None
         for preset in _parse_strings(presets, name="--presets"):
             run_dir = out / preset
             run_dir.mkdir(parents=True, exist_ok=True)
+            nodes = _resolve_nodes(slurm, phase="scale", preset=preset)
             overrides = [
                 f"model.mup_output_mult={_as_float(winner['output_mult'])}",
                 f"train.lr={_as_float(winner['lr'])}",
@@ -1600,13 +1607,31 @@ def scale(
                 # `--config run.yaml`, so this is the only place to set it).
                 "train.auto_resume=true",
             ]
+            if token_mode:
+                # One token budget for every preset; each preset's micro-batch and accumulation
+                # follow from its node count and memory cap.
+                width = int(
+                    load_config(
+                        ["--config", str(config), "--preset", preset]
+                    ).model.max_position_embeddings
+                )
+                plan = resolve_token_plan(
+                    global_tokens=int(base.train.tokens_per_step),
+                    world_size=nodes * slurm.gpus_per_node,
+                    max_batch_tokens=_resolve_max_batch_tokens(slurm, preset),
+                    width=width,
+                )
+                overrides += [
+                    f"train.batch_tokens={plan.batch_tokens}",
+                    f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+                ]
             cfg = load_config(["--config", str(config), "--preset", preset, *overrides])
             run_yaml = run_dir / "run.yaml"
             run_yaml.write_text(serialize_config(cfg))
             name = f"oplm-{preset}-scale"
             spec = JobSpec(
                 name=name,
-                nodes=_resolve_nodes(slurm, phase="scale", preset=preset),
+                nodes=nodes,
                 time_limit=_resolve_time_limit(slurm, phase="scale", preset=preset),
                 command=accelerate_command(
                     module="oplm.train",
