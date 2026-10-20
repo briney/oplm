@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,7 @@ pytestmark = pytest.mark.slow
 def test_token_mode_derives_accumulation_and_logs_fill(
     training_parquet: Path, tmp_path: Path
 ) -> None:
+    from oplm.training.mup import SweepMetricsCallback
     from oplm.training.trainer import Trainer
 
     cfg = tiny_train_cfg(
@@ -29,7 +31,8 @@ def test_token_mode_derives_accumulation_and_logs_fill(
         pack_sequences=True,
     )
     callback = FullRecordingCallback()
-    trainer = Trainer(cfg, callbacks=[callback])
+    result_json = tmp_path / "result.json"
+    trainer = Trainer(cfg, callbacks=[callback, SweepMetricsCallback(result_json)])
     trainer.train()
     assert trainer.cfg.train.gradient_accumulation_steps == 2  # 512 / (256 x 1 process)
     assert trainer.accelerator.gradient_accumulation_steps == 2
@@ -40,6 +43,9 @@ def test_token_mode_derives_accumulation_and_logs_fill(
         assert math.isfinite(metrics["train/loss"])
     assert 0 < trainer.tokens_seen <= 4 * 512
     assert logs[-1]["train/samples"] == trainer._samples_seen > 0
+    # Sweep provenance records the token budget, not batch_size x accumulation.
+    payload = json.loads(result_json.read_text())
+    assert (payload["global_batch"], payload["global_batch_unit"]) == (512, "tokens")
 
 
 def test_token_mode_turns_off_save_alignment(training_parquet: Path, tmp_path: Path) -> None:

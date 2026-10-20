@@ -27,6 +27,7 @@ from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM, OplmForSequenceClassification
 from oplm.training.mup import SweepMetricsCallback, mup_fanin_mult, mup_lr_multiplier
 from oplm.training.optim import build_optimizers, partition_optimizer_params
+from oplm.training.trainer import Trainer
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -378,11 +379,14 @@ class _StubTrainer:
 
     Exposes exactly the attributes that method reads (``src/oplm/training/mup.py``):
     ``cfg.train.{batch_size,gradient_accumulation_steps,lr}``, ``cfg.model.hidden_size``,
-    ``accelerator.num_processes``, and ``total_steps`` (read via ``getattr(..., default=
-    cfg.train.max_steps)``, so the real ``Trainer`` — which always sets it in
-    ``__init__`` — takes the ``total_steps`` branch). Notably, ``on_train_end`` never
-    reads ``global_step``.
+    ``accelerator.num_processes``, ``_token_mode`` and ``_global_effective_batch_size`` (the
+    real method, bound here, so the test covers the trainer's own batch figure), and
+    ``total_steps`` (read via ``getattr(..., default=cfg.train.max_steps)``, so the real
+    ``Trainer`` — which always sets it in ``__init__`` — takes the ``total_steps`` branch).
+    Notably, ``on_train_end`` never reads ``global_step``.
     """
+
+    _global_effective_batch_size = Trainer._global_effective_batch_size
 
     def __init__(
         self,
@@ -394,6 +398,8 @@ class _StubTrainer:
         num_attention_heads: int = 2,
         num_processes: int = 1,
         total_steps: int = 7,
+        tokens_per_step: int | None = None,
+        batch_tokens: int | None = None,
     ) -> None:
         self.cfg = OplmConfig(
             model=OplmModelConfig(hidden_size=hidden_size, num_attention_heads=num_attention_heads),
@@ -401,8 +407,11 @@ class _StubTrainer:
                 batch_size=batch_size,
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 lr=lr,
+                tokens_per_step=tokens_per_step,
+                batch_tokens=batch_tokens,
             ),
         )
+        self._token_mode = batch_tokens is not None
         self.accelerator = _StubAccelerator(num_processes)
         self.total_steps = total_steps
 
@@ -416,6 +425,32 @@ def test_result_json_records_installed_version(tmp_path: Path) -> None:
 
     payload = json.loads((tmp_path / "result.json").read_text())
     assert payload["oplm_version"] == version("oplm")
+
+
+def test_result_json_global_batch_counts_sequences_in_sequence_mode(tmp_path: Path) -> None:
+    """Sequence mode keeps batch_size x accumulation x processes, tagged as sequences."""
+    trainer = _StubTrainer(batch_size=4, gradient_accumulation_steps=2, num_processes=3)
+    SweepMetricsCallback(tmp_path / "result.json").on_train_end(trainer)
+
+    payload = json.loads((tmp_path / "result.json").read_text())
+    assert payload["global_batch"] == 24
+    assert payload["global_batch_unit"] == "sequences"
+
+
+def test_result_json_global_batch_is_the_token_budget_in_token_mode(tmp_path: Path) -> None:
+    """Token mode records tokens_per_step (batch_size only sizes eval there), tagged as tokens."""
+    trainer = _StubTrainer(
+        batch_size=4,
+        gradient_accumulation_steps=2,  # derived: 1024 / (256 x 2 processes)
+        num_processes=2,
+        tokens_per_step=1024,
+        batch_tokens=256,
+    )
+    SweepMetricsCallback(tmp_path / "result.json").on_train_end(trainer)
+
+    payload = json.loads((tmp_path / "result.json").read_text())
+    assert payload["global_batch"] == 1024
+    assert payload["global_batch_unit"] == "tokens"
 
 
 def test_result_json_version_is_none_when_package_not_found(
