@@ -6,7 +6,10 @@ sequences. This times a compiled training forward + backward (bf16 autocast) on 
 with the same number of token slots but different widths (default 84 x 512 and 21 x 2048),
 with each kernel, and reports synced step time and peak memory. Sequence lengths are drawn from
 the run's data.train sources by their fractions, as docs/perf/packing_memory.py does (imported
-from the same directory). The model is a fresh preset (weights do not affect timing).
+from the same directory), all capped at the narrowest shape's width: every shape packs the same
+length population, so the comparison is width at equal tokens and equal sequences, not data. The
+table gives each batch's token-weighted mean segment length to confirm it. The model is a fresh
+preset (weights do not affect timing).
 
     python docs/perf/attention_width_bench.py --config <run.yaml> --preset 170M
 
@@ -36,6 +39,14 @@ from oplm.training.stream_replay import compile_like_trainer  # noqa: E402
 def parse_shapes(text: str) -> list[tuple[int, int]]:
     """``"84x512,21x2048"`` -> ``[(84, 512), (21, 2048)]`` as (rows, width)."""
     return [tuple(int(v) for v in item.split("x")) for item in text.split(",")]  # type: ignore[misc]
+
+
+def mean_segment_length(batch: dict[str, torch.Tensor]) -> float:
+    """Token-weighted mean length of the segments in a packed batch."""
+    seg = batch["segment_ids"]
+    rows = torch.arange(seg.shape[0], device=seg.device)[:, None].expand_as(seg)
+    _, counts = torch.unique((rows * (int(seg.max()) + 1) + seg)[seg > 0], return_counts=True)
+    return float((counts**2).sum() / counts.sum())
 
 
 def train_step(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> None:
@@ -78,7 +89,9 @@ def main() -> None:
 
     shapes = parse_shapes(args.shapes)
     cfg = load_config(["--config", str(args.config), "--preset", args.preset])
-    cfg.model.max_position_embeddings = max(width for _, width in shapes)
+    # token_lengths caps lengths at max_position_embeddings: cap at the narrowest width so every
+    # shape draws the same population, then widen it (RoPE positions must cover the widest row).
+    cfg.model.max_position_embeddings = min(width for _, width in shapes)
     # Read before building the model: transformers deletes the flag from the config it builds with.
     checkpointing = (
         bool(getattr(cfg.model, "gradient_checkpointing", False))
@@ -86,6 +99,7 @@ def main() -> None:
         else args.checkpointing
     )
     sources = token_lengths(cfg, args.shards_per_source)
+    cfg.model.max_position_embeddings = max(width for _, width in shapes)
     vocab = canonical_amino_acid_ids(get_tokenizer())
     rng = np.random.default_rng(0)
     batches = {shape: packed_batch(sources, rng, *shape, vocab) for shape in shapes}
@@ -97,24 +111,29 @@ def main() -> None:
         model.gradient_checkpointing_disable()
     params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"{args.preset}: {params:.0f}M params, checkpointing={checkpointing}")
-    print(f"{'kernel':>6s} {'rows x width':>13s} {'real tokens':>12s} {'ms':>8s} {'GiB':>7s}")
+    print(
+        f"{'kernel':>6s} {'rows x width':>13s} {'real tokens':>12s} {'mean seg':>9s} "
+        f"{'ms':>8s} {'GiB':>7s}"
+    )
 
     results: dict[tuple[str, tuple[int, int]], float] = {}
     for backend in args.backends.split(","):
         model.config.packed_attention = backend
         for shape, batch in batches.items():
             torch._dynamo.reset()
-            compiled = compile_like_trainer(model, cfg, ddp=False)
+            # DDP-wrapped, as the trainer compiles it (DDPOptimizer splits the graph).
+            compiled = compile_like_trainer(model, cfg, ddp=True)
             label = f"{shape[0]} x {shape[1]}"
             real = int(batch["attention_mask"].sum())
+            seg_len = mean_segment_length(batch)
             try:
                 ms, gib = time_steps(compiled, batch, args.warmup, args.steps)
             except torch.OutOfMemoryError:
-                print(f"{backend:>6s} {label:>13s} {real:12d} {'OOM':>8s}")
+                print(f"{backend:>6s} {label:>13s} {real:12d} {seg_len:9.1f} {'OOM':>8s}")
                 torch.cuda.empty_cache()
                 continue
             results[backend, shape] = ms
-            print(f"{backend:>6s} {label:>13s} {real:12d} {ms:8.1f} {gib:7.1f}")
+            print(f"{backend:>6s} {label:>13s} {real:12d} {seg_len:9.1f} {ms:8.1f} {gib:7.1f}")
 
     narrow, wide = min(shapes, key=lambda s: s[1]), max(shapes, key=lambda s: s[1])
     for backend in args.backends.split(","):

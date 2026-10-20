@@ -117,12 +117,17 @@ def main() -> None:
     print(torch.__version__, torch.cuda.get_device_name())
     cfg = load_config(["--config", str(args.checkpoint / "config.yaml")])
     model = OplmForMaskedLM.from_pretrained(args.checkpoint / "hf").cuda().train()
+    # The cudnn/efficient/compiled modes are about the dense-mask path whatever the checkpoint
+    # was trained with; only the flex run switches kernels (and restores this).
+    model.config.packed_attention = "sdpa"
     # Training checkpoints activations (a padded batch does not fit a B200 without it). Neither
     # saved config records that: transformers deletes the flag from the config it builds with.
     model.gradient_checkpointing_enable()
     print(f"activation checkpointing: {model.oplm.backbone.layers[0].gradient_checkpointing}")
     params = list(model.parameters())
-    compiled = compile_like_trainer(model, cfg, ddp=False)
+    # The trainer compiles the DDP-wrapped model; DDPOptimizer splits the graph even at world
+    # size 1, so flex's backward across those split points is exercised here too.
+    compiled = compile_like_trainer(model, cfg, ddp=True)
     size = cfg.train.batch_size
     kwargs = dict(
         max_length=cfg.model.max_position_embeddings,
