@@ -251,27 +251,32 @@ def test_generation_rejects_nonproduction_weight_decay(base_config: Path, tmp_pa
     assert "weight_decay=0.01" in result.output
 
 
-@pytest.mark.parametrize(
-    ("old", "new", "message"),
-    [
-        ("optimizer: muon", "optimizer: adamw", "optimizer=muon"),
-        (
-            "muon_adjust_lr_fn: original",
-            "muon_adjust_lr_fn: match_rms_adamw",
-            "muon_adjust_lr_fn=original",
-        ),
-    ],
-)
-def test_generation_rejects_nonproduction_optimizer(
-    base_config: Path, tmp_path: Path, old: str, new: str, message: str
+def test_generation_rejects_muon_without_original_adjust_fn(
+    base_config: Path, tmp_path: Path
 ) -> None:
-    base_config.write_text(base_config.read_text().replace(old, new))
+    text = base_config.read_text()
+    base_config.write_text(
+        text.replace("muon_adjust_lr_fn: original", "muon_adjust_lr_fn: match_rms_adamw")
+    )
     result = runner.invoke(
         phases.app,
         ["smoke", "--config", str(base_config), "--out", str(tmp_path / "smoke")],
     )
     assert result.exit_code != 0
-    assert message in result.output
+    assert "muon_adjust_lr_fn=original" in result.output
+
+
+def test_generation_accepts_adamw(base_config: Path, tmp_path: Path) -> None:
+    """AdamW-only μP (the ESM-C recipe) sweeps too; muon_adjust_lr_fn is inert there."""
+    text = base_config.read_text().replace("optimizer: muon", "optimizer: adamw")
+    base_config.write_text(
+        text.replace("muon_adjust_lr_fn: original", "muon_adjust_lr_fn: match_rms_adamw")
+    )
+    out = tmp_path / "smoke"
+    result = runner.invoke(phases.app, ["smoke", "--config", str(base_config), "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    run_yaml = next(out.glob("runs/*/run.yaml"))
+    assert load_config(["--config", str(run_yaml)]).train.optimizer == "adamw"
 
 
 def test_generation_rejects_nonintegral_accumulation(base_config: Path, tmp_path: Path) -> None:
