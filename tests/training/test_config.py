@@ -157,7 +157,7 @@ def test_ablation_toggle_defaults_preserve_current_behavior() -> None:
     assert cfg.model.qk_norm_l2_scale_init is None
     assert cfg.model.mask_dropout is False
     assert cfg.model.mask_dropout_reference_ratio == 0.12
-    assert cfg.model.residual_gate == "channel"
+    assert cfg.model.residual_gate == "none"
     assert cfg.model.residual_gate_init == 1.0
     assert cfg.model.canon_residual is True
 
@@ -184,29 +184,81 @@ def test_default_run_uses_mup_muon_recipe() -> None:
     cfg = load_config([])
     assert cfg.train.optimizer == "muon"
     assert cfg.train.muon_adjust_lr_fn == "original"
-    # LR-sweep 800M confirm winner (Aug 2026), anchored at the 768-wide 170M proxy.
-    assert cfg.train.lr == pytest.approx(0.0035)
+    # μP refresh winner (Oct 2026, 4M tokens/step), anchored at the 768-wide 170M proxy.
+    assert cfg.train.lr == pytest.approx(0.0063)
+    assert cfg.train.adamw_lr_mult == pytest.approx(0.333)
+    assert cfg.train.embedding_weight_decay == pytest.approx(0.01)
+    assert cfg.train.weight_decay_to_init == pytest.approx(0.1)
+    assert cfg.model.residual_gate == "none"
     assert cfg.model.mup_enable is True
     assert cfg.model.mup_base_width == 768
-    assert cfg.model.mup_output_mult == 0.5
+    assert cfg.model.mup_output_mult == 1.0
     # Default hidden_size 1024 over base 768 ⇒ m = 4/3 (μP actively scales here).
     assert cfg.model.mup_width_mult() == pytest.approx(1024 / 768)
 
 
-def test_vanilla_esmc_overlay_restores_conventional_recipe() -> None:
-    """The vanilla ESM-C overlay turns μP off, switches to AdamW, and reverts the architecture."""
-    overlay = str(files("oplm.configs.train").joinpath("vanilla_esm-c.yaml"))
-    cfg = load_config(["--config", overlay])
-    # Optimizer / μP opt-out
-    assert cfg.train.optimizer == "adamw"
-    assert cfg.train.muon_adjust_lr_fn == "match_rms_adamw"
-    assert cfg.model.mup_enable is False
-    assert cfg.model.mup_width_mult() == 1.0
-    # Architecture reverts to the conventional pre-2026 recipe
-    assert cfg.model.norm_strategy == "pre"
-    assert cfg.model.attn_output_gate == "none"
-    assert cfg.model.value_residual == "none"
-    assert cfg.model.canon_enabled is False
+_ESMC_RECIPE = str(files("oplm.configs.train").joinpath("esm-c.yaml"))
+# Set by --preset, the tokenizer, the fine-tuning head, or the runtime -- not part of a recipe.
+_ESMC_UNPINNED_MODEL_KEYS = {
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "head_dim",
+    "intermediate_size",
+    "max_position_embeddings",
+    "packed_attention",
+    "gradient_checkpointing",
+    "gradient_checkpointing_mode",
+    "num_labels",
+    "classifier_pool",
+    "classifier_dropout",
+    "pre_head_norm",
+    "pad_token_id",
+    "bos_token_id",
+    "eos_token_id",
+    "unk_token_id",
+    "mask_token_id",
+}
+_ESMC_PINNED_TRAIN_KEYS = {
+    "optimizer",
+    "lr",
+    "weight_decay",
+    "adam_beta1",
+    "adam_beta2",
+    "adam_eps",
+    "mup_depth_lr_exponent",
+    "mup_depth_reference_layers",
+    "adamw_lr_mult",
+    "embedding_weight_decay",
+    "weight_decay_to_init",
+}
+
+
+def test_esmc_recipe_pins_every_architecture_key() -> None:
+    """A new OPLM model knob can't leak into the ESM-C recipe: it must be pinned there too."""
+    base = _packaged_section("oplm.configs.model", "base.yaml", "model")
+    esmc = _packaged_section("oplm.configs.train", "esm-c.yaml", "model")
+    assert set(esmc) == set(base) - _ESMC_UNPINNED_MODEL_KEYS
+
+
+def test_esmc_recipe_pins_the_optimizer() -> None:
+    esmc = _packaged_section("oplm.configs.train", "esm-c.yaml", "train")
+    assert set(esmc) == _ESMC_PINNED_TRAIN_KEYS
+
+
+def test_esmc_recipe_resolves_esmc_architecture() -> None:
+    """Pre-LN, full-width QK LayerNorm, sqrt(L/36) branches, nothing OPLM-specific, AdamW μP."""
+    cfg = load_config(["--config", _ESMC_RECIPE])
+    m, t = cfg.model, cfg.train
+    assert (m.norm_strategy, m.norm_type, m.norm_eps) == ("pre", "layernorm", 1e-5)
+    assert (m.qk_norm, m.qk_norm_mode, m.residual_scaling) == (True, "full", "esmc")
+    assert (m.residual_gate, m.attn_output_gate, m.value_residual) == ("none", "none", "none")
+    assert m.canon_enabled is False
+    assert (m.ffn_activation, m.ffn_bias, m.tie_word_embeddings) == ("swiglu", False, False)
+    assert m.mup_enable is True
+    assert t.optimizer == "adamw"
+    assert (t.adamw_lr_mult, t.weight_decay_to_init, t.embedding_weight_decay) == (1.0, 0.0, 0.0)
 
 
 def test_dataclass_fallbacks_are_conservative() -> None:
@@ -373,7 +425,15 @@ _MODEL_YAML = _packaged_section("oplm.configs.model", "base.yaml", "model")
 # train/base.yaml carries OPLM's opinionated production defaults (μP + Muon), which
 # intentionally diverge from the conservative TrainConfig dataclass fallbacks for
 # these fields. Every other key must still mirror the dataclass (drift guard).
-_TRAIN_PRODUCTION_OVERRIDES = {"optimizer", "lr", "muon_adjust_lr_fn", "mup_depth_lr_exponent"}
+_TRAIN_PRODUCTION_OVERRIDES = {
+    "optimizer",
+    "lr",
+    "muon_adjust_lr_fn",
+    "mup_depth_lr_exponent",
+    "adamw_lr_mult",
+    "embedding_weight_decay",
+    "weight_decay_to_init",
+}
 
 
 @pytest.mark.parametrize("key", sorted(_TRAIN_YAML))

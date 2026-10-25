@@ -19,15 +19,15 @@ train:
   tokens_per_step: null
   batch_tokens: null
 
-  # Optimizer — μP + Muon is the default recipe (disable via configs/train/vanilla_esm-c.yaml).
+  # Optimizer — μP + Muon is the default recipe (configs/train/esm-c.yaml is the AdamW comparison).
   optimizer: muon             # adamw | muon
   # μP base learning rate. With μP on (the default; model.mup_enable), this value
   # transfers across model width automatically — do NOT retune it per preset/size.
   # Tuned at mup_base_width=768 (Muon, adjust_lr_fn=original) via the phased sweep
-  # in docs/LR_SWEEP.md; 800M confirm winner, Aug 2026. Only retune if you DISABLE
-  # μP (e.g. via configs/train/vanilla_esm-c.yaml), where it is no longer
-  # width-correct.
-  lr: 0.0035
+  # in docs/LR_SWEEP.md (μP refresh, Oct 2026), at 4M tokens/step (tokens_per_step
+  # 4194304, packed, context 2048) and ranked after an LR decay; confirmed at 800M.
+  # LR depends on batch size: retune if you train at a very different batch.
+  lr: 0.0063
   min_lr: 0.0
   weight_decay: 0.01
   adam_beta1: 0.9
@@ -48,11 +48,13 @@ train:
   mup_depth_reference_layers: 24
   # Multiplier on the AdamW-side LR only (embeddings, head, norms, biases, gates,
   # Canon kernels). Muon matrices are untouched. 1.0 = AdamW groups inherit `lr`.
-  adamw_lr_mult: 1.0
+  adamw_lr_mult: 0.333
   # Decoupled decay for what weight_decay skips (0 = off): the token embedding toward 0, and
   # norm gains / residual gates / biases toward their initial values. See docs/TRAIN.md §7.
-  embedding_weight_decay: 0.0
-  weight_decay_to_init: 0.0
+  # 0.1 bounds the sandwich post-norm gains (they otherwise drift upward without limit,
+  # so the top layers swamp the stream on long runs) at no measurable loss cost.
+  embedding_weight_decay: 0.01
+  weight_decay_to_init: 0.1
   max_grad_norm: 1.0
 
   # Scheduler

@@ -338,6 +338,25 @@ def test_disabled_qk_norm_uses_canonical_kernel_scale():
     assert not hasattr(attn, "qk_l2_scale")
 
 
+def test_full_mode_normalizes_q_and_k_across_all_heads():
+    """Full mode is ESM-C's QK LayerNorm: one bias-free norm over every head's channels jointly."""
+    torch.manual_seed(0)
+    attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4, qk_norm_mode="full"))
+    assert attn.attn_scale == pytest.approx(1.0 / (8**0.5))
+    assert attn.q_norm.weight.shape == (32,)
+    assert attn.q_norm.bias is None
+    q = torch.randn(2, 4, 6, 8)  # (B, H, T, d_head)
+    k = torch.randn(2, 4, 6, 8)
+
+    def reference(t: torch.Tensor) -> torch.Tensor:
+        flat = torch.nn.functional.layer_norm(t.transpose(1, 2).reshape(2, 6, 32), (32,), eps=1e-6)
+        return flat.view(2, 6, 4, 8).transpose(1, 2)
+
+    q_hat, k_hat = attn._qk_norm(q, k)
+    assert torch.allclose(q_hat, reference(q), atol=1e-5)
+    assert torch.allclose(k_hat, reference(k), atol=1e-5)
+
+
 def test_l2_mode_builds_per_head_scale_and_identity_norms():
     """L2 mode replaces the channel norms with a learned per-head scale param."""
     attn = OplmAttention(_config(hidden_size=32, num_attention_heads=4, qk_norm_mode="l2"))

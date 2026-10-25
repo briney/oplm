@@ -224,9 +224,8 @@ def _write_run_config(
     preset = str(params["preset"])
     preset_model = get_preset_config(preset).model
     base = load_config(["--config", str(base_config)])
-    if base.train.optimizer != "muon":
-        raise ValueError(f"μP sweep requires train.optimizer=muon, got {base.train.optimizer}")
-    if base.train.muon_adjust_lr_fn != "original":
+    # AdamW-only μP (the ESM-C recipe) needs no adjust_lr_fn; Muon must use "original".
+    if base.train.optimizer == "muon" and base.train.muon_adjust_lr_fn != "original":
         raise ValueError(
             "μP sweep requires train.muon_adjust_lr_fn=original, "
             f"got {base.train.muon_adjust_lr_fn}"

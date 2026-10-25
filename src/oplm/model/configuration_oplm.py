@@ -26,8 +26,8 @@ __all__ = ["OplmConfig"]
 
 _VALID_NORM_TYPES = ("layernorm", "rmsnorm")
 _VALID_NORM_STRATEGIES = ("pre", "sandwich", "hybrid", "post_sdpa")
-_VALID_QK_NORM_MODES = ("channel", "l2")
-_VALID_RESIDUAL_SCALINGS = ("sqrt_num_layers", "none")
+_VALID_QK_NORM_MODES = ("channel", "l2", "full")
+_VALID_RESIDUAL_SCALINGS = ("sqrt_num_layers", "esmc", "none")
 _VALID_RESIDUAL_GATES = ("none", "scalar", "channel")
 _VALID_ATTN_OUTPUT_GATES = ("none", "sigmoid", "silu")
 _VALID_VALUE_RESIDUALS = ("none", "fixed", "learnable")
