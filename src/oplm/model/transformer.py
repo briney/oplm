@@ -117,12 +117,15 @@ class OplmBlock(nn.Module):
 
         if config.residual_scaling == "sqrt_num_layers":
             alpha_val = 1.0 / math.sqrt(config.num_hidden_layers)
+        elif config.residual_scaling == "esmc":
+            # ESM-C's TransformerStack divides each branch by sqrt(L / 36).
+            alpha_val = 1.0 / math.sqrt(config.num_hidden_layers / 36)
         elif config.residual_scaling == "none":
             alpha_val = 1.0
         else:
             raise ValueError(
                 f"Unknown residual_scaling {config.residual_scaling!r}; "
-                "expected 'sqrt_num_layers' or 'none'."
+                "expected 'sqrt_num_layers', 'esmc', or 'none'."
             )
         # Register as a persistent buffer (scalar tensor) rather than a plain Python float.
         #

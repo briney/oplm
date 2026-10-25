@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 from .conv import CanonConv
 from .masking import segment_attention_mask
-from .norm import make_norm
+from .norm import OplmLayerNorm, make_norm
 from .rope import RotaryEmbedding
 
 if TYPE_CHECKING:
@@ -44,6 +44,9 @@ class OplmAttention(nn.Module):
       `d_head` in fp32 and multiplies Q by a learned per-head scale
       (`qk_l2_scale`, shape `(num_attention_heads,)`); the attention kernel then
       runs with scale `1.0` (the score scale is folded into `qk_l2_scale`).
+    * `qk_norm=True, qk_norm_mode="full"` is ESM-C's QK norm: one bias-free norm
+      over the full `hidden_size` (all heads jointly), with the `1/sqrt(d_head)`
+      kernel scale.
     * `qk_norm=False` leaves Q and K unnormalized (Identity) with the
       `1/sqrt(d_head)` kernel scale.
     * Under `norm_strategy == "hybrid"`, an additional `v_norm` is installed on
@@ -155,9 +158,18 @@ class OplmAttention(nn.Module):
                     "value_residual_lambda", torch.tensor(lam_init), persistent=True
                 )
 
-        # Channel-mode QK norm installs per-head norm modules; L2 mode and the
-        # disabled path leave them as Identity (L2 normalization is functional).
-        if self.qk_norm_enabled and not self.qk_l2:
+        # Channel-mode QK norm installs per-head norm modules, full mode one norm over
+        # all heads (bias-free, as in ESM-C); L2 mode and the disabled path leave them
+        # as Identity (L2 normalization is functional).
+        self.qk_full = self.qk_norm_enabled and self.qk_norm_mode == "full"
+        if self.qk_full:
+            if config.norm_type == "layernorm":
+                self.q_norm = OplmLayerNorm(hidden_size, eps=config.norm_eps, bias=False)
+                self.k_norm = OplmLayerNorm(hidden_size, eps=config.norm_eps, bias=False)
+            else:
+                self.q_norm = make_norm(config.norm_type, hidden_size, eps=config.norm_eps)
+                self.k_norm = make_norm(config.norm_type, hidden_size, eps=config.norm_eps)
+        elif self.qk_norm_enabled and not self.qk_l2:
             self.q_norm: nn.Module = make_norm(config.norm_type, head_dim, eps=config.norm_eps)
             self.k_norm: nn.Module = make_norm(config.norm_type, head_dim, eps=config.norm_eps)
         else:
@@ -229,10 +241,19 @@ class OplmAttention(nn.Module):
 
         Channel mode uses the per-head `q_norm`/`k_norm` modules (their internals
         already cast to fp32 and return the input dtype). L2 mode dispatches to
-        `_qk_l2_norm`. When `qk_norm=False`, both norms are `nn.Identity`.
+        `_qk_l2_norm`. Full mode merges the heads, norms over `hidden_size`, and
+        splits them back. When `qk_norm=False`, both norms are `nn.Identity`.
         """
         if self.qk_l2:
             return self._qk_l2_norm(q, k)
+        if self.qk_full:
+            batch, heads, seq_len, head_dim = q.shape
+
+            def full(t: torch.Tensor, norm: nn.Module) -> torch.Tensor:
+                merged = norm(t.transpose(1, 2).reshape(batch, seq_len, self.hidden_size))
+                return merged.view(batch, seq_len, heads, head_dim).transpose(1, 2)
+
+            return full(q, self.q_norm), full(k, self.k_norm)
         return self.q_norm(q), self.k_norm(k)
 
     def _qk_l2_norm(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

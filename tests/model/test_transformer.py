@@ -106,6 +106,13 @@ def test_block_alpha_uses_sqrt_num_layers():
     assert block.alpha.item() == pytest.approx(1.0 / math.sqrt(4))
 
 
+def test_block_alpha_uses_esmc_scaling():
+    """ESM-C divides each residual branch by sqrt(L / 36)."""
+    cfg = _config(num_hidden_layers=4, residual_scaling="esmc")
+    block = OplmBlock(cfg, layer_idx=0)
+    assert block.alpha.item() == pytest.approx(1.0 / math.sqrt(4 / 36))
+
+
 def test_block_alpha_is_one_under_no_residual_scaling():
     cfg = _config(residual_scaling="none")
     block = OplmBlock(cfg, layer_idx=0)

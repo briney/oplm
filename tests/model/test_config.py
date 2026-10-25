@@ -509,3 +509,10 @@ def test_packed_attention_rejects_unknown_value() -> None:
 def test_packed_attention_flex_rejects_attention_dropout() -> None:
     with pytest.raises(ValueError, match="no attention dropout"):
         OplmConfig(packed_attention="flex", attention_dropout=0.1)
+
+
+def test_accepts_esmc_qk_norm_and_residual_scaling():
+    """The ESM-C recipe's full-width QK norm and sqrt(L/36) residual scaling validate."""
+    cfg = OplmConfig(qk_norm_mode="full", residual_scaling="esmc")
+    assert cfg.qk_norm_mode == "full"
+    assert cfg.residual_scaling == "esmc"
