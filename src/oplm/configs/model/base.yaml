@@ -30,13 +30,13 @@ model:
   norm_eps: 1.0e-6
   norm_strategy: sandwich # pre | sandwich | hybrid | post_sdpa
   qk_norm: true
-  qk_norm_mode: channel # channel (LayerNorm/RMSNorm + 1/sqrt(d) scale) | l2 (L2-normalize + learned per-head scale)
+  qk_norm_mode: channel # channel (per-head LayerNorm/RMSNorm + 1/sqrt(d) scale) | l2 (L2-normalize + learned per-head scale) | full (ESM-C: one bias-free norm over all heads)
   qk_norm_l2_scale_init: null # l2 mode only; per-head scale init (null -> sqrt(head_dim)); positive if set
   post_embed_norm: false
   mask_dropout: false # zero <mask> embeddings and rescale by expected/observed mask ratio
   mask_dropout_reference_ratio: 0.12 # expected fraction of real tokens that are <mask> (mask_prob * mask_token_prob); in [0, 1)
-  residual_scaling: sqrt_num_layers # sqrt_num_layers | none
-  residual_gate: channel # none | scalar | channel (learnable multiplicative refinement on residual writes); channel matches the swept/production architecture
+  residual_scaling: sqrt_num_layers # sqrt_num_layers (1/sqrt(L)) | esmc (1/sqrt(L/36)) | none
+  residual_gate: none # none | scalar | channel (learnable multiplicative refinement on residual writes); channel duplicates the sandwich post-norm gain, so production drops it
   residual_gate_init: 1.0 # initial value for residual gate parameters
   attn_output_gate: sigmoid # none | sigmoid | silu (post-SDPA G1 output gate, arXiv:2505.06708)
   value_residual: learnable # none | fixed | learnable (ResFormer value residual, arXiv:2410.17897)
@@ -77,15 +77,16 @@ model:
   # μP (maximal update parametrization) — LR transfer across width, ON by default.
   # train.lr is the μP base LR and transfers across width automatically (no manual
   # retune per size). At this default hidden_size (1024) over mup_base_width (768),
-  # m = 4/3, so μP actively scales init/LR. To DISABLE μP, use the AdamW baseline
-  # overlay (configs/train/vanilla_esm-c.yaml) — then train.lr must be retuned.
-  # See docs/MUP.md. (The bare OplmConfig() dataclass default is mup_enable=false.)
-  # base_width, output_mult, and train.{lr, mup_depth_lr_exponent} are one tuned
-  # set (LR-sweep 800M confirm winner, Aug 2026, anchored at the 768-wide 170M
-  # proxy) — do not change one without re-validating the others.
+  # m = 4/3, so μP actively scales init/LR. The ESM-C comparison recipe
+  # (configs/train/esm-c.yaml) carries its own tuned μP set. See docs/MUP.md.
+  # (The bare OplmConfig() dataclass default is mup_enable=false.)
+  # base_width, output_mult, and train.{lr, mup_depth_lr_exponent, adamw_lr_mult,
+  # weight_decay_to_init} are one tuned set (μP refresh, Oct 2026: 170M proxy at
+  # 4M tokens/step, confirmed at 800M) — do not change one without re-validating
+  # the others.
   mup_enable: true
   mup_base_width: 768 # hidden_size of the proxy/base model where the width multiplier m = 1
-  mup_output_mult: 0.5 # tunable O(1) readout (output-logit) multiplier
+  mup_output_mult: 1.0 # tunable O(1) readout (output-logit) multiplier
 
   # Init / checkpointing
   initializer_range: 0.02

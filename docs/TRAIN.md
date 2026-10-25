@@ -274,13 +274,14 @@ field.
 oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.01, by default
 ```
 
-To run the **vanilla ESM-C recipe** (μP off, AdamW, and the conventional pre-2026
-architecture), apply the opt-out overlay (its `lr` is a plain AdamW LR you must
-tune per size):
+To train the **ESM-C comparison model** (ESM-C's architecture with AdamW-only μP),
+merge `configs/train/esm-c.yaml` over your run config and train on the result:
 
 ```bash
-oplm train --preset 400M --config src/oplm/configs/train/vanilla_esm-c.yaml \
-  data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
+python -c "import sys; from omegaconf import OmegaConf as O; \
+  O.save(O.merge(O.load(sys.argv[1]), O.load(sys.argv[2])), sys.argv[3])" \
+  my-run.yaml src/oplm/configs/train/esm-c.yaml esmc-run.yaml
+oplm train --preset 400M --config esmc-run.yaml
 ```
 
 See [MUP.md](MUP.md) for the full recipe, the coord-check gate, and the pilot LR

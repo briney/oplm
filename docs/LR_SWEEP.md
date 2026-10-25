@@ -33,7 +33,7 @@ model:
   norm_strategy: sandwich
   canon_enabled: true
   canon_positions: [A, B, C, D]
-  residual_gate: channel
+  residual_gate: none
 
 train:
   batch_size: 32
@@ -92,6 +92,21 @@ that page for every field, its default, and the accepted `nodes`/`time_limit` fo
 command below reads `nodes`, `time_limit`, and `max_batch_size` from it and derives each cell's
 per-device batch and gradient-accumulation steps, so **the `slurm:` block is required even when
 running a phase with `--local`** — it is not only consulted for real Slurm submission.
+
+## ESM-C comparison recipe
+
+The same workflow tunes the ESM-C comparison model (`configs/train/esm-c.yaml`: ESM-C's
+architecture with AdamW-only μP). Merge the recipe over the production config, ESM-C winning,
+and pass the result as `--config` to every command below (coord-check with `--optimizer adamw`):
+
+```bash
+python -c "import sys; from omegaconf import OmegaConf as O; \
+  O.save(O.merge(O.load(sys.argv[1]), O.load(sys.argv[2])), sys.argv[3])" \
+  configs/mup-production.yaml src/oplm/configs/train/esm-c.yaml configs/esmc-production.yaml
+```
+
+The harness accepts `optimizer: adamw` (Muon runs still require `muon_adjust_lr_fn: original`).
+Write the confirmed `lr` and `mup_output_mult` back into `esm-c.yaml`, replacing its placeholders.
 
 ## Parameterization gates
 

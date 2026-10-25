@@ -143,13 +143,13 @@ are rejected, including for one loop. Effective depth is
 | `model.norm_eps` | `float` | `1e-6` | Norm epsilon. |
 | `model.norm_strategy` | `str` | `sandwich` | `pre`, `sandwich`, `hybrid`, or `post_sdpa` (run default `sandwich`; dataclass fallback `pre`). |
 | `model.qk_norm` | `bool` | `true` | Normalize Q and K before attention. |
-| `model.qk_norm_mode` | `str` | `channel` | `channel` (per-channel LayerNorm/RMSNorm + fixed `1/√head_dim` scale, the current behavior) or `l2` (fp32 L2-normalize over `head_dim` + a learned per-head scale). Inert when `qk_norm=false`. |
+| `model.qk_norm_mode` | `str` | `channel` | `channel` (per-head LayerNorm/RMSNorm + fixed `1/√head_dim` scale, the current behavior), `l2` (fp32 L2-normalize over `head_dim` + a learned per-head scale), or `full` (ESM-C's: one bias-free norm over the full `hidden_size`, all heads jointly, + `1/√head_dim`). Inert when `qk_norm=false`. |
 | `model.qk_norm_l2_scale_init` | `float \| null` | `null` | `l2` mode only: initial value of the learned per-head scale. `null` initializes to `√head_dim`. Must be positive when set. |
 | `model.post_embed_norm` | `bool` | `false` | Apply a norm after the token-embedding lookup. |
 | `model.mask_dropout` | `bool` | `false` | Zero every `<mask>` embedding row and rescale surviving embeddings by `(1 − reference_ratio) / (1 − observed_ratio)`. `input_ids` path only; the `inputs_embeds` path is unchanged. |
 | `model.mask_dropout_reference_ratio` | `float` | `0.12` | Expected fraction of real tokens that are `<mask>` under the training masking policy (`mask_prob · mask_token_prob`), **not** a fraction of mask tokens to drop. Must satisfy `0 ≤ ratio < 1`. |
-| `model.residual_scaling` | `str` | `sqrt_num_layers` | `sqrt_num_layers` (scale each sublayer's residual write by `1/√L`) or `none`. |
-| `model.residual_gate` | `str` | `channel` | Learnable multiplicative gate refining each residual write on top of `residual_scaling`: `none` (no new params), `scalar` (one param per attention/FFN write), or `channel` (`(hidden_size,)` param per write). Run default `channel` (the swept/production architecture); dataclass fallback `none`. |
+| `model.residual_scaling` | `str` | `sqrt_num_layers` | `sqrt_num_layers` (scale each sublayer's residual write by `1/√L`), `esmc` (ESM-C's `1/√(L/36)`), or `none`. |
+| `model.residual_gate` | `str` | `none` | Learnable multiplicative gate refining each residual write on top of `residual_scaling`: `none` (no new params), `scalar` (one param per attention/FFN write), or `channel` (`(hidden_size,)` param per write). Run default `none`: under sandwich norm a `channel` gate duplicates the post-norm gain (Oct 2026 μP refresh dropped it at no loss cost). Dataclass fallback `none`. |
 | `model.residual_gate_init` | `float` | `1.0` | Initial value for residual gate parameters. Must be finite. |
 | `model.attn_output_gate` | `str` | `sigmoid` | Post-SDPA attention output gate (arXiv:2505.06708, G1): `none` (no new params), `sigmoid`, or `silu`. Adds a bias-free `(hidden_size, hidden_size)` `gate_proj` per layer; the merged attention output is multiplied elementwise by `act(gate_proj(x))` before `o_proj`. Run default `sigmoid`; dataclass fallback `none`. |
 | `model.value_residual` | `str` | `learnable` | ResFormer value residual (arXiv:2410.17897): `none` (no new params), `fixed` (constant λ buffer, no new params), or `learnable` (one scalar λ per layer after the first). Layer 0 exposes its post-V-norm values `v₁`; every later layer blends `v' = λ·v + (1 − λ)·v₁` right after the V projection. Run default `learnable`; dataclass fallback `none`. |
@@ -212,9 +212,9 @@ Consumed by `OplmForSequenceClassification` / `OplmForTokenClassification`.
 μP makes a learning rate tuned on a small proxy model transfer to much larger
 models without re-sweeping at every scale. It is **on by default** for `oplm train`
 runs (with `train.optimizer=muon`, `train.muon_adjust_lr_fn=original`,
-`train.lr=0.0035`), and a no-op at the base width. See [MUP.md](MUP.md) for the full
-recipe and the tune-once-reuse-`train.lr` workflow; disable it with
-`configs/train/vanilla_esm-c.yaml`.
+`train.lr=0.0063`), and a no-op at the base width. See [MUP.md](MUP.md) for the full
+recipe and the tune-once-reuse-`train.lr` workflow, and for the ESM-C comparison
+recipe (`configs/train/esm-c.yaml`, AdamW-only μP).
 
 > **Run defaults vs. dataclass fallbacks.** The `Default` column below (and in the
 > Train table) is the **run default** from `configs/*/base.yaml` — what `oplm train`
@@ -228,7 +228,7 @@ recipe and the tune-once-reuse-`train.lr` workflow; disable it with
 | --- | --- | --- | --- |
 | `model.mup_enable` | `bool` | `true` | Master switch (run default; dataclass fallback `false`). When `false`, init, forward multipliers, and per-group LRs are identical to non-μP runs. |
 | `model.mup_base_width` | `int` | `768` | `hidden_size` of the proxy/base model where `m = hidden_size / mup_base_width` equals 1. Matches the production sweep's forced 768-wide (170M) anchor; dataclass fallback `512`. Must be `≥ 1`. |
-| `model.mup_output_mult` | `float` | `0.5` | Tunable O(1) multiplier on the output logits (applied as `mup_output_mult / m` on the readout matmul path). Run default is the LR-sweep confirm winner (Aug 2026); dataclass fallback `1.0`. Must be `> 0`. |
+| `model.mup_output_mult` | `float` | `1.0` | Tunable O(1) multiplier on the output logits (applied as `mup_output_mult / m` on the readout matmul path). Run default is the μP refresh winner (Oct 2026); dataclass fallback `1.0`. Must be `> 0`. |
 
 ### Derived and validated fields
 
@@ -266,7 +266,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.batch_tokens` | `int \| null` | `null` | Token mode: each process's micro-batch capacity, a multiple of `model.max_position_embeddings` (rows × width). Every micro-batch is exactly that shape. `train.batch_size` then only sizes eval batches. |
 | `train.gradient_accumulation_steps` | `int` | `1` | Must be `≥ 1`. |
 | `train.optimizer` | `str` | `muon` | `adamw` or `muon` (hybrid Muon + AdamW). Run default `muon` (dataclass fallback `adamw`). |
-| `train.lr` | `float` | `0.0035` | Peak learning rate. With μP on (the default) this is the **μP base LR** (LR-sweep confirm winner, Aug 2026) — it transfers across width, so do not retune per size; retune only if μP is disabled. Dataclass fallback `1e-4`. |
+| `train.lr` | `float` | `0.0063` | Peak learning rate. With μP on (the default) this is the **μP base LR** (μP refresh winner, Oct 2026, at 4M tokens/step) — it transfers across width, so do not retune per size; retune if μP is disabled or the batch is very different. Dataclass fallback `1e-4`. |
 | `train.min_lr` | `float` | `0.0` | Must be `≥ 0` and `≤ lr`. |
 | `train.weight_decay` | `float` | `0.01` | Decoupled weight decay. |
 | `train.adam_beta1` | `float` | `0.9` | AdamW β₁ (also Muon's auxiliary AdamW). |
@@ -278,9 +278,9 @@ Backed by `oplm.config.TrainConfig`.
 | `train.muon_ns_steps` | `int` | `5` | Newton–Schulz steps; must be `≥ 1`. |
 | `train.mup_depth_lr_exponent` | `float` | `0.5` | Repeated-block LR exponent; finite and `>= 0`. Zero is a no-op; the run default `0.5` is the sweep-verified correction (no-op at the 24-layer reference depth). Dataclass fallback `0.0`. |
 | `train.mup_depth_reference_layers` | `int` | `24` | Reference layer count in `(reference/L)^exponent`; must be `>= 1`. |
-| `train.adamw_lr_mult` | `float` | `1.0` | Multiplier on the AdamW-side LR only (under Muon: embeddings, head, norms, biases, residual gates, Canon kernels; under `adamw`: every group). Muon matrices are untouched. Must be finite and `> 0`. |
-| `train.embedding_weight_decay` | `float` | `0.0` | Decoupled weight decay on the token embedding, toward 0 (`0`: undecayed). Finite and `>= 0`. |
-| `train.weight_decay_to_init` | `float` | `0.0` | Decoupled weight decay toward each parameter's initial value: norm gains toward 1, residual gates toward `model.residual_gate_init`, biases toward 0 (`0`: undecayed). Value-residual lambdas and L2 QK scales are never decayed. Finite and `>= 0`. Turning this or `embedding_weight_decay` on or off changes the AdamW param groups, so a resume or branch must keep the setting (on or off) its checkpoint was saved with; changing a nonzero value is fine. |
+| `train.adamw_lr_mult` | `float` | `0.333` | Multiplier on the AdamW-side LR only (under Muon: embeddings, head, norms, biases, residual gates, Canon kernels; under `adamw`: every group). Muon matrices are untouched. Must be finite and `> 0`. Run default `0.333` (μP refresh); dataclass fallback `1.0`. |
+| `train.embedding_weight_decay` | `float` | `0.01` | Decoupled weight decay on the token embedding, toward 0 (`0`: undecayed). Finite and `>= 0`. Run default `0.01`; dataclass fallback `0`. |
+| `train.weight_decay_to_init` | `float` | `0.1` | Decoupled weight decay toward each parameter's initial value: norm gains toward 1, residual gates toward `model.residual_gate_init`, biases toward 0 (`0`: undecayed). Value-residual lambdas and L2 QK scales are never decayed. Finite and `>= 0`. Turning this or `embedding_weight_decay` on or off changes the AdamW param groups, so a resume or branch must keep the setting (on or off) its checkpoint was saved with; changing a nonzero value is fine. Run default `0.1`, which bounds the sandwich post-norm gains on long runs; dataclass fallback `0`. |
 | `train.max_grad_norm` | `float` | `1.0` | Set `0` to disable clipping. |
 | `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, or `wsd_cosine`. |
 | `train.warmup_steps` | `int` | `5_000` | Must be `≥ 0`. |

@@ -1,25 +1,83 @@
-# Vanilla ESM-C recipe — the conventional pre-2026 baseline / escape hatch.
+# ESM-C recipe: an ESM Cambrian-style encoder trained with AdamW, for comparison
+# against OPLM (configs/{model,train}/base.yaml). Architecture matches the `esm`
+# package's ESMC (esm 3.4.1): pre-LayerNorm blocks, QK LayerNorm over the full
+# width, residual branches divided by sqrt(L / 36), SwiGLU at 8/3 rounded up to
+# 256, no linear biases, full RoPE, untied GELU head. Checked against `esm`: with
+# ESM-C weights loaded, logits match to fp32 precision. Two cosmetic differences:
+# oplm's RoPE pairs adjacent channels where ESM-C pairs i with i + d/2 (a fixed
+# per-head channel permutation the Q/K projections absorb, so training from scratch
+# is unaffected), and oplm's final LayerNorm has a bias. ESM-C publishes no
+# training code, so the init and AdamW betas/eps/decay are OPLM's.
 #
-# OPLM now defaults to μP + Muon with sandwich norm, a sigmoid attention output
-# gate, a learnable value residual, and Canon at all four positions (see
-# configs/{train,model}/base.yaml). This overlay turns ALL of that off to recover
-# a conventional ESM-C-style encoder trained with AdamW — for ablations, A-B
-# comparisons, or reproducing the old recipe. Pass it with --config on top of a
-# size --preset:
+# Every architecture and optimizer knob is pinned here, so OPLM default changes
+# never leak in (tests/training/test_config.py enforces this). Dimensions come
+# from --preset; data, batch, schedule, and slurm come from your run config. The
+# loader takes one --config, so merge this file over your run config, ESM-C
+# winning:
 #
-#   oplm train --preset 400M --config src/oplm/configs/train/vanilla_esm-c.yaml \
-#     data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
+#   python -c "import sys; from omegaconf import OmegaConf as O; \
+#     O.save(O.merge(O.load(sys.argv[1]), O.load(sys.argv[2])), sys.argv[3])" \
+#     mup-production.yaml src/oplm/configs/train/esm-c.yaml esmc-production.yaml
 #
-# IMPORTANT: with μP off, `lr` no longer transfers across width. The value below is
-# a generic AdamW starting point — retune it for your model size. See docs/MUP.md.
-train:
-  optimizer: adamw
-  lr: 1.0e-4
-  muon_adjust_lr_fn: match_rms_adamw # restore the library default (inert for AdamW)
-
+# μP is on (AdamW-only mode, see docs/MUP.md). lr and mup_output_mult are
+# PLACEHOLDERS until the ESM-C μP campaign (docs/LR_SWEEP.md) fills them in.
 model:
-  mup_enable: false
+  num_loops: 1
+  loop_strategy: stack
+  loop_start: 0
+  loop_end: null
+
+  rope_theta: 10000.0
+  rope_dim: null
+  nope_dim: 0
+
+  norm_type: layernorm
+  norm_eps: 1.0e-5 # torch.nn.LayerNorm default, as in ESM-C
   norm_strategy: pre
+  qk_norm: true
+  qk_norm_mode: full # one bias-free LayerNorm over all heads jointly
+  qk_norm_l2_scale_init: null
+  post_embed_norm: false
+  mask_dropout: false
+  mask_dropout_reference_ratio: 0.12
+  residual_scaling: esmc # branches / sqrt(L / 36)
+  residual_gate: none
+  residual_gate_init: 1.0
   attn_output_gate: none
   value_residual: none
+  value_residual_lambda_init: 0.5
+  init_scale_output_projections: true
+
+  ffn_activation: swiglu
+  ffn_bias: false
+
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+
+  tie_word_embeddings: false
+  mlm_head_activation: gelu
+
   canon_enabled: false
+  canon_residual: true
+  canon_positions: [A, B, C, D]
+  canon_kernel_sizes: 7
+  canon_activation: none
+
+  mup_enable: true
+  mup_base_width: 768
+  mup_output_mult: 1.0 # PLACEHOLDER: ESM-C μP campaign
+
+  initializer_range: 0.02
+
+train:
+  optimizer: adamw
+  lr: 0.0016 # PLACEHOLDER: ESM-C μP campaign (μP base LR at width 768)
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_eps: 1.0e-8
+  mup_depth_lr_exponent: 0.5 # Depth-μP value for 1/sqrt(L)-scaled branches; verify at 800M
+  mup_depth_reference_layers: 24
+  adamw_lr_mult: 1.0 # every group is AdamW; lr applies as-is
+  embedding_weight_decay: 0.0
+  weight_decay_to_init: 0.0

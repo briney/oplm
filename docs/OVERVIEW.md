@@ -117,7 +117,7 @@ With every toggle off — the **bare/library default**, and what Part I's per-fi
 **production training default** (`oplm train`, via `configs/*/base.yaml`) instead
 turns on the validated best recipe: μP + Muon, sandwich norm, a sigmoid attention
 output gate, a learnable value residual, and Canon at all four positions (`k=7`).
-Recover the textbook baseline with `configs/train/vanilla_esm-c.yaml`. See
+Train the ESM-C comparison model with `configs/train/esm-c.yaml`. See
 [CONFIG.md](CONFIG.md) for the run-default-vs-library-fallback split.
 
 **Explicitly removed** (tried, no consistent gain, not even available as toggles;
@@ -370,9 +370,9 @@ inside the FFN module at intermediate width. See §11.
 | `norm_type` | global | `layernorm` (default) / `rmsnorm` |
 | `norm_strategy` | global | one enum, uniform |
 | `qk_norm` | global | per-head Norm on Q,K |
-| `qk_norm_mode`/`qk_norm_l2_scale_init` | global | `channel` (default) / `l2`; `l2` adds a learned per-head scale |
+| `qk_norm_mode`/`qk_norm_l2_scale_init` | global | `channel` (default) / `l2` / `full`; `l2` adds a learned per-head scale, `full` is ESM-C's full-width norm |
 | `mask_dropout`/`mask_dropout_reference_ratio` | global | `<mask>`-embedding dropout on the `input_ids` path |
-| `residual_scaling` | global | `sqrt_num_layers` / `none` |
+| `residual_scaling` | global | `sqrt_num_layers` / `esmc` / `none` |
 | `residual_gate`/`residual_gate_init` | global | `none` (default) / `scalar` / `channel` per-block residual gate |
 | `attn_output_gate` | global | `none` (default) / `sigmoid` / `silu` post-SDPA output gate (arXiv:2505.06708 G1) |
 | `value_residual`/`value_residual_lambda_init` | global | `none` (default) / `fixed` / `learnable` ResFormer value residual (arXiv:2410.17897) |
@@ -396,7 +396,7 @@ with `d = D/H` → QK-norm `(B,H,T,d)` → optional Canon-B depthwise conv on Q/
 → optional value residual → RoPE on Q,K → attention out `(B,H,T,d)` → reshape
 `(B,T,D)` → output projection `(B,T,D)`.
 
-**QK-norm / QKV-norm.** Two modes, selected by `qk_norm_mode` (only active when
+**QK-norm / QKV-norm.** Three modes, selected by `qk_norm_mode` (only active when
 `qk_norm=True`):
 
 * **`channel`** (default): Q and K each pass through a separate Norm over the
@@ -409,6 +409,9 @@ with `d = D/H` → QK-norm `(B,H,T,d)` → optional Canon-B depthwise conv on Q/
   initialized to `qk_norm_l2_scale_init` or `sqrt(d_head)`. The kernel score
   scale is then `1.0` (the temperature is folded into `qk_l2_scale`). The 1D
   scale lands in the no-decay optimizer group.
+* **`full`** (ESM-C's QK norm): Q and K each pass through one bias-free norm over
+  the full `hidden_size` — all heads normalized jointly, gain shape
+  `(hidden_size,)` — before the head split. Kernel scale `1/sqrt(d_head)`.
 
 When `qk_norm=False`, Q and K are unnormalized (`nn.Identity`) and the kernel
 keeps the `1/sqrt(d_head)` scale. V is not normed — *except* under
@@ -665,12 +668,12 @@ its kwargs. Derived fields (`head_dim`, `intermediate_size`, `rope_dim`,
 | `norm_eps` | 1e-6 | |
 | `norm_strategy` | `pre` | `pre`/`sandwich`/`hybrid`/`post_sdpa` |
 | `qk_norm` | `True` | per-head Norm on Q,K |
-| `qk_norm_mode` | `channel` | `channel` (LayerNorm/RMSNorm + `1/√head_dim` scale) / `l2` (L2-normalize + learned per-head scale); inert if `qk_norm=False` |
+| `qk_norm_mode` | `channel` | `channel` (per-head LayerNorm/RMSNorm + `1/√head_dim` scale) / `l2` (L2-normalize + learned per-head scale) / `full` (ESM-C: one bias-free norm over `hidden_size`); inert if `qk_norm=False` |
 | `qk_norm_l2_scale_init` | `None` | `l2` mode per-head scale init; `None` → `√head_dim`; positive if set |
 | `post_embed_norm` | `False` | |
 | `mask_dropout` | `False` | zero `<mask>` embeddings + rescale by `(1−ref)/(1−obs)`; `input_ids` path only |
 | `mask_dropout_reference_ratio` | `0.12` | expected `<mask>` fraction of real tokens (`mask_prob·mask_token_prob`); `0 ≤ ratio < 1` |
-| `residual_scaling` | `sqrt_num_layers` | / `none` |
+| `residual_scaling` | `sqrt_num_layers` | `1/√L` / `esmc` (`1/√(L/36)`) / `none` |
 | `residual_gate` | `none` | learnable gate on residual writes: `none`/`scalar`/`channel` |
 | `residual_gate_init` | `1.0` | init for gate params; finite |
 | `attn_output_gate` | `none` | post-SDPA elementwise output gate: `none`/`sigmoid`/`silu`; adds a `(D,D)` `gate_proj` per layer |

@@ -6,12 +6,11 @@ Tune `train.lr` **once** at a small proxy width, then reuse the same number at
 every larger preset.
 
 μP + Muon is the **default training recipe** (`oplm train` uses it out of the box;
-`train.lr` defaults to the μP base LR `0.0035`). It is a **no-op at the base width** —
+`train.lr` defaults to the μP base LR `0.0063`). It is a **no-op at the base width** —
 at `hidden_size == mup_base_width`, init, forward multipliers, and per-group LRs
 are bit-identical to a non-μP run. The production optimizer for μP is **Muon**;
-AdamW is also supported. To turn μP off (and recover the conventional ESM-C
-recipe — AdamW plus the pre-2026 architecture), apply
-`configs/train/vanilla_esm-c.yaml` (see §1).
+AdamW is also supported: the ESM-C comparison recipe
+(`configs/train/esm-c.yaml`, see §1) runs AdamW-only μP with its own tuned values.
 
 Backward-compatibility note: the default lives in the **YAML run-config layer**
 (`configs/*/base.yaml`). Bare `OplmConfig()` / `TrainConfig()` construction and
@@ -29,32 +28,42 @@ Related references:
 ## 1. Quick start
 
 μP + Muon is the default, so training at any preset just works — `train.lr` is the
-μP base LR (`0.0035`), reused unchanged at every size:
+μP base LR (`0.0063`), reused unchanged at every size:
 
 ```bash
-oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.0035, by default
+oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.0063, by default
 ```
 
 The defaults live in `configs/train/base.yaml` (`optimizer: muon`,
-`muon_adjust_lr_fn: original`, `lr: 0.0035`, `mup_depth_lr_exponent: 0.5`) and
-`configs/model/base.yaml` (`mup_enable: true`, `mup_base_width: 768`,
-`mup_output_mult: 0.5`) — the LR-sweep 800M confirm winner (Aug 2026). With μP
+`muon_adjust_lr_fn: original`, `lr: 0.0063`, `mup_depth_lr_exponent: 0.5`,
+`adamw_lr_mult: 0.333`, `weight_decay_to_init: 0.1`) and `configs/model/base.yaml`
+(`mup_enable: true`, `mup_base_width: 768`, `mup_output_mult: 1.0`) — the μP
+refresh winner (Oct 2026), tuned at 4M tokens/step and confirmed at 800M. With μP
 on, **`train.lr` is the base LR** and transfers across width — you do not
-re-tune it per preset.
+re-tune it per preset. It does depend on batch size: retune for a very different
+tokens-per-step.
 
 **To re-tune the base LR** for a new optimizer or data regime, follow the phased
 production workflow in [LR_SWEEP.md](LR_SWEEP.md). It ranks held-out validation
 loss, repeats finalists across three seeds, verifies transfer across the preset
 ray, and measures the production-batch correction.
 
-**To disable μP** (vanilla ESM-C recipe — AdamW plus the pre-2026 architecture,
-e.g. for an ablation), apply the opt-out overlay — note its `lr` is a plain AdamW
-LR that must be tuned per size:
+**To train the ESM-C comparison model** (ESM-C's architecture — pre-LN, full-width
+QK LayerNorm, `1/√(L/36)` residual branches — with AdamW-only μP), merge
+`configs/train/esm-c.yaml` over your run config (the loader takes one `--config`;
+the recipe pins every architecture and optimizer knob, your run config supplies data,
+batch, and schedule):
 
 ```bash
-oplm train --preset 400M --config src/oplm/configs/train/vanilla_esm-c.yaml \
-  data.train=/data/uniref50/ train.lr=<adamw-lr-for-this-size>
+python -c "import sys; from omegaconf import OmegaConf as O; \
+  O.save(O.merge(O.load(sys.argv[1]), O.load(sys.argv[2])), sys.argv[3])" \
+  my-run.yaml src/oplm/configs/train/esm-c.yaml esmc-run.yaml
+oplm train --preset 400M --config esmc-run.yaml
 ```
+
+Its `lr` and `mup_output_mult` are placeholders until its own μP campaign
+([LR_SWEEP.md](LR_SWEEP.md), with the merged config as `--config`) fills them in. To
+turn μP off entirely, add `model.mup_enable=false` and tune `lr` per size.
 
 ---
 
