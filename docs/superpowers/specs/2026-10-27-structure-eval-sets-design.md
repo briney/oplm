@@ -83,7 +83,8 @@ the official domain boundaries) and the official target sequences.
 | `CASP16/sequences/casp16.T1.seq.txt` | `77d0b5c4ffda52ca1be7563a92eabae7ca59a3aab814e79a377ddd962783e286` |
 
 Also save each edition's domain summary page (`/casp15/domains_summary.cgi`, and the CASP16
-equivalent) for FM/TBM labels, so results can be split by difficulty later.
+equivalent) for difficulty labels (CASP15: FM, FM/TBM, TBM-hard, TBM-easy; CASP16: easy,
+medium, hard), so results can be split by difficulty later.
 
 Each domain becomes one structure: SEQRES is the full target sequence, and only that domain's
 residues have coordinates. The model sees the whole target and is scored inside the domain, which
@@ -190,7 +191,7 @@ $OPLM_DATA/hf/structure-evals/2026-10-12/
   manifest.parquet       one row per exported structure: set, name (file stem), source, entry,
                          chain, cluster, method, resolution, release date, source file (CASP),
                          sequence, length, modeled count, long-range contacts, sha256. CASP
-                         FM/TBM labels stay in the saved domain summary pages (sources/) for
+                         difficulty labels stay in the saved domain summary pages (sources/) for
                          the eval toolkit to parse; they aren't manifest columns.
   summary.json           the README's counts and thresholds, machine-readable
   sources/               CASP tarballs, sequence files and domain summary pages, CAMEO list copy,
@@ -230,7 +231,8 @@ roughly 0.7%. The full PDB40 post-training eval (29,429 chains up to 1024 residu
   CASP domain placement, loader round-trip.
 - External dependency: the MMseqs2 binary (bioconda or a static release), with its version
   recorded. It is not a Python dependency.
-- Runtime: clustering 175k sequences takes roughly 10–30 min; export takes minutes. Building and
+- Runtime (measured, 28 threads): clustering 175k sequences takes about 1 min; the whole build
+  about 26 min. Building and
   testing is about 1.5 days.
 
 ## Decisions (approved 2026-10-27)

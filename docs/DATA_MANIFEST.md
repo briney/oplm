@@ -5,10 +5,10 @@ support the methods section: every value is copied from the build artifact named
 
 ## Structure evaluation sets (`structure-evals/2026-10-12`)
 
-Built 2026-10-27 with `oplm fold eval-sets` at commit `95b2e0e` (MMseqs2 18.8cc5c, installed
-from bioconda). Output: `$OPLM_DATA/hf/structure-evals/2026-10-12/`, with a
-`README.md`, `summary.json` (per-stage counts) and `manifest.parquet` (one row per structure,
-with its sha256). Design and rationale:
+Built 2026-10-27 with `oplm fold eval-sets` at commit `c0b5f08` (oplm 0.4.1.dev180+gc0b5f08aa;
+MMseqs2 18.8cc5c, installed from bioconda). Output: `$OPLM_DATA/hf/structure-evals/2026-10-12/`,
+with a `README.md`, `summary.json` (per-stage counts) and `manifest.parquet` (one row per
+structure, with its sha256). Design and rationale:
 `docs/superpowers/specs/2026-10-27-structure-eval-sets-design.md`.
 
 ### Sources
@@ -53,9 +53,10 @@ with its sha256). Design and rationale:
    clustered with MMseqs2 (`mmseqs easy-cluster --min-seq-id 0.4 -c 0.8 --cov-mode 0 -s 7.5
    --dbtype 1`; `--dbtype 1` forces amino-acid input, because without it MMseqs2 guessed
    nucleotide from the sorted FASTA's leading poly-A sequences) into 49,986 clusters. For each
-   cluster, candidate chains passing the quality filter were ranked by resolution, then resolved
-   fraction, then entry and chain id. The first candidate passing the curation rules became the
-   cluster's representative.
+   cluster, candidate chains passing the quality filter, the length range, the standard-residue
+   rule and a screen of at least 70% resolved residues were ranked by resolution, then resolved
+   fraction, then entry and chain id. Up to five candidates were tried in that order; the first
+   passing the curation rules became the cluster's representative.
 8. **Subsets.** Seed-42 random subsets of chains ≤ 512 residues: `cameo_256`, `pdb40_2048`
    and `pdb40_256`, with `pdb40_256` contained in `pdb40_2048`.
 9. **Scoring** (the `structure` eval type). Unsupervised contact precision from the model's
@@ -72,13 +73,16 @@ with its sha256). Design and rationale:
 | `cameo_256`, `pdb40_2048`, `pdb40_256` | | | 256, 2,048, 256 |
 
 CASP15 has 45 domain files (no duplicates); CASP16 has 159, of which 82 are duplicates, so
-45 + 77 = 122 distinct domains. The `pdb40` removed counts are clusters and sum with the 29,429
+45 + 77 = 122 distinct domains. CAMEO `skipped` counts listed chains with fewer than three
+resolved Cα atoms; `quality` is 46 NMR structures and 200 X-ray structures above 2.5 Å. The `pdb40` removed counts are clusters and sum with the 29,429
 exported to 49,986. `no_candidate` clusters had no chain passing the quality filter, length,
-standard-residue and 70% modeled screen; `exhausted` clusters had candidates that all failed the
+standard-residue and 70%-resolved screen; `exhausted` clusters had candidates that all failed the
 curation rules; `max_rounds` clusters still had untried candidates after 5 attempts. The
 build also counted individual candidates rejected by the curation rules while searching clusters
 (`contacts`: 3,940; `modeled`: 6). These are candidate-level counts, not clusters; don't add
 them to the removed total.
 
-Overlap: 202 CAMEO chains are also PDB40 representatives, and 395 CAMEO chains fall in a cluster
-with a PDB40 representative. Both are reported, not removed.
+Overlap: 202 of the 435 CAMEO chains are also PDB40 representatives, and all 435 fall in a 40%
+sequence cluster that has a PDB40 representative (every curated CAMEO chain is itself a valid
+candidate in its cluster). CAMEO is therefore not held out from PDB40. Both counts are reported;
+nothing is removed.
