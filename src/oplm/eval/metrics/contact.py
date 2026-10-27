@@ -1,9 +1,9 @@
-"""Contact-map geometry, APC, and precision@L utilities.
+"""Contact-map geometry and APC utilities.
 
 These are the shared primitives for structure contact prediction: building a
 binary ground-truth contact map from backbone coordinates, Average Product
-Correction, and precision@L scoring. They back the categorical-Jacobian contact
-metric (see :mod:`oplm.eval.metrics.categorical_jacobian`).
+Correction, and which residues can be scored. They back the categorical-Jacobian
+contact metric (see :mod:`oplm.eval.metrics.categorical_jacobian`).
 """
 
 from __future__ import annotations
@@ -75,6 +75,20 @@ def compute_contact_map(
     return (dists < threshold).float()
 
 
+def contact_positions_valid(coords: Tensor, use_cbeta: bool = True) -> Tensor:
+    """Residues whose contact position (virtual Cβ, or CA) is finite, shape ``(L,)`` bool.
+
+    A pair involving a residue without coordinates is unknown, not a non-contact: the
+    structure eval leaves it out of the ranking (the ESM-C convention).
+
+    Args:
+        coords: Backbone coordinates ``(L, 3, 3)`` with ``[N, CA, C]`` ordering.
+        use_cbeta: Score by virtual Cβ (needs N, CA and C) rather than CA alone.
+    """
+    positions = compute_virtual_cbeta(coords) if use_cbeta else coords[:, 1, :]
+    return torch.isfinite(positions).all(dim=-1)
+
+
 def apply_apc(matrix: Tensor) -> Tensor:
     """Apply Average Product Correction to a contact score matrix.
 
@@ -96,46 +110,3 @@ def apply_apc(matrix: Tensor) -> Tensor:
         return matrix
 
     return matrix - (row_mean * col_mean) / global_mean
-
-
-def compute_precision_at_l(
-    pred_contacts: Tensor,
-    true_contacts: Tensor,
-    seq_len: int,
-    min_seq_sep: int = 24,
-    l_divisor: int = 1,
-) -> float:
-    """Compute precision@(L/divisor) for long-range contacts.
-
-    Takes the top ``L/divisor`` predictions among residue pairs with
-    sequence separation >= ``min_seq_sep`` and computes the fraction
-    that are true contacts.
-
-    Args:
-        pred_contacts: Predicted contact scores ``(L, L)``.
-        true_contacts: Binary ground-truth contacts ``(L, L)``.
-        seq_len: Effective sequence length.
-        min_seq_sep: Minimum ``|i - j|`` for long-range contacts.
-        l_divisor: Denominator for L (1 -> L, 2 -> L/2, 5 -> L/5).
-
-    Returns:
-        Precision as a float in ``[0, 1]``. Returns 0.0 if no valid
-        pairs exist or k is zero.
-    """
-    L = pred_contacts.shape[0]
-
-    # Build mask: upper triangle, |i - j| >= min_seq_sep
-    row_idx, col_idx = torch.triu_indices(L, L, offset=min_seq_sep)
-    if len(row_idx) == 0:
-        return 0.0
-
-    pred_scores = pred_contacts[row_idx, col_idx]
-    true_labels = true_contacts[row_idx, col_idx]
-
-    k = max(1, seq_len // l_divisor)
-    k = min(k, len(pred_scores))  # Don't exceed available pairs
-
-    _, top_indices = torch.topk(pred_scores, k)
-    precision = true_labels[top_indices].float().mean().item()
-
-    return precision

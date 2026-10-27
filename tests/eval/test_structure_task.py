@@ -11,6 +11,7 @@ import math
 from typing import TYPE_CHECKING
 
 import pytest
+import torch
 
 from oplm.config import (
     DataConfig,
@@ -19,6 +20,8 @@ from oplm.config import (
     ScheduleSpec,
     TrainConfig,
 )
+from oplm.data import StructureData, get_tokenizer, load_structures
+from oplm.eval.metrics.categorical_jacobian import get_canonical_amino_acid_token_ids
 from oplm.eval.tasks.structure import StructureEvalTask, StructureTaskConfig
 from oplm.model import OplmConfig as OplmModelConfig
 
@@ -93,3 +96,56 @@ def test_structure_eval_precision_in_unit_interval(
     p = metrics["precision_at_L"]
     assert math.isfinite(p)
     assert 0.0 <= p <= 1.0
+
+
+def _task() -> StructureEvalTask:
+    """A structure task with its tokenizer state initialized, as ``evaluate`` would."""
+    cfg = OplmConfig(
+        model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
+        train=TrainConfig(wandb_enabled=False),
+        data=DataConfig(num_workers=0, pin_memory=False),
+    )
+    entry = EvalDatasetEntry(
+        name="struct", path=".", type="structure", schedule=ScheduleSpec("steps", 1)
+    )
+    task = StructureEvalTask(entry, cfg)
+    task._tokenizer = get_tokenizer()
+    task._canonical_aa_token_ids = get_canonical_amino_acid_token_ids(task._tokenizer)
+    return task
+
+
+def test_structure_without_modeled_residues_is_skipped(
+    make_model: Callable[..., OplmForMaskedLM],
+) -> None:
+    """No residue with a full backbone: skipped before any forward pass."""
+    struct = StructureData(
+        name="empty",
+        sequence="ACDEFGHIK",
+        coords=torch.full((9, 3, 3), float("nan")),
+        chain_id="A",
+    )
+    model = make_model(max_position_embeddings=_MAX_SEQ_LEN)
+    assert _task()._process_single_structure(struct, model, torch.device("cpu")) is None
+
+
+@pytest.mark.slow
+def test_unmodeled_residues_are_unscored(
+    structure_fixtures_dir: Path,
+    tmp_path: Path,
+    make_model: Callable[..., OplmForMaskedLM],
+) -> None:
+    """Five unmodeled residues: the model reads all 46, L counts the 41 modeled."""
+    lines = [
+        line
+        for line in (structure_fixtures_dir / "1CRN.pdb").read_text().splitlines(keepends=True)
+        if not (line.startswith(("ATOM", "ANISOU")) and 20 <= int(line[22:26]) <= 24)
+    ]
+    (tmp_path / "1CRN_gap.pdb").write_text("".join(lines))
+    (struct,) = load_structures(tmp_path)
+    model = make_model(max_position_embeddings=_MAX_SEQ_LEN)
+    data = _task()._process_single_structure(struct, model, torch.device("cpu"))
+    assert data is not None
+    assert len(struct.sequence) == 46 and data.seq_len == 41
+    gap = torch.arange(19, 24)
+    assert not torch.isin(data.pair_indices[0], gap).any()
+    assert not torch.isin(data.pair_indices[1], gap).any()

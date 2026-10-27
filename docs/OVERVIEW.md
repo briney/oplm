@@ -1389,12 +1389,14 @@ Eval-specific scoring math, kept in the harness (it is scoring, not loading).
   (`exp(loss)`, capped at 1000 to stay finite early).
   `compute_mlm_metrics(model, dataloader, accelerator) -> {loss, accuracy,
   perplexity}`.
-- **Contact / precision@L primitives (`contact.py`)**: **contact map** — binary
-  `(L,L)`, residues `i,j` in contact iff Cβ–Cβ distance (virtual Cβ from N,CA,C
-  when absent) `< contact_threshold` (8.0 Å) and `|i−j| ≥ min_seq_sep` (24); **APC**
-  — `F_apc[i,j] = F[i,j] − (rowmean_i·colmean_j)/mean(F)`; **precision@L** — rank
-  long-range pairs by score, take top `L/l_divisor`, report fraction that are true
-  contacts.
+- **Contact primitives (`contact.py`)**: **contact map** — binary `(L,L)`,
+  residues `i,j` in contact iff Cβ–Cβ distance (virtual Cβ from N,CA,C when
+  absent) `< contact_threshold` (8.0 Å) and `|i−j| ≥ min_seq_sep` (24); **APC**
+  — `F_apc[i,j] = F[i,j] − (rowmean_i·colmean_j)/mean(F)`; **scorable residues**
+  — `contact_positions_valid` marks residues whose virtual Cβ is finite.
+  Precision@L (in `categorical_jacobian.py`) ranks only long-range pairs between
+  such residues, takes the top `L/l_divisor` with L = their count, and reports
+  the fraction that are true contacts.
 - **Categorical-Jacobian coupling (`categorical_jacobian.py`)** — the single
   contact signal. `J[i,a,j,b] = ∂ logit(x_j=b) / ∂(x_i=a)` estimated by finite
   differences (mutate each position to each canonical AA, measure the logit shift);

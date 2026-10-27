@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
-from oplm.eval.metrics.contact import apply_apc, compute_precision_at_l
+from oplm.eval.metrics.contact import apply_apc
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,7 +47,7 @@ class StructurePairScoreData:
     Attributes:
         scores: Predicted score for each valid residue pair, shape ``(n_pairs,)``.
         labels: Binary contact labels for the same pairs, shape ``(n_pairs,)``.
-        seq_len: Effective sequence length.
+        seq_len: L for precision@L: the number of residues with coordinates.
         pair_indices: ``(i_indices, j_indices)`` for reconstructing ``(L, L)``
             matrices from the flat arrays.
     """
@@ -202,17 +202,26 @@ def build_structure_pair_score_data(
     true_contacts: Tensor,
     seq_len: int,
     min_seq_sep: int = 24,
+    valid: Tensor | None = None,
 ) -> StructurePairScoreData:
-    """Flatten a contact score matrix into valid long-range residue pairs."""
-    seq_len_actual = true_contacts.shape[0]
-    i_indices, j_indices = torch.triu_indices(seq_len_actual, seq_len_actual, offset=min_seq_sep)
+    """Flatten a contact score matrix into the scorable long-range residue pairs.
 
-    scores = pred_contacts[i_indices, j_indices]
-    labels = true_contacts[i_indices, j_indices]
-
+    Args:
+        pred_contacts: Predicted contact scores ``(L, L)``.
+        true_contacts: Binary ground-truth contacts ``(L, L)``.
+        seq_len: L for precision@L (the number of residues with coordinates).
+        min_seq_sep: Minimum ``|i - j|`` of a long-range pair.
+        valid: Optional ``(L,)`` bool mask of residues with coordinates. Pairs touching an
+            invalid residue are dropped: unknown, not non-contacts.
+    """
+    n = true_contacts.shape[0]
+    i_indices, j_indices = torch.triu_indices(n, n, offset=min_seq_sep)
+    if valid is not None:
+        keep = valid[i_indices] & valid[j_indices]
+        i_indices, j_indices = i_indices[keep], j_indices[keep]
     return StructurePairScoreData(
-        scores=scores,
-        labels=labels,
+        scores=pred_contacts[i_indices, j_indices],
+        labels=true_contacts[i_indices, j_indices],
         seq_len=seq_len,
         pair_indices=(i_indices, j_indices),
     )
@@ -221,20 +230,18 @@ def build_structure_pair_score_data(
 def compute_mean_pair_score_precision_at_l(
     structures: list[StructurePairScoreData],
     l_divisor: int = 1,
-    min_seq_sep: int = 24,
 ) -> float:
-    """Average precision@L over per-structure pair-score predictions."""
+    """Mean precision@(L/l_divisor) over structures: the fraction of each structure's top
+    ``seq_len // l_divisor`` scorable pairs that are true contacts (0.0 with no pairs)."""
     precisions: list[float] = []
     for structure in structures:
-        pred = torch.zeros(structure.seq_len, structure.seq_len)
-        pred[structure.pair_indices[0], structure.pair_indices[1]] = structure.scores
-
-        true = torch.zeros(structure.seq_len, structure.seq_len)
-        true[structure.pair_indices[0], structure.pair_indices[1]] = structure.labels
-
-        precision = compute_precision_at_l(pred, true, structure.seq_len, min_seq_sep, l_divisor)
-        precisions.append(precision)
-
+        n_pairs = structure.scores.numel()
+        if n_pairs == 0:
+            precisions.append(0.0)
+            continue
+        k = min(max(1, structure.seq_len // l_divisor), n_pairs)
+        top = torch.topk(structure.scores, k).indices
+        precisions.append(structure.labels[top].float().mean().item())
     if not precisions:
         return 0.0
     return sum(precisions) / len(precisions)

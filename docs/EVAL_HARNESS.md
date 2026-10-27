@@ -84,14 +84,19 @@ respond to point mutations elsewhere:
 4. **Score** — build the ground-truth contact map from backbone coordinates
    (virtual Cβ via ideal backbone geometry, works for glycine; contact iff Cβ–Cβ
    distance < `contact_threshold`, default 8.0 Å), restrict to long-range pairs
-   (`|i − j| ≥ min_seq_sep`, default 24), and compute precision over the top
-   `L / l_divisor` predicted pairs.
+   (`|i − j| ≥ min_seq_sep`, default 24), drop pairs that involve a residue
+   without coordinates (unknown, not non-contacts), and compute precision over
+   the top `L / l_divisor` predicted pairs, where L is the number of residues
+   with coordinates.
 
 Structures are sharded across ranks and gathered with `all_gather_object`. A
-sequence is eligible only if `len + 2 ≤ max_position_embeddings`. NaN backbone
-coordinates are treated as infinite distance (no contact); with no valid pairs or
-no loaded structures the precision is `0.0` (a finite value in `[0, 1]`, not an
-error).
+sequence is eligible only if `len + 2 ≤ max_position_embeddings`. The model
+reads the full sequence. For a PDB file whose numbering fits its SEQRES, that
+includes unmodeled residues, which load as NaN rows (the ESM-C convention).
+Pairs involving a residue with a NaN backbone atom are left out of the ranking.
+A structure with no residue having a full backbone is skipped; with no valid
+pairs or no loaded structures the precision is `0.0` (a finite value in
+`[0, 1]`, not an error).
 
 > The cost of the Jacobian is `L × 20` forward passes per structure. Use
 > `categorical_jacobian_sample_size` to evaluate a deterministic subset and

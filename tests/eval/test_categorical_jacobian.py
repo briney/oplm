@@ -91,7 +91,7 @@ def test_mean_pair_score_precision_is_one_for_perfect_ranking() -> None:
     pred_contacts = true_contacts.clone()  # perfect prediction
     data = build_structure_pair_score_data(pred_contacts, true_contacts, seq_len, min_seq_sep)
 
-    precision = compute_mean_pair_score_precision_at_l([data], l_divisor=1, min_seq_sep=min_seq_sep)
+    precision = compute_mean_pair_score_precision_at_l([data], l_divisor=1)
 
     assert precision == pytest.approx(1.0)
 
@@ -99,3 +99,49 @@ def test_mean_pair_score_precision_is_one_for_perfect_ranking() -> None:
 def test_mean_pair_score_precision_empty_is_zero() -> None:
     """No structures yields 0.0 rather than dividing by zero."""
     assert compute_mean_pair_score_precision_at_l([]) == 0.0
+
+
+def _bands(seq_len: int) -> torch.Tensor:
+    """Ground truth with contacts on the 6th, 7th and 8th off-diagonals."""
+    true_contacts = torch.zeros(seq_len, seq_len)
+    for offset in (6, 7, 8):
+        idx = torch.arange(seq_len - offset)
+        true_contacts[idx, idx + offset] = 1.0
+    return true_contacts
+
+
+def test_pair_data_drops_pairs_touching_unmodeled_residues() -> None:
+    """With a validity mask, no kept pair involves an invalid residue."""
+    seq_len, min_seq_sep = 30, 6
+    valid = torch.ones(seq_len, dtype=torch.bool)
+    valid[[3, 17]] = False
+    data = build_structure_pair_score_data(
+        torch.rand(seq_len, seq_len), _bands(seq_len), 28, min_seq_sep, valid=valid
+    )
+    i, j = data.pair_indices
+    bad = torch.tensor([3, 17])
+    assert not torch.isin(i, bad).any() and not torch.isin(j, bad).any()
+    expected = sum(
+        1
+        for a in range(seq_len)
+        for b in range(a + min_seq_sep, seq_len)
+        if a not in (3, 17) and b not in (3, 17)
+    )
+    assert len(data.scores) == expected
+    assert data.seq_len == 28
+
+
+def test_unknown_pairs_are_not_false_positives() -> None:
+    """The top-scoring pair touches an unmodeled residue: masked, P@L stays 1.0."""
+    seq_len, min_seq_sep = 24, 6
+    true_contacts = _bands(seq_len)
+    pred = true_contacts.clone()
+    pred[0, 23] = 10.0  # highest score, not a contact, residue 0 unmodeled
+    valid = torch.ones(seq_len, dtype=torch.bool)
+    valid[0] = False
+    masked = build_structure_pair_score_data(
+        pred, true_contacts, seq_len - 1, min_seq_sep, valid=valid
+    )
+    unmasked = build_structure_pair_score_data(pred, true_contacts, seq_len, min_seq_sep)
+    assert compute_mean_pair_score_precision_at_l([masked]) == pytest.approx(1.0)
+    assert compute_mean_pair_score_precision_at_l([unmasked]) < 1.0
