@@ -139,7 +139,11 @@ def casp_domain_chains(
         for member in archive.getmembers():
             filename = Path(member.name).name
             match = _DOMAIN_FILE.match(filename)
-            handle = archive.extractfile(member) if member.isfile() and match else None
+            handle = (
+                archive.extractfile(member)
+                if (member.isfile() or member.islnk()) and match
+                else None
+            )
             if match is None or handle is None:
                 continue
             stats["files"] += 1

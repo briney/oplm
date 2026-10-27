@@ -57,10 +57,14 @@ def test_duplicates_versions_combined_units_and_mismatches_are_skipped(tmp_path:
 def test_hetatm_and_altloc_lines_are_ignored(tmp_path: Path) -> None:
     """Waters and a second alternate location don't break placement or add atoms."""
     lines = crambin_domain().decode().splitlines()
-    first_ca = next(line for line in lines if line[12:16] == " CA ")
+    # Find the first CA line and create an altloc-B version with a distinct coordinate
+    first_ca_idx = next(i for i, line in enumerate(lines) if line[12:16] == " CA ")
+    first_ca = lines[first_ca_idx]
     altloc_b = f"{first_ca[:16]}B{first_ca[17:30]}{99.0:>8.3f}{first_ca[38:]}"
     water = "HETATM  999  O   HOH A 101      10.000  10.000  10.000  1.00 20.00           O"
-    data = "\n".join([*lines[:-1], altloc_b, water, "END"]).encode()
+    # Insert altloc-B CA BEFORE original; would be kept by setdefault without the filter
+    modified_lines = lines[:first_ca_idx] + [altloc_b] + lines[first_ca_idx:-1] + [water, "END"]
+    data = "\n".join(modified_lines).encode()
     tarball = make_tarball(tmp_path / "d.tgz", {"T1104-D1.pdb": data})
     (chain,), _ = casp.casp_domain_chains(tarball, {"T1104": CRAMBIN}, "15")
     assert chain.modeled == 46
@@ -72,6 +76,29 @@ def test_member_paths_are_flattened(tmp_path: Path) -> None:
     tarball = make_tarball(tmp_path / "d.tgz", {"./T1104-D1.pdb": crambin_domain()})
     (chain,), _ = casp.casp_domain_chains(tarball, {"T1104": CRAMBIN}, "15")
     assert chain.name == "casp15_T1104-D1"
+
+
+def test_hard_linked_domain_files_are_counted_and_processed(tmp_path: Path) -> None:
+    """Hard-linked members in the tarball are counted and resolved."""
+    import tarfile
+
+    tarball_path = tmp_path / "d.tgz"
+    domain_data = crambin_domain()
+    with tarfile.open(tarball_path, "w:gz") as archive:
+        # Add the regular file
+        info = tarfile.TarInfo("T1104-D1.pdb")
+        info.size = len(domain_data)
+        archive.addfile(info, __import__("io").BytesIO(domain_data))
+        # Add a hard link that duplicates the domain under another name
+        link_info = tarfile.TarInfo("T0104-D1.pdb")
+        link_info.type = tarfile.LNKTYPE
+        link_info.linkname = "T1104-D1.pdb"
+        archive.addfile(link_info)
+    chains, stats = casp.casp_domain_chains(tarball_path, {"T1104": CRAMBIN}, "15")
+    assert len(chains) == 1
+    assert chains[0].name == "casp15_T1104-D1"
+    assert stats["files"] == 2  # both the regular file and the hard link
+    assert stats["duplicate"] == 1  # the hard link is a duplicate
 
 
 def test_canonical_target() -> None:
