@@ -220,6 +220,10 @@ chains per 5k-step round is roughly 2–3% of training compute: CASP inputs are 
 roughly 0.7%. The full PDB40 post-training eval (29,429 chains up to 1024 residues) is roughly
 1 h at 170M and 1.5–2 days at 6B on 32 GPUs.
 
+A structure longer than `max_position_embeddings - 2` is not scored (the eval logs a warning
+with the count): `casp15_16` needs at least 820 (its longest target is 818 residues; at 512, 29
+of the 101 domains drop out), full `pdb40` 1026, and the 256/2048 subsets 514.
+
 ## Implementation
 
 - Builder: one command next to `oplm fold preprocess` (e.g. `oplm fold eval-sets`), reusing the

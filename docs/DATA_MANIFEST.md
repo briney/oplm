@@ -60,8 +60,11 @@ structure, with its sha256). Design and rationale:
 8. **Subsets.** Seed-42 random subsets of chains ≤ 512 residues: `cameo_256`, `pdb40_2048`
    and `pdb40_256`, with `pdb40_256` contained in `pdb40_2048`.
 9. **Scoring** (the `structure` eval type). Unsupervised contact precision from the model's
-   categorical Jacobian (L × 20 single-substitution forward passes, centered, symmetrized,
-   APC-corrected), reported as precision at L, L/2 and L/5 over long-range pairs.
+   categorical Jacobian (20 single-substitution forward passes per residue of the full input
+   sequence; centered, symmetrized, APC-corrected), reported as precision at L, L/2 and L/5 over
+   long-range pairs (sequence separation ≥ 24). Pairs involving a residue without backbone
+   coordinates are excluded, and L is the number of residues with N, Cα and C coordinates, not
+   the full sequence length.
 
 ### Counts
 

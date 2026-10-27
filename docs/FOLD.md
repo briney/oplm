@@ -566,6 +566,10 @@ curl -O https://predictioncenter.org/download_area/CASP16/targets/casp16.targets
 curl -O https://predictioncenter.org/download_area/CASP16/sequences/casp16.T1.seq.txt
 oplm fold eval-sets --fold-data $OPLM_DATA/hf/wwpdb/2026-10-12 --casp-sources $OPLM_DATA/casp \
     --out $OPLM_DATA/hf/structure-evals/2026-10-12 --mmseqs ~/micromamba/envs/mmseqs2/bin/mmseqs
+# CASP difficulty labels (not used by the build; listed in docs/DATA_MANIFEST.md)
+cd $OPLM_DATA/hf/structure-evals/2026-10-12/sources
+curl -o casp15_domains_summary.html https://predictioncenter.org/casp15/domains_summary.cgi
+curl -o casp16_domains_summary.html https://predictioncenter.org/casp16/domains_summary.cgi
 ```
 
 | directory | contents |
@@ -588,4 +592,9 @@ data:
     pdb40_2048: {path: .../pdb40_2048, type: structure, every: {steps: 50_000}}
     cameo:      {path: .../cameo_256,  type: structure, every: {steps: 5_000}}
     casp:       {path: .../casp15_16,  type: structure, every: {steps: 5_000}}
+    casp14:     {path: <existing CASP14 set>, type: structure, every: {steps: 5_000}}
 ```
+
+A structure longer than `max_position_embeddings - 2` is not scored (the eval logs a warning
+with the count): `casp15_16` needs at least 820 (its longest target is 818 residues; at 512, 29
+of the 101 domains drop out), full `pdb40` 1026, and the 256/2048 subsets 514.

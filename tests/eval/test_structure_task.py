@@ -128,6 +128,21 @@ def test_structure_without_modeled_residues_is_skipped(
     assert _task()._process_single_structure(struct, model, torch.device("cpu")) is None
 
 
+def test_structures_too_long_for_the_context_are_reported(caplog: pytest.LogCaptureFixture) -> None:
+    """A set's longest chains drop out at a short context; say so instead of a DEBUG line."""
+
+    def struct(name: str, length: int) -> StructureData:
+        return StructureData(
+            name=name, sequence="A" * length, coords=torch.zeros(length, 3, 3), chain_id="A"
+        )
+
+    task = _task()
+    task._structures = [struct("short", _MAX_SEQ_LEN - 2), struct("long", _MAX_SEQ_LEN - 1)]
+    with caplog.at_level("WARNING"):
+        assert task._select_structure_names() == {"short"}
+    assert "1 of 2 structures" in caplog.text
+
+
 @pytest.mark.slow
 def test_unmodeled_residues_are_unscored(
     structure_fixtures_dir: Path,

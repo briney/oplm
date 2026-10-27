@@ -336,6 +336,15 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
         eligible_structures = [
             struct for struct in self._structures if self._is_structure_eligible(struct)
         ]
+        too_long = len(self._structures) - len(eligible_structures)
+        if too_long:
+            logger.warning(
+                "%s: %d of %d structures exceed max_position_embeddings - 2 = %d; not scored",
+                self.path,
+                too_long,
+                len(self._structures),
+                self.cfg.model.max_position_embeddings - 2,
+            )
         if not eligible_structures:
             return set()
 
