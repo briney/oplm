@@ -110,3 +110,30 @@ def test_run_mmseqs_reports_a_missing_binary(tmp_path: Path) -> None:
     fasta.write_text(">s0\nACDE\n")
     with pytest.raises(RuntimeError, match="no-such-mmseqs"):
         pdb.run_mmseqs(fasta, tmp_path, mmseqs=str(tmp_path / "no-such-mmseqs"))
+
+
+def test_mmseqs_version_reports_a_missing_binary(tmp_path: Path) -> None:
+    """mmseqs_version raises RuntimeError with binary name when binary is missing."""
+    with pytest.raises(RuntimeError, match="no-such-mmseqs"):
+        pdb.mmseqs_version(str(tmp_path / "no-such-mmseqs"))
+
+
+def test_run_mmseqs_reports_a_failing_binary(tmp_path: Path) -> None:
+    """run_mmseqs raises RuntimeError with stderr when binary exits non-zero."""
+    import sys
+
+    # Create a failing binary that writes to stderr and exits 1
+    bad_mmseqs = tmp_path / "bad-mmseqs"
+    bad_mmseqs.write_text(
+        f"""#!{sys.executable}
+import sys
+sys.stderr.write("boom")
+sys.exit(1)
+"""
+    )
+    bad_mmseqs.chmod(0o755)
+
+    fasta = tmp_path / "in.fasta"
+    fasta.write_text(">s0\nACDE\n")
+    with pytest.raises(RuntimeError, match="boom"):
+        pdb.run_mmseqs(fasta, tmp_path, mmseqs=str(bad_mmseqs))

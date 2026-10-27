@@ -97,6 +97,27 @@ def write_cluster_fasta(root: Path, path: Path) -> dict[str, str]:
     return ids
 
 
+def _run_mmseqs_cmd(mmseqs: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run mmseqs with args, raising clear RuntimeError on missing or failing binary.
+
+    Args:
+        mmseqs: Path or name of mmseqs executable.
+        args: Command and arguments, e.g. ["version"] or ["easy-cluster", ...].
+
+    Returns:
+        CompletedProcess with stdout and stderr as strings.
+
+    Raises:
+        RuntimeError: mmseqs binary not found or exited non-zero.
+    """
+    try:
+        return subprocess.run([mmseqs, *args], check=True, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"MMseqs2 executable not found: {mmseqs}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"{mmseqs} {args[0]} failed:\n{exc.stderr}") from exc
+
+
 def run_mmseqs(fasta: Path, workdir: Path, *, mmseqs: str = "mmseqs", threads: int = 1) -> Path:
     """Cluster ``fasta`` at 40% identity and 80% coverage; return the cluster TSV.
 
@@ -104,8 +125,7 @@ def run_mmseqs(fasta: Path, workdir: Path, *, mmseqs: str = "mmseqs", threads: i
         RuntimeError: ``mmseqs`` is missing or exits non-zero (the message carries stderr).
     """
     prefix = workdir / "pdb40"
-    command = [
-        mmseqs,
+    args = [
         "easy-cluster",
         str(fasta),
         str(prefix),
@@ -114,20 +134,14 @@ def run_mmseqs(fasta: Path, workdir: Path, *, mmseqs: str = "mmseqs", threads: i
         "--threads",
         str(threads),
     ]
-    try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"MMseqs2 executable not found: {mmseqs}") from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"{mmseqs} easy-cluster failed:\n{exc.stderr}") from exc
+    _run_mmseqs_cmd(mmseqs, args)
     return workdir / "pdb40_cluster.tsv"
 
 
 def mmseqs_version(mmseqs: str = "mmseqs") -> str:
     """The ``mmseqs version`` string, recorded in the README."""
-    return subprocess.run(
-        [mmseqs, "version"], check=True, capture_output=True, text=True
-    ).stdout.strip()
+    result = _run_mmseqs_cmd(mmseqs, ["version"])
+    return result.stdout.strip()
 
 
 def read_clusters(tsv: Path) -> dict[str, str]:
