@@ -187,28 +187,39 @@ def build(cfg: BuildConfig) -> dict[str, Any]:
 
     Raises:
         FileExistsError: ``cfg.out`` exists and is not empty.
-        RuntimeError: MMseqs2 failed, or a written file doesn't load back as built.
+        FileNotFoundError: A fold-dataset input or a CASP source file is missing.
+        ValueError: A CASP source file's sha256 differs from the pinned value.
+        RuntimeError: MMseqs2 is missing or failed, or a written file doesn't load back as built.
     """
     if cfg.out.exists() and any(cfg.out.iterdir()):
-        raise FileExistsError(f"{cfg.out} exists and is not empty")
+        raise FileExistsError(
+            f"{cfg.out} exists and is not empty; remove it or choose another --out"
+        )
+    # Preflight: the checks that most often fail on a first run, before anything is written, so
+    # a retry doesn't trip over a half-made output directory.
+    mmseqs = mmseqs_version(cfg.mmseqs)
+    casp_files = verify_casp_sources(cfg.casp_sources)
+    cameo_json = cfg.fold_data / "targets" / "cameo.json"
+    fold_manifest = cfg.fold_data / "manifest.json"
+    for required in (cfg.fold_data / "index.parquet", fold_manifest, cameo_json):
+        if not required.is_file():
+            raise FileNotFoundError(f"missing fold dataset file {required}")
+
     sources = cfg.out / "sources"
     sources.mkdir(parents=True, exist_ok=True)
     skip = {"fold_data", "casp_sources", "out", "mmseqs", "threads"}
     summary: dict[str, Any] = {
         "built": datetime.date.today().isoformat(),
         "oplm": metadata.version("oplm"),
-        "mmseqs": mmseqs_version(cfg.mmseqs),
+        "mmseqs": mmseqs,
         "config": {k: v for k, v in dataclasses.asdict(cfg).items() if k not in skip},
         "sources": {},
         "sets": {},
     }
-    for path in verify_casp_sources(cfg.casp_sources):
+    for path in casp_files:
         shutil.copy2(path, sources / path.name)
         summary["sources"][path.name] = sha256sum(path)
-    for name, path in (
-        ("cameo.json", cfg.fold_data / "targets" / "cameo.json"),
-        ("fold_manifest.json", cfg.fold_data / "manifest.json"),
-    ):
+    for name, path in (("cameo.json", cameo_json), ("fold_manifest.json", fold_manifest)):
         shutil.copy2(path, sources / name)
         summary["sources"][name] = sha256sum(path)
 

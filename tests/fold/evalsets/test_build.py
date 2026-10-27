@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
@@ -11,10 +12,13 @@ from typer.testing import CliRunner
 
 from oplm.data import load_structures
 from oplm.fold.cli import app
+from oplm.fold.evalsets import build as build_module
 from oplm.fold.evalsets.build import BuildConfig, build, nested_subsets
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from oplm.fold.evalsets.chain import EvalChain
 
 _SMALL = {
     "casp_length": (20, 1024),
@@ -84,6 +88,62 @@ def test_build_refuses_a_non_empty_output(
         mmseqs=str(fake_mmseqs),
     )
     with pytest.raises(FileExistsError, match="not empty"):
+        build(cfg)
+
+
+def test_a_failed_preflight_leaves_no_output_so_the_retry_builds(
+    fixture_dataset: Path, casp_sources: Path, fake_mmseqs: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    cfg = BuildConfig(
+        fold_data=fixture_dataset,
+        casp_sources=casp_sources,
+        out=out,
+        mmseqs=str(tmp_path / "no-such-mmseqs"),
+        **_SMALL,
+    )
+    with pytest.raises(RuntimeError):
+        build(cfg)
+    assert not out.exists()
+
+    missing = dataclasses.replace(cfg, fold_data=tmp_path / "no-dataset", mmseqs=str(fake_mmseqs))
+    with pytest.raises(FileNotFoundError, match="index.parquet"):
+        build(missing)
+    assert not out.exists()
+
+    summary = build(dataclasses.replace(cfg, mmseqs=str(fake_mmseqs)))
+    assert summary["exported"]["pdb40"] == 3
+
+
+def test_build_fails_when_a_written_file_does_not_load_back(
+    fixture_dataset: Path,
+    casp_sources: Path,
+    fake_mmseqs: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation is the build's guarantee: a written file that differs from the chain fails it."""
+    real_write_pdb = build_module.write_pdb
+
+    def corrupting_write_pdb(chain: EvalChain, path: Path) -> None:
+        real_write_pdb(chain, path)
+        if chain.name == "4hhb_A":
+            lines = path.read_text().splitlines(keepends=True)
+            first_ca = next(
+                i for i, ln in enumerate(lines) if ln[:4] == "ATOM" and ln[12:16] == " CA "
+            )
+            del lines[first_ca]
+            path.write_text("".join(lines))
+
+    monkeypatch.setattr(build_module, "write_pdb", corrupting_write_pdb)
+    cfg = BuildConfig(
+        fold_data=fixture_dataset,
+        casp_sources=casp_sources,
+        out=tmp_path / "out",
+        mmseqs=str(fake_mmseqs),
+        **_SMALL,
+    )
+    with pytest.raises(RuntimeError, match="does not load back as built"):
         build(cfg)
 
 
