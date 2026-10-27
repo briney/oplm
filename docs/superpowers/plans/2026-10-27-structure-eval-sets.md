@@ -2216,9 +2216,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Build the real sets (operational)
+### Task 7: Build the real sets and write the data manifest (operational)
 
-**Files:** none in the repo, except the spec's measured counts in Step 4.
+**Files:**
+- Create: `docs/DATA_MANIFEST.md` (where and when each source was obtained and how it was processed; the user will use it to write the methods section)
+- Modify: `docs/superpowers/specs/2026-10-27-structure-eval-sets-design.md` (measured counts)
 
 - [ ] **Step 1: Install MMseqs2 and fetch the CASP sources**
 
@@ -2231,15 +2233,17 @@ curl -O https://predictioncenter.org/download_area/CASP15/targets/casp15.targets
 curl -O https://predictioncenter.org/download_area/CASP15/sequences/casp15.seq.txt
 curl -O https://predictioncenter.org/download_area/CASP16/targets/casp16.targets_monomer_trimmed2domains.tgz
 curl -O https://predictioncenter.org/download_area/CASP16/sequences/casp16.T1.seq.txt
-sha256sum *
+date -u +%FT%TZ > DOWNLOADED_AT
+sha256sum *.gz *.tgz *.txt
 ```
 
-Expected: a version hash from MMseqs2, and the four sha256 values equal to `CASP_SHA256`.
+Expected: a version hash from MMseqs2, and the four sha256 values equal to `CASP_SHA256`. `DOWNLOADED_AT` records the download time for the manifest; the builder ignores files it doesn't pin.
 
 - [ ] **Step 2: Run the build**
 
 ```bash
 cd /home/bryanbriney/git/oplm
+git rev-parse --short HEAD > $OPLM_DATA/tmp/eval-sets.commit
 .venv/bin/oplm fold eval-sets --fold-data $OPLM_DATA/hf/wwpdb/2026-10-12 \
     --casp-sources $OPLM_DATA/casp --out $OPLM_DATA/hf/structure-evals/2026-10-12 \
     --mmseqs $OPLM_DATA/tmp/mmseqs/bin/mmseqs --threads 28 > $OPLM_DATA/tmp/eval-sets.log 2>&1
@@ -2265,17 +2269,106 @@ curl -o casp15_domains_summary.html https://predictioncenter.org/casp15/domains_
 curl -o casp16_domains_summary.html https://predictioncenter.org/casp16/domains_summary.cgi
 ```
 
-- [ ] **Step 4: Record the measured counts in the spec and commit**
+- [ ] **Step 4: Record the measured counts in the spec**
 
-Replace the spec's estimated sizes (Goal table; the CAMEO and PDB40 sections) with the counts from `summary.json`, then:
+Replace the spec's estimated sizes (Goal table; the CAMEO and PDB40 sections) with the counts from `summary.json`.
+
+- [ ] **Step 5: Write `docs/DATA_MANIFEST.md`**
+
+Create the file from the skeleton below. Each `«...»` names the artifact its value comes from. Replace every one with that value, and copy the tables' numbers from `summary.json` (`$OPLM_DATA/hf/structure-evals/2026-10-12/summary.json`). Values that are already filled come from `docs/fold/m2a/README.md` and `$OPLM_DATA/pdb/targets/sources/README.md`.
+
+````markdown
+# Data manifest
+
+Where and when each dataset used by oplm was obtained, and how it was processed. Written to
+support the methods section: every value is copied from the build artifact named beside it.
+
+## Structure evaluation sets (`structure-evals/2026-10-12`)
+
+Built «summary.json `built`» with `oplm fold eval-sets` at commit
+«`$OPLM_DATA/tmp/eval-sets.commit`» (oplm «summary.json `oplm`», MMseqs2
+«summary.json `mmseqs`»). Output: `$OPLM_DATA/hf/structure-evals/2026-10-12/`, with a
+`README.md`, `summary.json` (per-stage counts) and `manifest.parquet` (one row per structure,
+with its sha256). Design and rationale:
+`docs/superpowers/specs/2026-10-27-structure-eval-sets-design.md`.
+
+### Sources
+
+| source | origin | obtained | version, size, checksum |
+|---|---|---|---|
+| wwPDB mmCIF archive | `rsync.rcsb.org::ftp_data/structures/divided/mmCIF/` (port 33444) | 2026-10-12, 13:10–16:49 UTC | snapshot 2026-10-12; 260,626 entries, 92.3 GB |
+| Chemical Component Dictionary | `files.wwpdb.org` `components.cif.gz` | 2026-10-12 | 51,389 components; sha256 `405da7e5d06527d45292db9400378d9788c024830cad4e3b43890b6c6a0dd4c3` |
+| Preprocessed PDB (fold dataset) | `oplm fold preprocess`, code `e0ea2fd` (PR #34) | 2026-10-12 | 1,080,220 chains; HF `brineylab/oplmfold-training-data`, tag `wwpdb-2026-10-12` |
+| CAMEO target list | CAMEO one-year exports: Wayback capture (2023-08-07) of `to_date=2022-01-15`, and the Biodataset4AI mirror of `to_date=2022-12-31` (CAMEO's archive returned HTTP 503) | 2026-10-12 | 755 chains, weekly releases 2021-10-02 .. 2022-09-24 |
+| CASP15 domain targets | `predictioncenter.org/download_area/CASP15/targets/casp15.targets.TS-domains.public_12.20.2022.tar.gz` | «`$OPLM_DATA/casp/DOWNLOADED_AT`» | sha256 `ac159c284a1506b460143ef6e22832272c5da1b4078fdb5fec8292b373b6239b` |
+| CASP15 target sequences | `predictioncenter.org/download_area/CASP15/sequences/casp15.seq.txt` | «`DOWNLOADED_AT`» | sha256 `84dd04c1fda2a550af73e77ad25be94da23f16bd7ff6632f2c22c1978b9ee0a5` |
+| CASP16 domain targets | `predictioncenter.org/download_area/CASP16/targets/casp16.targets_monomer_trimmed2domains.tgz` | «`DOWNLOADED_AT`» | sha256 `30e6bf992baed08695ebebe481711adea867b483015d30e18d170a0eee66ceb9` |
+| CASP16 target sequences | `predictioncenter.org/download_area/CASP16/sequences/casp16.T1.seq.txt` | «`DOWNLOADED_AT`» | sha256 `77d0b5c4ffda52ca1be7563a92eabae7ca59a3aab814e79a377ddd962783e286` |
+| CASP domain classifications | `predictioncenter.org/casp15/domains_summary.cgi`, `/casp16/domains_summary.cgi` (saved HTML) | «date of Step 3» | FM/TBM labels, not used for filtering |
+
+### Processing
+
+1. **Structure parsing** (the preprocessed PDB). gemmi mmCIF parsing of L-peptide polymer
+   entities in the asymmetric unit; first model; highest-occupancy alternate location per
+   atom; hydrogens removed. Non-standard residues are mapped to their CCD parent when the
+   component is a non-D peptide, otherwise to unknown. Entries with resolution > 9 Å and
+   chains with fewer than 4 resolved residues are dropped. Each chain keeps its full entity
+   sequence, with a per-atom resolved mask.
+2. **Input convention.** Each structure is one chain. The model receives the full sequence:
+   the deposited entity sequence (CAMEO, PDB40) or the full target sequence (CASP).
+   Residues without coordinates stay in the sequence and are not scored: any residue pair
+   that involves one is excluded from evaluation.
+3. **Quality filter** (CAMEO, PDB40): X-ray diffraction at ≤ 2.5 Å or cryo-EM at ≤ 3.0 Å;
+   NMR structures are excluded.
+4. **Curation rules** (all sets). Only the 20 standard amino acids. Full-sequence length
+   50–1024 (CASP, PDB40) or 50–512 (CAMEO). At least 70% of residues with backbone N, Cα and
+   C (CAMEO, PDB40). At least L/5 long-range contacts, where L is the number of modeled
+   residues and a contact is virtual Cβ–Cβ < 8 Å with sequence separation ≥ 24.
+5. **CASP15 and CASP16.** Official domain-trimmed target coordinates. Combined
+   (multi-domain) evaluation units are excluded. CASP16 phase-2 copies (`T2xxx`) and
+   monomer-file aliases (`T0xxx`) are mapped to their `T1xxx` target. For versioned targets,
+   the lowest version is kept. One structure per (target, domain), with only that domain's
+   residues carrying coordinates.
+6. **CAMEO.** The listed chains that pass the quality filter and the curation rules.
+7. **PDB40.** The «summary.json `sets.pdb40.clusters`» distinct protein entity sequences of
+   length ≥ 30 in the snapshot were clustered with MMseqs2 (`easy-cluster --min-seq-id 0.4
+   -c 0.8 --cov-mode 0 -s 7.5`). For each cluster, candidate chains passing the quality
+   filter were ranked by resolution, then resolved fraction, then entry and chain id. The
+   first candidate passing the curation rules became the cluster's representative.
+8. **Subsets.** Seed-42 random subsets of chains ≤ 512 residues: `cameo_256`, `pdb40_2048`
+   and `pdb40_256`, with `pdb40_256` contained in `pdb40_2048`.
+9. **Scoring** (the `structure` eval type). Unsupervised contact precision from the model's
+   categorical Jacobian (L × 20 single-substitution forward passes, centered, symmetrized,
+   APC-corrected), reported as precision at L, L/2 and L/5 over long-range pairs.
+
+### Counts
+
+| set | candidates | removed (reason: count) | exported |
+|---|---|---|---|
+| `casp15_16` | «domain files, distinct domains» | «`sets.casp15_16`: per-edition skips and `rules`» | «`exported.casp15_16`» |
+| `cameo` | «`sets.cameo.listed`» | «`missing`, `skipped`, `quality`, `rules`» | «`exported.cameo`» |
+| `pdb40` | «`sets.pdb40.clusters`» clusters | «`no_candidate`, `exhausted`, `max_rounds`» | «`exported.pdb40`» |
+| `cameo_256`, `pdb40_2048`, `pdb40_256` | | | «`exported`» |
+
+Overlap: «`overlap.cameo_chains_in_pdb40`» CAMEO chains are also PDB40 representatives, and
+«`overlap.cameo_clusters_in_pdb40`» CAMEO chains fall in a cluster with a PDB40
+representative. Both are reported, not removed.
+````
+
+Check that nothing was left unfilled:
+
+Run: `grep -c "«" docs/DATA_MANIFEST.md`
+Expected: `0`
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add docs/superpowers/specs/2026-10-27-structure-eval-sets-design.md
-git commit -m "docs(specs): measured structure eval set sizes
+git add docs/DATA_MANIFEST.md docs/superpowers/specs/2026-10-27-structure-eval-sets-design.md
+git commit -m "docs: data manifest for the structure eval sets; measured set sizes
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Stop before publishing**
+- [ ] **Step 7: Stop before publishing**
 
 Publishing `brineylab/oplm-structure-evals` to the Hugging Face Hub is outward-facing. Report the counts and the README to the user and wait for the go-ahead. When approved, publish with `hf upload-large-folder` as in docs/FOLD.md §8, then tag the dataset `2026-10-12`.
