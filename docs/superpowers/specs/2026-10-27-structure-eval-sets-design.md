@@ -30,7 +30,9 @@ This needs two changes to the current eval, made as part of this work:
 1. **Loader** (`oplm.data.structure.loader`). Today the sequence is built from residues that have
    coordinates, so an unmodeled loop is spliced out. New behavior: when a file has SEQRES records,
    the sequence is the SEQRES sequence, and each residue is placed at index `resSeq − 1`. Residues
-   absent from the coordinates, or missing any of N/CA/C, become NaN rows. Placement is used
+   absent from the coordinates become NaN rows; a missing N, CA or C atom is NaN within its row,
+   as today, so under the default Cβ scoring such a residue has no position and goes unscored.
+   Placement is used
    only when every residue fits: inside the sequence, once, with no insertion code, and the same
    residue SEQRES has at that position. Otherwise, as for files without SEQRES, the loader keeps
    today's behavior. That way real PDB files numbered by author convention, and existing sets such
