@@ -43,8 +43,8 @@ class EvalChain:
     Attributes:
         name: File stem, e.g. ``casp16_T1201-D1`` or ``4hhb_A`` (entry and label chain id).
         sequence: Full input sequence, one letter per residue.
-        atoms: Per residue, modeled atom name -> ``(3,)`` float32 coordinates; ``{}`` when the
-            residue is unmodeled.
+        atoms: Per residue, modeled atom name -> ``(3,)`` float32 coordinates, rounded to the
+            0.001 Å a PDB file stores; ``{}`` when the residue is unmodeled.
         meta: Manifest fields (``source``, ``entry``, ``chain``, ``method``, ...).
     """
 
@@ -59,6 +59,16 @@ class EvalChain:
                 f"{self.name}: atoms for {len(self.atoms)} residues, "
                 f"sequence of {len(self.sequence)}"
             )
+        # The precision write_pdb stores, so curation and the manifest see what the eval reads.
+        # float64: a float32 times 1000 is exact there, so this rounds like "%.3f".
+        rounded = [
+            {
+                atom: np.round(xyz.astype(np.float64), 3).astype(np.float32)
+                for atom, xyz in r.items()
+            }
+            for r in self.atoms
+        ]
+        object.__setattr__(self, "atoms", rounded)
 
     @property
     def modeled(self) -> int:

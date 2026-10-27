@@ -54,6 +54,23 @@ def test_write_pdb_round_trips_through_the_loader(
     assert count_long_range_contacts(loaded.coords.numpy()) == count_long_range_contacts(built)
 
 
+def test_atoms_hold_the_precision_a_pdb_file_stores(
+    fixture_dataset_early_cutoff: Path, tmp_path: Path
+) -> None:
+    """Coordinates are rounded to the 0.001 Å a PDB file stores, so curation and the
+    manifest's contact count see the coordinates the eval reads (7aal_A had a virtual-Cβ
+    pair within 0.0005 Å of the 8 Å cutoff)."""
+    chain = _chain(fixture_dataset_early_cutoff, "valid", "2ds7_A")
+    jittered = EvalChain(
+        name=chain.name,
+        sequence=chain.sequence,
+        atoms=[{a: xyz + np.float32(4e-4) for a, xyz in r.items()} for r in chain.atoms],
+    )
+    write_pdb(jittered, tmp_path / f"{chain.name}.pdb")
+    (loaded,) = load_structures(tmp_path)
+    np.testing.assert_array_equal(loaded.coords.numpy(), jittered.backbone())
+
+
 def test_count_long_range_contacts(fixture_dataset: Path) -> None:
     """A lone helix has none; a globin has well over a hundred."""
     assert count_long_range_contacts(_chain(fixture_dataset, "casp14", "1jb6_A").backbone()) == 0
