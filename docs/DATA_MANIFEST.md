@@ -88,3 +88,14 @@ clusters; don't add them to the removed total.
 Overlap: 202 of the 435 CAMEO chains are also PDB40 representatives, and all 435 fall in a 40%
 sequence cluster that has a PDB40 representative (measured). CAMEO is therefore not held out
 from PDB40. Both counts are reported; nothing is removed.
+
+### Distribution
+
+Published 2026-10-27 as the Hugging Face dataset
+[`brineylab/oplm-structure-evals`](https://huggingface.co/datasets/brineylab/oplm-structure-evals),
+folder `2026-10-12/`, tag `2026-10-12` (commit `08f188a3`). The Hub limits a directory to
+10,000 files, so `pdb40/` is distributed as `2026-10-12/pdb40.tar.gz` (29,429 files; sha256
+`2aa92cc7a9b715d7374df1af04bb068be468fabb4afd73b73ff1e2615cc4cc08`), which extracts to `pdb40/`;
+the other sets are plain folders, byte-identical to the build output. Licenses: `cameo` and
+`pdb40` derive from the wwPDB archive (CC0 1.0); `casp15_16` and the CASP files in `sources/`
+fall under the Protein Structure Prediction Center's terms.

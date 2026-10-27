@@ -598,3 +598,23 @@ data:
 A structure longer than `max_position_embeddings - 2` is not scored (the eval logs a warning
 with the count): `casp15_16` needs at least 820 (its longest target is 818 residues; at 512, 29
 of the 101 domains drop out), full `pdb40` 1026, and the 256/2048 subsets 514.
+
+```bash
+# publish: the Hub caps a directory at 10,000 files, so the full pdb40 goes up as a tarball
+cd $OPLM_DATA/hf/structure-evals/2026-10-12
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='2026-10-27 00:00Z' -cf - pdb40 \
+    | gzip -n > pdb40.tar.gz
+hf upload-large-folder brineylab/oplm-structure-evals $OPLM_DATA/hf/structure-evals --repo-type dataset \
+    --exclude "2026-10-12/pdb40/*"
+hf repo tag create brineylab/oplm-structure-evals 2026-10-12 --repo-type dataset
+# pull the sets used in training
+hf download brineylab/oplm-structure-evals --repo-type dataset --revision 2026-10-12 \
+    --include "2026-10-12/casp15_16/*" --include "2026-10-12/cameo_256/*" \
+    --include "2026-10-12/pdb40_256/*" --include "2026-10-12/pdb40_2048/*" \
+    --local-dir $OPLM_DATA/hf/structure-evals
+```
+
+**Published:** [`brineylab/oplm-structure-evals`](https://huggingface.co/datasets/brineylab/oplm-structure-evals)
+at tag `2026-10-12` (commit `08f188a3`), folder `2026-10-12/`; built at `c0b5f08`. The full
+`pdb40/` ships as `pdb40.tar.gz` (extract it in place); every other set is a plain folder.
+Provenance for the methods section: [`docs/DATA_MANIFEST.md`](DATA_MANIFEST.md).
