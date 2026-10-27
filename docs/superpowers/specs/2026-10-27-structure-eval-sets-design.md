@@ -171,8 +171,10 @@ stay on CAMEO and CASP.
    sequence equal to the manifest, NaN rows exactly at the manifest's unmodeled positions.
 2. Long-range contact counts recomputed with the eval's own (updated) contact code match the
    manifest.
-3. Overlap report: chains and clusters shared between sets. CAMEO and CASP targets can also be
-   PDB40 representatives; this is reported, not removed.
+3. Overlap report: CAMEO chains that are also PDB40 representatives, and CAMEO chains in a
+   cluster with a PDB40 representative; reported, not removed. CASP targets come from the
+   Prediction Center's files rather than PDB entries, so their overlap with PDB40 would need a
+   sequence search and isn't reported.
 4. Counts after every filter stage are written to the README.
 5. First real use is the 0.0016 run and the `decay200k-50` branches. Expect P@L ordered
    PDB40 > CAMEO > CASP.
@@ -182,9 +184,11 @@ stay on CAMEO and CASP.
 ```
 $OPLM_DATA/hf/structure-evals/2026-10-12/
   README.md              provenance, thresholds, per-stage counts, tool versions
-  manifest.parquet       one row per exported structure: set, file, source id, chain, entity,
-                         cluster, method, resolution, release date, sequence length, modeled
-                         count, long-range contacts, CASP category, sha256
+  manifest.parquet       one row per exported structure: set, name (file stem), source, entry,
+                         chain, cluster, method, resolution, release date, source file (CASP),
+                         sequence, length, modeled count, long-range contacts, sha256. CASP
+                         FM/TBM labels stay in the saved domain summary pages (sources/) for
+                         the eval toolkit to parse; they aren't manifest columns.
   summary.json           the README's counts and thresholds, machine-readable
   sources/               CASP tarballs, sequence files and domain summary pages, CAMEO list copy,
                          MMseqs2 FASTA and cluster TSV
