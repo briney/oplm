@@ -1,5 +1,5 @@
-"""``oplm fold`` command group: ``bench-kernels``, ``compare``, ``eval``, ``make-fixtures``,
-``measure``, ``predict`` (design §5.2), ``preprocess``, and ``train``.
+"""``oplm fold`` command group: ``bench-kernels``, ``compare``, ``eval``, ``eval-sets``,
+``make-fixtures``, ``measure``, ``predict`` (design §5.2), ``preprocess``, and ``train``.
 
 Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 """
@@ -693,6 +693,44 @@ def preprocess_cmd(
     table.add_row("chains", str(manifest["chains"]))
     table.add_row("splits", json.dumps(manifest["splits"]))
     table.add_row("shards", str(len(manifest["shards"])))
+    console.print(table)
+
+
+@app.command("eval-sets")
+def eval_sets_cmd(
+    fold_data: Annotated[
+        Path, typer.Option("--fold-data", help="Preprocessed fold dataset (oplm fold preprocess)")
+    ],
+    casp_sources: Annotated[
+        Path,
+        typer.Option("--casp-sources", help="Directory with the pinned CASP15/16 source files"),
+    ],
+    out: Annotated[Path, typer.Option("--out", help="Output directory (absent or empty)")],
+    mmseqs: Annotated[str, typer.Option(help="MMseqs2 executable")] = "mmseqs",
+    threads: Annotated[int, typer.Option(help="MMseqs2 threads")] = max(
+        1, (os.cpu_count() or 2) - 1
+    ),
+    seed: Annotated[int, typer.Option(help="Seed for the nested subsets")] = 42,
+) -> None:
+    """Build the structure eval sets: CASP15+16 domains, CAMEO, PDB40 and its subsets."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    from oplm.fold.evalsets.build import BuildConfig, build
+
+    summary = build(
+        BuildConfig(
+            fold_data=fold_data,
+            casp_sources=casp_sources,
+            out=out,
+            mmseqs=mmseqs,
+            threads=threads,
+            seed=seed,
+        )
+    )
+    table = Table(title=f"eval-sets -> {out}")
+    table.add_column("set")
+    table.add_column("structures", justify="right")
+    for name, count in summary["exported"].items():
+        table.add_row(name, str(count))
     console.print(table)
 
 

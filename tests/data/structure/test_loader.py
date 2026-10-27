@@ -183,3 +183,77 @@ def test_biopython_missing_in_residue_mapping(monkeypatch: pytest.MonkeyPatch) -
     # A name not in the modified-residue map forces the biopython table lookup.
     with pytest.raises(ImportError, match=r"oplm\[train\]"):
         _residue_to_one_letter("ALA")
+
+
+# --------------------------------------------------------------------------- #
+# SEQRES placement (ESM convention: full sequence in, unmodeled residues NaN)
+# --------------------------------------------------------------------------- #
+
+_GAP = range(20, 25)  # crambin residues 20-24 (1-based)
+
+
+def _crambin_variant(
+    tmp_path: Path, drop: range = range(0), *, renumber: int = 0, keep_seqres: bool = True
+) -> Path:
+    """Crambin with residues ``drop`` removed, optionally renumbered or without SEQRES."""
+    kept: list[str] = []
+    for line in _require_crambin().read_text().splitlines(keepends=True):
+        if line.startswith("SEQRES") and not keep_seqres:
+            continue
+        if line.startswith(("ATOM", "ANISOU", "TER")) and line[22:26].strip():
+            resseq = int(line[22:26])
+            if resseq in drop:
+                continue
+            line = f"{line[:22]}{resseq + renumber:>4}{line[26:]}"
+        kept.append(line)
+    path = tmp_path / "crambin_variant.pdb"
+    path.write_text("".join(kept))
+    return path
+
+
+def test_seqres_keeps_unmodeled_residues_as_nan_rows(tmp_path: Path) -> None:
+    """Residues missing from the coordinates stay in the sequence as all-NaN rows."""
+    parsed = _parse_single_structure(_crambin_variant(tmp_path, _GAP))
+    assert parsed is not None
+    assert parsed.sequence == _CRAMBIN_SEQUENCE
+    assert parsed.coords.shape == (46, 3, 3)
+    gap = torch.tensor([i - 1 for i in _GAP])
+    assert torch.isnan(parsed.coords[gap]).all()
+    keep = torch.ones(46, dtype=torch.bool)
+    keep[gap] = False
+    assert torch.isfinite(parsed.coords[keep]).all()
+
+
+def test_seqres_numbering_offset_falls_back_to_modeled_residues(tmp_path: Path) -> None:
+    """Numbering that doesn't fit SEQRES keeps the coordinates-only sequence (old behavior)."""
+    parsed = _parse_single_structure(_crambin_variant(tmp_path, _GAP, renumber=100))
+    assert parsed is not None
+    expected = "".join(aa for i, aa in enumerate(_CRAMBIN_SEQUENCE, 1) if i not in _GAP)
+    assert parsed.sequence == expected
+    assert torch.isfinite(parsed.coords).all()
+
+
+def test_in_range_numbering_offset_falls_back_on_residue_mismatch(tmp_path: Path) -> None:
+    """Numbered from 2 but still inside SEQRES: only the residue-identity check catches it."""
+    parsed = _parse_single_structure(_crambin_variant(tmp_path, range(44, 47), renumber=1))
+    assert parsed is not None
+    assert parsed.sequence == _CRAMBIN_SEQUENCE[:43]
+    assert torch.isfinite(parsed.coords).all()
+
+
+def test_file_without_seqres_keeps_modeled_residues_only(tmp_path: Path) -> None:
+    """No SEQRES: today's behavior, unmodeled residues are absent."""
+    parsed = _parse_single_structure(_crambin_variant(tmp_path, _GAP, keep_seqres=False))
+    assert parsed is not None
+    assert len(parsed.sequence) == 41
+
+
+def test_author_numbered_seqres_file_falls_back() -> None:
+    """Real villin headpiece (1VII) is numbered from 41 against a 36-residue SEQRES."""
+    path = Path(__file__).resolve().parents[2] / "fixtures" / "eval" / "structures" / "1VII.pdb"
+    if not path.is_file():
+        pytest.skip(f"structure fixture missing: {path}")
+    parsed = _parse_single_structure(path)
+    assert parsed is not None
+    assert len(parsed.sequence) == 36
+    assert torch.isfinite(parsed.coords).all()

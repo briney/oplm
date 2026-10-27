@@ -28,7 +28,7 @@ src/oplm/fold/
 ├── train.py                # python -m oplm.fold.train entry point
 ├── predict.py              # fold(), mmCIF writer
 ├── fixtures.py             # ESMFold2 golden-fixture generator (runs in the esm venv)
-├── cli.py                  # oplm fold bench-kernels | compare | eval | make-fixtures | measure | predict | preprocess | train
+├── cli.py                  # oplm fold bench-kernels | compare | eval | eval-sets | make-fixtures | measure | predict | preprocess | train
 ├── data/
 │   ├── ccd.py              # residue vocabulary, reference conformers, ChemCompTable (CCD parents)
 │   ├── complex.py          # MolecularComplex (flat atoms/tokens/bonds) + Parquet row
@@ -37,11 +37,16 @@ src/oplm/fold/
 │   ├── featurize.py        # ChainSpec or MolecularComplex -> FoldFeatures (+ FoldTargets)
 │   ├── collate.py          # FoldBatch under the atom budget
 │   └── dataset.py          # oplm fold preprocess + StructureDataset (resume contract)
-└── eval/
-    ├── metrics.py          # TM-score and lDDT with explicit correspondence and masking
-    ├── targets.py          # held-out target sets (cameo/casp14 lists, valid split) + ground truth
-    ├── monomer.py          # fold and score one chain; score tables, summaries, comparison
-    └── tasks.py            # fold_monomer eval task (in-training scoring of the live model)
+├── eval/
+│   ├── metrics.py          # TM-score and lDDT with explicit correspondence and masking
+│   ├── targets.py          # held-out target sets (cameo/casp14 lists, valid split) + ground truth
+│   ├── monomer.py          # fold and score one chain; score tables, summaries, comparison
+│   └── tasks.py            # fold_monomer eval task (in-training scoring of the live model)
+└── evalsets/
+    ├── chain.py            # EvalChain, eval PDB writer (SEQRES + sequence numbering), curation rules
+    ├── casp.py             # CASP15/16 domain tarballs on the full target sequence (pinned sha256)
+    ├── pdb.py              # CAMEO list and PDB40 (MMseqs2 40% clusters) from the fold dataset
+    └── build.py            # oplm fold eval-sets: subsets, validation, manifest, README
 tests/fold/                 # mirrors the above; tests/fixtures/fold/ holds real entries
 tests/fold/oracles/         # frozen Boltz-2 loss functions the losses are checked against (§9)
 ```
@@ -542,3 +547,54 @@ A resume is forced once per run with `scancel --signal=USR1 <jobid>` (docs/SLURM
 `docs/fold/b200-m2c-eval.sbatch` then scores every permanent checkpoint's `hf_ema/` on CAMEO and
 CASP14. Results, the width decision and the reproduction commands are in
 [`docs/fold/m2/README.md`](fold/m2/README.md).
+
+## 11. Structure eval sets (`oplm fold eval-sets`)
+
+Builds the unsupervised contact-precision sets for the LM's `structure` eval. Design and
+curation rules are in `docs/superpowers/specs/2026-10-27-structure-eval-sets-design.md`:
+full sequence in, unresolved residues unscored; X-ray ≤ 2.5 Å or cryo-EM ≤ 3.0 Å; at least
+70% modeled; at least L/5 long-range contacts.
+
+```bash
+# MMseqs2 (bioconda); the version is recorded in the output README
+micromamba create -y -n mmseqs2 -c conda-forge -c bioconda mmseqs2
+# CASP sources (sha256-pinned in oplm.fold.evalsets.casp)
+mkdir -p $OPLM_DATA/casp && cd $OPLM_DATA/casp
+curl -O https://predictioncenter.org/download_area/CASP15/targets/casp15.targets.TS-domains.public_12.20.2022.tar.gz
+curl -O https://predictioncenter.org/download_area/CASP15/sequences/casp15.seq.txt
+curl -O https://predictioncenter.org/download_area/CASP16/targets/casp16.targets_monomer_trimmed2domains.tgz
+curl -O https://predictioncenter.org/download_area/CASP16/sequences/casp16.T1.seq.txt
+oplm fold eval-sets --fold-data $OPLM_DATA/hf/wwpdb/2026-10-12 --casp-sources $OPLM_DATA/casp \
+    --out $OPLM_DATA/hf/structure-evals/2026-10-12 --mmseqs ~/micromamba/envs/mmseqs2/bin/mmseqs
+# CASP difficulty labels (not used by the build; listed in docs/DATA_MANIFEST.md)
+cd $OPLM_DATA/hf/structure-evals/2026-10-12/sources
+curl -o casp15_domains_summary.html https://predictioncenter.org/casp15/domains_summary.cgi
+curl -o casp16_domains_summary.html https://predictioncenter.org/casp16/domains_summary.cgi
+```
+
+| directory | contents |
+| --- | --- |
+| `casp15_16/` | CASP15+16 single-domain units: full target sequence, coordinates only for the domain |
+| `cameo/`, `cameo_256/` | the fold head's CAMEO list (2021-10 .. 2022-09), filtered; seed-42 subset |
+| `pdb40/`, `pdb40_2048/`, `pdb40_256/` | one representative per MMseqs2 40% cluster; nested seed-42 subsets of chains ≤ 512 |
+| `manifest.parquet`, `summary.json`, `README.md`, `sources/` | per-file metadata, counts by stage, sources and their sha256 |
+
+Every file is one chain with SEQRES and residues numbered by sequence position, so
+`load_structures` returns the full sequence with NaN rows for unmodeled residues, and the metric
+leaves pairs that involve them out of the ranking. Names are `<entry>_<label chain>`, matching
+`EvalTarget.key`, or `casp<edition>_<target>-D<n>`. The build validates every directory by
+loading it back. In-training use:
+
+```yaml
+data:
+  eval:
+    pdb40:      {path: .../pdb40_256,  type: structure, every: {steps: 5_000}}
+    pdb40_2048: {path: .../pdb40_2048, type: structure, every: {steps: 50_000}}
+    cameo:      {path: .../cameo_256,  type: structure, every: {steps: 5_000}}
+    casp:       {path: .../casp15_16,  type: structure, every: {steps: 5_000}}
+    casp14:     {path: <existing CASP14 set>, type: structure, every: {steps: 5_000}}
+```
+
+A structure longer than `max_position_embeddings - 2` is not scored (the eval logs a warning
+with the count): `casp15_16` needs at least 820 (its longest target is 818 residues; at 512, 29
+of the 101 domains drop out), full `pdb40` 1026, and the 256/2048 subsets 514.

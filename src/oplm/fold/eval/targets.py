@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from oplm.fold.data.complex import MolecularComplex
 
-__all__ = ["EvalTarget", "TargetCoverage", "load_targets"]
+__all__ = ["EvalTarget", "TargetCoverage", "load_targets", "read_targets"]
 
 _INDEX_COLUMNS = [
     "id",
@@ -119,7 +119,7 @@ def load_targets(
     if limit is not None:
         eligible = eligible[:limit]
     targets: list[EvalTarget] = []
-    for target in _read_targets(root, eligible, target_set):
+    for target in read_targets(root, eligible, target_set):
         if int(target.resolved[target.ca_index].sum()) < 3:
             coverage.skipped[target.key] = "fewer than 3 resolved CA atoms"
         else:
@@ -158,8 +158,12 @@ def _rows_for_list(
     return rows, missing
 
 
-def _read_targets(root: Path, rows: list[dict[str, Any]], target_set: str) -> Iterator[EvalTarget]:
-    """Read each row's complex, one row group at a time, and cut out its chain."""
+def read_targets(root: Path, rows: list[dict[str, Any]], target_set: str) -> Iterator[EvalTarget]:
+    """Read each row's complex, one row group at a time, and cut out its chain.
+
+    ``rows`` are index rows (``id``, ``chain_id``, ``chain_index``, ``shard``, ``row``);
+    targets come out in shard order, not input order.
+    """
     size = int(json.loads((root / "manifest.json").read_text())["row_group_size"])
     by_shard: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:

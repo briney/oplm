@@ -18,7 +18,7 @@ from oplm.eval.metrics.categorical_jacobian import (
     compute_mean_pair_score_precision_at_l,
     get_canonical_amino_acid_token_ids,
 )
-from oplm.eval.metrics.contact import compute_contact_map
+from oplm.eval.metrics.contact import compute_contact_map, contact_positions_valid
 from oplm.eval.registry import register_eval_task
 from oplm.eval.tasks.base import EvalTask
 
@@ -189,7 +189,6 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
             results[metric_name] = compute_mean_pair_score_precision_at_l(
                 all_pair_score_data,
                 l_divisor=divisor,
-                min_seq_sep=self.tcfg.min_seq_sep,
             )
 
         return {k: v for k, v in results.items() if k in self.metrics}
@@ -216,6 +215,12 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
                 seq_len,
                 self.cfg.model.max_position_embeddings - 2,
             )
+            return None
+
+        valid = contact_positions_valid(struct.coords, use_cbeta=self.tcfg.use_cbeta)
+        modeled = int(valid.sum())
+        if modeled == 0:
+            logger.debug("Skipping %s: no residue has backbone coordinates", struct.name)
             return None
 
         token_ids_cpu = torch.tensor(self._tokenizer.encode(struct.sequence), dtype=torch.long)
@@ -273,8 +278,9 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
         pair_score_data = build_structure_pair_score_data(
             jacobian_contacts,
             true_contacts,
-            seq_len,
+            modeled,
             self.tcfg.min_seq_sep,
+            valid=valid,
         )
 
         del (
@@ -330,6 +336,15 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
         eligible_structures = [
             struct for struct in self._structures if self._is_structure_eligible(struct)
         ]
+        too_long = len(self._structures) - len(eligible_structures)
+        if too_long:
+            logger.warning(
+                "%s: %d of %d structures exceed max_position_embeddings - 2 = %d; not scored",
+                self.path,
+                too_long,
+                len(self._structures),
+                self.cfg.model.max_position_embeddings - 2,
+            )
         if not eligible_structures:
             return set()
 
