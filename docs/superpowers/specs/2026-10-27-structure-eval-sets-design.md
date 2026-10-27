@@ -1,7 +1,7 @@
 # Structure eval sets: sourcing and curation plan
 
-Status: plan, 2026-10-27; filtering decisions approved. Nothing has been built yet. Counts marked
-*measured* come from the downloaded sources and the fold dataset; the rest are estimates.
+Status: built 2026-10-27; filtering decisions approved. All counts are measured, from the downloaded
+sources, the fold dataset and the build's `summary.json`.
 
 ## Goal
 
@@ -12,9 +12,9 @@ separation ≥ 24):
 | set | role | size | cadence |
 |---|---|---|---|
 | `casp15_16` | hard targets | 101 domains (*measured*) | every 5k steps |
-| `cameo_256` | recent PDB, same chains as the fold head's held-out set | 256 of ~420 | every 5k steps |
+| `cameo_256` | recent PDB, same chains as the fold head's held-out set | 256 of 435 | every 5k steps |
 | `pdb40_256`, `pdb40_2048` | representative PDB, the decision metric | 256 / 2048 | 5k / 50k steps |
-| `pdb40` | full set, post-training eval only | ~29k | offline |
+| `pdb40` | full set, post-training eval only | 29,429 | offline |
 
 ## Convention: full sequence in, unresolved residues unscored
 
@@ -125,8 +125,7 @@ October 2026, and the provenance is in `docs/fold/m2a/README.md`. Sequences, coo
 resolved masks come from the fold dataset (wwPDB snapshot 2026-10-12).
 
 *Measured:* 752 present → 506 pass the quality filter (all X-ray; 46 NMR dropped) → 452 within
-50–512 residues → 439 with at least 70% modeled. The contact floor will remove a few more,
-leaving roughly 420.
+50–512 residues → 439 with at least 70% modeled → 435 with the contact floor, which removed 4.
 
 Outputs: `cameo/` (all survivors) and `cameo_256/` (a seed-42 subset of it). These are the same
 chains as the fold head's held-out CAMEO set, so LM contact precision and fold-head scores can
@@ -154,9 +153,11 @@ resolved masks and coordinates.
    - `pdb40_2048/` and `pdb40_256/`: the first 2048 and 256 chains of a seed-42 permutation of
      the `pdb40/` chains with length ≤ 512. The 256 set is contained in the 2048 set.
 
-Estimate: RCSB's weekly 40% cluster file (2026-10-18) has 29,610 clusters with a member passing
-quality, length and the 70% rule, so expect about 29k representatives. Our clustering sets the
-real number.
+*Measured:* 49,986 clusters, 29,429 representatives. The other 20,557 clusters have no usable
+representative: 19,298 had no candidate chain, 917 had candidates that all failed the shared
+rules, and 342 still had untried candidates after 5 attempts. For comparison, RCSB's weekly 40%
+cluster file (2026-10-18) has 29,610 clusters with a member passing quality, length and the 70%
+rule.
 
 Why not use RCSB's file: it's regenerated weekly and not archived, it clusters about 1.06M
 computed models alongside experimental entities (52,698 of its 324,268 clusters contain an
@@ -215,7 +216,7 @@ data:
 The subsets are materialized, so `categorical_jacobian_sample_size` isn't needed. About 610–650
 chains per 5k-step round is roughly 2–3% of training compute: CASP inputs are full targets up to
 1024 residues, which costs more per domain than a PDB40 chain. The 2048 set every 50k steps adds
-roughly 0.7%. The full PDB40 post-training eval (about 29k chains up to 1024 residues) is roughly
+roughly 0.7%. The full PDB40 post-training eval (29,429 chains up to 1024 residues) is roughly
 1 h at 170M and 1.5–2 days at 6B on 32 GPUs.
 
 ## Implementation
