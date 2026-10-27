@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
@@ -103,6 +104,21 @@ def test_run_mmseqs_with_a_stand_in(fake_mmseqs: Path, tmp_path: Path) -> None:
     tsv = pdb.run_mmseqs(fasta, tmp_path, mmseqs=str(fake_mmseqs))
     assert pdb.read_clusters(tsv) == {"s0": "s0", "s1": "s0", "s2": "s2"}
     assert pdb.mmseqs_version(str(fake_mmseqs)) == "fake-mmseqs"
+
+
+@pytest.mark.skipif(shutil.which("mmseqs") is None, reason="needs MMseqs2 on PATH")
+def test_run_mmseqs_reads_protein_when_the_fasta_opens_with_poly_a(tmp_path: Path) -> None:
+    """write_cluster_fasta sorts sequences, so the real file opens with poly-A. MMseqs2 guessed
+    nucleotide from it, found no hits and left 156k of 163k clusters as singletons."""
+    lysozyme = (
+        "KVFGRCELAAAMKRHGLDNYRGYSLGNWVCAAKFESNFNTQATNRNTDGSTDYGILQINSRWWCNDGRTPGSRNLCNIPCSALL"
+        "SSDITASVNCAKKIVSDGNGMNAWVAWRNRCKGTDVQAWIRGCRL"
+    )
+    poly_a = "".join(f">a{i}\n{'A' * (30 + i)}\n" for i in range(10))
+    fasta = tmp_path / "in.fasta"
+    fasta.write_text(f"{poly_a}>p1\n{lysozyme}\n>p2\n{lysozyme.replace('KVFGRC', 'KVFGRA')}\n")
+    clusters = pdb.read_clusters(pdb.run_mmseqs(fasta, tmp_path))
+    assert clusters["p1"] == clusters["p2"]
 
 
 def test_run_mmseqs_reports_a_missing_binary(tmp_path: Path) -> None:

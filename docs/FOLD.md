@@ -556,8 +556,8 @@ full sequence in, unresolved residues unscored; X-ray ≤ 2.5 Å or cryo-EM ≤ 
 70% modeled; at least L/5 long-range contacts.
 
 ```bash
-# MMseqs2 (static build); the version is recorded in the output README
-curl -L https://mmseqs.com/latest/mmseqs-linux-avx2.tar.gz | tar xz -C $OPLM_DATA/tmp
+# MMseqs2 (bioconda); the version is recorded in the output README
+micromamba create -y -n mmseqs2 -c conda-forge -c bioconda mmseqs2
 # CASP sources (sha256-pinned in oplm.fold.evalsets.casp)
 mkdir -p $OPLM_DATA/casp && cd $OPLM_DATA/casp
 curl -O https://predictioncenter.org/download_area/CASP15/targets/casp15.targets.TS-domains.public_12.20.2022.tar.gz
@@ -565,7 +565,7 @@ curl -O https://predictioncenter.org/download_area/CASP15/sequences/casp15.seq.t
 curl -O https://predictioncenter.org/download_area/CASP16/targets/casp16.targets_monomer_trimmed2domains.tgz
 curl -O https://predictioncenter.org/download_area/CASP16/sequences/casp16.T1.seq.txt
 oplm fold eval-sets --fold-data $OPLM_DATA/hf/wwpdb/2026-10-12 --casp-sources $OPLM_DATA/casp \
-    --out $OPLM_DATA/hf/structure-evals/2026-10-12 --mmseqs $OPLM_DATA/tmp/mmseqs/bin/mmseqs
+    --out $OPLM_DATA/hf/structure-evals/2026-10-12 --mmseqs ~/micromamba/envs/mmseqs2/bin/mmseqs
 ```
 
 | directory | contents |

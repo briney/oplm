@@ -28,7 +28,7 @@
 - Contact floor: at least L/5 long-range contacts, with L = modeled residues; a contact is virtual Cβ < 8 Å with |i − j| ≥ 24 by sequence position.
 - Lengths (full sequence): CASP target 50–1024, CAMEO 50–512, PDB40 50–1024; subsets draw from chains ≤ 512.
 - Subsets: seed 42; `cameo_256`; `pdb40_256` ⊂ `pdb40_2048`.
-- PDB40 clustering: distinct protein sequences of length ≥ 30, `mmseqs easy-cluster --min-seq-id 0.4 -c 0.8 --cov-mode 0 -s 7.5`.
+- PDB40 clustering: distinct protein sequences of length ≥ 30, `mmseqs easy-cluster --min-seq-id 0.4 -c 0.8 --cov-mode 0 -s 7.5 --dbtype 1`.
 - Exported files: one chain, PDB format, chain id `A`, SEQRES = full sequence, ATOM records only, residues numbered by sequence position (1-based).
 - File stems: `casp<edition>_<target>-D<n>` (CASP) and `<entry>_<label chain id>` (CAMEO, PDB40; label ids are upper-case, so names can't collide on case-insensitive filesystems, and they match the fold head's `EvalTarget.key`).
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -2333,7 +2333,7 @@ with its sha256). Design and rationale:
 6. **CAMEO.** The listed chains that pass the quality filter and the curation rules.
 7. **PDB40.** The «summary.json `sets.pdb40.sequences`» distinct protein entity sequences of
    length ≥ 30 in the snapshot were clustered with MMseqs2 (`easy-cluster --min-seq-id 0.4
-   -c 0.8 --cov-mode 0 -s 7.5`) into «`sets.pdb40.clusters`» clusters. For each cluster, candidate chains passing the quality
+   -c 0.8 --cov-mode 0 -s 7.5 --dbtype 1`) into «`sets.pdb40.clusters`» clusters. For each cluster, candidate chains passing the quality
    filter were ranked by resolution, then resolved fraction, then entry and chain id. The
    first candidate passing the curation rules became the cluster's representative.
 8. **Subsets.** Seed-42 random subsets of chains ≤ 512 residues: `cameo_256`, `pdb40_2048`

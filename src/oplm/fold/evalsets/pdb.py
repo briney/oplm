@@ -29,7 +29,7 @@ __all__ = [
 
 QUALITY_LIMITS: dict[str, float] = {"X-RAY DIFFRACTION": 2.5, "ELECTRON MICROSCOPY": 3.0}
 CLUSTER_MIN_LENGTH = 30
-MMSEQS_ARGS = ("--min-seq-id", "0.4", "-c", "0.8", "--cov-mode", "0", "-s", "7.5")
+MMSEQS_ARGS = ("--min-seq-id", "0.4", "-c", "0.8", "--cov-mode", "0", "-s", "7.5", "--dbtype", "1")
 _META_COLUMNS = ["id", "chain_id", "auth_chain_id", "method", "resolution", "release_date"]
 _CANDIDATE_COLUMNS = [
     *_META_COLUMNS,

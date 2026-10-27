@@ -140,7 +140,9 @@ resolved masks and coordinates.
 
 1. **Cluster** the 175,496 distinct protein entity sequences of length ≥ 30 (*measured*), all
    methods, with
-   `mmseqs easy-cluster --min-seq-id 0.4 -c 0.8 --cov-mode 0 -s 7.5`.
+   `mmseqs easy-cluster --min-seq-id 0.4 -c 0.8 --cov-mode 0 -s 7.5 --dbtype 1`.
+   `--dbtype 1` is required: the sorted FASTA opens with poly-A sequences, and MMseqs2's type
+   guess otherwise reads the whole file as nucleotide and clusters almost nothing.
    Clustering every chain, not only the quality-passing ones, makes clusters reflect whole PDB
    families.
 2. **Pick one representative per cluster.** Candidates are chains of member sequences that pass
