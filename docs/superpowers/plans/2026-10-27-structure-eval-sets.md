@@ -2049,6 +2049,7 @@ def build(cfg: BuildConfig) -> dict[str, Any]:
         max_length=cfg.pdb40_length[1],
         min_modeled_fraction=cfg.min_modeled_fraction,
     )
+    summary["sets"]["pdb40"]["sequences"] = len(ids)
 
     for chains in built.values():
         for chain in chains:
@@ -2330,9 +2331,9 @@ with its sha256). Design and rationale:
    the lowest version is kept. One structure per (target, domain), with only that domain's
    residues carrying coordinates.
 6. **CAMEO.** The listed chains that pass the quality filter and the curation rules.
-7. **PDB40.** The «summary.json `sets.pdb40.clusters`» distinct protein entity sequences of
+7. **PDB40.** The «summary.json `sets.pdb40.sequences`» distinct protein entity sequences of
    length ≥ 30 in the snapshot were clustered with MMseqs2 (`easy-cluster --min-seq-id 0.4
-   -c 0.8 --cov-mode 0 -s 7.5`). For each cluster, candidate chains passing the quality
+   -c 0.8 --cov-mode 0 -s 7.5`) into «`sets.pdb40.clusters`» clusters. For each cluster, candidate chains passing the quality
    filter were ranked by resolution, then resolved fraction, then entry and chain id. The
    first candidate passing the curation rules became the cluster's representative.
 8. **Subsets.** Seed-42 random subsets of chains ≤ 512 residues: `cameo_256`, `pdb40_2048`
