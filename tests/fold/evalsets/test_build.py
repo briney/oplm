@@ -13,12 +13,12 @@ from typer.testing import CliRunner
 from oplm.data import load_structures
 from oplm.fold.cli import app
 from oplm.fold.evalsets import build as build_module
-from oplm.fold.evalsets.build import BuildConfig, build, nested_subsets
+from oplm.fold.evalsets.build import BuildConfig, _overlap, build, nested_subsets
+from oplm.fold.evalsets.chain import EvalChain
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from oplm.fold.evalsets.chain import EvalChain
 
 _SMALL = {
     "casp_length": (20, 1024),
@@ -27,6 +27,22 @@ _SMALL = {
     "cameo_subsets": (1,),
     "pdb40_subsets": (1, 2),
 }
+
+
+def test_overlap_counts_cameo_chains_not_clusters() -> None:
+    """Two CAMEO chains in one PDB40 cluster count twice: the spec reports chains."""
+
+    def chain(name: str, sequence: str, cluster: str | None = None) -> EvalChain:
+        meta = {"cluster": cluster} if cluster else {}
+        return EvalChain(name=name, sequence=sequence, atoms=[{} for _ in sequence], meta=meta)
+
+    cameo = [chain("7aaa_A", "MKV"), chain("7bbb_A", "MKI"), chain("7ccc_A", "GGG")]
+    pdb40 = [chain("7aaa_A", "MKV", cluster="s0"), chain("1xyz_A", "WWW", cluster="s9")]
+    sequence_cluster = {"MKV": "s0", "MKI": "s0", "GGG": "s5", "WWW": "s9"}
+    assert _overlap(cameo, pdb40, sequence_cluster) == {
+        "cameo_chains_in_pdb40": 1,
+        "cameo_chains_in_pdb40_clusters": 2,
+    }
 
 
 def test_build_end_to_end(
@@ -57,7 +73,7 @@ def test_build_end_to_end(
     for files in names.values():
         assert len({n.lower() for n in files}) == len(files)
     assert summary["sets"]["casp15_16"]["casp16"]["duplicate"] == 1
-    assert summary["overlap"] == {"cameo_chains_in_pdb40": 0, "cameo_clusters_in_pdb40": 1}
+    assert summary["overlap"] == {"cameo_chains_in_pdb40": 0, "cameo_chains_in_pdb40_clusters": 1}
 
     (gapped,) = [s for s in load_structures(out / "casp15_16") if s.name == "casp16_T1201-D1"]
     assert len(gapped.sequence) == 46

@@ -153,6 +153,20 @@ def _write_manifest(path: Path, out: Path, built: dict[str, list[EvalChain]]) ->
     pq.write_table(pa.Table.from_pylist(rows), path)
 
 
+def _overlap(
+    cameo: list[EvalChain], pdb40: list[EvalChain], sequence_cluster: dict[str, str]
+) -> dict[str, int]:
+    """CAMEO chains that are PDB40 representatives, and CAMEO chains whose 40% cluster has one."""
+    names = {c.name for c in pdb40}
+    clusters = {c.meta["cluster"] for c in pdb40}
+    return {
+        "cameo_chains_in_pdb40": sum(c.name in names for c in cameo),
+        "cameo_chains_in_pdb40_clusters": sum(
+            sequence_cluster.get(c.sequence) in clusters for c in cameo
+        ),
+    }
+
+
 def render_readme(summary: dict[str, Any]) -> str:
     """The dataset card: what each directory holds, how it was built, and the counts."""
     sets = "\n".join(f"| `{name}` | {count} |" for name, count in summary["exported"].items())
@@ -267,14 +281,7 @@ def build(cfg: BuildConfig) -> dict[str, Any]:
                 shutil.copy2(cfg.out / parent / f"{n}.pdb", cfg.out / subset / f"{n}.pdb")
             built[subset] = [by_name[n] for n in names]
 
-    cameo_clusters = {sequence_cluster.get(c.sequence) for c in built["cameo"]} - {None}
-    pdb40_clusters = {c.meta["cluster"] for c in built["pdb40"]}
-    summary["overlap"] = {
-        "cameo_chains_in_pdb40": len(
-            {c.name for c in built["cameo"]} & {c.name for c in built["pdb40"]}
-        ),
-        "cameo_clusters_in_pdb40": len(cameo_clusters & pdb40_clusters),
-    }
+    summary["overlap"] = _overlap(built["cameo"], built["pdb40"], sequence_cluster)
 
     _validate(cfg.out, built)
     _write_manifest(cfg.out / "manifest.parquet", cfg.out, built)
