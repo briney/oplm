@@ -233,13 +233,13 @@ def test_seqres_numbering_offset_falls_back_to_modeled_residues(tmp_path: Path) 
     assert torch.isfinite(parsed.coords).all()
 
 
-
 def test_in_range_numbering_offset_falls_back_on_residue_mismatch(tmp_path: Path) -> None:
     """Numbered from 2 but still inside SEQRES: only the residue-identity check catches it."""
     parsed = _parse_single_structure(_crambin_variant(tmp_path, range(44, 47), renumber=1))
     assert parsed is not None
     assert parsed.sequence == _CRAMBIN_SEQUENCE[:43]
     assert torch.isfinite(parsed.coords).all()
+
 
 def test_file_without_seqres_keeps_modeled_residues_only(tmp_path: Path) -> None:
     """No SEQRES: today's behavior, unmodeled residues are absent."""
