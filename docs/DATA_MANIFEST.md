@@ -72,17 +72,16 @@ structure, with its sha256). Design and rationale:
 | `pdb40` | 49,986 clusters | no_candidate: 19,298; exhausted: 917; max_rounds: 342 | 29,429 |
 | `cameo_256`, `pdb40_2048`, `pdb40_256` | | | 256, 2,048, 256 |
 
-CASP15 has 45 domain files (no duplicates); CASP16 has 159, of which 82 are duplicates, so
-45 + 77 = 122 distinct domains. CAMEO `skipped` counts listed chains with fewer than three
-resolved Cα atoms; `quality` is 46 NMR structures and 200 X-ray structures above 2.5 Å. The `pdb40` removed counts are clusters and sum with the 29,429
-exported to 49,986. `no_candidate` clusters had no chain passing the quality filter, length,
-standard-residue and 70%-resolved screen; `exhausted` clusters had candidates that all failed the
-curation rules; `max_rounds` clusters still had untried candidates after 5 attempts. The
-build also counted individual candidates rejected by the curation rules while searching clusters
-(`contacts`: 3,940; `modeled`: 6). These are candidate-level counts, not clusters; don't add
-them to the removed total.
+CASP15 has 45 domain files (no duplicates); CASP16 has 159, of which 82 are duplicates, so 45 + 77 =
+122 distinct domains. CAMEO `skipped` counts listed chains with fewer than three resolved Cα atoms;
+`quality` is 46 NMR structures and 200 X-ray structures above 2.5 Å. The `pdb40` removed counts are
+clusters and sum with the 29,429 exported to 49,986. `no_candidate` clusters had no chain passing
+the quality filter, length, standard-residue and 70%-resolved screen; `exhausted` clusters had
+candidates that all failed the curation rules; `max_rounds` clusters still had untried candidates
+after 5 attempts. The build also counted individual candidates rejected by the curation rules while
+searching clusters (`contacts`: 3,940; `modeled`: 6). These are candidate-level counts, not
+clusters; don't add them to the removed total.
 
 Overlap: 202 of the 435 CAMEO chains are also PDB40 representatives, and all 435 fall in a 40%
-sequence cluster that has a PDB40 representative (every curated CAMEO chain is itself a valid
-candidate in its cluster). CAMEO is therefore not held out from PDB40. Both counts are reported;
-nothing is removed.
+sequence cluster that has a PDB40 representative (measured). CAMEO is therefore not held out
+from PDB40. Both counts are reported; nothing is removed.

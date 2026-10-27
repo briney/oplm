@@ -232,8 +232,7 @@ roughly 0.7%. The full PDB40 post-training eval (29,429 chains up to 1024 residu
 - External dependency: the MMseqs2 binary (bioconda or a static release), with its version
   recorded. It is not a Python dependency.
 - Runtime (measured, 28 threads): clustering 175k sequences takes about 1 min; the whole build
-  about 26 min. Building and
-  testing is about 1.5 days.
+  about 26 min. Building and testing is about 1.5 days.
 
 ## Decisions (approved 2026-10-27)
 
