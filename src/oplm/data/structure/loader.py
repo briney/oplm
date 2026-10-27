@@ -5,6 +5,10 @@ N/CA/C coordinates) for the structure eval modality. Biopython is lazy-imported
 inside the parsing functions and is only required under the ``train`` extra; the
 core training install never hard-requires it (docs/DATA_TOOLING.md §5.5).
 
+PDB files whose residue numbers fit their SEQRES records load on the full
+sequence, with unmodeled residues as NaN rows (the ESM-C convention; ``oplm
+fold eval-sets`` writes files this way).
+
 The structure modality is **eval-only**: sequences reuse the canonical tokenizer
 via the pad primitive and no masking is applied. This module's job ends at
 producing :class:`StructureData`; contact-map math lives in the eval harness.
@@ -22,6 +26,8 @@ from torch import Tensor
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from Bio.PDB.Chain import Chain
 
 logger = logging.getLogger(__name__)
 
@@ -101,12 +107,64 @@ def _residue_to_one_letter(residue_name: str) -> str:
     return str(protein_letters_3to1.get(residue_name.capitalize(), "X"))
 
 
+def _read_seqres(path: Path) -> dict[str, list[str]]:
+    """SEQRES residue names per chain id from a PDB-format file; empty when it has none.
+
+    Reading stops at the first coordinate record, since SEQRES belongs to the header.
+    """
+    seqres: dict[str, list[str]] = {}
+    with path.open() as handle:
+        for line in handle:
+            if line.startswith("SEQRES"):
+                seqres.setdefault(line[11], []).extend(line[19:].split())
+            elif line.startswith(("ATOM", "HETATM", "MODEL")):
+                break
+    return seqres
+
+
+def _place_on_seqres(chain: Chain, seqres: list[str]) -> tuple[str, Tensor] | None:
+    """Coordinates on the full SEQRES sequence, or ``None`` when the numbering doesn't fit.
+
+    Residue ``resSeq`` goes to index ``resSeq - 1``; indices with no residue (unmodeled) stay
+    ``NaN``. Placement fits only if every kept residue lands inside the sequence, once, with
+    no insertion code, and with the one-letter code SEQRES has at that index. Files numbered
+    by author convention (offsets, insertion codes) don't fit; the caller then falls back to
+    the coordinates-only sequence.
+    """
+    sequence = "".join(_residue_to_one_letter(name) for name in seqres)
+    coords = torch.full((len(sequence), len(_BACKBONE_ATOMS), 3), float("nan"))
+    placed: set[int] = set()
+    for residue in chain.get_residues():
+        hetflag, resseq, icode = residue.id
+        resname = residue.resname.strip()
+        if hetflag != " " and resname not in _MODIFIED_RESIDUE_MAP:
+            continue
+        index = resseq - 1
+        if (
+            icode.strip()
+            or not 0 <= index < len(sequence)
+            or index in placed
+            or _residue_to_one_letter(resname) != sequence[index]
+        ):
+            return None
+        placed.add(index)
+        for k, atom in enumerate(_BACKBONE_ATOMS):
+            if atom in residue:
+                coords[index, k] = torch.tensor(residue[atom].get_coord().tolist())
+    return sequence, coords
+
+
 def _parse_single_structure(path: Path) -> StructureData | None:
     """Parse one PDB/mmCIF file into :class:`StructureData`.
 
     Uses the **first model, first chain**. Heteroatoms are skipped unless they
     are known modified residues. Per residue, the N/CA/C backbone atoms are
     extracted (a ``NaN`` row substitutes for any missing atom).
+
+    A PDB file whose residue numbers fit its SEQRES (see :func:`_place_on_seqres`)
+    yields the full SEQRES sequence with NaN rows for unmodeled residues, so the
+    structure eval sees the deposited sequence and leaves those residues unscored.
+    Other files yield the residues that have coordinates.
 
     Args:
         path: Path to a single structure file.
@@ -140,6 +198,17 @@ def _parse_single_structure(path: Path) -> StructureData | None:
     if chain is None:
         logger.warning("no model/chain found in %s; skipping", path)
         return None
+
+    if path.suffix.lower() not in _MMCIF_SUFFIXES:
+        seqres = _read_seqres(path).get(chain.id)
+        placed = _place_on_seqres(chain, seqres) if seqres else None
+        if placed is not None:
+            sequence, coords = placed
+            return StructureData(
+                name=path.stem, sequence=sequence, coords=coords, chain_id=chain.id
+            )
+        if seqres:
+            logger.debug("%s: numbering doesn't fit SEQRES; using modeled residues only", path)
 
     sequence_chars: list[str] = []
     coord_rows: list[list[list[float]]] = []
