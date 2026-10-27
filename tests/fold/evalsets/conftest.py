@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import sys
 import tarfile
 from pathlib import Path
 
@@ -53,3 +54,34 @@ def casp_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     pinned = {path.name: casp.sha256sum(path) for path in directory.iterdir()}
     monkeypatch.setattr(casp, "CASP_SHA256", pinned)
     return directory
+
+
+_FAKE_MMSEQS = """
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[0] == "version":
+    print("fake-mmseqs")
+    raise SystemExit(0)
+assert args[0] == "easy-cluster" and "--min-seq-id" in args, args
+fasta, prefix = Path(args[1]), args[2]
+lines = fasta.read_text().splitlines()
+reps = {}
+rows = []
+for header, sequence in zip(lines[::2], lines[1::2]):
+    member = header[1:]
+    rep = reps.setdefault(sequence[:10], member)  # one cluster per ten-residue prefix
+    rows.append(f"{rep}\\t{member}\\n")
+Path(f"{prefix}_cluster.tsv").write_text("".join(rows))
+"""
+
+
+@pytest.fixture(scope="session")
+def fake_mmseqs(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """An ``mmseqs`` stand-in: ``version``, and ``easy-cluster`` by ten-residue prefix (so the
+    two crambins, 1crn and 1ejg, share a cluster)."""
+    path = tmp_path_factory.mktemp("bin") / "mmseqs"
+    path.write_text(f"#!{sys.executable}{_FAKE_MMSEQS}")
+    path.chmod(0o755)
+    return path
