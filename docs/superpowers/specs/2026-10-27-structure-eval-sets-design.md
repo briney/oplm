@@ -11,7 +11,7 @@ separation ≥ 24):
 
 | set | role | size | cadence |
 |---|---|---|---|
-| `casp15_16` | hard targets | 121 domains (*measured*), up to ~165 with the missing CASP16 sequences | every 5k steps |
+| `casp15_16` | hard targets | 101 domains (*measured*) | every 5k steps |
 | `cameo_256` | recent PDB, same chains as the fold head's held-out set | 256 of ~420 | every 5k steps |
 | `pdb40_256`, `pdb40_2048` | representative PDB, the decision metric | 256 / 2048 | 5k / 50k steps |
 | `pdb40` | full set, post-training eval only | ~29k | offline |
@@ -30,9 +30,12 @@ This needs two changes to the current eval, made as part of this work:
 1. **Loader** (`oplm.data.structure.loader`). Today the sequence is built from residues that have
    coordinates, so an unmodeled loop is spliced out. New behavior: when a file has SEQRES records,
    the sequence is the SEQRES sequence, and each residue is placed at index `resSeq − 1`. Residues
-   absent from the coordinates, or missing any of N/CA/C, become NaN rows. A residue whose name
-   disagrees with SEQRES at its position is an error. Files without SEQRES keep today's behavior,
-   so existing sets (e.g. your CASP14) still load.
+   absent from the coordinates, or missing any of N/CA/C, become NaN rows. Placement is used
+   only when every residue fits: inside the sequence, once, with no insertion code, and the same
+   residue SEQRES has at that position. Otherwise, as for files without SEQRES, the loader keeps
+   today's behavior. That way real PDB files numbered by author convention, and existing sets such
+   as your CASP14, still load. The builder's round-trip validation guarantees that its own files
+   take the placement path.
 2. **Metric** (`oplm.eval.metrics`). Today a pair with a NaN coordinate is labeled a non-contact
    (`compute_contact_map`), so predictions on unresolved residues would count as false positives.
    New behavior: such pairs are unknown and excluded before ranking. L is the number of residues
@@ -83,20 +86,25 @@ equivalent) for FM/TBM labels, so results can be split by difficulty later.
 Each domain becomes one structure: SEQRES is the full target sequence, and only that domain's
 residues have coordinates. The model sees the whole target and is scored inside the domain, which
 is how CASP assesses domains. Domain files are numbered in target coordinates: the residue name
-matched the target sequence at every position in all 148 domains checked (*measured*). CASP16
-monomer domain files are named `T0xxx` for targets `T1xxx` (each file's REMARK carries the real
-target id).
+matched the target sequence at every position in all 122 distinct domains (*measured*).
+
+The CASP16 tarball has three kinds of duplicates:
+
+- Phase-2 copies named `T2xxx`, with coordinates byte-identical to the `T1xxx` domain.
+- Monomer files that name target `T1xxx` as `T0xxx`.
+- Versioned targets (`T1228v1`, `T1228v2`), which are alternative versions of the same target.
+
+The builder maps `T0` and `T2` to `T1`, keeps the lowest version, and takes one file per
+(target, domain). File REMARK lines aren't a reliable target id (some read `TARGET` or `USER`).
+Every remaining target has a sequence in `casp16.T1.seq.txt`.
 
 Filter: target length 50–1024 and the contact floor. The 70% modeled rule doesn't apply, because
 a domain is deliberately a fraction of its target. *Measured:*
 
 - CASP15: 45 → 36 domains.
-- CASP16: 159 domain files, of which 56 have no sequence in the download area's sequence files
-  (40 targets: the `T2xxx` targets and versioned ones such as `T1228v2`). Of the other 103, 85 pass.
-- Total 121 domains, of which 31 are gapped or discontinuous, so a gap-free rule would have
+- CASP16: 159 files → 77 distinct domains → 65 pass.
+- Total 101 domains, of which 29 are gapped or discontinuous, so a gap-free rule would have
   dropped them.
-- Get the 40 missing sequences from the CASP16 target pages (`/casp16/targetlist.cgi`). That should
-  add roughly 40 more domains. If a sequence can't be found, drop that target.
 
 All CASP domains are used every 5k steps.
 
@@ -146,10 +154,11 @@ Estimate: RCSB's weekly 40% cluster file (2026-10-18) has 29,610 clusters with a
 quality, length and the 70% rule, so expect about 29k representatives. Our clustering sets the
 real number.
 
-Why not use RCSB's file directly: it's regenerated weekly and not archived, it clusters about
-1.06M computed models alongside experimental entities (52,698 of its 324,268 clusters contain an
-experimental entity), and it doesn't match our snapshot. We use it only as a cross-check: the share
-of our representatives that land in the same RCSB cluster.
+Why not use RCSB's file: it's regenerated weekly and not archived, it clusters about 1.06M
+computed models alongside experimental entities (52,698 of its 324,268 clusters contain an
+experimental entity), and it doesn't match our snapshot. It can't serve as a cross-check either:
+the fold index stores a 0-based polymer-entity index, not the mmCIF entity id that RCSB's file is
+keyed on.
 
 PDB40 overlaps the fold head's training data, so it is for LM evaluation only. Fold-head evals
 stay on CAMEO and CASP.
@@ -174,8 +183,9 @@ $OPLM_DATA/hf/structure-evals/2026-10-12/
   manifest.parquet       one row per exported structure: set, file, source id, chain, entity,
                          cluster, method, resolution, release date, sequence length, modeled
                          count, long-range contacts, CASP category, sha256
+  summary.json           the README's counts and thresholds, machine-readable
   sources/               CASP tarballs, sequence files and domain summary pages, CAMEO list copy,
-                         MMseqs2 cluster TSV, RCSB 40% file, SHA256SUMS
+                         MMseqs2 FASTA and cluster TSV
   casp15_16/  cameo/  cameo_256/  pdb40/  pdb40_2048/  pdb40_256/
 ```
 
@@ -194,7 +204,7 @@ data:
     casp14:     {path: <existing CASP14 set>, type: structure, every: {steps: 5_000}}
 ```
 
-The subsets are materialized, so `categorical_jacobian_sample_size` isn't needed. About 640–680
+The subsets are materialized, so `categorical_jacobian_sample_size` isn't needed. About 610–650
 chains per 5k-step round is roughly 2–3% of training compute: CASP inputs are full targets up to
 1024 residues, which costs more per domain than a PDB40 chain. The 2048 set every 50k steps adds
 roughly 0.7%. The full PDB40 post-training eval (about 29k chains up to 1024 residues) is roughly
