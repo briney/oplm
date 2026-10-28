@@ -397,7 +397,7 @@ Each published checkpoint is a full checkpoint directory, not just weights:
 | `hf_ema/` and `ema.pt` | The EMA export and tracker, when the run set `train.ema_decay`. |
 | DCP shards and `.metadata` | Model and optimizer state, including Muon's moments, and the LR scheduler. |
 | `rng_state_<rank>.pt` | Per-rank RNG state. |
-| `trainer_state.json` | Step, epoch, samples and tokens seen, and the **data cursor** (epoch, batches consumed, and the layout it was recorded under: world size, worker count, per-rank batch size, seed). |
+| `trainer_state.json` | Step, epoch, samples and tokens seen, and the **data cursor**: the epoch, batches consumed, and the layout it was recorded under (world size, worker count, per-rank batch size, seed). In token mode it also holds each rank's epoch, each worker's rows (and, for a mix, each source's pass and offset), and any reshard events from earlier layout changes. |
 | `config.yaml` | The resolved run config the checkpoint was written under. |
 
 The data cursor counts rows into the shard layout of the training set the run read, so it is
@@ -502,8 +502,8 @@ trailing decay step is harmless.
   data at a different path counts as different. For a downloaded checkpoint, put the training set
   at the paths its `config.yaml` names (mirror or symlink them). Any difference, including a
   different mix (the production decay-phase case), restarts the stream at row 0 of the current
-  epoch with a warning. The cursor's layout guard still applies, so branch on the same layout or
-  see [Resuming on different hardware](#resuming-on-different-hardware).
+  epoch with a warning. A kept cursor follows the same layout rules as a resume
+  ([Resuming on different hardware](#resuming-on-different-hardware)).
 
 The branch gets its own W&B run; `train/lr` (Muon) and `train/lr_adamw` show the live
 schedule from the first logged step. The worked set of branch experiments for the
@@ -518,19 +518,27 @@ The decay branches used to rank LR candidates are in
 ## Resuming on different hardware
 
 Resume is **data-exact** by default: `train.resume_data_position=true` replays the exact
-row-level position of the checkpoint, so no row is re-seen or skipped. That is only possible when
-the cursor's layout matches the live run. Data-exact resume currently requires the **same world
-size, worker count, per-rank batch size and seed**. `train.resume_data_position` validates this
-and **raises** on a mismatch, naming every differing field. In token mode (the production recipe)
-rows per worker do not depend on the batch size, so `per_rank_batch` drops out of the check, but the
-world size, worker count and seed must still match
-([Token-budget batching](#token-budget-batching-traintokens_per_step-trainbatch_tokens)).
+row-level position of the checkpoint, so no row is re-seen or skipped.
 
-A user with fewer GPUs than the production run therefore cannot resume data-exactly. Set
-`train.resume_data_position=false` instead. That restarts the current epoch's data stream from
-row 0, so some rows are seen again; for a shuffled, many-epoch run that is an efficiency cost, not a
-correctness problem. Everything else (weights, optimizer, scheduler, counters) still restores, and
-the checkpoint itself is parallelism-agnostic, so it loads at any world size.
+A **token-mode** cursor (the production recipe,
+[Token-budget batching](#token-budget-batching-traintokens_per_step-trainbatch_tokens)) resumes
+at **any world size and worker count**; only the seed must match. At a new layout the cursor
+becomes a reshard event: the rows each old `(rank, worker)` stream had not yet consumed are
+re-striped over the new streams, and every rank starts at the earliest epoch any old rank was in.
+The event is kept in the cursor and replayed by later resumes until every rank is past it, so a
+run can change layout more than once. For a `data.train` mix the resume is exact per source pass:
+no source row is served twice in a pass, and the epoch keeps its total draw count, but the mix
+order after the resume differs from an uninterrupted run. Resharding a mix needs each source's
+position in the cursor (`worker_sources`). An older cursor without it resumes a mix only at its own
+layout; at another layout it raises, naming `train.resume_data_position=false`.
+
+A **sequence-mode** cursor still requires the **same world size, worker count, per-rank batch
+size and seed**. `train.resume_data_position` validates this and **raises** on a mismatch, naming
+every differing field. To resume one on other hardware, set `train.resume_data_position=false`.
+That restarts the current epoch's data stream from row 0, so some rows are seen again; for a
+shuffled, many-epoch run that is an efficiency cost, not a correctness problem. Everything else
+(weights, optimizer, scheduler, counters) still restores, and the checkpoint itself is
+parallelism-agnostic, so it loads at any world size.
 
 One more constraint comes from the per-rank RNG files. A checkpoint saved by `N` ranks carries
 `rng_state_0.pt` to `rng_state_<N-1>.pt`. Resuming at a *smaller* world size works. A *larger* one
@@ -540,8 +548,6 @@ raises, because the extra ranks have no RNG file; set the environment variable
 A branch has one more limit: it keeps the cursor only when `data.train` matches the checkpoint's
 config as written, paths included ([Rules](#rules)). The check does not compare the data itself,
 so the same training set at a new path loses the cursor. Mirror or symlink the original paths.
-
-> **Pending:** a data-exact resume that does not need the original world size (waiting on #63).
 
 ---
 
@@ -813,9 +819,10 @@ than `batch_size × max_position_embeddings` once packed. Token mode fixes the t
   `train/epoch` stays the global fractional epoch (samples seen across all GPUs over the dataset size);
   the integer epoch saved in checkpoint state is rank 0's.
 - Resume is data-exact per worker: the checkpoint cursor records each rank's epoch and the rows
-  each worker had emitted. Only the world size, worker count and seed must match, so
-  `tokens_per_step` and `batch_tokens` can change at a resume or branch without losing the
-  position. A sequence-mode checkpoint resumes or branches into token mode at its exact position
+  each worker had emitted. Only the seed must match, so `tokens_per_step` and `batch_tokens`
+  can change at a resume or branch without losing the position, and a changed world size or
+  worker count re-stripes the unconsumed rows
+  ([Resuming on different hardware](#resuming-on-different-hardware)). A sequence-mode checkpoint resumes or branches into token mode at its exact position
   (same world size, workers and seed); the reverse, token to sequence, needs
   `train.resume_data_position=false`.
 - The worker-cycle save alignment is off in token mode; after a resume only the order in which
@@ -867,7 +874,7 @@ no-progress guard), see [slurm.md, *Requeue semantics*](slurm.md#requeue-semanti
 | `keep_every_n_steps` | `null` | Checkpoints on a step multiple of this value are permanent: excluded from `save_total_limit` rotation entirely. `null` disables the exemption. |
 | `keep_every_n_hours` | `null` | Marks a checkpoint permanent at least this many wall-clock hours after the previous permanent one (independent of `keep_every_n_steps`). `null` disables the exemption. |
 | `auto_resume` | `false` | Resume from the newest **committed** checkpoint under `output_dir` automatically at trainer start, with no `resume_from` needed. An explicit `resume_from` always wins over `auto_resume`. `oplm slurm generate` injects `train.auto_resume=true` into every job it renders (see [slurm.md, *Requeue semantics*](slurm.md#requeue-semantics-drain-budget-and-the-no-progress-guard)); `configs/scaling.yaml` also sets it explicitly, since that config only ever runs under Slurm. |
-| `resume_data_position` | `true` | **Data-exact resume.** When a checkpoint carries a data cursor and this is `true` (the default), a resume replays the exact row-level position the run was at when the checkpoint was taken — no row re-seen or skipped, same order as an uninterrupted run — instead of restarting the epoch's data stream from row 0. The cursor's layout (`world_size`, `num_workers`, per-rank batch size, seed) is validated against the live run; a mismatch raises, naming the escape hatch. Set `false` to restart the current epoch from row 0 — the escape hatch for resuming into a different world size/worker count, or a checkpoint with no cursor at all. See "What a resume restores" below and [Resuming on different hardware](#resuming-on-different-hardware). |
+| `resume_data_position` | `true` | **Data-exact resume.** When a checkpoint carries a data cursor and this is `true` (the default), a resume replays the exact row-level position the run was at when the checkpoint was taken — no row re-seen or skipped, same order as an uninterrupted run — instead of restarting the epoch's data stream from row 0. A token-mode cursor needs only the same seed and re-stripes onto any world size or worker count; a sequence-mode cursor's layout (`world_size`, `num_workers`, per-rank batch size, seed) is validated against the live run, and a mismatch raises, naming the escape hatch. Set `false` to restart the current epoch from row 0 — the escape hatch for a sequence-mode cursor on a different layout, or a checkpoint with no cursor at all. See "What a resume restores" below and [Resuming on different hardware](#resuming-on-different-hardware). |
 | `dist_timeout_minutes` | `15` | Timeout passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. A genuine hang raises within this window instead of wedging until the Slurm time limit; a no-op on a single process. |
 | `remote_checkpoint_uri` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background — durability beyond local/shared storage. `null` (default) disables it entirely: zero behavior change, no import of `oplm.training.remote`, no fsspec call. See "Remote checkpoint mirror" below. |
 | `ema_decay` | `null` | EMA of the trainable weights (fold stages use `0.999`). One update per optimizer step. Each checkpoint adds `ema.pt` + `hf_ema/`; resume restores the tracker; a pre-EMA checkpoint resumed with this set logs a warning and restarts the average from the live weights. `ddp` only. |
@@ -992,9 +999,11 @@ uninterrupted control run; no row is re-seen or skipped, and `tokens_seen` match
 uninterrupted run exactly. A checkpoint taken exactly at an epoch boundary resumes into the next
 epoch rather than replaying the finished one. Masking is unaffected by this: the collator's masking
 RNG is untouched, so post-resume masks differ bit-for-bit from an uninterrupted run even though the
-*data* stream is identical (data-exact, not bitwise). A cursor whose recorded layout doesn't match
-the live run's (different world size, worker count, batch size, or seed) raises rather than silently
-reproducing the wrong data order or coverage; the fix is either to resume at the original layout or
+*data* stream is identical (data-exact, not bitwise). A token-mode cursor re-stripes onto a new
+world size or worker count ([Resuming on different hardware](#resuming-on-different-hardware)). A
+sequence-mode cursor whose recorded layout doesn't match the live run's (different world size,
+worker count, batch size, or seed) raises rather than silently reproducing the wrong data order or
+coverage; the fix is either to resume at the original layout or
 set `resume_data_position=false` to restart the current
 epoch's data stream from row 0 — a minor efficiency cost, not a correctness issue, for a shuffled,
 many-epoch run). A checkpoint with no cursor at all always takes that same

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -165,17 +165,18 @@ def _resolve_rows_skip(rows_per_worker: Sequence[int], stream_length: int) -> in
 
 @dataclass(frozen=True)
 class DataCursor:
-    """Position of the training stream, plus the layout it is only valid under.
+    """Position of the training stream, plus the layout it was recorded under.
 
     Captured at checkpoint time (one per run, not per rank — in sequence mode ranks step in
     lockstep so ``batches_in_epoch`` is the same value everywhere; token mode adds the
     per-rank ``rank_epochs`` and ``worker_rows`` tables) and replayed on resume via
     :meth:`ShardedProteinDataset.set_resume_skip` (sequence mode) or ``set_resume_rows``
     (token mode). A sequence-mode cursor can resume a token-mode run (its position maps onto
-    per-worker rows); a token-mode cursor cannot resume a sequence-mode run. The layout fields
-    (``world_size``, ``num_workers``, ``per_rank_batch``, ``seed``) let the
-    resuming run detect a changed layout before trusting ``batches_in_epoch`` — see
-    Task 3.3's guard.
+    per-worker rows); a token-mode cursor cannot resume a sequence-mode run. A sequence-mode
+    cursor resumes only at its own layout (``world_size``, ``num_workers``,
+    ``per_rank_batch``, ``seed``). A token-mode cursor needs only the same ``seed``: at another
+    world size or worker count its position becomes a :class:`Reshard` event (``reshards``)
+    and the live streams stripe the rows the old ones had not consumed.
 
     Attributes:
         epoch: Epoch index the cursor was captured in.
@@ -190,7 +191,13 @@ class DataCursor:
         rank_epochs: Token mode only: each rank's epoch at the save (ranks roll over on their
             own).
         worker_rows: Token mode only: a ranks x workers table of the rows each worker had
-            emitted this epoch, the exact position whatever the batch size.
+            emitted this epoch, the exact position whatever the batch size (draws, for a mix).
+        worker_sources: Token mode only: a ranks x workers table of each worker's per-source
+            ``[pass, offset]`` (a mix's position tag; ``None`` for a single source or a worker
+            that had not produced a batch). ``None`` in cursors from before it existed.
+        reshards: Token mode only: the :class:`Reshard` events (as dicts) that still apply to
+            some rank's current or later epoch.
+        data_fingerprint: Content hash of ``data.train``, or ``None``.
     """
 
     epoch: int
@@ -201,6 +208,9 @@ class DataCursor:
     seed: int
     rank_epochs: list[int] | None = None
     worker_rows: list[list[int]] | None = None
+    worker_sources: list[list[list[list[int]] | None]] | None = None
+    reshards: list[dict] = field(default_factory=list)
+    data_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)

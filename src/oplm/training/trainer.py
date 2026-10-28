@@ -8,7 +8,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
     from oplm.config import OplmConfig
+    from oplm.data import Reshard
     from oplm.eval.context import EvalContext
     from oplm.eval.evaluator import Evaluator
     from oplm.model import OplmForMaskedLM
@@ -788,8 +789,12 @@ class Trainer:
         self._batches_in_epoch = 0
 
         # Token mode (spec §6.1): rows each DataLoader worker had emitted this epoch, as of the
-        # last batch the loop consumed (its stream_position). The per-worker resume position.
+        # last batch the loop consumed (its stream_position). The per-worker resume position; a
+        # mix counts draws and adds each worker's per-source [pass, offset] (`_worker_sources`).
         self._worker_rows = [0] * self._effective_num_workers()
+        self._worker_sources: list[list[list[int]] | None] = [None] * len(self._worker_rows)
+        # Reshard events (layout changes at a resume) the data stream replays; see DataCursor.
+        self._reshards: list[Reshard] = []
         self._step_local_samples = 0  # local sequences accumulated across the current opt step
         if self._token_mode:
             logger.info(
@@ -948,6 +953,7 @@ class Trainer:
                         self._batches_in_epoch = 0
                         self._clear_dataset_resume_skip()
                         self._worker_rows = [0] * self._effective_num_workers()
+                        self._worker_sources = [None] * len(self._worker_rows)
                         data_iter = iter(self.dataloader)
                         try:
                             batch = next(data_iter)
@@ -959,8 +965,14 @@ class Trainer:
                             ) from None
                 self._window_data_wait += time.perf_counter() - data_t0
                 if self._token_mode:
-                    worker_id, rows_emitted = batch["stream_position"][:2]
-                    self._worker_rows[int(worker_id)] = int(rows_emitted)
+                    # The DataLoader turns the tag's tuples into lists. A mix's tag is
+                    # (draws, per-source (pass, offset)); its draws are the resume position.
+                    worker_id, rows_emitted, tag = batch["stream_position"]
+                    worker = int(worker_id)
+                    self._worker_rows[worker] = int(tag[0] if tag else rows_emitted)
+                    self._worker_sources[worker] = (
+                        [[int(pass_), int(offset)] for pass_, offset in tag[1]] if tag else None
+                    )
 
                 # Forward + backward inside accumulation context
                 with self.accelerator.accumulate(self.model):
@@ -1616,14 +1628,21 @@ class Trainer:
 
         rank_epochs: list[int] | None = None
         worker_rows: list[list[int]] | None = None
+        worker_sources: list[list[list[list[int]] | None]] | None = None
+        reshards: list[dict[str, Any]] = []
         if self._token_mode:
             # Every rank enters this save at the same step (each trigger is rank-reduced, and
             # _SaveDeferral is off in token mode), so the gather cannot strand a rank.
             from accelerate.utils import gather_object
 
-            gathered = gather_object([(self.epoch, list(self._worker_rows))])
-            rank_epochs = [int(epoch) for epoch, _ in gathered]
-            worker_rows = [[int(n) for n in rows] for _, rows in gathered]
+            gathered = gather_object(
+                [(self.epoch, list(self._worker_rows), list(self._worker_sources))]
+            )
+            rank_epochs = [int(epoch) for epoch, _, _ in gathered]
+            worker_rows = [[int(n) for n in rows] for _, rows, _ in gathered]
+            worker_sources = [list(sources) for _, _, sources in gathered]
+            # An event no rank's current or later epoch is in can never apply again.
+            reshards = [asdict(r) for r in self._reshards if max(r.epochs) >= min(rank_epochs)]
         cursor = DataCursor(
             epoch=self.epoch,
             batches_in_epoch=self._batches_in_epoch,
@@ -1633,6 +1652,8 @@ class Trainer:
             seed=self.cfg.train.seed,
             rank_epochs=rank_epochs,
             worker_rows=worker_rows,
+            worker_sources=worker_sources,
+            reshards=reshards,
         )
 
         should_mark_permanent = False
@@ -1942,16 +1963,20 @@ class Trainer:
           a full worker-cycle boundary -- see the worker-cycle save-alignment deferral
           in :meth:`train`), a WARNING notes that global batch interleaving may be
           window-shifted, though each worker's own data content stays exact.
-        - Token mode (``train.batch_tokens`` set): the layout check drops ``per_rank_batch``
-          (rows per worker do not depend on the batch size, so the token budget may change at
-          a resume), then this rank's epoch is restored from ``cursor.rank_epochs`` and its
-          per-worker row counts from ``cursor.worker_rows``, armed via the top-level
-          dataset's ``set_resume_rows``. A sequence-mode cursor (no ``worker_rows``) maps
-          exactly onto per-worker rows (worker ``w`` has served ``len(range(w,
-          batches_in_epoch, num_workers)) * per_rank_batch`` rows, every rank in the cursor's
-          epoch) and resumes at its exact position; a token-mode cursor in a sequence-mode run
-          raises ``ValueError`` (per-worker counts are not batch multiples and ranks may be in
-          different epochs).
+        - Token mode (``train.batch_tokens`` set) with a token-mode cursor: only the seed must
+          match (the token budget may change at a resume too). The cursor's reshard events are
+          restored and replayed. At the same world size and worker count, this rank's epoch,
+          per-worker row counts (``cursor.worker_rows``) and, for a mix, per-source positions
+          (``cursor.worker_sources``) are restored and armed via the top-level dataset's
+          ``set_resume_rows``/``set_resume_sources``. At another layout the cursor becomes a
+          new :class:`~oplm.data.Reshard` event: every rank starts at ``min(rank_epochs)`` from
+          row 0 of a stream that stripes only the rows the old streams had not consumed. A mix
+          needs ``worker_sources`` for that (``ValueError`` without). A sequence-mode cursor
+          (no ``worker_rows``) must match the layout; it maps exactly onto per-worker rows
+          (worker ``w`` has served ``len(range(w, batches_in_epoch, num_workers)) *
+          per_rank_batch`` rows, every rank in the cursor's epoch). A token-mode cursor in a
+          sequence-mode run raises ``ValueError`` (per-worker counts are not batch multiples
+          and ranks may be in different epochs).
 
         Args:
             state: The trainer state dict returned by
@@ -1961,10 +1986,13 @@ class Trainer:
                 message only).
 
         Raises:
-            ValueError: The cursor's layout disagrees with the live run, or it is a token-mode
-                cursor in a sequence-mode run, and ``resume_data_position`` is true.
+            ValueError: The cursor's layout disagrees with the live run (only the seed, for a
+                token-mode cursor in token mode), it is a token-mode cursor in a sequence-mode
+                run, or it would reshard a mix without per-source positions, and
+                ``resume_data_position`` is true.
         """
-        from oplm.data import DataCursor
+        from oplm.data import DataCursor, Reshard
+        from oplm.data.config import parse_train_configs
 
         cursor_dict = state.get("cursor")
         if cursor_dict is None:
@@ -1996,14 +2024,18 @@ class Trainer:
                 "train.resume_data_position=false."
             )
         # Rows per worker depend only on the striping (world size, workers, seed); in token mode
-        # the batch size can change at a resume without moving the position.
+        # the batch size can change at a resume without moving the position, and a token-mode
+        # cursor reshards onto another world size or worker count.
+        world_size, num_workers = self.accelerator.num_processes, self._effective_num_workers()
         live_layout: dict[str, int] = {
-            "world_size": self.accelerator.num_processes,
-            "num_workers": self._effective_num_workers(),
+            "world_size": world_size,
+            "num_workers": num_workers,
             "seed": self.cfg.train.seed,
         }
         if not self._token_mode:
             live_layout["per_rank_batch"] = self.cfg.train.batch_size
+        elif cursor.worker_rows is not None:
+            del live_layout["world_size"], live_layout["num_workers"]
         mismatches = [
             f"{attr} (checkpoint={getattr(cursor, attr)!r}, live={live_value!r})"
             for attr, live_value in live_layout.items()
@@ -2042,12 +2074,59 @@ class Trainer:
                     cursor.per_rank_batch,
                 )
             assert cursor.rank_epochs is not None and cursor.worker_rows is not None
-            rank = self.accelerator.process_index
-            self.epoch = cursor.rank_epochs[rank]
+            dataset: Any = self._top_level_dataset()  # a TokenBatcher
+            self._reshards = [Reshard(**event) for event in cursor.reshards]
+            if (cursor.world_size, cursor.num_workers) == (world_size, num_workers):
+                rank = self.accelerator.process_index
+                self.epoch = cursor.rank_epochs[rank]
+                self._worker_rows = list(cursor.worker_rows[rank])
+                dataset.set_reshards(self._reshards)
+                dataset.set_resume_rows(cursor.worker_rows[rank])
+                if cursor.worker_sources is not None:
+                    self._worker_sources = list(cursor.worker_sources[rank])
+                    dataset.set_resume_sources(cursor.worker_sources[rank])
+            else:
+                if (
+                    cursor.worker_sources is None
+                    and len(parse_train_configs(self.cfg.data.train)) > 1
+                ):
+                    raise ValueError(
+                        f"Checkpoint {checkpoint_dir}'s data cursor has no per-source positions "
+                        "(saved before they were recorded), so it cannot reshard a data.train "
+                        f"mix from {cursor.world_size} ranks x {cursor.num_workers} workers to "
+                        f"{world_size} x {num_workers}. Resume at the checkpoint's layout, or set "
+                        "train.resume_data_position=false to restart the epoch's data position "
+                        "from row 0."
+                    )
+                self._reshards.append(
+                    Reshard(
+                        stride=cursor.world_size * cursor.num_workers,
+                        epochs=[e for e in cursor.rank_epochs for _ in range(cursor.num_workers)],
+                        rows=[n for rows in cursor.worker_rows for n in rows],
+                        sources=(
+                            None
+                            if cursor.worker_sources is None
+                            else [s for sources in cursor.worker_sources for s in sources]
+                        ),
+                    )
+                )
+                # Every new stream starts from row 0 of what the old streams left.
+                self.epoch = min(cursor.rank_epochs)
+                dataset.set_reshards(self._reshards)
+                logger.info(
+                    "Resharding the data cursor of %s: %d streams (%d ranks x %d workers) -> %d "
+                    "(%d x %d), starting at epoch %d.",
+                    checkpoint_dir,
+                    cursor.world_size * cursor.num_workers,
+                    cursor.world_size,
+                    cursor.num_workers,
+                    world_size * num_workers,
+                    world_size,
+                    num_workers,
+                    self.epoch,
+                )
             self._set_dataset_epoch(self.epoch)
             self._epoch_at_last_opt_step = self.epoch
-            self._worker_rows = list(cursor.worker_rows[rank])
-            self._top_level_dataset().set_resume_rows(cursor.worker_rows[rank])  # ty: ignore[unresolved-attribute]
             return
 
         self._batches_in_epoch = cursor.batches_in_epoch

@@ -6,10 +6,14 @@ import json
 import os
 import subprocess
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 
+from tests.data.conftest import write_sequence_shards
+from tests.training._token_resume_worker import patch_for_recording, record_batches
 from tests.training.conftest import FullRecordingCallback, tiny_train_cfg
 from tests.training.test_e2e_data_exact import _force_keep_sequence_ids, _wrap_recorder
 
@@ -25,6 +29,60 @@ def _run(cfg, callbacks=None):  # noqa: ANN001, ANN202
     recorder = _wrap_recorder(trainer)
     trainer.train()
     return trainer, recorder
+
+
+Records = list[dict]  # type: ignore[type-arg]  # one {"epoch", "ids"} per batch
+
+
+@pytest.fixture
+def mix_train(training_parquet: Path, tmp_path: Path) -> dict[str, dict[str, object]]:
+    """A 2-source ``data.train`` mix: 16 and 32 distinct real rows, half the draws each."""
+    table = pq.read_table(training_parquet, columns=["sequence_id", "sequence"])
+    records = list(zip(*(table.column(c).to_pylist() for c in table.column_names), strict=True))
+    mix: dict[str, dict[str, object]] = {}
+    for name, rows in (("a", records[:16]), ("b", records[16:48])):
+        (tmp_path / name).mkdir()
+        write_sequence_shards(tmp_path / name, rows, id_prefix=f"{name}:")
+        mix[name] = {"path": str(tmp_path / name), "fraction": 0.5}
+    return mix
+
+
+def _cfg(run_dir: Path, data: Path | dict[str, object], **kwargs: object):  # noqa: ANN202
+    """``tiny_train_cfg`` for a parquet path or a ``data.train`` mix mapping."""
+    cfg = tiny_train_cfg(run_dir, data if isinstance(data, Path) else Path("mix"), **kwargs)  # type: ignore[arg-type]
+    if not isinstance(data, Path):
+        cfg.data.train = data
+    return cfg
+
+
+def _run_recorded(cfg):  # noqa: ANN001, ANN202
+    from oplm.training.trainer import Trainer
+
+    trainer = Trainer(cfg, callbacks=[])
+    records = record_batches(trainer)
+    trainer.train()
+    return trainer, records
+
+
+def _assert_finished_epochs_exact(phases: list[list[Records]], ids: set[str] | None = None) -> None:
+    """Each epoch every rank of the last phase got past serves each id exactly once overall.
+
+    ``phases`` holds, per phase, each rank's records. A mix's ids carry their source pass
+    (``patch_for_recording``), so for a mix this is "exact per source pass": no row twice in one
+    pass. With ``ids`` (a single source, ``drop_last=false``), every id is also served.
+    """
+    finished = min(max(r["epoch"] for r in records) for records in phases[-1])
+    assert finished > 0, "no epoch finished"
+    served: defaultdict[int, Counter[str]] = defaultdict(Counter)
+    for ranks in phases:
+        for records in ranks:
+            for record in records:
+                served[record["epoch"]].update(record["ids"])
+    for epoch in range(finished):
+        repeated = [sid for sid, n in served[epoch].items() if n > 1]
+        assert not repeated, (epoch, repeated)
+        if ids is not None:
+            assert set(served[epoch]) == ids, epoch
 
 
 def _interrupt_and_resume(
@@ -170,22 +228,87 @@ def test_resume_token_cursor_into_sequence_mode_raises(
         Trainer(resumed, callbacks=[])
 
 
-def test_token_resume_rejects_a_changed_worker_count(
-    training_parquet: Path, tmp_path: Path
+def test_token_resume_restripes_a_changed_worker_count(
+    mix_train: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    patch_for_recording(monkeypatch)
+    run_dir = tmp_path / "run"
+    budget = dict(tokens_per_step=128, batch_tokens=128, drop_last=False, **TOKEN)
+    _, rec1 = _run_recorded(
+        _cfg(run_dir, mix_train, max_steps=10, save_every=10, save_final=False, **budget)
+    )
+    state = json.loads((run_dir / "checkpoint-10" / "trainer_state.json").read_text())
+    assert state["cursor"]["num_workers"] == 1 and state["cursor"]["rank_epochs"] == [0]
+    assert state["cursor"]["worker_sources"][0][0] is not None
+    run2, rec2 = _run_recorded(
+        _cfg(
+            run_dir,
+            mix_train,
+            max_steps=60,
+            save_final=False,
+            auto_resume=True,
+            num_workers=2,
+            **budget,
+        )
+    )
+    assert run2.epoch >= 2
+    _assert_finished_epochs_exact([[rec1], [rec2]])
+
+
+def test_same_layout_resume_after_a_reshard(
+    mix_train: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_for_recording(monkeypatch)
+    run_dir = tmp_path / "run"
+    budget = dict(tokens_per_step=128, batch_tokens=128, drop_last=False, **TOKEN)
+    _, rec1 = _run_recorded(
+        _cfg(run_dir, mix_train, max_steps=10, save_every=10, save_final=False, **budget)
+    )
+    two = dict(num_workers=2, auto_resume=True, **budget)
+    # Phase 2 (resharded to 2 workers) saves while still in epoch 0, so the event is kept.
+    _, rec2 = _run_recorded(
+        _cfg(run_dir, mix_train, max_steps=16, save_every=16, save_final=False, **two)
+    )
+    cursor = json.loads((run_dir / "checkpoint-16" / "trainer_state.json").read_text())["cursor"]
+    assert cursor["rank_epochs"] == [0] and len(cursor["reshards"]) == 1
+    assert cursor["reshards"][0]["stride"] == 1
+    run3, rec3 = _run_recorded(_cfg(run_dir, mix_train, max_steps=60, save_final=True, **two))
+    assert run3.epoch >= 2
+    _assert_finished_epochs_exact([[rec1], [rec2], [rec3]])
+    # Pruned once every rank is past the epochs it applies to.
+    final = json.loads((run_dir / "checkpoint-60" / "trainer_state.json").read_text())["cursor"]
+    assert final["reshards"] == []
+
+
+def test_token_resume_rejects_a_changed_seed(training_parquet: Path, tmp_path: Path) -> None:
     from oplm.training.trainer import Trainer
 
     run_dir = tmp_path / "run"
     budget = dict(tokens_per_step=256, batch_tokens=256, **TOKEN)
     Trainer(tiny_train_cfg(run_dir, training_parquet, max_steps=2, **budget), callbacks=[]).train()
     resumed = tiny_train_cfg(
-        run_dir, training_parquet, max_steps=4, auto_resume=True, num_workers=2, **budget
+        run_dir, training_parquet, max_steps=4, auto_resume=True, seed=7, **budget
     )
-    with pytest.raises(ValueError, match="num_workers"):
+    with pytest.raises(ValueError, match=r"seed.*resume_data_position=false"):
         Trainer(resumed, callbacks=[])
 
 
-def _launch(worker: Path, *args: str) -> None:
+def test_reshard_of_a_mix_needs_worker_sources(mix_train: dict, tmp_path: Path) -> None:
+    from oplm.training.trainer import Trainer
+
+    run_dir = tmp_path / "run"
+    budget = dict(tokens_per_step=128, batch_tokens=128, **TOKEN)
+    Trainer(_cfg(run_dir, mix_train, max_steps=2, **budget), callbacks=[]).train()
+    state_path = run_dir / "checkpoint-2" / "trainer_state.json"
+    state = json.loads(state_path.read_text())
+    del state["cursor"]["worker_sources"]  # a cursor from before per-source positions
+    state_path.write_text(json.dumps(state))
+    resumed = _cfg(run_dir, mix_train, max_steps=4, auto_resume=True, num_workers=2, **budget)
+    with pytest.raises(ValueError, match="resume_data_position=false"):
+        Trainer(resumed, callbacks=[])
+
+
+def _launch(worker: Path, *args: str, nproc: int = 2) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     pythonpath = os.pathsep.join(
         p for p in (str(repo_root), str(repo_root / "src"), os.environ.get("PYTHONPATH", "")) if p
@@ -201,7 +324,7 @@ def _launch(worker: Path, *args: str) -> None:
             sys.executable,
             "-m",
             "torch.distributed.run",
-            "--nproc_per_node=2",
+            f"--nproc_per_node={nproc}",
             "--rdzv_backend=c10d",
             "--rdzv_endpoint=localhost:0",
             str(worker),
@@ -244,3 +367,50 @@ def test_two_rank_token_resume_with_uneven_rollovers(
     for rank in range(2):
         resumed = [r["ids"] for r in load("first", rank) + load("second", rank)]
         assert resumed == [r["ids"] for r in control[rank]], rank
+
+
+# Checkpoint steps where the two ranks are in different epochs (one of them mid-epoch) at width
+# 256 and drop_last=false: single source, rank 0 in epoch 4 and rank 1 in 5; mix, the reverse.
+_STRADDLE_STOP = {"single": 19, "mix": 20}
+
+
+@pytest.mark.parametrize(
+    ("first_nproc", "second_nproc", "kind"),
+    [
+        (2, 1, "single"),
+        (2, 1, "mix"),
+        # A larger world size needs RNG sidecars for the new ranks (#63, Task 4).
+        pytest.param(1, 2, "single", marks=pytest.mark.xfail(strict=True)),
+    ],
+)
+def test_two_rank_token_reshard(
+    tiny_training_parquet: Path,
+    mix_train: dict,
+    tmp_path: Path,
+    first_nproc: int,
+    second_nproc: int,
+    kind: str,
+) -> None:
+    worker = Path(__file__).with_name("_token_resume_worker.py")
+    out = tmp_path / "out"
+    out.mkdir()
+    total, stop = 40, _STRADDLE_STOP[kind]
+    data = str(tiny_training_parquet) if kind == "single" else json.dumps(mix_train)
+    run = str(tmp_path / "interrupt")
+    for phase, nproc in (("first", first_nproc), ("second", second_nproc)):
+        _launch(worker, run, data, str(out), phase, str(total), str(stop), "false", nproc=nproc)
+
+    cursor = json.loads(
+        (tmp_path / "interrupt" / f"checkpoint-{stop}" / "trainer_state.json").read_text()
+    )["cursor"]
+    if first_nproc == 2:
+        # The straddle: the old ranks were in different epochs at the checkpoint.
+        assert cursor["rank_epochs"][0] != cursor["rank_epochs"][1]
+    phases = [
+        [json.loads((out / f"{phase}-rank{r}.json").read_text()) for r in range(nproc)]
+        for phase, nproc in (("first", first_nproc), ("second", second_nproc))
+    ]
+    ids = None
+    if kind == "single":
+        ids = set(pq.read_table(tiny_training_parquet).column("sequence_id").to_pylist())
+    _assert_finished_epochs_exact(phases, ids)

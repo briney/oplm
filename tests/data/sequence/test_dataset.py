@@ -328,6 +328,8 @@ def test_data_cursor_loads_old_dicts() -> None:
     }
     cursor = DataCursor(**old)
     assert cursor.rank_epochs is None and cursor.worker_rows is None
+    assert cursor.worker_sources is None and cursor.reshards == []
+    assert cursor.data_fingerprint is None
 
 
 def test_data_cursor_round_trips_token_fields() -> None:
