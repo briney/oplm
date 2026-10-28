@@ -344,3 +344,37 @@ def test_data_cursor_round_trips_token_fields() -> None:
         worker_rows=[[4, 5], [0, 2]],
     )
     assert DataCursor(**asdict(cursor)) == cursor
+
+
+# --------------------------------------------------------------------------- #
+# train_data_fingerprint
+# --------------------------------------------------------------------------- #
+
+
+def test_fingerprint_ignores_location(sequence_shards: Path, tmp_path: Path) -> None:
+    import shutil
+
+    from oplm.data import train_data_fingerprint
+
+    copy = tmp_path / "copy"
+    shutil.copytree(sequence_shards, copy)
+    assert train_data_fingerprint(str(sequence_shards)) == train_data_fingerprint(str(copy))
+
+
+def test_fingerprint_sees_content_and_fraction(tmp_path: Path) -> None:
+    from oplm.data import train_data_fingerprint
+
+    records = [(f"id{i}", "ACDEFGHIKLMNPQRSTVWY"[: 5 + i]) for i in range(10)]
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    write_sequence_shards(a, records, n_shards=1)
+    write_sequence_shards(b, [*records[1:], records[0]], n_shards=1)
+    assert train_data_fingerprint(str(a)) != train_data_fingerprint(str(b))
+    one = train_data_fingerprint(
+        {"x": {"path": str(a), "fraction": 0.5}, "y": {"path": str(b), "fraction": 0.5}}
+    )
+    two = train_data_fingerprint(
+        {"x": {"path": str(a), "fraction": 0.25}, "y": {"path": str(b), "fraction": 0.75}}
+    )
+    assert one != two

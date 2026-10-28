@@ -12,11 +12,12 @@ happens later, in the collator (``data/sequence/collate.py``). Rows are yielded 
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -42,6 +43,27 @@ _WEIGHTS_COLUMN = "masking_weights"
 _PHI = 0x9E3779B97F4A7C15  # golden-ratio mix
 _PRIME = 0x0100_0003
 _MASK32 = 0xFFFF_FFFF
+
+
+def train_data_fingerprint(raw_train: Any) -> str:
+    """Hex sha256 identifying the training data by content, not location.
+
+    Hashes each ``data.train`` entry's fraction and the raw parquet footer of each of its
+    shards (row counts, row-group layout, statistics), in config order then shard order.
+    The same shards at another path hash equal; a re-cut or reordered set does not.
+    """
+    from oplm.data.config import parse_train_configs
+
+    h = hashlib.sha256()
+    for entry in parse_train_configs(raw_train):
+        h.update(repr(entry.fraction).encode())
+        for shard in ShardedProteinDataset._discover_shards(Path(entry.path)):
+            with shard.open("rb") as f:
+                f.seek(-8, os.SEEK_END)
+                n = int.from_bytes(f.read(4), "little")
+                f.seek(-8 - n, os.SEEK_END)
+                h.update(f.read(n))
+    return h.hexdigest()
 
 
 def _epoch_seed(base: int, epoch: int) -> int:

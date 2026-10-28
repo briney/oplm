@@ -397,7 +397,7 @@ Each published checkpoint is a full checkpoint directory, not just weights:
 | `hf_ema/` and `ema.pt` | The EMA export and tracker, when the run set `train.ema_decay`. |
 | DCP shards and `.metadata` | Model and optimizer state, including Muon's moments, and the LR scheduler. |
 | `rng_state_<rank>.pt` | Per-rank RNG state. |
-| `trainer_state.json` | Step, epoch, samples and tokens seen, and the **data cursor**: the epoch, batches consumed, and the layout it was recorded under (world size, worker count, per-rank batch size, seed). In token mode it also holds each rank's epoch, each worker's rows (and, for a mix, each source's pass and offset), and any reshard events from earlier layout changes. |
+| `trainer_state.json` | Step, epoch, samples and tokens seen, and the **data cursor**: the epoch, batches consumed, and the layout it was recorded under (world size, worker count, per-rank batch size, seed). In token mode it also holds each rank's epoch, each worker's rows (and, for a mix, each source's pass and offset), and any reshard events from earlier layout changes. It also holds a fingerprint of the training data, which `branch_from` compares by content. |
 | `config.yaml` | The resolved run config the checkpoint was written under. |
 
 The data cursor counts rows into the shard layout of the training set the run read, so it is
@@ -497,12 +497,13 @@ trailing decay step is harmless.
   This is what lets a requeued branch job continue as a plain resume of itself.
 - `max_steps` must exceed the checkpoint's step. All other config (model geometry, data
   layout) must match the checkpoint, exactly as for a resume.
-- The data cursor is restored only when `data.train` equals the checkpoint's `data.train`
-  exactly, as written: every source name, fraction and path, absolute paths included. The same
-  data at a different path counts as different. For a downloaded checkpoint, put the training set
-  at the paths its `config.yaml` names (mirror or symlink them). Any difference, including a
-  different mix (the production decay-phase case), restarts the stream at row 0 of the current
-  epoch with a warning. A kept cursor follows the same layout rules as a resume
+- The data cursor is restored only when the training data matches the checkpoint's **by
+  content**: the cursor records a fingerprint (a hash of each source's fraction and each shard's
+  parquet footer, in config order), and the branch compares it with the live one. The same data at
+  a different path, or a renamed source, keeps the cursor. A different mix, a different fraction
+  or a re-cut shard set (the production decay-phase case) restarts the stream at row 0 of the
+  current epoch with a warning. A checkpoint saved before fingerprints existed is compared by
+  `data.train` as written, paths included. A kept cursor follows the same layout rules as a resume
   ([Resuming on different hardware](#resuming-on-different-hardware)).
 
 The branch gets its own W&B run; `train/lr` (Muon) and `train/lr_adamw` show the live
@@ -546,10 +547,6 @@ files. At a *larger* one, each rank past the checkpoint's sidecar count is resee
 `train.seed + rank` and a warning is logged. The environment variable `OPLM_ALLOW_MISSING_RNG=1`
 only applies to a sidecar missing below the count (or a checkpoint with none): it starts that
 rank's RNG fresh instead of raising.
-
-A branch has one more limit: it keeps the cursor only when `data.train` matches the checkpoint's
-config as written, paths included ([Rules](#rules)). The check does not compare the data itself,
-so the same training set at a new path loses the cursor. Mirror or symlink the original paths.
 
 ---
 

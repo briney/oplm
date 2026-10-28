@@ -260,12 +260,13 @@ class Trainer:
         from rich.console import Console
 
         from oplm.config import validate_parallelism_compat, validate_token_batching
-        from oplm.data import DeviceDataLoader
+        from oplm.data import DeviceDataLoader, train_data_fingerprint
         from oplm.training.optim import build_optimizers, build_schedulers
         from oplm.training.preflight import run_preflight
         from oplm.training.task import MLMTask
 
         self.cfg = cfg
+        self._data_fingerprint = train_data_fingerprint(cfg.data.train)
         self.callbacks = list(callbacks or [])
         # Objective-specific model/data/step (docs/training.md, "Training tasks"). The default
         # reproduces MLM training exactly; fold stages pass FoldTask (milestone 2).
@@ -1654,6 +1655,7 @@ class Trainer:
             worker_rows=worker_rows,
             worker_sources=worker_sources,
             reshards=reshards,
+            data_fingerprint=self._data_fingerprint,
         )
 
         should_mark_permanent = False
@@ -1869,8 +1871,9 @@ class Trainer:
         the live schedule's λ is then evaluated at the restored step so the very first
         branch step already uses the right LR (LambdaLR only sets it on ``step()``).
 
-        The data cursor is restored only when ``data.train`` matches the checkpoint's
-        config (a different mix invalidates the cursor; the stream then restarts at row 0).
+        The data cursor is restored only when the training data matches the checkpoint's, by
+        content fingerprint (or, for a cursor without one, by ``data.train`` as written). A
+        different mix invalidates the cursor; the stream then restarts at row 0.
         """
         from oplm.config import load_config
         from oplm.training.checkpoint import (
@@ -1914,15 +1917,21 @@ class Trainer:
         self._step_local_samples = 0
 
         config_path = checkpoint_dir / "config.yaml"
-        if config_path.is_file():
-            checkpoint_train = load_config(["--config", str(config_path)]).data.train
-            if checkpoint_train != self.cfg.data.train:
-                logger.warning(
-                    "branch_from: data.train differs from the checkpoint's; dropping its data "
-                    "cursor and starting the stream from row 0 of epoch %d.",
-                    self.epoch,
-                )
-                state.pop("cursor", None)
+        saved = state.get("cursor")
+        saved_fp = saved.get("data_fingerprint") if isinstance(saved, dict) else None
+        if saved_fp is not None:
+            differs = saved_fp != self._data_fingerprint
+        elif config_path.is_file():
+            differs = load_config(["--config", str(config_path)]).data.train != self.cfg.data.train
+        else:
+            differs = False
+        if differs:
+            logger.warning(
+                "branch_from: data.train differs from the checkpoint's; dropping its data "
+                "cursor and starting the stream from row 0 of epoch %d.",
+                self.epoch,
+            )
+            state.pop("cursor", None)
         self._resume_data_cursor(state, str(checkpoint_dir))
 
         logger.info(

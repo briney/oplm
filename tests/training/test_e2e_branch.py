@@ -6,6 +6,7 @@ import logging
 import shutil
 from typing import TYPE_CHECKING
 
+import pyarrow.parquet as pq
 import pytest
 
 from oplm.training.checkpoint import _unwrap_optimizer
@@ -97,7 +98,7 @@ def test_branch_with_different_data_drops_the_cursor(
 
     ckpt = _train_main(training_parquet, tmp_path)
     other_data = tmp_path / "other.parquet"
-    shutil.copy(training_parquet, other_data)
+    pq.write_table(pq.read_table(training_parquet).slice(0, 5), other_data)
 
     cfg = tiny_train_cfg(
         tmp_path / "branch",
@@ -128,3 +129,26 @@ def test_branch_refuses_a_finished_budget(training_parquet: Path, tmp_path: Path
     )
     with pytest.raises(ValueError, match="nothing left to train"):
         Trainer(cfg, callbacks=[])
+
+
+def test_branch_keeps_cursor_for_data_at_a_new_path(
+    training_parquet: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from oplm.training.trainer import Trainer
+
+    ckpt = _train_main(training_parquet, tmp_path)
+    moved = tmp_path / "moved.parquet"
+    shutil.copy(training_parquet, moved)
+
+    cfg = tiny_train_cfg(
+        tmp_path / "branch",
+        moved,
+        max_steps=8,
+        stable_steps=4,
+        branch_from=str(ckpt),
+        **_COMMON,
+    )
+    with caplog.at_level(logging.WARNING):
+        trainer = Trainer(cfg, callbacks=[])
+    assert "data.train differs" not in caplog.text
+    assert trainer._batches_in_epoch > 0

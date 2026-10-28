@@ -16,6 +16,7 @@ from oplm.data.sequence.dataset import (
     InterleavedDataset,
     Reshard,
     ShardedProteinDataset,
+    train_data_fingerprint,
 )
 from oplm.data.sequence.loaders import (
     DeviceDataLoader,
@@ -49,4 +50,5 @@ __all__ = [
     "parse_eval_configs",
     "parse_train_configs",
     "tokenize_and_pad",
+    "train_data_fingerprint",
 ]
