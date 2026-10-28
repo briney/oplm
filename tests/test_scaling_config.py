@@ -46,18 +46,28 @@ def test_scaling_config_schedule_has_a_real_decay_phase() -> None:
 def test_scaling_config_loads_the_fault_tolerance_knobs() -> None:
     """``load_config`` must accept the Task 1.9 fault-tolerance keys in scaling.yaml.
 
-    Regression for the production config gaining ``save_every_minutes``,
-    ``keep_every_n_steps``, and an explicit ``auto_resume: true`` (this config only ever
-    runs under Slurm, via ``oplm slurm generate``) -- and for the ``slurm:`` block, which
+    Regression for the production config gaining ``keep_every_n_steps`` and an explicit
+    ``auto_resume: true`` (this config only ever runs under Slurm, via
+    ``oplm slurm generate``) -- and for the ``slurm:`` block, which
     ``load_config`` tolerates as an unrecognized top-level key, still round-tripping
     alongside them.
     """
     cfg = load_config(["--config", str(_SCALING_CONFIG)])
     train = cfg.train
 
-    assert train.save_every_minutes == 30
-    assert train.keep_every_n_steps == 100_000
+    assert train.keep_every_n_steps == 50_000
     assert train.auto_resume is True
-    assert train.save_total_limit == 3
     # Reserved fields stay untouched by this config -- Phase 4 activates remote sync.
     assert train.remote_checkpoint_uri is None
+
+
+def test_scaling_config_is_the_current_recipe() -> None:
+    """configs/scaling.yaml matches the 170M long run's recipe (W&B oplm-170M-long)."""
+    cfg = load_config(["--config", str(_SCALING_CONFIG), "--preset", "170M"])
+    assert cfg.train.tokens_per_step == 4_194_304
+    assert cfg.data.pack_sequences is True
+    assert cfg.model.max_position_embeddings == 2048
+    assert cfg.model.residual_gate == "none"
+    assert cfg.train.weight_decay_to_init == 0.1
+    assert cfg.train.lr == 0.0063
+    assert cfg.model.packed_attention == "flex"
