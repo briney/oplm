@@ -7,8 +7,8 @@ replacement on top, supporting optional per-residue weighted masking.
 The masking scheme (docs/data.md, Masking) is **dynamic** (RoBERTa-style):
 masks are drawn fresh each call, so the same sequence is masked differently across
 epochs. Evaluation freezes them via ``deterministic=True`` — a per-batch seeded
-generator, *not* a separate collator class (§4.6). All token-id constants are
-derived from the tokenizer (``data/tokenizer.py``), never hardcoded.
+generator, *not* a separate collator class (docs/data.md, Deterministic eval masking). All token-id
+constants are derived from the tokenizer (``data/tokenizer.py``), never hardcoded.
 """
 
 from __future__ import annotations
@@ -398,7 +398,8 @@ class MLMCollator:
         """Reset the per-batch counter so the next call is batch index 0 again.
 
         Only meaningful under ``deterministic=True``, where the per-batch RNG is
-        seeded by ``seed + batch_index`` (§4.6): resetting before a fresh pass
+        seeded by ``seed + batch_index`` (docs/data.md,
+        Deterministic eval masking): resetting before a fresh pass
         makes that pass reproduce the previous one exactly (identical masks),
         which is what makes MLM-eval metrics comparable across training steps. The
         sequence-eval dataloader calls this at the start of each iteration. The

@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 # Default column names (overridable per call). The sequence column matches the
-# sequence modality's convention (docs/data.md, Truncation, padding, packing).
+# sequence modality's convention (docs/data.md, Dataset formats).
 _SEQUENCE_COLUMN = "sequence"
 _LABEL_COLUMN = "label"
 

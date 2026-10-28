@@ -203,7 +203,7 @@ def _resolve_wildtype(
 ) -> str:
     """Resolve the wild-type sequence for one assay.
 
-    Resolution order (the documented accepted sources, §6.1):
+    Resolution order (the documented accepted sources, docs/data.md, Other modalities):
 
     1. An explicit ``override`` (e.g. plumbed from
        ``EvalDatasetEntry.extra["wildtype"]`` / a sidecar) takes precedence.

@@ -104,8 +104,8 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
             (seed, batch size).
 
     Returns:
-        A :class:`~torch.utils.data.DataLoader` yielding the §4.7 batch contract
-        (``input_ids`` / ``attention_mask`` / ``labels``). In token mode
+        A :class:`~torch.utils.data.DataLoader` yielding the batch contract
+        (docs/data.md, Collation) (``input_ids`` / ``attention_mask`` / ``labels``). In token mode
         (``train.batch_tokens`` set) it yields :class:`TokenBatcher`'s fixed
         ``(rows, max_position_embeddings)`` batches instead, with no DataLoader batching.
 
@@ -185,7 +185,8 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
             training builder.
 
     Returns:
-        A :class:`~torch.utils.data.DataLoader` yielding the §4.7 batch contract.
+        A :class:`~torch.utils.data.DataLoader` yielding the batch contract
+        (docs/data.md, Collation).
     """
     dataset = ShardedProteinDataset(
         path,
@@ -214,7 +215,8 @@ class _ResettingDataLoader(DataLoader):  # generic param set at call sites
     """DataLoader that rewinds a deterministic collator at the start of each pass.
 
     The deterministic :class:`MLMCollator` seeds its per-batch RNG from a running
-    batch counter (§4.6); without a rewind, a second pass over the *same* loader
+    batch counter (docs/data.md,
+    Deterministic eval masking); without a rewind, a second pass over the *same* loader
     would continue the counter and draw different masks. Resetting in
     ``__iter__`` — before any worker processes are spawned, so the rewound state
     is what gets pickled to them — makes every pass reproduce the first, which is

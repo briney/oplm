@@ -304,7 +304,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
 
         The shuffle seed is a pure function of ``(seed, epoch)``, so the same
         epoch yields the same order across runs and ranks. The trainer calls this
-        on each epoch boundary (docs/data.md, Why the data is shuffled).
+        on each epoch boundary (docs/data.md, Dataset formats).
 
         Args:
             epoch: Epoch index (0-based).

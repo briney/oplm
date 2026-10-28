@@ -206,22 +206,6 @@ order, so an oversampled source is not replayed as the same sequence of rows. Wi
 rows per epoch and partial batches are dropped, so all ranks run the same number of
 full batches per epoch.
 
-### Why the data is shuffled
-
-Shuffling in the loader is per shard: every rank and worker reads the same shard at
-the same time, so each training batch comes from one shard per source for many
-consecutive steps. That is only iid if each shard is a random sample of its source.
-Data written in a sorted or clustered order (for example, by cluster) must be
-shuffled globally across shards before training.
-
-The late-loss investigation found why: the loss jump at epoch boundaries was
-train-loss flattery, not harder data. Cluster-ordered deepclust70 shards, read in
-lockstep, gave batches of near-duplicate sequences, so training loss in the first
-epoch was flattered and then jumped when the order changed. It was resolved by
-replacing deepclust70 `train/` with a globally shuffled copy (2026-10-20). The full
-record is
-[LATE_LOSS_INVESTIGATION.md](https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LATE_LOSS_INVESTIGATION.md).
-
 ## Tokenizer
 
 `OplmTokenizerFast` (`src/oplm/model/tokenization_oplm.py`) is a 33-token
@@ -243,7 +227,9 @@ the model's embedding table expects. Every downstream constant (`mask_token_id`,
 `pad_token_id`, `non_maskable_ids`, the canonical-AA set) is derived from the live
 tokenizer instance, never hardcoded (`src/oplm/data/tokenizer.py`). The canonical-AA
 set is also the random-replacement pool for masking and the masked-marginal scoring
-pool for eval.
+pool for eval. An earlier data-side tokenizer defined a different, off-by-one
+vocabulary (its IDs did not match the model's embedding rows) and was removed;
+`tests/data/test_tokenizer.py` checks every derived constant against the live tokenizer.
 
 Per-residue features (such as masking weights) follow the same truncation,
 `<cls>`/`<eos>` insertion and padding as `input_ids` via `align_per_residue`
@@ -379,3 +365,19 @@ below only load. See [EVAL_HARNESS.md](EVAL_HARNESS.md).
   column(s). Per-residue labels are aligned to non-special positions and padded
   with `-100`; sequence-level labels are one scalar (regression) or class index
   (classification) per sequence.
+
+## Why the data is shuffled
+
+Shuffling in the loader is per shard: every rank and worker reads the same shard at
+the same time, so each training batch comes from one shard per source for many
+consecutive steps. That is only iid if each shard is a random sample of its source.
+Data written in a sorted or clustered order (for example, by cluster) must be
+shuffled globally across shards before training.
+
+The late-loss investigation found why: the loss jump at epoch boundaries was
+train-loss flattery, not harder data. Cluster-ordered deepclust70 shards, read in
+lockstep, gave batches of near-duplicate sequences, so training loss in the first
+epoch was flattered and then jumped when the order changed. It was resolved by
+replacing deepclust70 `train/` with a globally shuffled copy (2026-10-20). The full
+record is
+[LATE_LOSS_INVESTIGATION.md](https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LATE_LOSS_INVESTIGATION.md).

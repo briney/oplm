@@ -183,7 +183,7 @@ def test_custom_column_names(tmp_path: Path, real_records: list[Record]) -> None
 
 
 # --------------------------------------------------------------------------- #
-# Label collation contract (§7.3)
+# Label collation contract (docs/data.md, Other modalities)
 # --------------------------------------------------------------------------- #
 
 
