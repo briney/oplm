@@ -151,6 +151,8 @@ def test_pending_markers_present() -> None:
         "docs/reproduce.md": ["#55"],  # decay recipe + expected loss / P@L ranges
     }
     for doc, issues in expect.items():
-        lines = [ln for ln in (REPO / doc).read_text().splitlines() if ln.startswith(PENDING)]
+        # each marker is its blockquote: the Pending line plus the consecutive ">" lines after it
+        text = (REPO / doc).read_text()
+        markers = re.findall(rf"^{re.escape(PENDING)}.*(?:\n>.*)*", text, re.MULTILINE)
         for issue in issues:
-            assert any(issue in ln for ln in lines), f"{doc}: no Pending marker for {issue}"
+            assert any(issue in m for m in markers), f"{doc}: no Pending marker for {issue}"

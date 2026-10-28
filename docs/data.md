@@ -339,7 +339,8 @@ The sequence-eval builder also turns shard and row shuffling off.
 The sequence path above is the pretraining substrate. Three further modalities
 reuse the canonical tokenizer (via `tokenize_and_pad`, **no masking**) and feed
 the eval harness. The harness owns task logic, scoring and metrics; the loaders
-below only load. See [evaluation.md](evaluation.md), *Tasks and metrics*.
+below only load. The harness gets all its data through `oplm.data`; there is no
+`src/oplm/eval/data/`. See [evaluation.md](evaluation.md), *Tasks and metrics*.
 
 - **Structure** (`src/oplm/data/structure/`): parses `*.pdb`/`*.cif`/`*.ent`/
   `*.mmcif` with BioPython into `StructureData` (`name`, `sequence`, `coords`

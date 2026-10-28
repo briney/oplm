@@ -6,8 +6,8 @@ One open project, two models:
   and per-protein embeddings, plus amino-acid logits.
 - **OPLMFold** predicts protein structure on top of OPLM.
 
-Everything is open: the weights, the exact training data and how it was built, and the full
-training recipe.
+Everything is open, as it is published: the weights, the exact training data and how it was
+built, and the full training recipe.
 
 ## Install
 
@@ -26,7 +26,8 @@ once it is ready.
 import torch
 from oplm import LogitsConfig, OplmForMaskedLM
 
-# Placeholder name until checkpoints are published: use a local save_pretrained directory.
+# Placeholder: this name does not work yet. Until checkpoints are published,
+# point at a local model directory.
 model = OplmForMaskedLM.from_pretrained("brineylab/oplm-170M").eval()
 
 sequences = ["MSHHWGYGKHNGPEHWHKDFPIAKGERQSPVDIDTHTAKYDPSLKPLSVSYDQATSLRIL", "MEEPQSDPSVEPPLSQ"]
@@ -80,7 +81,8 @@ Coming:
 
 ## Training and reproducing
 
-The training data, configs and recipe are all published, so you can retrain OPLM yourself.
+The configs and recipe are in this repo, and the exact training data and checkpoints will be
+published too (some steps are still pending), so you can retrain OPLM yourself.
 [docs/reproduce.md](docs/reproduce.md) walks through it in order, from data to evaluation.
 Training at full scale needs a multi-node GPU cluster. Starting from a published checkpoint, for
 example to try a different decay phase, is much cheaper and has its own section there. OPLMFold
@@ -94,7 +96,8 @@ described in [docs/architecture.md](docs/architecture.md). Contributors start wi
 
 ## Citation
 
-A citation is coming. Until then, please cite this repository.
+A paper is coming. Until then, cite the repository URL, https://github.com/briney/oplm, and the
+commit you used.
 
 ## License
 

@@ -92,8 +92,17 @@ The definitions live in `src/oplm/model/outputs.py`.
 
 ## Per-protein embeddings
 
-For one fixed-size vector per sequence, run the backbone (`OplmModel`) and pool over the residue
-dimension. `mean_pool` is mask-aware, so padding does not dilute the average:
+For one fixed-size vector per sequence, average each sequence's residues from `out.embeddings`
+(the previous section). This leaves out `<cls>`, `<eos>` and padding:
+
+```python
+per_protein = torch.stack(
+    [out.embeddings[i, 1 : 1 + len(s)].mean(0) for i, s in enumerate(sequences)]
+)  # (B, hidden_size)
+```
+
+Alternatively, run the backbone (`OplmModel`) and pool with `mean_pool`. It is mask-aware, so
+padding does not dilute the average, but the mean includes `<cls>` and `<eos>` (see below):
 
 ```python
 from oplm import OplmModel
@@ -108,14 +117,14 @@ with torch.no_grad():
         attention_mask=batch["attention_mask"],
     ).last_hidden_state                                  # (B, T, hidden_size)
 
-per_protein = mean_pool(hidden, batch["attention_mask"])  # (B, hidden_size)
+pooled = mean_pool(hidden, batch["attention_mask"])  # (B, hidden_size)
 ```
 
 Loading the backbone from a masked-LM checkpoint prints a load report listing the `lm_head.*` weights as
 `UNEXPECTED`. That is expected: the backbone has no head.
 
-The mean includes the `<cls>` and `<eos>` positions, which the attention mask counts as real
-tokens. If you want residues only, use the `out.embeddings` slice from the previous section instead.
+The `mean_pool` average includes the `<cls>` and `<eos>` positions, which the attention mask counts
+as real tokens, so it differs slightly from the residue-only mean above.
 `oplm.model` also exports `cls_pool`, which returns the `<cls>` vector (position 0) instead.
 
 Pass the attention mask whenever you call the model yourself. Without it, pad tokens are treated
