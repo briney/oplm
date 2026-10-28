@@ -228,7 +228,8 @@ def _write_scaler_sidecar(tmp_dir: Path, accelerator: Accelerator) -> None:
     persist, so only the main process needs to write it.
 
     A no-op when ``accelerator.scaler`` is ``None`` (bf16/no mixed precision, the common
-    case for this codebase -- see docs/MUP.md on why fp16 is not the default).
+    case for this codebase -- see docs/training.md, "Troubleshooting", on why fp16 is not
+    the default).
     """
     if accelerator.scaler is None:
         return

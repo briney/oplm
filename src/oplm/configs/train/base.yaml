@@ -1,6 +1,6 @@
 # OPLM default training configuration — loaded by oplm.config.load_config.
 # These are OPLM's opinionated *production* defaults: μP + Muon, with `lr` as the
-# μP base LR (see docs/MUP.md). They intentionally differ from the conservative
+# μP base LR (see docs/mup-lr.md). They intentionally differ from the conservative
 # oplm.config.TrainConfig dataclass fallbacks (adamw / lr 1e-4 / match_rms_adamw),
 # which back bare TrainConfig() / direct construction. tests/training/test_config.py
 # checks every key here is a real TrainConfig field (typo guard), not value-equality.
@@ -23,8 +23,8 @@ train:
   optimizer: muon             # adamw | muon
   # μP base learning rate. With μP on (the default; model.mup_enable), this value
   # transfers across model width automatically — do NOT retune it per preset/size.
-  # Tuned at mup_base_width=768 (Muon, adjust_lr_fn=original) via the phased sweep
-  # in docs/LR_SWEEP.md (μP refresh, Oct 2026), at 4M tokens/step (tokens_per_step
+  # Tuned at mup_base_width=768 (Muon, adjust_lr_fn=original) by the μP refresh funnel
+  # in docs/mup-lr.md, "Commands" (Oct 2026), at 4M tokens/step (tokens_per_step
   # 4194304, packed, context 2048) and ranked after an LR decay; confirmed at 800M.
   # LR depends on batch size: retune if you train at a very different batch.
   lr: 0.0063
@@ -123,7 +123,7 @@ train:
   throughput_warmup_steps: 50
   peak_tflops: null   # set device peak (TFLOPs) to log MFU
 
-  # Training-stability diagnostics (deep-model μP debugging; see docs/LR_SWEEP.md).
+  # Training-stability diagnostics (see docs/mup-lr.md, "Stability diagnostics").
   # When true, logs the pre-clip global grad norm every training log and runs an
   # eager diagnostic probe forward (per-depth residual RMS, logit RMS, attention
   # entropy under diag/*) every stability_probe_every log emissions.

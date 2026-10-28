@@ -41,7 +41,7 @@ y = h + a * Norm4(FFN(Norm3(h)))
 
 The last block's output passes one final norm before the head. The optimizer recipe that goes with
 this architecture (Muon plus μP) is in `src/oplm/configs/train/base.yaml` and is described in
-[MUP.md](MUP.md). The ESM-C comparison model is a separate recipe in
+[mup-lr.md](mup-lr.md). The ESM-C comparison model is a separate recipe in
 `src/oplm/configs/train/esm-c.yaml`. It pins pre-norm, full-width QK-norm, `esmc` residual scaling,
 and no gates, value residual or Canon, so default changes never leak into it.
 
@@ -349,7 +349,7 @@ by `sqrt(fan_in multiplier)` (`mup_fanin_mult`). Readout: output logits are scal
 `mup_output_mult / m`. At `hidden_size == mup_base_width` both are identities, so init and forward
 are bit-identical to a non-μP model. The per-group learning rates that complete μP live in the
 trainer. The recipe, the optimizer interplay and the workflow for transferring `train.lr` across
-presets are in [MUP.md](MUP.md). `mup_base_width`, `mup_output_mult` and the train-side multipliers
+presets are in [mup-lr.md](mup-lr.md#recipe). `mup_base_width`, `mup_output_mult` and the train-side multipliers
 are one tuned set, so do not change one without re-validating the others.
 
 ## Initialization and runtime contract

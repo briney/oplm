@@ -223,8 +223,8 @@ Consumed by `OplmForSequenceClassification` / `OplmForTokenClassification`.
 μP makes a learning rate tuned on a small proxy model transfer to much larger
 models without re-sweeping at every scale. It is **on by default** for `oplm train`
 runs (with `train.optimizer=muon`, `train.muon_adjust_lr_fn=original`,
-`train.lr=0.0063`), and a no-op at the base width. See [MUP.md](MUP.md) for the full
-recipe and the tune-once-reuse-`train.lr` workflow, and for the ESM-C comparison
+`train.lr=0.0063`), and a no-op at the base width. See [mup-lr.md](mup-lr.md) for the full
+recipe and the tune-once-reuse-`train.lr` workflow, and for retuning the ESM-C comparison
 recipe (`configs/train/esm-c.yaml`, AdamW-only μP).
 
 > **Run defaults vs. dataclass fallbacks.** The `Default` column below (and in the

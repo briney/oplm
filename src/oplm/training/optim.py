@@ -256,7 +256,7 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
         optimizer plus an auxiliary AdamW optimizer for ``optimizer="muon"``.
     """
     # μP+Muon requires the aspect-ratio-only "original" adjust-lr fn: the default
-    # "match_rms_adamw" scales like √width and breaks LR transfer (see docs/MUP.md).
+    # "match_rms_adamw" scales like √width and breaks LR transfer (see docs/mup-lr.md).
     if (
         cfg.optimizer == "muon"
         and cfg.muon_adjust_lr_fn == "match_rms_adamw"
@@ -265,7 +265,7 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
         raise ValueError(
             "μP with Muon requires muon_adjust_lr_fn='original' (the default; got "
             "'match_rms_adamw', which scales like √width and does not transfer). Set "
-            "train.muon_adjust_lr_fn=original (see docs/MUP.md)."
+            "train.muon_adjust_lr_fn=original (see docs/mup-lr.md)."
         )
 
     param_groups = partition_optimizer_params(model, cfg)

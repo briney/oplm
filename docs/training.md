@@ -16,7 +16,7 @@ Related pages:
 - [data.md](data.md): the training set, dataset formats and the masking scheme.
 - [evaluation.md](evaluation.md): evaluation during training.
 - [architecture.md](architecture.md): the model itself.
-- [MUP.md](MUP.md): μP learning-rate transfer across width (tune `lr` once, reuse at scale).
+- [mup-lr.md](mup-lr.md): μP and the learning-rate method (tune `lr` once, reuse at every width).
 
 > Training builds a **fresh, randomly initialized** `OplmForMaskedLM` from
 > `model.*`. There is no "continue from a pretrained checkpoint" switch on the
@@ -290,12 +290,12 @@ uses.
 See [config.md](config.md#train-fields-train) for every optimizer and scheduler
 field.
 
-**μP learning-rate transfer** — μP + Muon is the **default**, so `train.lr` is the
-μP base LR (`0.01`) and transfers across width: pick any preset and reuse the same
-`lr` — no per-size retuning.
+**μP learning-rate transfer** — μP + Muon is the **default**, so `train.lr` (in
+`src/oplm/configs/train/base.yaml`) is the μP base LR and transfers across width: pick any
+preset and reuse the same `lr` — no per-size retuning.
 
 ```bash
-oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + lr 0.01, by default
+oplm train --preset 1B data.train=/data/uniref50/   # μP + Muon + the base LR, by default
 ```
 
 To train the **ESM-C comparison model** (ESM-C's architecture with AdamW-only μP),
@@ -308,7 +308,8 @@ python -c "import sys; from omegaconf import OmegaConf as O; \
 oplm train --preset 400M --config esmc-run.yaml
 ```
 
-See [MUP.md](MUP.md) for the full recipe, the coord-check gate, and the pilot LR
+See [mup-lr.md](mup-lr.md) for the full recipe, the coordinate-check gate, and how the LR
+was tuned.
 
 ---
 
@@ -495,8 +496,10 @@ trailing decay step is harmless.
 The branch gets its own W&B run; `train/lr` (Muon) and `train/lr_adamw` show the live
 schedule from the first logged step. The worked set of branch experiments for the
 late-loss investigation (decay, AdamW-LR, all-LR, and weight-decay branches, plus the
-WSD branch-point comparison) lives in
-[LATE_LOSS_INVESTIGATION.md](LATE_LOSS_INVESTIGATION.md).
+WSD branch-point comparison) is in
+[LATE_LOSS_INVESTIGATION.md](https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LATE_LOSS_INVESTIGATION.md).
+The decay branches used to rank LR candidates are in
+[mup-lr.md, *Decay every refine cell*](mup-lr.md#decay-every-refine-cell).
 
 ---
 

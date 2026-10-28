@@ -9,7 +9,7 @@ This is the *how-to* for the general layer. Related references:
 
 - [training.md](training.md) — training itself (config, launch, checkpointing).
 - [config.md](config.md) — every `model.*` / `train.*` / `data.*` field.
-- [LR_SWEEP.md](LR_SWEEP.md) — the μP learning-rate sweep, a higher-level tool built on top of
+- [mup-lr.md](mup-lr.md) — the μP learning-rate sweep, a higher-level tool built on top of
   this layer (per-phase job arrays, ranking, resubmission). Nothing on this page requires it.
 - [RECOVERY_TESTS.md](RECOVERY_TESTS.md) — six opt-in failure-injection scripts for testing
   checkpoint rollback, W&B continuity, automatic requeue, and replacement of failed nodes.
@@ -102,7 +102,7 @@ completely before `default` is ever consulted.
 resolves with `phase=None`, meaning only a bare scalar or the `default` table (or its own
 top-level per-preset form) is reachable. The per-phase form exists for phase-aware callers built
 on this layer — e.g. the μP sweep's phase generator, which resolves `nodes`/`time_limit` once per
-named phase (`smoke`, `bridge`, `confirm`, …; see [LR_SWEEP.md](LR_SWEEP.md)). A plain training
+named phase (`smoke`, `refine`, `confirm`, …; see [mup-lr.md, *Commands*](mup-lr.md#commands)). A plain training
 config normally only needs the scalar or per-preset form.
 
 Because `configs/scaling.yaml`'s `nodes` table has no `default`/wildcard entry, `--preset` is
@@ -155,7 +155,7 @@ the function directly. `scaling.yaml` itself sets `max_batch_tokens` (token mode
 sets its own per-device batch directly, the ordinary way (see [training.md](training.md)).
 `max_batch_size` and `resolve_batch_plan` are the mechanism a phase-aware tool built on this layer
 uses to plan `train.batch_size`/`train.gradient_accumulation_steps` *before* writing each job's
-config — the μP sweep's phase generator is the current example (see [LR_SWEEP.md](LR_SWEEP.md));
+config — the μP sweep's phase generator is the current example (see [mup-lr.md](mup-lr.md#sweep-config));
 both fields are part of the general schema so any similar tool can reuse the same derivation.
 
 `oplm.slurm.config.resolve_token_plan(*, global_tokens, world_size, max_batch_tokens, width)` is
@@ -247,7 +247,7 @@ counts) needs one array *per resource shape*, not one array across all of them. 
 generate` only ever emits a single, non-array job per invocation; array-job generation is a
 capability of the `oplm.slurm.render` layer for tools that need to fan a phase of work out across
 many homogeneous cells — the μP sweep's phase generator is the concrete, in-repo example (one
-array per preset, since node count varies by preset there; see [LR_SWEEP.md](LR_SWEEP.md)).
+array per preset, since node count varies by preset there; see [mup-lr.md](mup-lr.md#status-resubmission-and-phase-artifacts)).
 
 A job that needs no GPU at all (e.g. a lightweight post-processing step run after an array
 finishes) can omit `--gres` entirely — `JobSpec.gres` defaults to `True` but can be set `False`.
@@ -476,4 +476,4 @@ ask about, since that would look identical to the job having actually completed.
 
 - [training.md](training.md) — training how-to: config, launch, checkpointing, resume.
 - [config.md](config.md) — full `model.*` / `train.*` / `data.*` reference.
-- [LR_SWEEP.md](LR_SWEEP.md) — the μP learning-rate sweep, built on this layer.
+- [mup-lr.md](mup-lr.md) — the μP learning-rate sweep, built on this layer.

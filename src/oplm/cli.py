@@ -220,10 +220,13 @@ def stream_replay(
 
     Per window: rows, mean sequence length, source mix, and (with --score) masked-token
     loss overall and per data.train source. Comparing windows before and after a loss jump
-    separates harder data from a worse model (docs/LATE_LOSS_INVESTIGATION.md). --compiled
-    adds the loss of the same batches through ``torch.compile`` in train mode with a backward
-    pass (the trainer's step, weights untouched) and its difference from eager; --partial-after
-    feeds the short batches that end an epoch through that compiled step mid-run.
+    separates harder data from a worse model. --compiled adds the loss of the same batches
+    through ``torch.compile`` in train mode with a backward pass (the trainer's step, weights
+    untouched) and its difference from eager; --partial-after feeds the short batches that end
+    an epoch through that compiled step mid-run.
+
+    Background, the late-loss investigation:
+    https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LATE_LOSS_INVESTIGATION.md
     """
     import csv
 

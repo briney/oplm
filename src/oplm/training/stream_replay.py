@@ -5,7 +5,8 @@ layout, so the batches one rank served at any global step can be rebuilt offline
 same resume-skip machinery the trainer uses on requeue. Scoring a *frozen* checkpoint on
 windows before and after an event (an epoch boundary, a loss jump) separates "the data got
 harder" from "the model got worse". Rows are tagged with their source so the loss and the
-mix can be split per ``data.train`` entry. See docs/LATE_LOSS_INVESTIGATION.md.
+mix can be split per ``data.train`` entry. See the late-loss investigation:
+https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LATE_LOSS_INVESTIGATION.md
 """
 
 from __future__ import annotations

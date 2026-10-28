@@ -53,7 +53,7 @@ class TrainConfig:
     # Optimizer.
     # NOTE: these are conservative *library* fallbacks for bare TrainConfig() /
     # direct construction. OPLM's production training default (what `oplm train`
-    # loads) is μP + Muon with lr 0.0035 — see configs/train/base.yaml and docs/MUP.md.
+    # loads) is μP + Muon — see configs/train/base.yaml and docs/mup-lr.md, "Recipe".
     optimizer: str = "adamw"
     lr: float = 1e-4
     min_lr: float = 0.0
@@ -189,7 +189,7 @@ class TrainConfig:
     # Device peak TFLOPs for MFU calculation. None → log achieved TFLOPs only.
     peak_tflops: float | None = None
 
-    # Training-stability diagnostics (deep-model μP debugging; see docs/LR_SWEEP.md).
+    # Training-stability diagnostics (see docs/mup-lr.md, "Stability diagnostics").
     # When True, the Trainer attaches a StabilityDiagnosticsCallback. It logs the
     # pre-clip global grad norm every training log (free, no hooks), and every
     # `stability_probe_every` logs runs one eager diagnostic forward on the

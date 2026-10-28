@@ -66,7 +66,7 @@ src/oplm/                      # main package (src layout)
 │   ├── render.py                # JobSpec -> sbatch script text, submit.sh, job arrays
 │   ├── submit.py                # sbatch/squeue subprocess calls
 │   └── cli.py                   # `oplm slurm generate|submit|status`
-└── sweep/                      # μP learning-rate sweep phases (docs/LR_SWEEP.md), built on slurm/
+└── sweep/                      # μP learning-rate sweep phases (docs/mup-lr.md), built on slurm/
     ├── phases.py                # phase generators (smoke/coarse/.../scale), ranking, analyze/status
     ├── coord_check.py           # μP coordinate-check CLI (`oplm sweep coord-check`)
     ├── run.py                   # trains one resolved sweep cell (`oplm.sweep.run`)

@@ -288,7 +288,7 @@ class Trainer:
         # when max_grad_norm <= 0 (no clip) so the diagnostic simply omits it.
         self._last_grad_norm: torch.Tensor | None = None
 
-        # Opt-in deep-model stability diagnostics (docs/LR_SWEEP.md). Attached
+        # Opt-in stability diagnostics (docs/mup-lr.md, "Stability diagnostics"). Attached
         # here so plain `oplm train ... train.stability_diagnostics=true` runs
         # (the probe/control) get it without a bespoke entry point.
         if cfg.train.stability_diagnostics:

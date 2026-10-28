@@ -470,7 +470,8 @@ class OplmForSequenceClassification(OplmPreTrainedModel, EsmcCompatMixin):
             self.pre_head_norm = nn.Identity()
         self.dropout = nn.Dropout(config.classifier_dropout)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels, bias=True)
-        # μP readout: width-independent init (constant σ, never σ/sqrt(m)). See docs/MUP.md.
+        # μP readout: width-independent init (constant σ, never σ/sqrt(m)).
+        # See docs/mup-lr.md, "Parameterization".
         self.classifier._is_readout = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
         self.tokenizer = None
         self.post_init()
@@ -574,7 +575,8 @@ class OplmForTokenClassification(OplmPreTrainedModel, EsmcCompatMixin):
             self.pre_head_norm = nn.Identity()
         self.dropout = nn.Dropout(config.classifier_dropout)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels, bias=True)
-        # μP readout: width-independent init (constant σ, never σ/sqrt(m)). See docs/MUP.md.
+        # μP readout: width-independent init (constant σ, never σ/sqrt(m)).
+        # See docs/mup-lr.md, "Parameterization".
         self.classifier._is_readout = True  # ty: ignore[unresolved-attribute]  # nn.Module setattr
         self.tokenizer = None
         self.post_init()

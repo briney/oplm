@@ -17,10 +17,10 @@
 #
 #   python -c "import sys; from omegaconf import OmegaConf as O; \
 #     O.save(O.merge(O.load(sys.argv[1]), O.load(sys.argv[2])), sys.argv[3])" \
-#     mup-production.yaml src/oplm/configs/train/esm-c.yaml esmc-production.yaml
+#     my-run.yaml src/oplm/configs/train/esm-c.yaml esmc-run.yaml
 #
-# μP is on (AdamW-only mode, see docs/MUP.md). lr and mup_output_mult are
-# PLACEHOLDERS until the ESM-C μP campaign (docs/LR_SWEEP.md) fills them in.
+# μP is on (AdamW-only mode, see docs/mup-lr.md, "Recipe"). lr and mup_output_mult are
+# PLACEHOLDERS until the ESM-C μP campaign (docs/mup-lr.md, "How to change it") fills them in.
 model:
   num_loops: 1
   loop_strategy: stack
