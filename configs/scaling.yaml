@@ -17,7 +17,6 @@ train:
   # production value comes from the LR-vs-length extrapolation (docs/mup-lr.md).
   lr: 0.0063
   weight_decay_to_init: 0.1
-  mup_depth_lr_exponent: 0
   tokens_per_step: 4194304
   # Per-device micro-batch (170M run: 65536 x 2 accumulation steps x 32 GPUs = tokens_per_step).
   # `oplm slurm generate` re-derives this per preset from slurm.max_batch_tokens.

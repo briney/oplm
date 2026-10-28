@@ -71,3 +71,4 @@ def test_scaling_config_is_the_current_recipe() -> None:
     assert cfg.train.weight_decay_to_init == 0.1
     assert cfg.train.lr == 0.0063
     assert cfg.model.packed_attention == "flex"
+    assert cfg.train.mup_depth_lr_exponent == 0.5
