@@ -1,4 +1,5 @@
-"""G4 — gradient accumulation through the real Trainer (docs/TESTING_E2E.md §5).
+"""G4 — gradient accumulation through the real Trainer (docs/testing.md,
+End-to-end scenario gallery).
 
 With ``gradient_accumulation_steps=4`` the trainer must take exactly one optimizer
 step per four micro-batches, log the mean loss across those micro-batches (not the

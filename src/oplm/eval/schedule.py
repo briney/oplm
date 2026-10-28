@@ -1,4 +1,4 @@
-"""Eval cadence strategies — pure functions of EvalContext. See EVAL_HARNESS.md §4."""
+"""Eval cadence strategies, pure functions of EvalContext. See docs/evaluation.md."""
 
 from __future__ import annotations
 

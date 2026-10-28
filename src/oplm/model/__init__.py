@@ -17,7 +17,7 @@ all registered with the HuggingFace Auto* classes and carrying an ESM-C-style
 conv, attention, transformer, masking) live in their own modules and are
 re-exported here for convenience.
 
-See ``docs/MODEL_ARCHITECTURE.md`` for the full architecture specification.
+See ``docs/architecture.md`` for the full architecture specification.
 """
 
 from __future__ import annotations

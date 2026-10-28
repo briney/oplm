@@ -42,7 +42,8 @@ except ImportError:  # torch < 2.4
 # recompute but cheap to store. Saving these avoids re-running the expensive
 # kernels during the backward recompute, while everything else (norms, SiLU/GELU,
 # RoPE, softmax, dropout, residual scaling, reshapes) is recomputed to free
-# memory. See docs/TRAIN.md for the memory/compute tradeoff rationale.
+# memory. See docs/training.md, "What a training step does", for the memory/compute
+# tradeoff rationale.
 def _build_sac_save_ops() -> frozenset:
     """Collect the ops SAC keeps in memory (matmuls, SDPA backends, FlexAttention).
 
@@ -213,7 +214,7 @@ class OplmBlock(nn.Module):
             kernel_size = kernel_sizes[layer_idx]
             activation = getattr(config, "canon_activation", "none")
             # A acts on the attention pre-norm stream, C on the FFN pre-norm
-            # stream (paper-exact insertion sites; see docs/MODEL_ARCHITECTURE.md).
+            # stream (paper-exact insertion sites; see docs/architecture.md, Canon semantics).
             if "A" in positions:
                 self.conv_a = CanonConv(config.hidden_size, kernel_size, activation=activation)
             if "C" in positions:

@@ -1,4 +1,4 @@
-"""Tests for the downstream loader (Phase 8, docs/DATA_TOOLING.md §7).
+"""Tests for the downstream loader (Phase 8, docs/data.md, Other modalities).
 
 Covers loading labeled-sequence benchmarks from parquet/CSV (per-residue,
 sequence-level regression, sequence-level classification) and the label-collation
@@ -183,7 +183,7 @@ def test_custom_column_names(tmp_path: Path, real_records: list[Record]) -> None
 
 
 # --------------------------------------------------------------------------- #
-# Label collation contract (§7.3)
+# Label collation contract (docs/data.md, Other modalities)
 # --------------------------------------------------------------------------- #
 
 

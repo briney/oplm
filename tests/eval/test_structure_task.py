@@ -1,7 +1,7 @@
 """Structure-eval task tests: a slow end-to-end run plus pure config-parse tests.
 
-The slow test exercises the canonical-tokenizer swap (TODOS.md §4.2) and the
-full categorical-Jacobian P@L path — wildtype + per-mutation forward passes,
+The slow test exercises the canonical-tokenizer swap and
+the full categorical-Jacobian P@L path — wildtype + per-mutation forward passes,
 the ``(L, A, L, A)`` reduction, and precision@L scoring — over real structures.
 """
 

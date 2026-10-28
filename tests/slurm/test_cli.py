@@ -118,7 +118,7 @@ def test_generate_wires_progress_dir_for_the_requeue_wrapper(tmp_path: Path) -> 
     )
     assert result.exit_code == 0, result.stdout
     text = (tmp_path / "oplm-400M.sbatch").read_text()
-    assert 'STEP_FILE="/mnt/home/briney/projects/oplm/scaling/.last_requeue_step"' in text
+    assert 'STEP_FILE="/path/to/oplm-runs/scaling/.last_requeue_step"' in text
 
 
 def test_generate_resolves_a_relative_config_path_to_absolute(

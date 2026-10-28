@@ -9,8 +9,9 @@ The two builders share the same machinery — :class:`ShardedProteinDataset`
 (optionally wrapped in :class:`InterleavedDataset`), an :class:`MLMCollator`, and
 a :class:`~torch.utils.data.DataLoader`. They differ only in *policy*
 parameters: training shuffles and draws fresh masks each epoch, while sequence
-evaluation freezes shuffling and masking for reproducibility (docs/DATA_TOOLING.md
-§9). There is deliberately no separate "eval dataset"/"eval collator" class.
+evaluation freezes shuffling and masking for reproducibility (docs/data.md,
+Deterministic eval masking). There is deliberately no separate "eval dataset"/"eval collator"
+class.
 
 :class:`DeviceDataLoader` wraps the training dataloader in place of
 ``accelerator.prepare`` (see its docstring): the dataset self-shards over
@@ -43,7 +44,7 @@ __all__ = ["DeviceDataLoader", "build_sequence_eval_dataloader", "build_train_da
 # Fixed seed for sequence evaluation. Shuffling is off and masks are frozen, so
 # the seed only needs to be stable run-to-run; decoupling it from
 # ``train.seed`` keeps eval batches identical even when the training seed
-# changes (docs/DATA_TOOLING.md §9.2).
+# changes (docs/data.md, Deterministic eval masking).
 _EVAL_SEED = 42
 
 
@@ -103,8 +104,8 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
             (seed, batch size).
 
     Returns:
-        A :class:`~torch.utils.data.DataLoader` yielding the §4.7 batch contract
-        (``input_ids`` / ``attention_mask`` / ``labels``). In token mode
+        A :class:`~torch.utils.data.DataLoader` yielding the batch contract
+        (docs/data.md, Collation) (``input_ids`` / ``attention_mask`` / ``labels``). In token mode
         (``train.batch_tokens`` set) it yields :class:`TokenBatcher`'s fixed
         ``(rows, max_position_embeddings)`` batches instead, with no DataLoader batching.
 
@@ -175,7 +176,7 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
     Applies the **evaluation policy**: shard/row shuffling disabled and masking
     frozen via ``deterministic=True`` so repeated passes yield byte-identical
     batches. Masking probabilities and DataLoader settings are otherwise shared
-    with training (docs/DATA_TOOLING.md §9.2).
+    with training (docs/data.md, Deterministic eval masking).
 
     Args:
         path: A single ``.parquet`` file or directory of shards to evaluate on.
@@ -184,7 +185,8 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
             training builder.
 
     Returns:
-        A :class:`~torch.utils.data.DataLoader` yielding the §4.7 batch contract.
+        A :class:`~torch.utils.data.DataLoader` yielding the batch contract
+        (docs/data.md, Collation).
     """
     dataset = ShardedProteinDataset(
         path,
@@ -213,7 +215,8 @@ class _ResettingDataLoader(DataLoader):  # generic param set at call sites
     """DataLoader that rewinds a deterministic collator at the start of each pass.
 
     The deterministic :class:`MLMCollator` seeds its per-batch RNG from a running
-    batch counter (§4.6); without a rewind, a second pass over the *same* loader
+    batch counter (docs/data.md,
+    Deterministic eval masking); without a rewind, a second pass over the *same* loader
     would continue the counter and draw different masks. Resetting in
     ``__iter__`` — before any worker processes are spawned, so the rewound state
     is what gets pickled to them — makes every pass reproduce the first, which is

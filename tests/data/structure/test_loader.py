@@ -1,4 +1,4 @@
-"""Tests for the structure loader (Phase 6, docs/DATA_TOOLING.md §5).
+"""Tests for the structure loader (Phase 6, docs/data.md, Other modalities).
 
 Parses a real PDB fixture (crambin, ``1CRN``) into :class:`StructureData` and
 checks the backbone-coordinate contract, modified-residue mapping, missing-atom

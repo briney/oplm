@@ -4,11 +4,11 @@
 :class:`MLMCollator` layers fixed-``k`` Gumbel-top-k masking with BERT 80/10/10
 replacement on top, supporting optional per-residue weighted masking.
 
-The masking scheme (docs/DATA_TOOLING.md §4.5) is **dynamic** (RoBERTa-style):
+The masking scheme (docs/data.md, Masking) is **dynamic** (RoBERTa-style):
 masks are drawn fresh each call, so the same sequence is masked differently across
 epochs. Evaluation freezes them via ``deterministic=True`` — a per-batch seeded
-generator, *not* a separate collator class (§4.6). All token-id constants are
-derived from the tokenizer (``data/tokenizer.py``), never hardcoded.
+generator, *not* a separate collator class (docs/data.md, Deterministic eval masking). All token-id
+constants are derived from the tokenizer (``data/tokenizer.py``), never hardcoded.
 """
 
 from __future__ import annotations
@@ -189,7 +189,7 @@ class MLMCollator:
     """Masked-language-model collator: tokenize/pad, then mask.
 
     Wraps :func:`tokenize_and_pad` and applies the OPLM masking scheme
-    (docs/DATA_TOOLING.md §4.5): per row, a **fixed count**
+    (docs/data.md, Masking): per row, a **fixed count**
     ``k = round(mask_prob * n_eligible)`` of eligible positions is sampled without
     replacement via **Gumbel-top-k**, then the BERT 80/10/10 split decides each
     masked token's replacement (``<mask>`` / random canonical AA / keep original).
@@ -398,7 +398,8 @@ class MLMCollator:
         """Reset the per-batch counter so the next call is batch index 0 again.
 
         Only meaningful under ``deterministic=True``, where the per-batch RNG is
-        seeded by ``seed + batch_index`` (§4.6): resetting before a fresh pass
+        seeded by ``seed + batch_index`` (docs/data.md,
+        Deterministic eval masking): resetting before a fresh pass
         makes that pass reproduce the previous one exactly (identical masks),
         which is what makes MLM-eval metrics comparable across training steps. The
         sequence-eval dataloader calls this at the start of each iteration. The
@@ -430,7 +431,7 @@ class MLMCollator:
         Rows without weights (non-mapping, or ``None``) surface as ``None`` and are
         treated as uniform by :func:`~oplm.data.tokenizer.align_per_residue`. If the
         whole batch lacks weights (column entirely absent), warn once and fall back
-        to uniform masking (docs/DATA_TOOLING.md §4.5.1).
+        to uniform masking (docs/data.md, Masking).
         """
         weights: list[list[float] | None] = []
         any_present = False

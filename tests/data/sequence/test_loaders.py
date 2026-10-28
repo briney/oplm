@@ -1,6 +1,6 @@
 """Tests for the sequence dataloader builders (Phase 5).
 
-Covers the shared §4.7 batch contract, the train/eval policy split (training
+Covers the shared batch contract (docs/data.md, Collation), the train/eval policy split (training
 reshuffles across epochs and draws fresh masks; sequence eval is byte-identical
 across passes and keeps natural order), multi-dataset interleaving, and the
 ``num_workers == 0`` → ``prefetch_factor is None`` DataLoader rule.
@@ -89,7 +89,7 @@ def _originals_in_order(batches: list[dict[str, Tensor]]) -> list[tuple[int, ...
 
 
 def test_train_batch_contract(sequence_shards: Path) -> None:
-    """Train batches expose exactly the §4.7 keys/shapes/dtypes; T ≤ max_seq_len."""
+    """Train batches expose exactly the contract keys/shapes/dtypes; T ≤ max_seq_len."""
     cfg = _make_config(str(sequence_shards))
     cfg.data.drop_last = False  # every row exactly once; drop_last trims the tail
     loader = build_train_dataloader(cfg)
@@ -209,7 +209,7 @@ def test_multi_dataset_wraps_interleaved(
     loader = build_train_dataloader(cfg)
     assert isinstance(loader.dataset, InterleavedDataset)
 
-    # The interleaved loader still produces the §4.7 contract.
+    # The interleaved loader still produces the batch contract (docs/data.md, Collation).
     batch = next(iter(loader))
     assert set(batch) == {"input_ids", "attention_mask", "labels"}
 

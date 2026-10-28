@@ -1,4 +1,7 @@
-"""EMA tracker semantics and config validation (docs/TRAIN.md §16, `train.ema_decay`)."""
+"""EMA tracker semantics and config validation.
+
+See docs/training.md, "Fault tolerance", for `train.ema_decay`.
+"""
 
 from __future__ import annotations
 

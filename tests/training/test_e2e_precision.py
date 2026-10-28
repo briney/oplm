@@ -1,4 +1,4 @@
-"""G5 — mixed-precision training (docs/TESTING_E2E.md §5). CUDA-only.
+"""G5 — mixed-precision training (docs/testing.md, End-to-end scenario gallery). CUDA-only.
 
 Guards the Accelerate autocast / GradScaler path that every fp32 test skips: a
 bf16 and an fp16 run must complete with finite loss, actually reduce eval loss

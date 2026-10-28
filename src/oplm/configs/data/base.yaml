@@ -19,7 +19,7 @@ data:
   # cadence (`every`): exactly one of {steps: N} | {tokens: N}, optional
   # at_start (default false) / at_end (default true); datasets that omit `every`
   # use train.eval_every. Task-specific keys sit at the same level as
-  # `path`/`type`. See docs/EVAL_HARNESS.md §9.
+  # `path`/`type`. See docs/evaluation.md, `data.eval` schema.
   #   eval:
   #     heldout:    { path: /data/eval.parquet, type: sequence, every: { tokens: 20_000_000 } }
   #     structures: { path: /data/pdb, type: structure, every: { steps: 20_000 },
@@ -31,10 +31,10 @@ data:
   # Collation padding: null = pad to batch-longest; N = pad to smallest multiple of N >= batch-longest.
   pad_to_multiple_of: null
   # Training only: pack each batch's sequences into as few max-length rows as fit
-  # (block-diagonal attention, Canon stops at sequence boundaries). See docs/TRAIN.md §14.
+  # (block-diagonal attention, Canon stops at sequence boundaries). See docs/training.md, "Sequence packing".
   pack_sequences: false
 
-  # Sequence masking (see docs/DATA_TOOLING.md §4.5). Probabilities in [0, 1];
+  # Sequence masking (see docs/data.md, Masking). Probabilities in [0, 1];
   # mask_token_prob + random_token_prob <= 1 (the remainder keeps the original token).
   mask_prob: 0.15 # fraction of eligible positions selected for masking
   mask_token_prob: 0.8 # of masked positions -> <mask>

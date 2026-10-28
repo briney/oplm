@@ -1,4 +1,4 @@
-"""G3 — checkpointing, rotation & resume equivalence (docs/TESTING_E2E.md §5).
+"""G3 — checkpointing, rotation & resume equivalence (docs/testing.md, End-to-end scenario gallery).
 
 The first test drives a real run with ``save_every`` + ``save_total_limit`` and
 asserts exactly the expected ``checkpoint-*`` set survives rotation, each carrying

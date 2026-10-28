@@ -1,120 +1,100 @@
-# Production scaling runs. Usable on its own:
-#   oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
+# The production training recipe: the settings of the 170M long run (W&B
+# thebrineylab/oplm-170M-long, run 170M-lr0.0063-long), stated as overrides on top of the
+# packaged defaults (src/oplm/configs/train/base.yaml and the model preset). Token mode: the
+# global batch is train.tokens_per_step; per-device batch and accumulation are derived from
+# slurm.max_batch_tokens. Usable on its own:
+#   oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/170M
 # `oplm sweep scale` merges the confirmed muP winner into this file before generating.
+# Cluster paths, partition and container are placeholders: edit them for your site.
 
 model:
-  max_position_embeddings: 512
-  gradient_checkpointing: true
-  gradient_checkpointing_mode: full
-  norm_strategy: sandwich
-  canon_enabled: true
-  canon_positions: [A, B, C, D]
-  residual_gate: channel
-  mup_enable: true
-  mup_base_width: 768
+  max_position_embeddings: 2048
+  packed_attention: flex
+  residual_gate: none
 
 train:
-  optimizer: muon
-  muon_adjust_lr_fn: original
-  weight_decay: 0.01
-  mup_depth_reference_layers: 24
+  # Tuned at 4M tok/step for 24k steps. PENDING(#55): best LR falls with training length;
+  # production value comes from the LR-vs-length extrapolation (docs/mup-lr.md).
+  lr: 0.0063
+  weight_decay_to_init: 0.1
+  tokens_per_step: 4194304
+  # Per-device micro-batch (170M run: 65536 x 2 accumulation steps x 32 GPUs = tokens_per_step).
+  # `oplm slurm generate` renders this value as-is for every preset; it does not read
+  # slurm.max_batch_tokens (only `oplm sweep` does). For another preset pass
+  # train.batch_tokens=<slurm.max_batch_tokens[preset]> on the generate command line.
+  batch_tokens: 65536
   scheduler: wsd_linear
-  # 5k warmup + 85k stable + 10k decay = 100k max_steps. Keep warmup_steps + stable_steps
-  # strictly less than max_steps -- a 10% decay tail is the repo convention for real training
-  # runs. (The sweep-phase convention of stable_steps = max_steps - warmup_steps is deliberate
-  # for short proxy runs, where it produces NO decay; that convention does not belong here.)
-  max_steps: 100000
-  stable_steps: 85000
-  warmup_steps: 5000
-  save_every: 10000
-  save_total_limit: 3
-  # Also checkpoint every 30 wall-clock minutes (in addition to the save_every step
-  # cadence) so a preemption never loses more than ~30 minutes of progress on a long run.
-  save_every_minutes: 30
-  # Retain a permanent checkpoint every 100k steps, exempt from save_total_limit rotation.
-  keep_every_n_steps: 100000
-  # Explicit here (this config only ever runs under Slurm, via `oplm slurm generate`): resume
-  # from the newest committed checkpoint under output_dir automatically on every restart, so a
-  # requeue after preemption/failure continues training instead of restarting from step 0.
+  # 170M long-run horizon. PENDING(#55): production horizon.
+  # 2k warmup + 248k stable + 50k decay = 300k max_steps. Keep warmup_steps + stable_steps
+  # strictly less than max_steps so the decay phase exists (the sweep-phase convention of
+  # stable_steps = max_steps - warmup_steps is for short proxy runs and does not belong here).
+  max_steps: 300000
+  stable_steps: 248000
+  warmup_steps: 2000
+  save_every: 5000
+  # Retain a permanent checkpoint every 50k steps, exempt from save_total_limit rotation.
+  keep_every_n_steps: 50000
+  # Resume from the newest committed checkpoint under output_dir on every restart, so a
+  # requeue after preemption continues training instead of restarting from step 0.
   auto_resume: true
-  # Additionally mirror every committed checkpoint to remote object storage for durability
-  # beyond /mnt/home (Task 4.2). Uncomment and point at a real bucket/prefix to enable --
-  # requires the `s3` extra for s3:// URIs (`pip install oplm[s3]`) and valid AWS credentials
-  # in the environment (never in this file). Left commented by default: opt in per run.
-  # remote_checkpoint_uri: s3://oplm-checkpoints/scaling
-  # Parallelism strategy (see docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md
-  # §2 and docs/TRAIN.md's "Fault tolerance" knob table for the full memory picture):
-  #   - 6B fits DDP comfortably; 12B fits DDP only barely (~145 GB param+grad+optim states on
-  #     a 180 GB B200 -- no headroom for activations at any real batch size without gradient
-  #     checkpointing). 24-30B does not fit DDP at all (Muon's 12 B/param states put a 30B
-  #     model at ~360 GB, double a single B200's memory) and REQUIRES hsdp.
-  #   - Explicit `ddp` here, not `hsdp`, even though this config is meant to scale up to the
-  #     12B/24-30B range eventually: this config sets `data.eval` (see below), and
-  #     `oplm.config.validate_parallelism_compat` refuses `parallelism=hsdp` together with any
-  #     configured `data.eval` -- in-loop eval under FSDP2 all-gathers on rank-striped forward
-  #     counts and deadlocks (known limitation; the fix is rank-padded forward counts or a
-  #     gathered eval copy of the model, tracked as follow-up work, not yet implemented). A
-  #     24-30B run on this config today must either run eval as a separate ddp job against
-  #     periodic checkpoints (dropping `data.eval` from the training config, then switching
-  #     `parallelism: hsdp`), or wait for that follow-up.
+  # Must be an absolute path on shared storage (all nodes write checkpoints here).
+  output_dir: /path/to/oplm-runs/scaling
   parallelism: ddp
-  eval_every: {steps: 5000}
   compile: true
-  wandb_project: oplm-scaling
-  output_dir: /mnt/home/briney/projects/oplm/scaling
+  compile_dynamic: false
 
 data:
+  pack_sequences: true
   train:
+    # PENDING(#61): paths become the published training-set layout.
+    # Rows, not tokens (0.05 rows ≈ 11% tokens). PENDING(#58): production mix.
     uniref70:
-      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/train
-      fraction: 0.35
-    omg70:
-      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/train
-      fraction: 0.45
-    deepclust30:
-      path: /mnt/data/datasets/plm-training-data/deepclust30-bigg2/train
-      fraction: 0.20
+      path: /path/to/oplm-training-data/uniref70/train
+      fraction: 0.05
+    deepclust70:
+      path: /path/to/oplm-training-data/deepclust70/train
+      fraction: 0.95
   eval:
     uniref70:
-      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/eval.parquet
+      path: /path/to/oplm-training-data/uniref70/eval.parquet
       type: sequence
-    omg70:
-      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/omg70/eval.parquet
-      type: sequence
-    deepclust30:
-      path: /mnt/data/datasets/plm-training-data/deepclust30-bigg2/eval.parquet
-      type: sequence
-    casp14:
-      path: /mnt/data/datasets/plm-training-data/casp/casp14
+      every: {steps: 500}
+    # Structure evals (contact precision@L), published as brineylab/oplm-structure-evals.
+    pdb40:
+      path: /path/to/oplm-structure-evals/pdb40_256
       type: structure
-    proteingym_clinical:
-      path: /mnt/data/datasets/plm-training-data/ProteinGym/eval/clinical_substitutions
-      type: proteingym_clinical
-      scoring: wt_marginals
-      top_k_fraction: 0.1
-    proteingym_dms:
-      path: /mnt/data/datasets/plm-training-data/ProteinGym/eval/dms_substitutions
-      type: proteingym
-      scoring: wt_marginals
-      top_k_fraction: 0.1
+      every: {steps: 5000}
+    pdb40_2048:
+      path: /path/to/oplm-structure-evals/pdb40_2048
+      type: structure
+      every: {steps: 50000}
+    cameo:
+      path: /path/to/oplm-structure-evals/cameo_256
+      type: structure
+      every: {steps: 5000}
+    casp:
+      path: /path/to/oplm-structure-evals/casp15_16
+      type: structure
+      every: {steps: 5000}
 
 slurm:
-  partition: hpc-mid
+  partition: gpu
   time_limit:
     default: "168:00:00"
   cpus_per_task: 128
   gpus_per_node: 8
   exclusive: true
   mem: "0"
-  log_dir: /mnt/home/briney/logs
-  env_file: /mnt/home/briney/.env
-  container_image: /mnt/data/containers/deeplearning_v2026-05-26.sqsh
+  log_dir: /path/to/logs
+  env_file: /path/to/.env
+  container_image: /path/to/deeplearning.sqsh
   container_mounts:
-    - /mnt/data:/mnt/data
+    - /path/to/data:/path/to/data
     - /tmp:/tmp
   install: pip install oplm[train]
   max_concurrent: 4
-  # Requeue budget for the rendered sbatch requeue wrapper -- see docs/SLURM.md §8.
+  # Requeue budget for the rendered sbatch requeue wrapper.
   max_requeues: 20
   nodes: {170M: 4, 400M: 8, 800M: 16, 1B: 16}
-  max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
+  # Per-device micro-batch cap in tokens; the 170M run used 65536 with 2 accumulation steps.
+  max_batch_tokens: {170M: 65536, 400M: 32768, 800M: 16384, 1B: 16384}

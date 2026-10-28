@@ -6,8 +6,8 @@ tokenizer accessor, derived id constants computed from the tokenizer instance,
 and per-residue vector alignment to tokenized ``input_ids``.
 
 All id constants are *derived* from the live tokenizer rather than hardcoded, so
-they can never drift from the model's embedding table (see docs/DATA_TOOLING.md
-§3.3 and the legacy off-by-one vocabulary bug in §3.5). The constant accessors
+they can never drift from the model's embedding table (see docs/data.md, Tokenizer
+and the legacy off-by-one vocabulary bug). The constant accessors
 default to the shared :func:`get_tokenizer` instance but accept an explicit
 tokenizer so the collator can pass the one it already holds.
 """

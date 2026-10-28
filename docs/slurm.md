@@ -1,4 +1,4 @@
-# Running OPLM Training on Slurm
+# Running OPLM training on Slurm
 
 A practical guide to turning an ordinary oplm training config into Slurm job scripts and
 submitting them, using `oplm.slurm` — a general layer with no μP or sweep concepts in it. It
@@ -7,16 +7,16 @@ about the schema is CoreWeave-specific.
 
 This is the *how-to* for the general layer. Related references:
 
-- [TRAIN.md](TRAIN.md) — training itself (config, launch, checkpointing).
-- [CONFIG.md](CONFIG.md) — every `model.*` / `train.*` / `data.*` field.
-- [LR_SWEEP.md](LR_SWEEP.md) — the μP learning-rate sweep, a higher-level tool built on top of
+- [training.md](training.md) — training itself (config, launch, checkpointing).
+- [config.md](config.md) — every `model.*` / `train.*` / `data.*` field.
+- [mup-lr.md](mup-lr.md) — the μP learning-rate sweep, a higher-level tool built on top of
   this layer (per-phase job arrays, ranking, resubmission). Nothing on this page requires it.
-- [RECOVERY_TESTS.md](RECOVERY_TESTS.md) — six opt-in failure-injection scripts for testing
+- [testing.md](testing.md#cluster-recovery-drills) — six opt-in failure-injection scripts for testing
   checkpoint rollback, W&B continuity, automatic requeue, and replacement of failed nodes.
 
 ---
 
-## 1. Overview
+## Overview
 
 Add a `slurm:` block to any oplm training config, then run `oplm slurm generate` to write an
 `sbatch` script for it. `oplm slurm submit` queues the scripts a `generate` call wrote, and
@@ -29,25 +29,25 @@ own saved config, and adding one to `configs/scaling.yaml` changes nothing about
 trains.
 
 ```bash
-oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
+oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M train.batch_tokens=32768
 ```
 
 writes `jobs/400M/oplm-400M.sbatch` plus a small `jobs.json` manifest, ready for `oplm slurm
-submit jobs/400M` (§8 has the full worked example).
+submit jobs/400M` ([`oplm slurm generate`, `submit` and `status`](#oplm-slurm-generate-submit-and-status) has the full worked example).
 
 ---
 
-## 2. The `slurm:` block
+## The `slurm:` block
 
 Every field, its type, and its default (`SlurmConfig` in `src/oplm/slurm/config.py`):
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `partition` | string | *required* | Slurm partition (`#SBATCH --partition`). |
-| `time_limit` | scalar or table | *required* | Wall-clock limit(s). Four accepted forms — §3. |
-| `nodes` | scalar or table | *required* | Node count(s). Same four forms — §3. |
-| `max_batch_size` | map of preset → int | `{}` | Per-preset memory cap on per-device batch, consumed by the batch-plan derivation (§4). |
-| `max_batch_tokens` | map of preset → int | `{}` | Per-preset memory cap on a device's token micro-batch, consumed by the token-mode plan (`resolve_token_plan`, §4). Only token-mode sweeps and token-mode `scale` read it. |
+| `time_limit` | scalar or table | *required* | Wall-clock limit(s). Four accepted forms, see [`nodes` and `time_limit`](#nodes-and-time_limit-four-accepted-forms). |
+| `nodes` | scalar or table | *required* | Node count(s). Same four forms. |
+| `max_batch_size` | map of preset → int | `{}` | Per-preset memory cap on per-device batch, consumed by the batch-plan derivation ([Per-device batch](#per-device-batch-and-gradient-accumulation-are-derived-not-configured)). |
+| `max_batch_tokens` | map of preset → int | `{}` | Per-preset memory cap on a device's token micro-batch, consumed by the token-mode plan (`resolve_token_plan`). Only token-mode sweeps and token-mode `scale` read it. |
 | `log_dir` | path | *required* | Directory for `--output`/`--error` logs. |
 | `env_file` | path | *required* | Shell script `source`d at job start; creates the job's node-local `$JOB_WORK_DIR` and exports object-storage / W&B credentials. |
 | `container_image` | path | *required* | Enroot/Pyxis `.sqsh` container image (`--container-image`). |
@@ -57,34 +57,14 @@ Every field, its type, and its default (`SlurmConfig` in `src/oplm/slurm/config.
 | `cpus_per_task` | positive int | `128` | `--cpus-per-task`. |
 | `mem` | string | `"0"` | `--mem`; the conventional Slurm meaning of `"0"` is "all memory on the node." |
 | `exclusive` | bool | `true` | Whether to pass `--exclusive`. |
-| `max_concurrent` | positive int | `4` | Array-job throttle: rendered as `--array=0-N%max_concurrent` (§6). |
+| `max_concurrent` | positive int | `4` | Array-job throttle: rendered as `--array=0-N%max_concurrent` ([Job arrays](#job-arrays-and-the-homogeneous-resource-constraint)). |
 | `account` | string or null | `null` | Optional `--account` for billing/allocation; omitted from the header when unset. |
-| `max_requeues` | positive int | `20` | Requeue budget consulted by the rendered requeue wrapper — §8. |
+| `max_requeues` | positive int | `20` | Requeue budget consulted by the rendered requeue wrapper, see [Requeue semantics](#requeue-semantics-drain-budget-and-the-no-progress-guard). |
 | `nccl_debug` | string | `"WARN"` | Value exported as `NCCL_DEBUG`. Set `INFO` for verbose rendezvous/topology logging; noisy for routine production runs. |
 
-A minimal, real block — `configs/scaling.yaml`'s own `slurm:` section:
-
-```yaml
-slurm:
-  partition: hpc-mid
-  time_limit:
-    default: "168:00:00"
-  cpus_per_task: 128
-  gpus_per_node: 8
-  exclusive: true
-  mem: "0"
-  log_dir: /mnt/home/briney/logs
-  env_file: /mnt/home/briney/.env
-  container_image: /mnt/data/containers/deeplearning_v2026-05-26.sqsh
-  container_mounts:
-    - /mnt/data:/mnt/data
-    - /tmp:/tmp
-  install: pip install oplm[train]
-  max_concurrent: 4
-  max_requeues: 20
-  nodes: {170M: 4, 400M: 8, 800M: 16, 1B: 16}
-  max_batch_size: {170M: 256, 400M: 256, 800M: 256, 1B: 128}
-```
+The real, working block is the `slurm:` section of [`configs/scaling.yaml`](../configs/scaling.yaml).
+Its partition, paths and container are placeholders to edit for your site. That file is the home
+for the values; this page documents the schema, not a copy of them.
 
 `bool` values are rejected everywhere an int is expected (`gpus_per_node`, `cpus_per_task`,
 `max_concurrent`, every `max_batch_size` entry) even though Python's `bool` is an `int` subclass —
@@ -99,7 +79,7 @@ is why `container_mounts` only needs to list *shared* paths like a data or scrat
 
 ---
 
-## 3. `nodes` and `time_limit`: four accepted forms
+## `nodes` and `time_limit`: four accepted forms
 
 Both fields share one small format (`PhaseTable` in `oplm/slurm/config.py`), because both need to
 vary per model-size preset and, for tools that generate several related jobs, per phase:
@@ -122,7 +102,7 @@ completely before `default` is ever consulted.
 resolves with `phase=None`, meaning only a bare scalar or the `default` table (or its own
 top-level per-preset form) is reachable. The per-phase form exists for phase-aware callers built
 on this layer — e.g. the μP sweep's phase generator, which resolves `nodes`/`time_limit` once per
-named phase (`smoke`, `bridge`, `confirm`, …; see [LR_SWEEP.md](LR_SWEEP.md)). A plain training
+named phase (`smoke`, `refine`, `confirm`, …; see [mup-lr.md, *Commands*](mup-lr.md#commands)). A plain training
 config normally only needs the scalar or per-preset form.
 
 Because `configs/scaling.yaml`'s `nodes` table has no `default`/wildcard entry, `--preset` is
@@ -131,7 +111,7 @@ picking an arbitrary preset.
 
 ---
 
-## 4. Per-device batch and gradient accumulation are derived, not configured
+## Per-device batch and gradient accumulation are derived, not configured
 
 `oplm.slurm.config.resolve_batch_plan(*, global_examples, world_size, max_batch_size)` turns a
 target **global** batch (in examples per optimizer step), a world size, and a per-preset memory
@@ -143,7 +123,7 @@ cap into a `BatchPlan(per_device_batch, gradient_accumulation_steps, world_size)
    *and* `base // accum <= max_batch_size`.
 3. That `accum` is `gradient_accumulation_steps`; `base // accum` is `per_device_batch`.
 
-Node counts are chosen for wall time (§3); per-device batch is a *consequence* of that node count,
+Node counts are chosen for wall time (`nodes`, above); per-device batch is a *consequence* of that node count,
 never configured directly — so a preset can move to more nodes without anyone hand-editing its
 batch size. An **indivisible** configuration (the global batch does not divide evenly by the world
 size at all) is a hard error, never a silently adjusted global batch:
@@ -156,8 +136,9 @@ Traceback (most recent call last):
 ValueError: global batch 4096 is not divisible by world size 24
 ```
 
-Worked examples against `configs/scaling.yaml`'s own `nodes`/`max_batch_size` table
-(`gpus_per_node=8`, so `world_size = nodes * 8`), verified by calling the function directly:
+Worked examples using the node counts of `configs/scaling.yaml`'s `nodes` table (`gpus_per_node=8`, so
+`world_size = nodes * 8`) and example `max_batch_size` caps (256, and 128 for `1B`), verified by calling
+the function directly. `scaling.yaml` itself sets `max_batch_tokens` (token mode), not `max_batch_size`:
 
 | Preset | Nodes | World size | Global examples | Per-device batch | Accum |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -171,15 +152,14 @@ Worked examples against `configs/scaling.yaml`'s own `nodes`/`max_batch_size` ta
 **`oplm slurm generate` itself does not call this.** It renders whatever `train.batch_size` /
 `train.gradient_accumulation_steps` your config already specifies (the packaged defaults are
 `batch_size=32`, `gradient_accumulation_steps=1`, unaffected by node count) — a plain training job
-sets its own per-device batch directly, the ordinary way (see [TRAIN.md](TRAIN.md)).
+sets its own per-device batch directly, the ordinary way (see [training.md](training.md)).
 `max_batch_size` and `resolve_batch_plan` are the mechanism a phase-aware tool built on this layer
 uses to plan `train.batch_size`/`train.gradient_accumulation_steps` *before* writing each job's
-config — the μP sweep's phase generator is the current example (see [LR_SWEEP.md](LR_SWEEP.md));
+config — the μP sweep's phase generator is the current example (see [mup-lr.md](mup-lr.md#sweep-config));
 both fields are part of the general schema so any similar tool can reuse the same derivation.
 
 `oplm.slurm.config.resolve_token_plan(*, global_tokens, world_size, max_batch_tokens, width)` is
-the token-mode counterpart (`train.tokens_per_step` / `train.batch_tokens`; see TRAIN.md
-"Token-budget batching"). A device's micro-batch is a whole number of `width`-token rows
+the token-mode counterpart (`train.tokens_per_step` / `train.batch_tokens`; see [training.md, *Token-budget batching*](training.md#token-budget-batching-traintokens_per_step-trainbatch_tokens)). A device's micro-batch is a whole number of `width`-token rows
 (`model.max_position_embeddings`). The budget must split into whole rows per replica, and the
 smallest accumulation that keeps a device at or under `max_batch_tokens` wins. For example,
 4,194,304 tokens over 32 GPUs at width 2048 with a 65,536 cap gives `batch_tokens=65536`,
@@ -187,7 +167,7 @@ accumulation 2.
 
 ---
 
-## 5. One launcher form for every job
+## One launcher form for every job
 
 Every rendered job — one node or many — uses the same `srun` + `accelerate launch` body
 (`oplm.slurm.render.render_job` / `accelerate_command`):
@@ -236,7 +216,7 @@ the hostname lookup ever failed.
 
 ---
 
-## 6. Job arrays and the homogeneous-resource constraint
+## Job arrays and the homogeneous-resource constraint
 
 A Slurm job array shares one `#SBATCH` header — including `--nodes` — across every task in it, so
 an array can only ever hold jobs that need the *same* resources. `JobSpec` (`oplm.slurm.render`)
@@ -259,7 +239,7 @@ fi
 export RUN_DIR="$BASE_DIR/runs/$RUN_ID"
 ```
 
-`max_concurrent` (§2) throttles how many array tasks run at once (the `%4` above), independent of
+`max_concurrent` throttles how many array tasks run at once (the `%4` above), independent of
 how many tasks exist in total.
 
 Consequence: a set of jobs that differ in node count (e.g. different presets on different node
@@ -267,14 +247,14 @@ counts) needs one array *per resource shape*, not one array across all of them. 
 generate` only ever emits a single, non-array job per invocation; array-job generation is a
 capability of the `oplm.slurm.render` layer for tools that need to fan a phase of work out across
 many homogeneous cells — the μP sweep's phase generator is the concrete, in-repo example (one
-array per preset, since node count varies by preset there; see [LR_SWEEP.md](LR_SWEEP.md)).
+array per preset, since node count varies by preset there; see [mup-lr.md](mup-lr.md#status-resubmission-and-phase-artifacts)).
 
 A job that needs no GPU at all (e.g. a lightweight post-processing step run after an array
 finishes) can omit `--gres` entirely — `JobSpec.gres` defaults to `True` but can be set `False`.
 
 ---
 
-## 7. Job dependencies: `afterany`, not `afterok`
+## Job dependencies: `afterany`, not `afterok`
 
 `render_submit_script` renders a `submit.sh` that submits every job in order and threads job IDs
 into `--dependency`:
@@ -294,7 +274,7 @@ in `DependencyNeverSatisfied` forever, with no job ever running to report why.
 
 ---
 
-## 8. Requeue semantics: drain, budget, and the no-progress guard
+## Requeue semantics: drain, budget, and the no-progress guard
 
 Every generated job carries `#SBATCH --requeue` unconditionally. This tells Slurm it may
 automatically resubmit the job (same job ID) if it is preempted or the node otherwise fails —
@@ -322,7 +302,7 @@ saves a checkpoint, logs a warning, writes a `.drained` marker file into `train.
 (`oplm.training.signals.DRAIN_MARKER_NAME`), and exits with `DRAIN_EXIT_CODE` (`85`) — a code
 reserved exclusively for "drained cleanly, resume expected," distinct from `0` (reached
 `max_steps`) and any other nonzero exit (a crash). See
-[TRAIN.md §16](TRAIN.md#16-fault-tolerance) for the full knob table and what a resume restores.
+[training.md, *Fault tolerance*](training.md#fault-tolerance) for the full knob table and what a resume restores.
 
 **Forcing a drain by hand** (for example, to exercise resume once per run): `scancel
 --signal=USR1 <jobid>`. Without `--batch`, Slurm signals only the job steps, so the batch
@@ -397,7 +377,7 @@ every job it produces resumes from the newest committed checkpoint under `train.
 every restart, without an explicit `train.resume_from`. (`configs/scaling.yaml` also sets
 `train.auto_resume: true` explicitly in the YAML itself — this config only ever runs under Slurm,
 so there is no ambiguity about whether it should auto-resume.) An explicit `train.resume_from`
-always wins if both are set. See [TRAIN.md §16](TRAIN.md#16-fault-tolerance) for the resolution
+always wins if both are set. See [training.md, *Fault tolerance*](training.md#fault-tolerance) for the resolution
 mechanics (main-rank scan + broadcast) and exactly what state a resume restores.
 
 **The end-to-end failure-recovery walkthrough:** a node fails or is preempted → the training
@@ -412,7 +392,7 @@ is specific to that runner, not this general layer.)
 
 ---
 
-## 9. `oplm slurm generate` / `submit` / `status`
+## `oplm slurm generate`, `submit` and `status`
 
 ### `generate`
 
@@ -423,14 +403,16 @@ oplm slurm generate --config FILE --out DIRECTORY [--preset TEXT] [--nodes INT]
 
 Writes one `<name>.sbatch` into `--out`, plus a `jobs.json` manifest `submit`/`status` read.
 Positional `KEY=VALUE` tokens are appended verbatim to the rendered training command (after
-the injected `train.auto_resume=true`), so one YAML can back many jobs — e.g. the branch
-experiments in [TRAIN.md](TRAIN.md#branching-a-run-wsd-decays-and-lr-experiments):
+the injected `train.auto_resume=true`), so one YAML can back many jobs, for example the decay
+branches in [training.md, *Worked example*](training.md#worked-example).
 
-```bash
-oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/170M-decay-250k \
-  --name 170M-decay-250k train.branch_from=/runs/170M/checkpoint-250000 \
-  train.output_dir=/runs/170M-decay-250k train.stable_steps=245000 train.max_steps=300000
-```
+`generate` renders `train.*` as the config and overrides give it. In particular it does **not**
+derive `train.batch_tokens` from `slurm.max_batch_tokens` (only `oplm sweep` and token-mode `scale`
+do, through `resolve_token_plan`). `configs/scaling.yaml` sets `train.batch_tokens: 65536`, the 170M
+micro-batch, so every other preset needs `train.batch_tokens=<slurm.max_batch_tokens[preset]>` on
+the command line: 32768 for 400M, 16384 for 800M and 1B. Without it, 400M runs at twice its cap,
+and 800M and 1B fail at launch because 4,194,304 tokens per step is not a multiple of
+65,536 x 128 GPUs. Whether those caps fit in memory has not been checked on hardware.
 
 A `train.output_dir=` override also steers the requeue wrapper's no-progress guard, which
 scans that directory for committed checkpoints.
@@ -441,19 +423,20 @@ would silently resolve to the wrong file there). `--nodes`/`--time-limit` overri
 supply both.
 
 `generate` launches `oplm.fold.train` instead of `oplm.train` when the resolved run config has a
-`fold:` block (docs/FOLD.md §10), and refuses a relative `train.output_dir`: the job runs from a
+`fold:` block ([FOLD.md, *Milestone 2c: evaluation and the proof runs*](FOLD.md#10-milestone-2c-evaluation-and-the-proof-runs-oplmfoldeval)), and refuses a relative `train.output_dir`: the job runs from a
 node-local `$JOB_WORK_DIR`, so a relative path would keep checkpoints only until the job ends and
 auto-resume would find nothing.
 
 ```bash
-oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
+oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M train.batch_tokens=32768
 # wrote jobs/400M/oplm-400M.sbatch (8 nodes, 168:00:00)
 ```
 
 The rendered script matches `configs/scaling.yaml`'s `nodes: {..., 400M: 8, ...}` exactly
 (`#SBATCH --nodes=8`), embeds the absolute `--config` path, and names the job `oplm-400M` by
 default (override with `--name`). Every other preset in that file resolves the same way:
-`170M` → 4 nodes, `800M` → 16 nodes, `1B` → 16 nodes.
+`170M` → 4 nodes, `800M` → 16 nodes, `1B` → 16 nodes. Pass each preset's `batch_tokens` cap as
+above (none needed for 170M).
 
 ### `submit`
 
@@ -494,6 +477,6 @@ ask about, since that would look identical to the job having actually completed.
 
 ## See also
 
-- [TRAIN.md](TRAIN.md) — training how-to: config, launch, checkpointing, resume.
-- [CONFIG.md](CONFIG.md) — full `model.*` / `train.*` / `data.*` reference.
-- [LR_SWEEP.md](LR_SWEEP.md) — the μP learning-rate sweep, built on this layer.
+- [training.md](training.md) — training how-to: config, launch, checkpointing, resume.
+- [config.md](config.md) — full `model.*` / `train.*` / `data.*` reference.
+- [mup-lr.md](mup-lr.md) — the μP learning-rate sweep, built on this layer.

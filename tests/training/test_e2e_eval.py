@@ -1,4 +1,4 @@
-"""G2 — eval cadence through the real Trainer (docs/TESTING_E2E.md §5).
+"""G2 — eval cadence through the real Trainer (docs/testing.md, End-to-end scenario gallery).
 
 Asserts that ``on_eval_end`` fires on exactly the steps the ``_crossed`` schedule
 semantics predict — for both step and token cadences — by reconstructing the

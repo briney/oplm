@@ -1,4 +1,4 @@
-"""G1 — logging cadence & train-metric contract (docs/TESTING_E2E.md §5).
+"""G1 — logging cadence & train-metric contract (docs/testing.md, End-to-end scenario gallery).
 
 Drives a real ~12-step :class:`~oplm.training.trainer.Trainer` run with
 ``log_every=3`` across the ``(device, precision)`` matrix and asserts the

@@ -266,7 +266,7 @@ class Trainer:
 
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
-        # Objective-specific model/data/step (docs/TRAIN.md §17). The default
+        # Objective-specific model/data/step (docs/training.md, "Training tasks"). The default
         # reproduces MLM training exactly; fold stages pass FoldTask (milestone 2).
         self.task: TrainTask = task if task is not None else MLMTask()
 
@@ -288,7 +288,7 @@ class Trainer:
         # when max_grad_norm <= 0 (no clip) so the diagnostic simply omits it.
         self._last_grad_norm: torch.Tensor | None = None
 
-        # Opt-in deep-model stability diagnostics (docs/LR_SWEEP.md). Attached
+        # Opt-in stability diagnostics (docs/mup-lr.md, "Stability diagnostics"). Attached
         # here so plain `oplm train ... train.stability_diagnostics=true` runs
         # (the probe/control) get it without a bespoke entry point.
         if cfg.train.stability_diagnostics:
@@ -2330,7 +2330,8 @@ def _consult_remote_resume_candidate(
     away. If ``output_dir`` is instead node-local storage (e.g. node-local NVMe) on a
     multi-node run, only ranks on the main process's own node can actually see the
     download -- this function has no way to detect that from here, so a multi-node
-    run with a node-local ``output_dir`` must not rely on this path (see docs/TRAIN.md).
+    run with a node-local ``output_dir`` must not rely on this path (see docs/training.md,
+    "Remote checkpoint mirror").
 
     Args:
         local_found: The local candidate already selected (possibly ``None``).

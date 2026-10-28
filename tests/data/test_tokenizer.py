@@ -1,7 +1,7 @@
 """Tests for the tokenizer access layer (Phase 2).
 
 The parity guard is the regression test that would have caught the legacy
-off-by-one vocabulary bug (docs/DATA_TOOLING.md §3.5): every derived constant is
+off-by-one vocabulary bug (docs/data.md, Tokenizer): every derived constant is
 checked against the canonical :class:`~oplm.model.OplmTokenizerFast`. The
 alignment tests pin :func:`~oplm.data.tokenizer.align_per_residue` to the
 ``<cls> … <eos>`` / truncation / padding rules it must mirror.

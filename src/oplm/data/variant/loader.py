@@ -3,7 +3,7 @@
 Loads zero-shot variant-effect assays (e.g. ProteinGym) into
 :class:`VariantAssay`, parsing and validating mutations against the wild-type
 sequence. Scoring itself lives in the eval harness; this module only loads and
-validates (docs/DATA_TOOLING.md §6).
+validates (docs/data.md, Other modalities).
 
 The variant modality is **eval-only** and uses no MLM masking: scoring is
 position-specific (masked-marginal) and is the eval harness's job. This module's
@@ -203,7 +203,7 @@ def _resolve_wildtype(
 ) -> str:
     """Resolve the wild-type sequence for one assay.
 
-    Resolution order (the documented accepted sources, §6.1):
+    Resolution order (the documented accepted sources, docs/data.md, Other modalities):
 
     1. An explicit ``override`` (e.g. plumbed from
        ``EvalDatasetEntry.extra["wildtype"]`` / a sidecar) takes precedence.

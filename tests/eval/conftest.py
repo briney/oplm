@@ -88,7 +88,7 @@ def make_model() -> Callable[..., OplmForMaskedLM]:
 
     ``OplmForMaskedLM.__init__`` takes the HuggingFace ``oplm.model.OplmConfig``
     (a ``PretrainedConfig``), not the ``oplm.config.ModelConfig`` dataclass — the
-    two schemas diverge and there is no converter (see TODOS.md Phase 0). So the
+    two schemas diverge and there is no converter. So the
     factory constructs the HF config directly with its native field names, keeping
     ``vocab_size`` at the tokenizer's 33-token default.
     """

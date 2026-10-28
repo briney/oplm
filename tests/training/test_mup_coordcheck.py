@@ -4,7 +4,8 @@ Runs :func:`oplm.training.mup.coord_check` over a few widths on real sequences a
 asserts the **one-sided** oracle: with μP, no module's activation RMS grows with
 width; the ``--no-mup`` control fans out. Growth is read at the final step
 (``t = steps ≥ 1``), so the readout's init-time ``Θ(1/√m)`` shrink (``t=0``) is
-excluded by construction — see ``docs/MUP.md`` and ``scripts/mup_coord_check.py``.
+excluded by construction — see ``docs/mup-lr.md`` ("Coordinate check") and
+``oplm sweep coord-check``.
 """
 
 from __future__ import annotations

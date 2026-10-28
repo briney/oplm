@@ -53,7 +53,7 @@ class TrainConfig:
     # Optimizer.
     # NOTE: these are conservative *library* fallbacks for bare TrainConfig() /
     # direct construction. OPLM's production training default (what `oplm train`
-    # loads) is μP + Muon with lr 0.0035 — see configs/train/base.yaml and docs/MUP.md.
+    # loads) is μP + Muon — see configs/train/base.yaml and docs/mup-lr.md, "Recipe".
     optimizer: str = "adamw"
     lr: float = 1e-4
     min_lr: float = 0.0
@@ -145,7 +145,7 @@ class TrainConfig:
 
     # Exponential moving average of the trainable weights (fold stages set 0.999).
     # None = off (MLM runs unchanged). Updated once per successful optimizer step;
-    # every checkpoint then also writes ema.pt + hf_ema/ (docs/TRAIN.md §16).
+    # every checkpoint then also writes ema.pt + hf_ema/ (docs/training.md, "Fault tolerance").
     ema_decay: float | None = None
 
     # Parallelism strategy.
@@ -154,7 +154,7 @@ class TrainConfig:
     #   "hsdp" — FSDP2 (`fully_shard`) over a 2-D device mesh: shard within a node,
     #            replicate across nodes. Required before ~24B; needs world size > 1.
     # Checkpoints are parallelism-agnostic (DCP `get_state_dict`), so the same
-    # checkpoint resumes under either setting -- see docs/TRAIN.md.
+    # checkpoint resumes under either setting -- see docs/training.md, "Fault tolerance".
     parallelism: str = "ddp"
 
     # Infrastructure
@@ -189,7 +189,7 @@ class TrainConfig:
     # Device peak TFLOPs for MFU calculation. None → log achieved TFLOPs only.
     peak_tflops: float | None = None
 
-    # Training-stability diagnostics (deep-model μP debugging; see docs/LR_SWEEP.md).
+    # Training-stability diagnostics (see docs/mup-lr.md, "Stability diagnostics").
     # When True, the Trainer attaches a StabilityDiagnosticsCallback. It logs the
     # pre-clip global grad norm every training log (free, no hooks), and every
     # `stability_probe_every` logs runs one eager diagnostic forward on the
@@ -385,7 +385,7 @@ class TrainDatasetEntry:
     fraction: float
 
 
-_VALID_SCHEDULE_UNITS = ("steps", "tokens")  # "epochs" deferred — EVAL_HARNESS.md §4.6
+_VALID_SCHEDULE_UNITS = ("steps", "tokens")  # "epochs" deferred (docs/evaluation.md)
 _SCHEDULE_KEYS = frozenset({*_VALID_SCHEDULE_UNITS, "at_start", "at_end"})
 
 
@@ -423,8 +423,8 @@ def parse_schedule_block(raw: Any, label: str) -> ScheduleSpec:
         )
     if "epochs" in raw:
         raise ValueError(
-            f"{label}: epoch cadence is not yet supported (see docs/EVAL_HARNESS.md "
-            f"§4.6); use {{steps: N}} or {{tokens: N}}"
+            f"{label}: epoch cadence is not yet supported (see docs/evaluation.md, "
+            f"Scheduling during training); use {{steps: N}} or {{tokens: N}}"
         )
     unknown = [k for k in raw if k not in _SCHEDULE_KEYS]
     if unknown:
@@ -480,11 +480,12 @@ class DataConfig:
     # Parsed at runtime via oplm.data.config.parse_eval_configs().
     eval: Any = None
 
-    # Sequence masking (see docs/DATA_TOOLING.md §4.5)
+    # Sequence masking (see docs/data.md, Masking)
     mask_prob: float = 0.15  # fraction of eligible positions selected for masking
     mask_token_prob: float = 0.8  # of masked positions -> <mask>
     random_token_prob: float = 0.1  # of masked positions -> random canonical AA
-    weighted_masking: bool = False  # honor the masking_weights column when True (§4.5.1)
+    # Honor the masking_weights column when True (docs/data.md, Masking).
+    weighted_masking: bool = False
 
     # Collation padding: None = pad to batch-longest sequence; N = pad to the
     # smallest multiple of N that is >= batch-longest. Useful for compile+static

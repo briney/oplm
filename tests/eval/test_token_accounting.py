@@ -1,7 +1,7 @@
 """Token-accounting and rank-sync tests — the guarantee behind token cadence.
 
 The trainer rank-reduces each optimizer step's tokens so ``tokens_seen`` is the
-true global count and identical on every rank (docs/EVAL_HARNESS.md §3.2). These
+true global count and identical on every rank (docs/evaluation.md). These
 tests pin that accounting (single process), the purity that makes ranks agree
 without communicating, and — when a multi-process launch is available — that a
 token-cadence eval does not deadlock under ragged per-rank batches.

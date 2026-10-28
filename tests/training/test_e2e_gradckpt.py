@@ -1,4 +1,5 @@
-"""G9 — gradient checkpointing through the real Trainer (docs/TESTING_E2E.md §5).
+"""G9 — gradient checkpointing through the real Trainer (docs/testing.md,
+End-to-end scenario gallery).
 
 ``gradient_checkpointing=True`` trades compute for memory by recomputing block
 activations in the backward pass; it must be mathematically transparent. We run

@@ -209,7 +209,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
     a time to bound memory. Shuffling is deterministic per ``(seed, epoch)`` and
     identical across runs and ranks; rank/worker striping is explicit (over the
     joint ``(rank, worker)`` index) so coverage does not depend on launcher
-    behavior. See docs/DATA_TOOLING.md §4.2.
+    behavior. See docs/data.md, Dataset formats.
 
     Each shard must contain columns ``sequence_id`` (str) and ``sequence`` (str,
     raw one-letter amino acids). An optional ``masking_weights`` column
@@ -304,7 +304,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
 
         The shuffle seed is a pure function of ``(seed, epoch)``, so the same
         epoch yields the same order across runs and ranks. The trainer calls this
-        on each epoch boundary (docs/DATA_TOOLING.md §10.1).
+        on each epoch boundary (docs/data.md, Dataset formats).
 
         Args:
             epoch: Epoch index (0-based).
@@ -520,7 +520,7 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
     next item; an exhausted source is re-initialized so sources of unequal size
     keep mixing at the requested ratio for the whole epoch. Sub-datasets perform
     their own ``(rank, worker)`` striping, so this class strides only the *number
-    of steps* per worker. See docs/DATA_TOOLING.md §4.3.
+    of steps* per worker. See docs/data.md, Dataset formats.
 
     Args:
         datasets: Source iterable datasets (typically :class:`ShardedProteinDataset`).

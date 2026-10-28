@@ -1,7 +1,7 @@
 """Downstream-task loading.
 
 Loads labeled-sequence benchmarks (TAPE / ProteinGLUE) into :class:`DownstreamExample`
-records and defines the label-collation contract (docs/DATA_TOOLING.md §7):
+records and defines the label-collation contract (docs/data.md, Other modalities):
 
 - **per-residue** tasks (secondary structure, per-residue contacts) → ``(B, T)``
   ``long`` label tensors aligned to non-special positions, padded with ``-100``;
@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 # Default column names (overridable per call). The sequence column matches the
-# sequence modality's convention (docs/DATA_TOOLING.md §4.1).
+# sequence modality's convention (docs/data.md, Dataset formats).
 _SEQUENCE_COLUMN = "sequence"
 _LABEL_COLUMN = "label"
 
@@ -255,7 +255,7 @@ def collate_downstream_labels(
 ) -> Tensor:
     """Collate a batch of example labels into a model-ready target tensor.
 
-    Implements the label contract (docs/DATA_TOOLING.md §7.3):
+    Implements the label contract (docs/data.md, Other modalities):
 
     - per-residue → ``(B, T)`` ``long``, aligned to non-special positions via
       :func:`~oplm.data.tokenizer.align_per_residue`; ``<cls>``/``<eos>`` and

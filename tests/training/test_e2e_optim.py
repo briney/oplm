@@ -1,4 +1,5 @@
-"""G6 + G7 — optimizers, LR schedules, learning, and grad clipping (docs/TESTING_E2E.md §5).
+"""G6 + G7 — optimizers, LR schedules, learning, and grad clipping
+(docs/testing.md, End-to-end scenario gallery).
 
 Covers four trainer surfaces that fp32/AdamW/constant-LR runs never exercise:
 

@@ -11,7 +11,8 @@ the model-package single source of truth (so width-aware init stays
   width);
 * :class:`SweepMetricsCallback` — the LR-cell metric utility.
 
-See ``docs/MUP.md`` for the recipe table and the coord-check pass/fail oracle.
+See ``docs/mup-lr.md`` ("Parameterization", "Coordinate check") for the recipe table and
+the coord-check pass/fail oracle.
 """
 
 from __future__ import annotations
@@ -156,8 +157,8 @@ def coord_check(
     oracle can exclude it for the readout (allowed to shrink ``Θ(1/√m)`` at init).
 
     The pass/fail oracle is **one-sided**: with μP on, no module's RMS should grow
-    with width; the ``--no-mup`` control fans out. See ``docs/MUP.md`` and
-    ``scripts/mup_coord_check.py``.
+    with width; the ``--no-mup`` control fans out. See ``docs/mup-lr.md``
+    ("Coordinate check") and ``oplm sweep coord-check``.
 
     Args:
         build_cfg_fn: Maps a hidden width to a fully-formed ``OplmConfig``. The

@@ -1,4 +1,4 @@
-"""OPLM evaluation harness. See docs/EVAL_HARNESS.md for the design."""
+"""OPLM evaluation harness. See docs/evaluation.md for the design."""
 
 from __future__ import annotations
 

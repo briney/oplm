@@ -47,7 +47,8 @@ class OplmConfig(PretrainedConfig):
 
     Maps 1:1 to the `model:` block of the project YAML schema and to the
     constructor kwargs of every `Oplm*` class. See
-    `docs/MODEL_ARCHITECTURE.md` §12 for the field reference and validation rules.
+    `docs/config.md` (Model fields, Derived and validated fields) for the field
+    reference and validation rules.
     """
 
     model_type = "oplm"
@@ -100,7 +101,7 @@ class OplmConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         # μP off by default at the library level (bare OplmConfig() / from_pretrained
         # of configs that omit it). OPLM's production training default enables μP via
-        # configs/model/base.yaml; existing checkpoints carry their own value. See docs/MUP.md.
+        # configs/model/base.yaml; existing checkpoints carry their own value. See docs/mup-lr.md.
         mup_enable: bool = False,
         mup_base_width: int = 512,
         mup_output_mult: float = 1.0,
@@ -370,7 +371,7 @@ class OplmConfig(PretrainedConfig):
                 raise ValueError(
                     "Canon is not supported with norm_strategy='hybrid' (it has no "
                     "outer attention pre-norm for Canon-A); use 'pre', 'sandwich', "
-                    "or 'post_sdpa'. See docs/MODEL_ARCHITECTURE.md."
+                    "or 'post_sdpa'. See docs/architecture.md, Canon semantics."
                 )
             bad_positions = [p for p in self.canon_positions if p not in _VALID_CANON_POSITIONS]
             if bad_positions:
@@ -408,7 +409,7 @@ class OplmConfig(PretrainedConfig):
         matrix (attention/MLP/`lm_head.dense`) scales its init/LR by, and that the
         readout output-logit multiplier divides by. `down_proj` uses
         `intermediate_size / mup_base_intermediate_size()` instead — see
-        `docs/MUP.md` for the per-matrix fan-in rule.
+        `docs/mup-lr.md` ("Parameterization") for the per-matrix fan-in rule.
         """
         if not self.mup_enable:
             return 1.0
@@ -427,7 +428,7 @@ class OplmConfig(PretrainedConfig):
     def mup_fanin_mult(self, fan_in: int) -> float:
         """Per-matrix μP fan-in multiplier `m_W = fan_in / fan_in_base`.
 
-        The single scaling quantity of the μP recipe (see `docs/MUP.md`): a
+        The single scaling quantity of the μP recipe (see `docs/mup-lr.md`, "Parameterization"): a
         matrix's live `fan_in` divided by its fan-in at the base width
         `mup_base_width`. Hidden-fan-in matrices (`q/k/v/o_proj`, `gate/up_proj`,
         `lm_head.dense`, the readout) map to `mup_base_width`; `down_proj`

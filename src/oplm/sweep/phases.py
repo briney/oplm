@@ -51,7 +51,9 @@ console = Console()
 # Grid re-centered after the 170M coarse sweep ranked 0.0025 ~ 0.004 >> 0.0063 > 0.01 > 0.016,
 # putting the winner on the old grid's lower boundary. Same 1.6x spacing, shifted one half-decade
 # down, so both observed winners sit interior with headroom below and 0.0063 remains an upper
-# guard. See docs/LR_SWEEP.md.
+# guard. The token-mode refresh passes --lrs to coarse instead (docs/mup-lr.md, "Commands").
+# The batch-mode history is in
+# https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LR_SWEEP.md
 SMOKE_LRS = (0.0004, 0.0016, 0.0063)
 COARSE_LRS = (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)
 OUTPUT_MULTS = (0.5, 1.0, 2.0)
@@ -64,7 +66,9 @@ DEPTH_REFERENCE_LAYERS = 24
 # a coarse-grid-spaced (1.6x) LR bracket around each replicated finalist, and the depth-LR
 # exponent pinned at 0.5 -- the value consistent with the frozen 1/sqrt(L) residual branch
 # scaling. The phase verifies that the exponent-corrected LR optimum stays centered as depth
-# varies, rather than sweeping the exponent itself; see docs/LR_SWEEP.md.
+# varies, rather than sweeping the exponent itself. The exponent's derivation is in
+# docs/mup-lr.md, "Depth correction"; the depth-ray check is described in
+# https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LR_SWEEP.md.
 TRANSFER_DEPTHS = (12, 24, 48)
 TRANSFER_LR_MULTS = (0.625, 1.0, 1.6)
 TRANSFER_DEPTH_EXPONENT = 0.5
@@ -268,7 +272,7 @@ def _write_run_config(
         f"train.output_dir={run_dir / 'output'}",
         f"train.wandb_run_name={run_name}",
         # Explicitly pin diagnostics so the flag overrides whatever the base config
-        # carries (off by default keeps the sweep robust; see docs/LR_SWEEP.md).
+        # carries (off by default keeps the sweep robust; see docs/mup-lr.md).
         f"train.stability_diagnostics={str(diagnostics).lower()}",
     ]
     cfg = load_config(["--config", str(base_config), *overrides])

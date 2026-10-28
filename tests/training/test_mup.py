@@ -3,8 +3,8 @@
 These exercise the μP recipe without training: the per-matrix fan-in multiplier
 and LR multiplier, width-aware init, the readout output multiplier, per-group
 learning-rate assembly under both optimizers, the Muon+μP guard, and the
-no-op-when-off / no-op-at-base-width invariants. See ``docs/MUP.md`` for the
-recipe table these mirror.
+no-op-when-off / no-op-at-base-width invariants. See ``docs/mup-lr.md``
+("Parameterization") for the recipe table these mirror.
 
 Width-aware init is checked *exactly*, not statistically: ``trunc_normal_`` scales
 a fixed sequence of draws by ``std``, so with one shared seed a μP-on model's

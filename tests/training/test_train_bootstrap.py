@@ -1,4 +1,5 @@
-"""Fast unit tests for ``_bootstrap_training_environment`` (docs/TESTING_E2E.md §5, G11).
+"""Fast unit tests for ``_bootstrap_training_environment``
+(docs/testing.md, End-to-end scenario gallery, G11).
 
 The bootstrap step scrubs DeepSpeed env vars (unless explicitly opted in) and
 ensures a writable Triton autotune cache directory exists. These tests inject an

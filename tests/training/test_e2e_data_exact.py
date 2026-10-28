@@ -1,4 +1,5 @@
-"""Phase 3 acceptance gate — data-exact resume (docs/TESTING_E2E.md; TODOS Task 3.4).
+"""Phase 3 acceptance gate — data-exact resume (docs/testing.md;
+fault-tolerant-training plan Task 3.4).
 
 Tasks 3.1-3.3 made resume *data-exact*: a checkpoint records a :class:`~oplm.data.DataCursor`
 (epoch, batches-in-epoch, layout) and, on a layout-compatible resume, the top-level dataset's
@@ -31,8 +32,8 @@ the true stop step makes the resumed run re-derive already-consumed data). ``sto
 chosen per ``num_workers`` to be exactly where a *correct* deferral commits (see the
 ``pytest.mark.parametrize`` comment) rather than backstopped by an unconditional final save.
 
-Masking is untouched by this tier: masks are dynamic (redrawn every call, docs/DATA_TOOLING.md
-§4.5) and may differ bit-for-bit between the control and the interrupted-then-resumed run even
+Masking is untouched by this tier: masks are dynamic (redrawn every call, docs/data.md,
+Masking) and may differ bit-for-bit between the control and the interrupted-then-resumed run even
 when the underlying rows match exactly. The assertion is on ``sequence_ids`` (which rows, in
 which order) and ``tokens_seen`` (how much real content), never on ``input_ids``/``labels``.
 

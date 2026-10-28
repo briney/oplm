@@ -1,6 +1,6 @@
 # Structure Prediction Head (`oplm.fold`)
 
-Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
+Architecture contract for the folding head, in the role [`architecture.md`](architecture.md)
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
 this file records what is implemented. **Status: milestone 2c (evaluation and proof runs) implemented, proof runs pending; milestone 2b (losses and training) accepted 2026-10-13 (measured on one B200; docs/fold/m2/); milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
@@ -114,9 +114,9 @@ must bucket shapes (crops are multiples of 128), accept a precomputed `BlockMask
 ## 4. Training seam and EMA
 
 The Trainer builds the model/dataloader and runs a step through a `TrainTask`
-(`docs/TRAIN.md` §17); the structure head's `FoldTask` is described in §9. `train.ema_decay`
+(`docs/training.md`, *Training tasks*); the structure head's `FoldTask` is described in §9. `train.ema_decay`
 keeps an EMA of the trainable weights, updated once per optimizer step, saved as `ema.pt` and
-exported as `hf_ema/` with every checkpoint (`docs/TRAIN.md` §16). The frozen LM is an
+exported as `hf_ema/` with every checkpoint (`docs/training.md`, *Fault tolerance*). The frozen LM is an
 unregistered attribute of the fold model that `__deepcopy__` shares instead of copying, so the
 EMA never holds a second LM (milestone 1).
 
@@ -461,7 +461,7 @@ so 600M gives 37 states of width 1152. `lm_hidden_size` and `lm_num_hidden_state
 from the loaded LM when `fold.model` does not set them.
 
 **Run config and CLI.** A run is an ordinary `OplmConfig` plus a `fold:` block
-([`CONFIG.md`](CONFIG.md#fold-fields-fold)); every `data.train` entry is a structure shard
+([`config.md`](config.md#fold-fields-fold)); every `data.train` entry is a structure shard
 directory. `oplm fold train --config run.yaml [overrides]` runs one process and
 `accelerate launch -m oplm.fold.train --config run.yaml` runs DDP; both build
 `Trainer(cfg, task=FoldTask())`. `FoldTask.build_model` builds the head from `fold.model`
@@ -540,10 +540,10 @@ bootstrap 95 % CI.
 - `valid` eval every 2000 steps, and once right after the first step, so a broken eval path
   fails within minutes instead of at step 2000.
 
-`oplm slurm generate` launches `oplm.fold.train` for them (docs/SLURM.md §9). Each attempt builds
+`oplm slurm generate` launches `oplm.fold.train` for them (`docs/slurm.md`, *`oplm slurm generate`, `submit` and `status`*). Each attempt builds
 or reuses a per-run Python 3.12 venv with `oplm[train,fold,esmc]` from the tag `fold-m2c-runs`,
 on each node's local `/tmp` because every node runs the install.
-A resume is forced once per run with `scancel --signal=USR1 <jobid>` (docs/SLURM.md §8).
+A resume is forced once per run with `scancel --signal=USR1 <jobid>` (`docs/slurm.md`, *Requeue semantics*).
 `docs/fold/b200-m2c-eval.sbatch` then scores every permanent checkpoint's `hf_ema/` on CAMEO and
 CASP14. Results, the width decision and the reproduction commands are in
 [`docs/fold/m2/README.md`](fold/m2/README.md).
@@ -566,7 +566,7 @@ curl -O https://predictioncenter.org/download_area/CASP16/targets/casp16.targets
 curl -O https://predictioncenter.org/download_area/CASP16/sequences/casp16.T1.seq.txt
 oplm fold eval-sets --fold-data $OPLM_DATA/hf/wwpdb/2026-10-12 --casp-sources $OPLM_DATA/casp \
     --out $OPLM_DATA/hf/structure-evals/2026-10-12 --mmseqs ~/micromamba/envs/mmseqs2/bin/mmseqs
-# CASP difficulty labels (not used by the build; listed in docs/DATA_MANIFEST.md)
+# CASP difficulty labels (not used by the build; listed in docs/data.md, Structure evaluation sets)
 cd $OPLM_DATA/hf/structure-evals/2026-10-12/sources
 curl -o casp15_domains_summary.html https://predictioncenter.org/casp15/domains_summary.cgi
 curl -o casp16_domains_summary.html https://predictioncenter.org/casp16/domains_summary.cgi
@@ -617,4 +617,4 @@ hf download brineylab/oplm-structure-evals --repo-type dataset --revision 2026-1
 **Published:** [`brineylab/oplm-structure-evals`](https://huggingface.co/datasets/brineylab/oplm-structure-evals)
 at tag `2026-10-12` (commit `08f188a3`), folder `2026-10-12/`; built at `c0b5f08`. The full
 `pdb40/` ships as `pdb40.tar.gz` (extract it in place); every other set is a plain folder.
-Provenance for the methods section: [`docs/DATA_MANIFEST.md`](DATA_MANIFEST.md).
+Provenance for the methods section: [`docs/data.md`](data.md), *Structure evaluation sets*.

@@ -1,4 +1,4 @@
-"""Tests for the variant loader (Phase 7, docs/DATA_TOOLING.md §6).
+"""Tests for the variant loader (Phase 7, docs/data.md, Other modalities).
 
 Covers mutation parsing, wild-type-consistency validation, multi-mutant
 splitting, CSV column requirements, and wild-type resolution (explicit mapping

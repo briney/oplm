@@ -1,4 +1,4 @@
-"""Eval-task registry tests — pure, no model. See docs/EVAL_HARNESS.md §10."""
+"""Eval-task registry tests — pure, no model. See docs/evaluation.md, Tasks and metrics."""
 
 from __future__ import annotations
 
