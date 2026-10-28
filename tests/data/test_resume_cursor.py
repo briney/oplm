@@ -111,12 +111,13 @@ def test_skip_equal_to_stream_length_is_an_empty_stream(sequence_shards: Path) -
 
     # Per-source arming (InterleavedDataset's path) still wraps: a source refills in-epoch,
     # so a fully consumed pass resumes at the start of the next one (here, without
-    # reshuffle_on_refill, the epoch's order again).
+    # reshuffle_on_refill, the epoch's order again; the pass count still advances, for the tag).
     baseline_ds = ShardedProteinDataset(sequence_shards, seed=0)
     baseline_ds.set_epoch(0)
     baseline = _ids(baseline_ds)
-    wrapped, pass_index = InterleavedDataset([baseline_ds], [1.0])._arm_source_skip(0, stream_len)
-    assert pass_index == 0
+    mix = InterleavedDataset([baseline_ds], [1.0])
+    wrapped, pass_index, offset = mix._arm_source_skip(0, stream_len)
+    assert (pass_index, offset) == (1, 0)
     assert [str(row["sequence_id"]) for row in wrapped] == baseline
 
 

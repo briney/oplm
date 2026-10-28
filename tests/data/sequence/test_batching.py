@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from oplm.data import build_train_dataloader
 from oplm.data.sequence.batching import TokenBatcher
 from oplm.data.sequence.collate import MLMCollator, token_length
-from oplm.data.sequence.dataset import ShardedProteinDataset
+from oplm.data.sequence.dataset import POSITION_KEY, ShardedProteinDataset
 from oplm.data.tokenizer import get_tokenizer
 from tests.data.conftest import write_sequence_shards
 from tests.data.sequence.test_refill_and_remainder import _mix, _sources
@@ -53,7 +53,7 @@ def test_batches_close_at_the_first_sequence_that_fits_nowhere(tmp_path: Path) -
     batches = list(_batcher(_dataset(tmp_path, [10, 10, 5, 12, 2, 1]), drop_last=False))
     assert [b["num_sequences"] for b in batches] == [2, 4]
     assert [b["sequence_ids"] for b in batches] == [["0", "1"], ["2", "3", "4", "5"]]
-    assert [tuple(b["stream_position"]) for b in batches] == [(0, 2), (0, 6)]
+    assert [tuple(b["stream_position"]) for b in batches] == [(0, 2, None), (0, 6, None)]
     for b in batches:
         assert b["input_ids"].shape == b["segment_ids"].shape == (ROWS, WIDTH)
 
@@ -125,6 +125,19 @@ def test_resume_rows_continue_each_worker_through_a_reshuffled_mix(
     # times per worker before the cut, so the resume lands inside a later pass.
     dataset = _mix(_sources(tmp_path), reshuffle=True)
     _assert_resume_rows_continue_each_worker(dataset, num_workers=num_workers)
+
+
+def test_stream_position_carries_the_last_rows_tag(tmp_path: Path) -> None:
+    mix = _mix(_sources(tmp_path), reshuffle=True)
+    stream = [(str(row["sequence_id"]), row[POSITION_KEY]) for row in mix]
+    batches = list(_batcher(mix, drop_last=False))
+    assert len(batches) > 3
+    for b in batches:
+        _, emitted, tag = b["stream_position"]
+        # The batch's last row is row `emitted - 1`; the row that closed it is not counted.
+        assert b["sequence_ids"][-1] == stream[emitted - 1][0]
+        assert tag == stream[emitted - 1][1]
+        assert tag[0] == emitted  # one draw per row: nothing here hits an exhausted source
 
 
 def test_build_train_dataloader_in_token_mode(training_parquet: Path, tmp_path: Path) -> None:
