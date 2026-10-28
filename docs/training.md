@@ -441,6 +441,13 @@ and the LR falls to `min_lr` at step `N + D`. Keep `warmup_steps`, `lr`, `min_lr
 > (`max_steps` 3,000,000), with `W = 2,000` as in `configs/scaling.yaml`. It is not a published run.
 > `<run>` is the downloaded or local run directory, and `<fresh>` a new output directory.
 
+Build each branch config from the checkpoint's own `config.yaml`, the resolved config of the run
+that wrote it, and append your `slurm:` block (`config.yaml` has none). Don't start from
+`configs/scaling.yaml`: its LR, data mix and horizon may differ from the run you branch off. This
+is the same pattern as the refine-cell decays in
+[mup-lr.md, *Decay every refine cell*](mup-lr.md#decay-every-refine-cell), which start from each
+cell's `run.yaml`.
+
 The main run's own schedule is `stable_steps = 2,500,000 - 2,000 = 2,498,000` and
 `max_steps = 2,500,000 + 500,000 = 3,000,000`.
 
@@ -451,7 +458,9 @@ The main run's own schedule is `stable_steps = 2,500,000 - 2,000 = 2,498,000` an
 - check: `2,550,000 - 2,000 - 2,498,000 = 50,000` decay steps
 
 ```bash
-oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/decay-50k \
+# config.yaml has no slurm: block; append the one from your edited configs/scaling.yaml.
+{ cat <run>/checkpoint-2500000/config.yaml; awk '/^[^ #]/{p=/^slurm:/} p' configs/scaling.yaml; } > decay-50k.yaml
+oplm slurm generate --config decay-50k.yaml --preset 170M --out jobs/decay-50k \
   --name decay-50k train.branch_from=<run>/checkpoint-2500000 train.output_dir=<fresh> \
   train.stable_steps=2498000 train.max_steps=2550000
 ```
@@ -464,7 +473,8 @@ and the horizon move:
 - check: `1,520,000 - 2,000 - 1,498,000 = 20,000` decay steps
 
 ```bash
-oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/decay-20k \
+{ cat <run>/checkpoint-1500000/config.yaml; awk '/^[^ #]/{p=/^slurm:/} p' configs/scaling.yaml; } > decay-20k.yaml
+oplm slurm generate --config decay-20k.yaml --preset 170M --out jobs/decay-20k \
   --name decay-20k train.branch_from=<run>/checkpoint-1500000 train.output_dir=<fresh> \
   train.stable_steps=1498000 train.max_steps=1520000
 ```
@@ -487,10 +497,13 @@ trailing decay step is harmless.
   This is what lets a requeued branch job continue as a plain resume of itself.
 - `max_steps` must exceed the checkpoint's step. All other config (model geometry, data
   layout) must match the checkpoint, exactly as for a resume.
-- The data cursor is restored only when `data.train` is unchanged. A different mix (the
-  production decay-phase case) restarts the stream at row 0 of the current epoch with a
-  warning. The cursor's layout guard still applies, so branch on the same layout or see
-  [Resuming on different hardware](#resuming-on-different-hardware).
+- The data cursor is restored only when `data.train` equals the checkpoint's `data.train`
+  exactly, as written: every source name, fraction and path, absolute paths included. The same
+  data at a different path counts as different. For a downloaded checkpoint, put the training set
+  at the paths its `config.yaml` names (mirror or symlink them). Any difference, including a
+  different mix (the production decay-phase case), restarts the stream at row 0 of the current
+  epoch with a warning. The cursor's layout guard still applies, so branch on the same layout or
+  see [Resuming on different hardware](#resuming-on-different-hardware).
 
 The branch gets its own W&B run; `train/lr` (Muon) and `train/lr_adamw` show the live
 schedule from the first logged step. The worked set of branch experiments for the
@@ -523,6 +536,10 @@ One more constraint comes from the per-rank RNG files. A checkpoint saved by `N`
 `rng_state_0.pt` to `rng_state_<N-1>.pt`. Resuming at a *smaller* world size works. A *larger* one
 raises, because the extra ranks have no RNG file; set the environment variable
 `OPLM_ALLOW_MISSING_RNG=1` to start those ranks' RNG fresh.
+
+A branch has one more limit: it keeps the cursor only when `data.train` matches the checkpoint's
+config as written, paths included ([Rules](#rules)). The check does not compare the data itself,
+so the same training set at a new path loses the cursor. Mirror or symlink the original paths.
 
 > **Pending:** a data-exact resume that does not need the original world size (waiting on #63).
 

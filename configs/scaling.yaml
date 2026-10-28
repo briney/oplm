@@ -19,7 +19,9 @@ train:
   weight_decay_to_init: 0.1
   tokens_per_step: 4194304
   # Per-device micro-batch (170M run: 65536 x 2 accumulation steps x 32 GPUs = tokens_per_step).
-  # `oplm slurm generate` re-derives this per preset from slurm.max_batch_tokens.
+  # `oplm slurm generate` renders this value as-is for every preset; it does not read
+  # slurm.max_batch_tokens (only `oplm sweep` does). For another preset pass
+  # train.batch_tokens=<slurm.max_batch_tokens[preset]> on the generate command line.
   batch_tokens: 65536
   scheduler: wsd_linear
   # 170M long-run horizon. PENDING(#55): production horizon.

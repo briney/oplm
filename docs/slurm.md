@@ -29,7 +29,7 @@ own saved config, and adding one to `configs/scaling.yaml` changes nothing about
 trains.
 
 ```bash
-oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
+oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M train.batch_tokens=32768
 ```
 
 writes `jobs/400M/oplm-400M.sbatch` plus a small `jobs.json` manifest, ready for `oplm slurm
@@ -403,14 +403,16 @@ oplm slurm generate --config FILE --out DIRECTORY [--preset TEXT] [--nodes INT]
 
 Writes one `<name>.sbatch` into `--out`, plus a `jobs.json` manifest `submit`/`status` read.
 Positional `KEY=VALUE` tokens are appended verbatim to the rendered training command (after
-the injected `train.auto_resume=true`), so one YAML can back many jobs — e.g. the branch
-experiments in [training.md, *Branching a decay off a checkpoint*](training.md#branching-a-decay-off-a-checkpoint):
+the injected `train.auto_resume=true`), so one YAML can back many jobs, for example the decay
+branches in [training.md, *Worked example*](training.md#worked-example).
 
-```bash
-oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/170M-decay-250k \
-  --name 170M-decay-250k train.branch_from=/runs/170M/checkpoint-250000 \
-  train.output_dir=/runs/170M-decay-250k train.stable_steps=248000 train.max_steps=300000
-```
+`generate` renders `train.*` as the config and overrides give it. In particular it does **not**
+derive `train.batch_tokens` from `slurm.max_batch_tokens` (only `oplm sweep` and token-mode `scale`
+do, through `resolve_token_plan`). `configs/scaling.yaml` sets `train.batch_tokens: 65536`, the 170M
+micro-batch, so every other preset needs `train.batch_tokens=<slurm.max_batch_tokens[preset]>` on
+the command line: 32768 for 400M, 16384 for 800M and 1B. Without it, 400M runs at twice its cap,
+and 800M and 1B fail at launch because 4,194,304 tokens per step is not a multiple of
+65,536 x 128 GPUs. Whether those caps fit in memory has not been checked on hardware.
 
 A `train.output_dir=` override also steers the requeue wrapper's no-progress guard, which
 scans that directory for committed checkpoints.
@@ -426,14 +428,15 @@ node-local `$JOB_WORK_DIR`, so a relative path would keep checkpoints only until
 auto-resume would find nothing.
 
 ```bash
-oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M
+oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M train.batch_tokens=32768
 # wrote jobs/400M/oplm-400M.sbatch (8 nodes, 168:00:00)
 ```
 
 The rendered script matches `configs/scaling.yaml`'s `nodes: {..., 400M: 8, ...}` exactly
 (`#SBATCH --nodes=8`), embeds the absolute `--config` path, and names the job `oplm-400M` by
 default (override with `--name`). Every other preset in that file resolves the same way:
-`170M` → 4 nodes, `800M` → 16 nodes, `1B` → 16 nodes.
+`170M` → 4 nodes, `800M` → 16 nodes, `1B` → 16 nodes. Pass each preset's `batch_tokens` cap as
+above (none needed for 170M).
 
 ### `submit`
 

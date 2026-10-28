@@ -23,5 +23,6 @@ One line per doc. Start with the group that matches what you want to do.
 
 ## Contribute
 
+- [AGENTS.md](../AGENTS.md): instructions for agents and contributors: commands, architecture and documentation rules.
 - [testing.md](testing.md): running the test suite, end-to-end scenarios and cluster recovery drills.
 - [superpowers/](superpowers/): dated design specs and plans, kept as design records.

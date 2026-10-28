@@ -9,27 +9,15 @@ simply points back to this file).
 ## Build & Test Commands
 
 ```bash
-# install (editable, with dev dependencies)
-pip install -e ".[dev]"
-
-# run all tests
-pytest
-
-# run tests with coverage
-pytest --cov=oplm
-
-# skip slow tests
-pytest -m "not slow"
-
-# lint
-ruff check src/
-
-# format
-ruff format src/
-
-# type check (ty — Astral's checker; configured under [tool.ty] in pyproject.toml)
-ty check src/
+pip install -e ".[dev]"                        # install (editable, with dev dependencies)
+.venv/bin/python -m pytest -m "not slow" -q    # fast suite
+ruff check src/                                # lint
+ruff format src/                               # format
+ty check src/                                  # type check (Astral's ty; [tool.ty] in pyproject.toml)
 ```
+
+Run tests through `python -m pytest`, not bare `pytest`. The full suite, coverage and the E2E and
+cluster drills are in [docs/testing.md](docs/testing.md).
 
 > **Type checking uses `ty`, not mypy.** `ty` is pre-1.0/beta but handles this
 > HuggingFace/torch-heavy codebase far better than mypy (which drowned in

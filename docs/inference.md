@@ -132,9 +132,14 @@ as real input.
 
 ## Batching, length and devices
 
-- **Length limit.** The context window is 1024 positions, so a sequence can have at most 1022
-  residues. Truncate on the way in with `model.tokenize(seqs, truncation=True, max_length=1024)`,
-  or split long proteins yourself.
+- **Length limit.** The model was trained on `model.config.max_position_embeddings` positions,
+  so a sequence should have at most `model.config.max_position_embeddings - 2` residues (the other
+  two positions are `<cls>` and `<eos>`). `logits` does not truncate, and longer inputs run but are
+  outside the trained context. Truncate on the way in with
+  `model.tokenize(seqs, truncation=True, max_length=model.config.max_position_embeddings)`, or split
+  long proteins yourself. A truncated sequence keeps only its first
+  `max_position_embeddings - 2` residues, so slice it with that length, not `len(s)`, in the
+  residue and per-protein snippets above.
 - **Batch by length.** Padding costs compute. Sort sequences by length and feed batches of similar
   length together, then put the results back in the original order.
 - **Inference mode.** Call `.eval()` and wrap forward passes in `torch.no_grad()`, as above.

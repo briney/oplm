@@ -29,8 +29,9 @@ published separately. Point `data.train` and `data.eval` in the config at the do
 Tune `train.lr` once on the 170M proxy, rank candidates on loss after a decay, confirm at 800M, and
 reuse the result at every width. Run the coordinate check first. The recipe config already carries
 the learning rate from the last funnel, so this step is only needed to re-derive it (a different
-batch, context, mix or optimizer). Make a sweep config from `configs/scaling.yaml` and set
-`CONFIG=...` and `SWEEP=...` (absolute paths) as in [mup-lr.md, *Sweep config*](mup-lr.md#sweep-config).
+batch, context, mix or optimizer). Make a sweep config from `configs/scaling.yaml` as in
+[mup-lr.md, *Sweep config*](mup-lr.md#sweep-config), then set `CONFIG=...` and `SWEEP=...`
+(absolute paths) as in [*Run the coordinate check*](mup-lr.md#run-the-coordinate-check).
 The commands below are the first two of the funnel.
 
 ```bash
@@ -61,6 +62,16 @@ oplm slurm submit jobs/170M
 oplm slurm status jobs/170M
 ```
 
+`generate` renders the config's `train.batch_tokens` (65536, the 170M micro-batch) for every
+preset; it does not read `slurm.max_batch_tokens`. For any other preset, pass that preset's cap on
+the command line, for example `train.batch_tokens=32768` for 400M. Without it, 400M runs at twice
+its cap and 800M and 1B fail at launch. Whether those caps fit in memory has not been checked on
+hardware.
+
+```bash
+oplm slurm generate --config configs/scaling.yaml --preset 400M --out jobs/400M train.batch_tokens=32768
+```
+
 - Launch, nodes and requeue behavior: [slurm.md, *`oplm slurm generate`, `submit` and `status`*](slurm.md#oplm-slurm-generate-submit-and-status).
 - The training loop, schedule and checkpoints: [training.md, *Optimizer and schedule*](training.md#optimizer-and-schedule)
   and [*Checkpointing and resume*](training.md#checkpointing-and-resume).
@@ -69,22 +80,29 @@ oplm slurm status jobs/170M
 ## 4. Run the decay phase
 
 The decay is a branch off a stable-phase checkpoint: it keeps the optimizer state and ramps the LR
-down. You set `train.branch_from`, `train.stable_steps` and `train.max_steps`, and the arithmetic
-is in the worked example. The same command is how you try a different decay off a published
-checkpoint.
+down. Build the branch config from the checkpoint's own `config.yaml` plus your `slurm:` block, then
+set `train.branch_from`, `train.stable_steps` and `train.max_steps`. The arithmetic is in the worked
+example. The same commands are how you try a different decay off a published checkpoint.
 
 ```bash
-oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/decay-50k \
+# config.yaml has no slurm: block; append the one from your edited configs/scaling.yaml.
+{ cat <run>/checkpoint-2500000/config.yaml; awk '/^[^ #]/{p=/^slurm:/} p' configs/scaling.yaml; } > decay-50k.yaml
+oplm slurm generate --config decay-50k.yaml --preset 170M --out jobs/decay-50k \
   --name decay-50k train.branch_from=<run>/checkpoint-2500000 train.output_dir=<fresh> \
   train.stable_steps=2498000 train.max_steps=2550000
 ```
+
+The data cursor carries over only if `data.train` in that config matches the checkpoint's exactly,
+absolute paths included, so keep the training set at the paths the checkpoint names (mirror or
+symlink them). Otherwise the branch restarts the data stream from row 0 of the epoch.
 
 The example is hypothetical, not a published run. Mechanics and rules:
 [training.md, *Branching a decay off a checkpoint*](training.md#branching-a-decay-off-a-checkpoint).
 Decay shape, length and floor: [mup-lr.md, *Decay recipe*](mup-lr.md#decay-recipe).
 
-> **Pending:** the production decay recipe (shape, length fraction, LR floor) and its data mix
-> (waiting on #55).
+> **Pending:** the production decay recipe (shape, length fraction, LR floor) (waiting on #55).
+
+> **Pending:** the production data mix for the stable and decay phases (waiting on #58).
 
 ## 5. Evaluate
 
@@ -111,8 +129,14 @@ checkpoint, or a 20k decay off the 1.5M checkpoint. Only the plateau end and the
 
 1. Pick a checkpoint from [training.md, *Published checkpoints*](training.md#published-checkpoints).
    It lists what a checkpoint contains and which training-set tag its data cursor refers to.
-2. Download that training-set tag (step 1), so the cursor is exact.
-3. Branch the decay with the command in step 4. What must match the original run, and what can
+2. Download that training-set tag (step 1) and put it at the absolute paths the checkpoint's
+   `config.yaml` lists under `data.train` (mirror or symlink them). The cursor is kept only when
+   `data.train` matches the checkpoint's exactly, paths included; any difference restarts the stream
+   from row 0.
+3. Branch the decay with the commands in step 4, building the config from the checkpoint's own
+   `config.yaml`, not from `configs/scaling.yaml`, whose LR, mix and horizon are still pending and may
+   differ from the published run. Point its `data.eval` paths at your copies of the eval sets
+   (those paths do not affect the cursor). What must match the original run, and what can
    change freely (decay length, shape, LR floor, decay data mix), is in
    [training.md, *Branching a decay off a checkpoint*](training.md#branching-a-decay-off-a-checkpoint).
 4. With fewer GPUs than the original run, data-exact resume is not possible. The limit and the

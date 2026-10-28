@@ -6,8 +6,8 @@ under `src/oplm/eval/`. For every `data.eval` key and default, see
 [config.md](config.md), *Eval datasets*. For how the eval data was built, see
 [data.md](data.md), *Evaluation data*.
 
-Evaluation is training-integrated only. There is no standalone `oplm eval` command;
-the CLI exposes `train`, `encode`, `info` and `fold` (`src/oplm/cli.py`).
+Evaluation is training-integrated only. There is no standalone `oplm eval` command (see
+`oplm --help`).
 
 ## Tasks and metrics
 
@@ -183,8 +183,8 @@ and point `path` at a set's folder:
 | set | use | needs `model.max_position_embeddings` |
 | --- | --- | --- |
 | `casp15_16` | CASP15 and CASP16 domains | at least 820 |
-| `cameo`, `cameo_256` | CAMEO chains; seed-42 256-chain subset | `cameo_256` at least 514 |
-| `pdb40`, `pdb40_2048`, `pdb40_256` | PDB40 representatives; seed-42 subsets | full `pdb40` at least 1026; `_256` subsets at least 514 |
+| `cameo`, `cameo_256` | CAMEO chains; seed-42 256-chain subset | at least 514 (both are capped at 512 residues) |
+| `pdb40`, `pdb40_2048`, `pdb40_256` | PDB40 representatives; seed-42 subsets | full `pdb40` at least 1026; `pdb40_2048` and `pdb40_256` at least 514 (subsets are capped at 512 residues) |
 
 Sequences too long for the context are skipped, not errors, so a too-small
 `model.max_position_embeddings` silently shrinks the set. The `2026-10-12` folder

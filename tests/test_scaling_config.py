@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from oplm.config import load_config
+from omegaconf import OmegaConf
+
+from oplm.config import load_config, resolve_token_accumulation
 from oplm.training.optim import get_schedule_fn
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -72,3 +74,19 @@ def test_scaling_config_is_the_current_recipe() -> None:
     assert cfg.train.lr == 0.0063
     assert cfg.model.packed_attention == "flex"
     assert cfg.train.mup_depth_lr_exponent == 0.5
+
+
+def test_every_preset_plans_with_its_batch_tokens_cap() -> None:
+    """Each preset's token plan divides with ``train.batch_tokens`` set to its cap.
+
+    ``oplm slurm generate`` renders ``train.batch_tokens`` as-is (it does not read
+    ``slurm.max_batch_tokens``), so the docs tell users to pass the preset's cap as an
+    override. That override must give a valid accumulation at the preset's node count.
+    """
+    slurm = OmegaConf.load(_SCALING_CONFIG).slurm
+    for preset, nodes in slurm.nodes.items():
+        cap = slurm.max_batch_tokens[preset]
+        cfg = load_config(
+            ["--config", str(_SCALING_CONFIG), "--preset", preset, f"train.batch_tokens={cap}"]
+        )
+        assert resolve_token_accumulation(cfg.train, nodes * slurm.gpus_per_node) >= 1, preset

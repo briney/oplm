@@ -6,8 +6,8 @@ One open project, two models:
   and per-protein embeddings, plus amino-acid logits.
 - **OPLMFold** predicts protein structure on top of OPLM.
 
-Everything is open, as it is published: the weights, the exact training data and how it was
-built, and the full training recipe.
+The weights, the exact training data and how it was built, and the full recipe are all open
+(weights and data are being published now).
 
 ## Install
 
@@ -40,7 +40,9 @@ per_protein = torch.stack(
 )  # (B, hidden_size): the mean over each sequence's residues
 ```
 
-`out.sequence_logits` holds the per-residue amino-acid logits. Batching, GPUs, pooling options and
+`out.sequence_logits` holds the per-residue amino-acid logits. The slice assumes each sequence fits
+the model's context (`model.config.max_position_embeddings - 2` residues); for longer ones see the
+length limit in [docs/inference.md](docs/inference.md#batching-length-and-devices). Batching, GPUs, pooling options and
 the `transformers` `Auto*` classes are covered in [docs/inference.md](docs/inference.md).
 
 **Coming from ESM-C?** The API mirrors it: the same `LogitsConfig` and `LogitsOutput`, and the same

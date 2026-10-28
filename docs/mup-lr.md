@@ -243,7 +243,7 @@ decayed loss. The harness doesn't automate this. Each branch is an ordinary trai
 from the cell's own resolved `run.yaml`, with three overrides: `train.branch_from` (the
 checkpoint), `train.stable_steps` (the plateau ends at the checkpoint's step) and
 `train.max_steps` (the end of the decay). The arithmetic and the rules (fresh `train.output_dir`,
-same node count so the data cursor is restored) are in
+`data.train` left as `run.yaml` has it and the same node count, so the data cursor is restored) are in
 [training.md, *Branching a decay off a checkpoint*](training.md#branching-a-decay-off-a-checkpoint).
 
 For a cell of `N` steps with `W` warmup steps and a decay of `D = N / 5` steps:
@@ -297,7 +297,8 @@ oplm sweep confirm --config $CONFIG --from $SWEEP/replicate/phase.json \
 
 Cells run 10,000 steps with a 1,000-step warmup (the defaults), about 4.3 h each on 8 nodes. Decay
 them with the same loop and `PHASE=confirm NODES=8 N=10000 W=1000 D=2000`, and rank on step 12,000.
-The winner's LR goes into `train.lr` in `src/oplm/configs/train/base.yaml`.
+The winner's LR goes into `train.lr` in both `src/oplm/configs/train/base.yaml` and
+[`configs/scaling.yaml`](../configs/scaling.yaml), which pins its own `lr`.
 
 ### Status, resubmission and phase artifacts
 

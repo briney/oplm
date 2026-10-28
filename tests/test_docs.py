@@ -128,7 +128,7 @@ def test_documented_config_fields_exist() -> None:
     checked = 0
     for doc in TREE_DOCS:
         for section, name in pat.findall(doc.read_text(encoding="utf-8")):
-            if name in {"py", "yaml", "md", "json"}:
+            if name in {"py", "yaml", "md", "json", "safetensors", "pt", "bin", "config"}:
                 continue
             checked += 1
             ok = hasattr(model, name) if section == "model" else name in fields[section]
@@ -143,12 +143,12 @@ PENDING = "> **Pending:**"
 
 def test_pending_markers_present() -> None:
     expect = {  # doc → issue numbers whose Pending markers must appear in it
-        "docs/data.md": ["#61"],
+        "docs/data.md": ["#61", "#58"],
         "docs/training.md": ["#62", "#63"],
         "docs/mup-lr.md": ["#55"],
         "docs/inference.md": ["#62"],
         "docs/evaluation.md": ["#57"],
-        "docs/reproduce.md": ["#55"],  # decay recipe + expected loss / P@L ranges
+        "docs/reproduce.md": ["#55", "#58"],  # decay recipe, loss / P@L ranges; data mix
     }
     for doc, issues in expect.items():
         # each marker is its blockquote: the Pending line plus the consecutive ">" lines after it
@@ -156,3 +156,22 @@ def test_pending_markers_present() -> None:
         markers = re.findall(rf"^{re.escape(PENDING)}.*(?:\n>.*)*", text, re.MULTILINE)
         for issue in issues:
             assert any(issue in m for m in markers), f"{doc}: no Pending marker for {issue}"
+
+
+def test_pending_markers_have_the_exact_form() -> None:
+    """Every Pending blockquote reads ``> **Pending:** <what> (waiting on #N).``"""
+    bad = []
+    for doc in TREE_DOCS:
+        text = _FENCE.sub("", doc.read_text(encoding="utf-8"))
+        for quote in re.findall(r"^>.*(?:\n>.*)*", text, re.MULTILINE):
+            if "**Pending:**" not in quote:
+                continue
+            lines = quote.splitlines()
+            joined = " ".join(line[1:].strip() for line in lines)
+            if (
+                not lines[0].startswith(f"{PENDING} ")
+                or quote.count("**Pending:**") != 1
+                or not re.search(r"\(waiting on #\d+\)\.$", joined)
+            ):
+                bad.append(f"{doc.relative_to(REPO)}: {joined}")
+    assert not bad, "\n".join(bad)

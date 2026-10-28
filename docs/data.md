@@ -17,6 +17,8 @@ uniref70 `fraction: 0.05` and deepclust70 `fraction: 0.95`. Fractions are **rows
 not tokens, because the loader samples a source per row. Sequences differ in length
 between the two sets, so the token share is not the row share.
 
+> **Pending:** the production data mix for the stable and decay phases (waiting on #58).
+
 Rows to tokens: `tokens = rows x mean tokens per row`, with the mean taken per source.
 
 | source | rows | tokens | mean tokens per row |
