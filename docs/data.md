@@ -350,7 +350,10 @@ below only load. See [EVAL_HARNESS.md](EVAL_HARNESS.md).
   skipped with a warning; results sorted by filename. BioPython is imported lazily,
   so `import oplm.data` never hard-requires it.
 - **Variant** (`src/oplm/data/variant/`): zero-shot variant-effect assays loaded
-  and validated from CSV (one per assay). DMS-substitution assays (`mutant`, `DMS_score`) load via
+  and validated from CSV (one per assay). The wild-type comes from, in order: an explicit
+  override (`EvalDatasetEntry.extra["wildtype"]` or a sidecar), then a constant
+  `wildtype` column (`protein_sequence` for clinical assays), then reconstruction from
+  `mutated_sequence`. DMS-substitution assays (`mutant`, `DMS_score`) load via
   `load_variant_assays`, which reconstructs the wild-type from `mutated_sequence`
   when no explicit WT is given and reads the optional `DMS_score_bin` column into
   `VariantAssay.bin_labels` (used for AUROC). ProteinGym **clinical**-substitution

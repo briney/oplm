@@ -484,9 +484,8 @@ class DataConfig:
     mask_prob: float = 0.15  # fraction of eligible positions selected for masking
     mask_token_prob: float = 0.8  # of masked positions -> <mask>
     random_token_prob: float = 0.1  # of masked positions -> random canonical AA
-    weighted_masking: bool = (
-        False  # honor the masking_weights column when True (docs/data.md, Masking)
-    )
+    # Honor the masking_weights column when True (docs/data.md, Masking).
+    weighted_masking: bool = False
 
     # Collation padding: None = pad to batch-longest sequence; N = pad to the
     # smallest multiple of N that is >= batch-longest. Useful for compile+static
