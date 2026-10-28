@@ -53,10 +53,11 @@ def test_relative_links_resolve() -> None:
     for doc in TREE_DOCS:
         text = _FENCE.sub("", doc.read_text(encoding="utf-8"))
         for target in _LINK.findall(text):
-            if target.startswith(("http://", "https://", "mailto:")):
+            if target.startswith(("http://", "https://", "mailto:", "tel:")):
                 continue
             path_part, _, anchor = target.partition("#")
-            dest = (doc.parent / path_part).resolve() if path_part else doc
+            base = REPO if path_part.startswith("/") else doc.parent  # "/x" = repo root
+            dest = (base / path_part.lstrip("/")).resolve() if path_part else doc
             if not dest.exists():
                 failures.append(f"{doc.relative_to(REPO)}: {target}")
             elif anchor and dest.suffix == ".md" and anchor not in _anchors(dest):
