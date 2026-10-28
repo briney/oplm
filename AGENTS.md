@@ -117,7 +117,7 @@ Deferred work for this repo lives on its GitHub Projects board (Triage, Planned,
 
 Make these moves without asking, and report them in one line, e.g. `Board: #12 → Done (PR #49), #15 → In Progress`.
 
-New ideas go in Triage (the `defer` skill does this). Check `board search TERMS` first; on an open match, `board comment N --body - <<'EOF'` instead of filing a duplicate. A card must stand on its own weeks later:
+New ideas go in Triage (the `codebox-defer` skill does this). Check `board search TERMS` first; on an open match, `board comment N --body - <<'EOF'` instead of filing a duplicate. A card must stand on its own weeks later:
 
 ```
 board add --title 'Short, specific title' --body - <<'EOF'
