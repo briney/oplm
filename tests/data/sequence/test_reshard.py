@@ -8,7 +8,7 @@ must be byte-identical to the pre-layer stream.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import TYPE_CHECKING
 
 import pytest
@@ -17,11 +17,14 @@ import oplm.data.sequence.dataset as dataset_mod
 from oplm.data import Reshard
 from oplm.data.sequence.dataset import (
     _FULL,
+    POSITION_KEY,
+    InterleavedDataset,
     ShardedProteinDataset,
     _level_sizes,
     _resolve_layers,
 )
 from tests.data.conftest import _load_real_records, write_sequence_shards
+from tests.data.sequence.test_refill_and_remainder import _mix, _sources
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -234,3 +237,137 @@ def test_resolve_layers_per_source() -> None:
     assert resolve(0, 1, 0) == [(3, [2, 0, _FULL])]
     assert resolve(1, 0, 0) == [(3, [0, 0, 9])]
     assert resolve(1, 1, 0) == []  # every count is 0: identity, dropped
+
+
+# --------------------------------------------------------------------------- #
+# Mixes: per-source position tags and layered passes
+# --------------------------------------------------------------------------- #
+
+Tagged = tuple[str, tuple[int, tuple[tuple[int, int], ...]]]  # (id, (draws_done, positions))
+
+
+def _mix_stream(
+    mix: InterleavedDataset, rank: int, world: int, worker: int = 0, workers: int = 1
+) -> list[Tagged]:
+    """``(id, tag)`` of every row one ``(rank, worker)`` stream of ``mix`` yields."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            dataset_mod, "_resolve_distributed_context", lambda: (rank, world, worker, workers)
+        )
+        return [(str(row["sequence_id"]), row[POSITION_KEY]) for row in mix]  # ty: ignore[invalid-return-type]
+
+
+def _mix_streams(mix: InterleavedDataset, world: int) -> list[list[Tagged]]:
+    return [_mix_stream(mix, rank, world) for rank in range(world)]
+
+
+def _draws(streams: list[list[Tagged]]) -> int:
+    """Total draws of whole streams (a draw that hit an exhausted source serves no row)."""
+    return sum(stream[-1][1][0] for stream in streams if stream)
+
+
+def _source(rid: str) -> int:
+    return "ab".index(rid[0])  # _sources: "a" is the small source, "b" the big one
+
+
+def _reshard(streams: list[list[Tagged]], draws: Sequence[int]) -> Reshard:
+    """The event a save after ``draws`` draws of each stream records (from the last rows' tags)."""
+    tags = [stream[n - 1][1] if n else None for stream, n in zip(streams, draws, strict=True)]
+    return Reshard(
+        stride=len(streams),
+        epochs=[0] * len(streams),
+        rows=[tag[0] if tag else 0 for tag in tags],
+        sources=[[list(pos) for pos in tag[1]] if tag else None for tag in tags],
+    )
+
+
+def _assert_exact_per_source_pass(
+    sources: list[ShardedProteinDataset], served: list[Tagged], last: list[list[Tagged]]
+) -> None:
+    """Every pass the ``last`` streams all finished holds each row once; later ones repeat none."""
+    for s, source in enumerate(sources):
+        everything = Counter(_stream(source, 0, 1))
+        by_pass: defaultdict[int, list[str]] = defaultdict(list)
+        for rid, (_, positions) in served:
+            if _source(rid) == s:
+                by_pass[positions[s][0]].append(rid)
+        finished = min(stream[-1][1][1][s][0] for stream in last if stream)
+        for p in range(finished):
+            assert Counter(by_pass[p]) == everything, (s, p)
+        for p in range(finished, max(by_pass) + 1):
+            assert len(set(by_pass[p])) == len(by_pass[p]), (s, p)
+
+
+def test_rows_carry_position_tags(tmp_path: Path) -> None:
+    rows = _mix_stream(_mix(_sources(tmp_path), reshuffle=True), 0, 1)
+    lengths = [10, 100]
+    state = [[0, 0], [0, 0]]
+    for i, (rid, (draws, positions)) in enumerate(rows, 1):
+        assert draws == i
+        s = _source(rid)
+        if state[s][1] == lengths[s]:  # the source refilled: next pass, offset from 0
+            state[s] = [state[s][0] + 1, 0]
+        state[s][1] += 1
+        assert positions == tuple(tuple(pos) for pos in state)
+    assert state[0][0] >= 3  # the small source refilled several times
+
+
+def test_mix_reshard_is_exact_per_source_pass(tmp_path: Path) -> None:
+    sources = _sources(tmp_path)
+    mix = _mix(sources, reshuffle=True)
+    old_streams = _mix_streams(mix, 3)
+    draws = [30, 5, 20]
+    old = [row for stream, n in zip(old_streams, draws, strict=True) for row in stream[:n]]
+    mix.set_reshards([_reshard(old_streams, draws)])
+    new_streams = _mix_streams(mix, 2)
+    new = [row for stream in new_streams for row in stream]
+    assert sum(draws) + _draws(new_streams) == len(mix) == 110
+    _assert_exact_per_source_pass(sources, old + new, new_streams)
+
+
+def test_same_layout_resume_inside_a_layered_epoch(tmp_path: Path) -> None:
+    sources = _sources(tmp_path)
+    mix = _mix(sources, reshuffle=True)
+    old_streams = _mix_streams(mix, 3)
+    reshard = _reshard(old_streams, [30, 5, 20])
+    mix.set_reshards([reshard])
+    # The live layout: 1 rank x 2 workers. Worker 1 is saved before its first batch.
+    baseline = [_mix_stream(mix, 0, 1, w, 2) for w in range(2)]
+    cut = [17, 0]
+    tags = [stream[n - 1][1] if n else None for stream, n in zip(baseline, cut, strict=True)]
+    resumed = _mix(sources, reshuffle=True)
+    resumed.set_reshards([reshard])
+    resumed.set_resume_rows([tag[0] if tag else 0 for tag in tags])
+    resumed.set_resume_sources([[list(p) for p in tag[1]] if tag else None for tag in tags])
+    for w in range(2):
+        assert _mix_stream(resumed, 0, 1, w, 2) == baseline[w][cut[w] :], w
+
+
+def test_nested_reshard_with_an_idle_old_worker(tmp_path: Path) -> None:
+    sources = _sources(tmp_path)
+    mix = _mix(sources, reshuffle=True)
+    phase1 = _mix_streams(mix, 3)
+    first = _reshard(phase1, [30, 5, 20])
+    mix.set_reshards([first])
+    phase2 = _mix_streams(mix, 2)
+    second = _reshard(phase2, [15, 0])  # stream 1 is idle: no tag, `None` sources
+    assert second.sources is not None and second.sources[1] is None
+    mix.set_reshards([first, second])
+    phase3 = _mix_streams(mix, 4)
+    served = (
+        [row for stream, n in zip(phase1, [30, 5, 20], strict=True) for row in stream[:n]]
+        + phase2[0][:15]
+        + [row for stream in phase3 for row in stream]
+    )
+    # Tiny layered passes of the small source give some stride-4 streams no row of a pass:
+    # those draws hit an exhausted source, so count draws, not rows.
+    assert sum(first.rows) + 15 + _draws(phase3) == len(mix)
+    _assert_exact_per_source_pass(sources, served, phase3)
+
+
+def test_layered_resume_without_sources_raises(tmp_path: Path) -> None:
+    mix = _mix(_sources(tmp_path), reshuffle=True)
+    mix.set_reshards([_reshard(_mix_streams(mix, 3), [30, 5, 20])])
+    mix.set_resume_rows([4])
+    with pytest.raises(ValueError, match="needs per-source positions"):
+        _mix_stream(mix, 0, 1)

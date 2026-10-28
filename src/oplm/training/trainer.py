@@ -959,7 +959,7 @@ class Trainer:
                             ) from None
                 self._window_data_wait += time.perf_counter() - data_t0
                 if self._token_mode:
-                    worker_id, rows_emitted = batch["stream_position"]
+                    worker_id, rows_emitted = batch["stream_position"][:2]
                     self._worker_rows[int(worker_id)] = int(rows_emitted)
 
                 # Forward + backward inside accumulation context

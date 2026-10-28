@@ -627,6 +627,11 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
 # worker) even after re-iteration — distinct from any real row dict.
 _EXHAUSTED = object()
 
+# Row key of an `InterleavedDataset` row's stream position: `(draws_done, ((pass, offset), ...))`
+# after the draw that served it, the offset counting this stream's rows of the source's current
+# (layered) pass. The token batcher pops it into its batch's `stream_position`.
+POSITION_KEY = "_stream_position"
+
 
 class InterleavedDataset(IterableDataset[dict[str, object]]):
     """Interleave several iterable datasets by sampling fraction.
@@ -636,6 +641,11 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
     keep mixing at the requested ratio for the whole epoch. Sub-datasets perform
     their own ``(rank, worker)`` striping, so this class strides only the *number
     of steps* per worker. See docs/data.md, Dataset formats.
+
+    Every row carries its stream position under :data:`POSITION_KEY`: ``(draws_done,
+    ((pass, offset), ...))``, this stream's draws so far and, per source, its pass and the rows
+    this stream has served of that pass. A checkpoint that stores it resumes exactly at any
+    layout (:meth:`set_resume_sources`, :meth:`set_reshards`).
 
     Args:
         datasets: Source iterable datasets (typically :class:`ShardedProteinDataset`).
@@ -693,6 +703,11 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         self._resume_num_workers = 1
         # Token-mode resume skip: rows already emitted, one entry per DataLoader worker.
         self._resume_rows: list[int] | None = None
+        # Per worker, per source `[pass, offset]` (from POSITION_KEY); with it, `_resume_rows`
+        # counts draws.
+        self._resume_sources: list[Sequence[Sequence[int]] | None] | None = None
+        # Reshard events (layout changes) to replay; persist across epochs and resume skips.
+        self._reshards: list[Reshard] = []
 
     def _default_num_samples(self) -> int:
         """Sum of source lengths, or 0 if any source has no defined length."""
@@ -724,6 +739,14 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
             set_epoch = getattr(ds, "set_epoch", None)
             if callable(set_epoch):
                 set_epoch(epoch)
+
+    def set_reshards(self, reshards: Sequence[Reshard]) -> None:
+        """Replay these reshard events in every later epoch they apply to.
+
+        Each event layers the epoch's draw budget (its ``rows`` are draws) and every source pass
+        (its ``sources``). Persists across epochs and is not cleared by :meth:`clear_resume_skip`.
+        """
+        self._reshards = list(reshards)
 
     def set_resume_skip(self, batches_in_epoch: int, per_rank_batch: int, num_workers: int) -> None:
         """Arm a one-epoch skip so the next ``__iter__`` (in every worker) resumes mid-epoch.
@@ -761,8 +784,18 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         """
         self._resume_rows = list(rows_per_worker)
 
+    def set_resume_sources(self, sources: Sequence[Sequence[Sequence[int]] | None]) -> None:
+        """Arm each worker's per-source ``[pass, offset]`` (its last row's :data:`POSITION_KEY`).
+
+        Armed together with :meth:`set_resume_rows`, whose counts then mean draws: each worker
+        skips its draws and starts every source exactly where its tag says, so the resume is
+        exact even inside a resharded epoch. A ``None`` entry is a worker that had drawn
+        nothing. Cleared by :meth:`clear_resume_skip`.
+        """
+        self._resume_sources = list(sources)
+
     def clear_resume_skip(self) -> None:
-        """Disarm both resume skips; the next ``__iter__`` starts each stream at step 0.
+        """Disarm every resume skip; the next ``__iter__`` starts each stream at step 0.
 
         Since per-source sample skips are computed fresh inside ``__iter__`` from the
         (now-unarmed) skip rather than stored on the sub-datasets, this also implicitly
@@ -770,18 +803,20 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         """
         self._resume_batches_in_epoch = None
         self._resume_rows = None
+        self._resume_sources = None
 
     def _arm_source_skip(
         self, source_idx: int, n_samples: int
-    ) -> tuple[Iterator[dict[str, object]], int]:
-        """Return ``(iterator, pass_index)`` for source ``source_idx``, ``n_samples`` in.
+    ) -> tuple[Iterator[dict[str, object]], int, int]:
+        """Return ``(iterator, pass_index, offset)`` for source ``source_idx``, ``n_samples`` in.
 
         ``n_samples`` counts this worker's draws of the source before the interruption,
         across however many passes (refills) it had already made this epoch. With
         ``reshuffle_on_refill`` each pass has its own order, so the source resumes at pass
         ``n_samples // stream_length``, offset ``n_samples % stream_length``, and later
         refills continue from the following pass; without it every pass is the epoch's
-        order and only the offset matters. Applies to the first iterator only:
+        order and only the offset matters (the returned ``pass_index`` still counts passes,
+        for the position tag). Applies to the first iterator only:
         :meth:`_next_or_refill` starts later passes unskipped. Sources without
         ``_iter_pass`` (anything but :class:`ShardedProteinDataset`) restart from position
         0 instead, logged via :data:`logger`, since data-exact resume is unavailable there.
@@ -795,9 +830,8 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         if callable(iter_pass):
             length = source.stream_length()  # ty: ignore[unresolved-attribute]  # duck-typed with _iter_pass
             pass_index, offset = divmod(n_samples, length) if length > 0 else (0, 0)
-            if not self._reshuffle_on_refill:
-                pass_index = 0
-            return iter_pass(pass_index, offset), pass_index
+            order = pass_index if self._reshuffle_on_refill else 0
+            return iter_pass(order, offset), pass_index, offset
         if n_samples > 0:
             logger.warning(
                 "InterleavedDataset resume skip: source %d (%s) has no sample-skip "
@@ -807,19 +841,55 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
                 type(source).__name__,
                 n_samples,
             )
-        return iter(source), 0
+        return iter(source), 0, 0
 
-    def _refill(self, source_idx: int, pass_index: int) -> Iterator[dict[str, object]]:
-        """A fresh pass over source ``source_idx`` (reshuffled when enabled and supported)."""
+    def _open(
+        self, source_idx: int, pass_index: int, offset: int = 0
+    ) -> Iterator[dict[str, object]]:
+        """Source ``source_idx``'s ``pass_index``-th pass, ``offset`` rows in, with its layers.
+
+        The pass is read in its own order when ``reshuffle_on_refill`` is set (else the epoch's)
+        and with the reshard layers of that pass. Sources without ``_iter_pass`` (anything but
+        :class:`ShardedProteinDataset`) just restart.
+        """
         source = self._datasets[source_idx]
         iter_pass = getattr(source, "_iter_pass", None)
-        if self._reshuffle_on_refill and callable(iter_pass):
-            return iter_pass(pass_index)
-        return iter(source)
+        if not callable(iter_pass):
+            return iter(source)
+        layers = _resolve_layers(
+            self._reshards, self._epoch, source=source_idx, pass_index=pass_index
+        )
+        return iter_pass(pass_index if self._reshuffle_on_refill else 0, offset, layers)
+
+    def _start_pass(self, source_idx: int) -> int:
+        """The first pass of source ``source_idx`` the reshard layers left any rows of."""
+        source = self._datasets[source_idx]
+        last = 1 + max(
+            (
+                positions[source_idx][0]
+                for reshard in self._reshards
+                if min(reshard.epochs) <= self._epoch <= max(reshard.epochs)
+                for positions in reshard.sources or ()
+                if positions is not None
+            ),
+            default=-1,
+        )
+        for pass_index in range(last):
+            layers = _resolve_layers(
+                self._reshards, self._epoch, source=source_idx, pass_index=pass_index
+            )
+            total = source.total_length  # ty: ignore[unresolved-attribute]  # ShardedProteinDataset
+            drop = source._drop_remainder  # ty: ignore[unresolved-attribute]
+            if _level_sizes(total, layers, drop)[-1] > 0:
+                return pass_index
+        return last
 
     def __iter__(self) -> Iterator[dict[str, object]]:
         joint_index, stride = _joint_stripe()
-        if self._num_samples <= 0 or joint_index >= self._num_samples:
+        layers = _resolve_layers(self._reshards, self._epoch)
+        # The draw budget: what the old streams' draws left of `num_samples`.
+        budget = _level_sizes(self._num_samples, layers, self._drop_remainder)[-1]
+        if budget <= 0 or joint_index >= budget:
             return
 
         # One generator per (epoch, rank, worker) so each worker draws an
@@ -828,41 +898,70 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         generator.manual_seed((_epoch_seed(self._seed, self._epoch) + joint_index) & _MASK32)
 
         if self._drop_remainder:
-            n_steps = self._num_samples // stride
+            n_steps = budget // stride
         else:
-            n_steps = len(range(joint_index, self._num_samples, stride))
+            n_steps = len(range(joint_index, budget, stride))
+        if n_steps <= 0:
+            return
         weights = torch.tensor(self._fractions, dtype=torch.float64)
         choices = torch.multinomial(weights, n_steps, replacement=True, generator=generator)
 
-        if self._resume_rows is not None:
+        n_sources = len(self._datasets)
+        if self._resume_sources is not None:
+            # Exact per-source positions: skip the draws, start each source where its tag says.
+            if self._resume_rows is None:
+                raise ValueError("set_resume_sources needs set_resume_rows (the draw counts)")
             skip = _resolve_rows_skip(self._resume_rows, n_steps)
+            _, _, worker_id, _ = _resolve_distributed_context()
+            tag = self._resume_sources[worker_id]
+            if tag is None:  # this worker had drawn nothing
+                tag = [(self._start_pass(idx), 0) for idx in range(n_sources)]
+            passes = [int(pass_index) for pass_index, _ in tag]
+            offsets = [int(offset) for _, offset in tag]
+            iters = [self._open(idx, passes[idx], offsets[idx]) for idx in range(n_sources)]
         else:
-            skip = _resolve_sample_skip(
-                self._resume_batches_in_epoch,
-                self._resume_per_rank_batch,
-                self._resume_num_workers,
-                n_steps,
-            )
-        if skip:
-            # Per-source draw counts among the choices already consumed before the
-            # interruption; each count is a sample count for that source alone, so
-            # `_arm_source_skip` reduces it modulo that source's own stream length.
-            counts = torch.bincount(choices[:skip], minlength=len(self._datasets))
-            armed = [
-                self._arm_source_skip(idx, int(counts[idx].item()))
-                for idx in range(len(self._datasets))
-            ]
-            iters = [it for it, _ in armed]
-            passes = [pass_index for _, pass_index in armed]
-            choices = choices[skip:]
-        else:
-            iters = [iter(ds) for ds in self._datasets]
-            passes = [0] * len(self._datasets)
+            if self._resume_rows is not None:
+                skip = _resolve_rows_skip(self._resume_rows, n_steps)
+            else:
+                skip = _resolve_sample_skip(
+                    self._resume_batches_in_epoch,
+                    self._resume_per_rank_batch,
+                    self._resume_num_workers,
+                    n_steps,
+                )
+            armed_skip = self._resume_rows is not None or self._resume_batches_in_epoch is not None
+            if layers and armed_skip:
+                raise ValueError(
+                    "resuming a resharded mix needs per-source positions (set_resume_sources); "
+                    "draw counts alone cannot place each source inside a layered pass"
+                )
+            if skip:
+                # Per-source draw counts among the choices already consumed before the
+                # interruption; each count is a sample count for that source alone, so
+                # `_arm_source_skip` reduces it modulo that source's own stream length.
+                counts = torch.bincount(choices[:skip], minlength=n_sources)
+                armed = [
+                    self._arm_source_skip(idx, int(counts[idx].item())) for idx in range(n_sources)
+                ]
+                iters = [it for it, _, _ in armed]
+                passes = [pass_index for _, pass_index, _ in armed]
+                offsets = [offset for _, _, offset in armed]
+            else:
+                passes = [self._start_pass(idx) for idx in range(n_sources)]
+                offsets = [0] * n_sources
+                iters = [self._open(idx, passes[idx]) for idx in range(n_sources)]
 
-        for source_idx in choices.tolist():
+        draws = skip
+        for source_idx in choices[skip:].tolist():
+            pass_before = passes[source_idx]
             item = self._next_or_refill(iters, passes, source_idx)
+            draws += 1
+            if passes[source_idx] != pass_before:
+                offsets[source_idx] = 0  # refilled: the new pass's rows count from 0
             if item is _EXHAUSTED:
                 continue  # source produced nothing for this (rank, worker)
+            offsets[source_idx] += 1
+            item[POSITION_KEY] = (draws, tuple(zip(passes, offsets, strict=True)))  # ty: ignore[invalid-assignment]  # a row dict
             yield item  # ty: ignore[invalid-yield]  # _EXHAUSTED sentinel filtered above
 
     def _next_or_refill(
@@ -878,7 +977,7 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
             return next(iters[source_idx])
         except StopIteration:
             passes[source_idx] += 1
-            iters[source_idx] = self._refill(source_idx, passes[source_idx])
+            iters[source_idx] = self._open(source_idx, passes[source_idx])
             try:
                 return next(iters[source_idx])
             except StopIteration:
