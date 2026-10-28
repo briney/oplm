@@ -702,6 +702,37 @@ def test_load_checkpoint_allows_missing_rng_sidecar_via_env_escape_hatch(
     assert "OPLM_ALLOW_MISSING_RNG" in caplog.text
 
 
+def test_extra_rank_is_reseeded_without_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Rank 1 of a 1-sidecar checkpoint (larger world size) reseeds with seed + rank."""
+    from oplm.training.checkpoint import _restore_rng_sidecar
+
+    cfg = _cfg()
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+    )
+    committed = tmp_path / "checkpoint-10"
+    assert not (committed / "rng_state_1.pt").exists()
+
+    monkeypatch.delenv("OPLM_ALLOW_MISSING_RNG", raising=False)
+    with caplog.at_level(logging.WARNING):
+        _restore_rng_sidecar(committed, 1, 1234)
+
+    assert torch.initial_seed() == 1235
+    assert "reseeding" in caplog.text
+
+
 # --- Task 2.3: async save --------------------------------------------------------------
 
 

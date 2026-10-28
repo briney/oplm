@@ -379,8 +379,7 @@ _STRADDLE_STOP = {"single": 19, "mix": 20}
     [
         (2, 1, "single"),
         (2, 1, "mix"),
-        # A larger world size needs RNG sidecars for the new ranks (#63, Task 4).
-        pytest.param(1, 2, "single", marks=pytest.mark.xfail(strict=True)),
+        (1, 2, "single"),
     ],
 )
 def test_two_rank_token_reshard(

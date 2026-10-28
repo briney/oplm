@@ -541,9 +541,11 @@ shuffled, many-epoch run that is an efficiency cost, not a correctness problem. 
 parallelism-agnostic, so it loads at any world size.
 
 One more constraint comes from the per-rank RNG files. A checkpoint saved by `N` ranks carries
-`rng_state_0.pt` to `rng_state_<N-1>.pt`. Resuming at a *smaller* world size works. A *larger* one
-raises, because the extra ranks have no RNG file; set the environment variable
-`OPLM_ALLOW_MISSING_RNG=1` to start those ranks' RNG fresh.
+`rng_state_0.pt` to `rng_state_<N-1>.pt`. Resuming at a *smaller* world size ignores the extra
+files. At a *larger* one, each rank past the checkpoint's sidecar count is reseeded with
+`train.seed + rank` and a warning is logged. The environment variable `OPLM_ALLOW_MISSING_RNG=1`
+only applies to a sidecar missing below the count (or a checkpoint with none): it starts that
+rank's RNG fresh instead of raising.
 
 A branch has one more limit: it keeps the cursor only when `data.train` matches the checkpoint's
 config as written, paths included ([Rules](#rules)). The check does not compare the data itself,

@@ -2292,7 +2292,6 @@ def _select_auto_resume_candidate(
     output_dir: Path,
     cfg: OplmConfig,
     status: Callable[[str], None] | None,
-    world_size: int | None = None,
 ) -> Path | None:
     """Pick the newest committed checkpoint that passes cheap pre-load validation.
 
@@ -2312,9 +2311,6 @@ def _select_auto_resume_candidate(
         cfg: The live, resolved config being trained/resumed with (for schedule-compat
             validation).
         status: Optional main-process-only status callback; ``None`` suppresses it.
-        world_size: The live run's world size, threaded into validation so a candidate
-            saved at a smaller world size is rejected here (rank-identically) rather
-            than on the new ranks alone, mid-load.
 
     Returns:
         The selected checkpoint path, or ``None`` if there is no committed checkpoint at
@@ -2337,7 +2333,7 @@ def _select_auto_resume_candidate(
     last_error: Exception | None = None
     for index, candidate in enumerate(attempts):
         try:
-            validate_checkpoint_for_resume(candidate, cfg, world_size=world_size)
+            validate_checkpoint_for_resume(candidate, cfg)
         except Exception as exc:  # noqa: BLE001 -- any validation failure triggers fallback
             remaining = len(attempts) - index - 1
             logger.error(
@@ -2378,7 +2374,6 @@ def _consult_remote_resume_candidate(
     output_dir: Path,
     cfg: OplmConfig,
     status: Callable[[str], None] | None,
-    world_size: int | None = None,
 ) -> Path | None:
     """Extend auto-resume (Task 4.2) to consult the remote mirror, main process only.
 
@@ -2417,8 +2412,6 @@ def _consult_remote_resume_candidate(
         output_dir: The training output directory (download destination).
         cfg: The live, resolved config being trained/resumed with.
         status: Optional main-process-only status callback; ``None`` suppresses it.
-        world_size: The live run's world size, threaded into the downloaded
-            checkpoint's validation exactly like a local candidate's.
 
     Returns:
         ``local_found``, or the freshly downloaded remote checkpoint's local path if
@@ -2459,7 +2452,7 @@ def _consult_remote_resume_candidate(
         remote_uri,
     )
     downloaded = store.download_checkpoint(remote_name, output_dir)
-    validate_checkpoint_for_resume(downloaded, cfg, world_size=world_size)
+    validate_checkpoint_for_resume(downloaded, cfg)
     return downloaded
 
 
@@ -2532,11 +2525,8 @@ def _resolve_resume_target(
     resolve_error: str | None = None
     if resume_target is None and auto_resume and accelerator.is_main_process:
         try:
-            world_size = accelerator.num_processes
-            found = _select_auto_resume_candidate(Path(output_dir), cfg, status, world_size)
-            found = _consult_remote_resume_candidate(
-                found, Path(output_dir), cfg, status, world_size
-            )
+            found = _select_auto_resume_candidate(Path(output_dir), cfg, status)
+            found = _consult_remote_resume_candidate(found, Path(output_dir), cfg, status)
         except Exception as exc:  # noqa: BLE001 -- packaged into the broadcast, see above
             resolve_error = (
                 f"auto_resume: no usable checkpoint found under {output_dir} after "

@@ -557,28 +557,14 @@ def test_explicit_resume_from_corrupted_checkpoint_raises_at_load(tmp_path: Path
         )
 
 
-# --- review fix: symmetric world-size-increase rejection (RNG sidecar count) ---------
+# --- #63: a larger world size is valid; extra ranks are reseeded at load -------------
 
 
 @pytest.mark.slow
-def test_validate_rejects_resume_at_a_larger_world_size_than_the_rng_sidecars(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A ws-increase resume fails validation on the MAIN process, symmetrically.
+def test_validate_allows_a_larger_world_size(tmp_path: Path) -> None:
+    """``validate_checkpoint_for_resume`` no longer rejects by RNG sidecar count.
 
-    Important review finding: each rank's RNG state lives in its own
-    ``rng_state_<rank>.pt`` sidecar, so resuming a checkpoint saved at world size N with
-    a live world size > N leaves the extra ranks with no sidecar -- and
-    ``_restore_rng_sidecar`` raises there, on *those ranks only*, deep inside
-    ``load_checkpoint``. That asymmetric raise is exactly the desynchronized-exception
-    shape the pre-broadcast validation discipline exists to avoid. The cheap sidecar
-    *count* check now runs in ``validate_checkpoint_for_resume`` (main process, before
-    the broadcast), so every rank fails identically with one message naming both counts
-    and the ``OPLM_ALLOW_MISSING_RNG`` escape hatch.
-
-    A world-size-2 checkpoint is simulated by copying rank 0's real sidecar to rank 1's
-    name (the save here is genuinely single-process), then validated against a fake
-    accelerator reporting ``num_processes=4``.
+    Ranks beyond the checkpoint's sidecars are reseeded in ``_restore_rng_sidecar``.
     """
     import shutil
 
@@ -599,30 +585,9 @@ def test_validate_rejects_resume_at_a_larger_world_size_than_the_rng_sidecars(
         tokens_seen=160,
     )
     committed = tmp_path / "checkpoint-4"
-    shutil.copy(committed / "rng_state_0.pt", committed / "rng_state_1.pt")
+    shutil.copy(committed / "rng_state_0.pt", committed / "rng_state_1.pt")  # 2 sidecars
 
-    class _FakeAccelerator:
-        num_processes = 4
-
-    live = _FakeAccelerator()
-
-    monkeypatch.delenv("OPLM_ALLOW_MISSING_RNG", raising=False)
-    with pytest.raises(ValueError) as exc_info:
-        validate_checkpoint_for_resume(committed, cfg, world_size=live.num_processes)
-
-    message = str(exc_info.value)
-    assert "2" in message and "4" in message  # both counts are named
-    assert "OPLM_ALLOW_MISSING_RNG" in message  # ... and so is the escape hatch
-
-    # The escape hatch turns it back into a supported (RNG-resetting) resume.
-    monkeypatch.setenv("OPLM_ALLOW_MISSING_RNG", "1")
-    validate_checkpoint_for_resume(committed, cfg, world_size=live.num_processes)
-
-    # A same-or-smaller live world size is always fine, env var or not.
-    monkeypatch.delenv("OPLM_ALLOW_MISSING_RNG", raising=False)
-    validate_checkpoint_for_resume(committed, cfg, world_size=2)
-    validate_checkpoint_for_resume(committed, cfg, world_size=1)
-    validate_checkpoint_for_resume(committed, cfg)  # unknown world size -> not checked
+    validate_checkpoint_for_resume(committed, cfg)  # must not raise (live world size 3+)
 
 
 # --- Task 2.2 fix round: auto_map regression (serialize_config / load_config) --------
