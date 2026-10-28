@@ -209,7 +209,7 @@ you need an exact production comparison.
 Install the published release on the controller:
 
 ```bash
-pip install "oplm[train]==<release>"
+pip install "oplm[train]==<release>"   # use the version pinned in slurm.install of configs/recovery_400M.yaml
 ```
 
 The config's container install command (`slurm.install`) pins a PyPI release, so every requeued attempt installs the same version. No shared source
