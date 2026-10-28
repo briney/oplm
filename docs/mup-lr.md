@@ -122,8 +122,9 @@ correction on.
 ### Multipliers across the presets
 
 `m = hidden_size / 768`, `m_ffn = intermediate_size / 2048` (2048 is `i0` at `d0 = 768`), and the
-depth factor is `(24 / L) ** 0.5` with `L = num_hidden_layers`. Dimensions come from
-`src/oplm/configs/model/presets/*.yaml`.
+depth factor is `(24 / L) ** 0.5` with `L = num_hidden_layers`. `hidden_size` and `L` come from
+the preset YAMLs (`src/oplm/configs/model/presets/*.yaml`); `intermediate_size` is as `OplmConfig`
+derives it.
 
 | Preset | `hidden_size` | `intermediate_size` | `L` | `m` | `m_ffn` | depth factor |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -294,7 +295,7 @@ oplm sweep confirm --config $CONFIG --from $SWEEP/replicate/phase.json \
   --diagnostics --out $SWEEP/confirm --submit
 ```
 
-Cells run 10,000 steps with a 1,000-step warmup (the defaults), about 4.6 h each on 8 nodes. Decay
+Cells run 10,000 steps with a 1,000-step warmup (the defaults), about 4.3 h each on 8 nodes. Decay
 them with the same loop and `PHASE=confirm NODES=8 N=10000 W=1000 D=2000`, and rank on step 12,000.
 The winner's LR goes into `train.lr` in `src/oplm/configs/train/base.yaml`.
 
@@ -347,11 +348,14 @@ Final `eval/uniref70/loss` from the refresh. A re-run on the same data should la
   so `refine` explored 0.004, 0.0063 and 0.01.
 - **Decaying flipped the refine ranking.** Undecayed at 20k, 0.004 led. After the 20k → 24k decay,
   0.0063 at output multiplier 1 scored **2.0775**, against **2.0792** for the best 0.004 cell
-  (output multiplier 2). 0.0063 beat 0.004 at every output multiplier. The output multiplier had
-  no consistent effect, so the recipe keeps it at 1.
-- **The optimum is bracketed.** 0.01 finished ≈0.002 behind 0.0063 (at output multipliers 0.5 and
-  1; at 2 it tied), so the best LR at this length sits between 0.004 and 0.01, at or a little above
-  0.0063.
+  (output multiplier 2). 0.0063 beat 0.004 at every output multiplier.
+- **Output multiplier.** Output multiplier 2 was nominally best at every LR on seed 42 (by
+  0.0004–0.0019, unreplicated, within the seed-to-seed spread of about 0.0016); the lowest decayed
+  refine cell was 0.0063 at output multiplier 2 (2.0771). The recipe keeps 1.
+- **The optimum is bracketed.** 0.004 is clearly worse. At output multiplier 1, 0.01 finished 0.002
+  behind 0.0063 on seed 42 (0.0009 behind the 3-seed mean), and within 0.0005 at 0.5 and 2. The
+  basin is flat between 0.0063 and 0.01 (vertex ≈0.007), consistent with ~0.008 at 24k in
+  [LR vs training length](#lr-vs-training-length).
 - **Replicate (3 seeds, decayed, output multiplier 1):** 0.0063 2.0786 against 0.004 2.0812, a gap
   of 0.0026 (about 4.5 standard errors). Undecayed, the order reverses.
 - **Confirm (800M):** undecayed at 10k, 0.0063 2.0819 < 0.004 2.0837 < 0.01 2.0845, the same order
@@ -393,6 +397,10 @@ end of a real run. It is not the production decay.
 
 > **Pending:** the production decay shape, length fraction and LR floor (waiting on #55).
 
+Whatever the decay recipe turns out to be, keep the optimizer state through the stable-to-decay
+transition, including the data-mix change there: no momentum reset and no second warmup. A branch
+off the stable-phase checkpoint does this by default.
+
 The mechanics of running a decay off a stable-phase checkpoint are in
 [training.md, *Branching a decay off a checkpoint*](training.md#branching-a-decay-off-a-checkpoint).
 
@@ -429,9 +437,10 @@ The mechanics of running a decay off a stable-phase checkpoint are in
 - **`train.weight_decay_to_init`** at 0.1 bounds the post-norm gains at no measurable loss cost:
   paired decayed 170M runs at 0.0063 scored 2.0794 at 0.1 against 2.0790 at 0.01, within noise.
   See [training.md, *Optimizer and schedule*](training.md#optimizer-and-schedule).
-- **`train.adamw_lr_mult`** was held fixed during the refresh. It traces to the late-loss
-  investigation's AdamW-side LR branches (÷3 and ÷10); the record is
-  [LATE_LOSS_INVESTIGATION.md](https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LATE_LOSS_INVESTIGATION.md).
+- **`train.adamw_lr_mult`** was carried over from earlier 170M runs at a smaller batch (AdamW-side
+  LR ÷3 against ÷10, first set up as branches in the late-loss investigation,
+  [LATE_LOSS_INVESTIGATION.md](https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LATE_LOSS_INVESTIGATION.md));
+  it was held fixed and not re-tuned at 4,194,304 tokens per step.
 - **AdamW-only μP** is the ESM-C comparison recipe in `src/oplm/configs/train/esm-c.yaml`, not the
   production optimizer.
 - The batch-mode funnel this replaces (proxy batch of 2,048 sequences, a depth-ray `transfer`, a
