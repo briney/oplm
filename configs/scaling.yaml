@@ -35,6 +35,8 @@ train:
   # Resume from the newest committed checkpoint under output_dir on every restart, so a
   # requeue after preemption continues training instead of restarting from step 0.
   auto_resume: true
+  # Must be an absolute path on shared storage (all nodes write checkpoints here).
+  output_dir: /path/to/oplm-runs/scaling
   parallelism: ddp
   compile: true
   compile_dynamic: false
