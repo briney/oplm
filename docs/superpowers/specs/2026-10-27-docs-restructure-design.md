@@ -14,6 +14,11 @@ agent working for a user should be able to run inference, retrain OPLM from scra
 published checkpoint and try a different phase-2 (decay) strategy, using only the docs and the
 shipped configs.
 
+**Openness principle (user, 2026-10-27):** everything is published. That means the exact training
+set in full, a detailed account of how it was built with links to the primary sources, and
+checkpoints throughout training with everything needed to resume from them. If in doubt, make it
+available, in the most useful form. The docs are how people find all of this and use it.
+
 The restructure is happening now, while the 300k-step 170M runs finish, because the pLM training
 setup must be ready for a large compute allocation that arrives soon.
 
@@ -46,7 +51,15 @@ against.
 - Building any missing tooling (inference CLI, standalone eval, fold). The docs describe what
   exists on `main` and mark what is coming.
 - Rewriting or moving any fold documentation (see "Untouched").
-- Changing code, apart from updating comments that point at moved or deleted docs.
+- Changing code, apart from updating comments that point at moved or deleted docs. One exception:
+  add a shipped production recipe config (`src/oplm/configs/train/production.yaml`, or similar)
+  built from the config the long runs actually use. Today no shipped YAML holds that recipe:
+  `train/base.yaml` has `tokens_per_step: null`, context 1024 and `max_steps: 50_000`, and
+  `configs/scaling.yaml` is stale (`residual_gate: channel`, context 512). Rule 3 needs a file to
+  point at. Remove or fix `configs/scaling.yaml` so it no longer claims to be the reference.
+  *(Design call, following the openness principle; the user didn't answer this explicitly.)*
+- Publishing the training data or checkpoints. That is separate work (#61, #62). The docs
+  describe them and stay marked pending until they exist.
 
 ## Anti-goals: failure even if technically done
 
@@ -128,15 +141,42 @@ config field, contribute. One line per doc.
 
 An ordered pipeline. Each step gets a few sentences, the command, and a link to the detailed doc:
 
-1. Get or build the training and eval data (`data.md`).
-2. Determine the LR with μP: proxy sweep, transfer, LR vs training length (`mup-lr.md`).
+1. Get the training and eval data: download the published sets, or rebuild them from primary
+   sources (`data.md`).
+2. Determine the LR with μP: proxy sweep ranked on decayed loss, 800M confirm, LR vs training
+   length (`mup-lr.md`).
 3. Run the stable phase at production scale (`training.md`, Slurm).
 4. Run the decay phase (`training.md`, `mup-lr.md`).
 5. Evaluate (`evaluation.md`).
 
-It also has a "Starting from a published checkpoint" section. This is the same path, entered at
-step 4: load a stable-phase checkpoint and run a different decay. It explains what must match the
-original run (data stream position, optimizer state, schedule) and what can change.
+It also has a **"Starting from a published checkpoint"** section, written as a first-class path and
+not a footnote. This is the same pipeline, entered at step 4 (or partway through step 3): download
+a published stable-phase checkpoint, then branch a different decay off it with `train.branch_from`.
+The user's own examples are the worked examples: if the recipe is 2.5M stable + 500k decay, a user
+can run a 50k decay off the 2.5M checkpoint, or a 20k decay off the 1.5M checkpoint. The section
+covers:
+
+- what a published checkpoint contains (weights, optimizer state, scheduler, data cursor, RNG,
+  resolved config) and which dataset tag its cursor refers to;
+- what must match the original run, and what happens when it can't. Data-exact resume currently
+  requires the same world size, worker count, per-rank batch size and seed (`resume_data_position`
+  validates this and raises). A user with fewer GPUs than the production run can only resume with
+  `resume_data_position=false`, which restarts the epoch from row 0. Document that limit honestly,
+  and link #63, the card for removing it;
+- what can change freely (decay length, shape, LR floor, data mix in the decay).
+
+## Data and checkpoints in the docs
+
+- `data.md` gets a section called **"How the training set was built"**. It must be detailed
+  enough to rebuild the set: every primary source with a link and version or date, each filtering,
+  clustering and shuffling step with the exact commands or scripts, and final row and token
+  counts. It also gets **"Download the exact training set"**, with the HF repo and tag (pending
+  until published). The existing structure-eval provenance (`DATA_MANIFEST.md`) moves in alongside
+  it.
+- Checkpoints: the README models table and `inference.md` list the final weights. A
+  "Published checkpoints" section (in `training.md`, linked from `reproduce.md`) lists every
+  intermediate checkpoint with its step, phase, Hub location and contents. The cadence is to be
+  decided when publishing (every 100k or 500k phase-1 steps).
 
 ## Where current content goes
 
@@ -195,7 +235,10 @@ waiting for:
 - the decay recipe (shape, length fraction, LR) in `reproduce.md` / `mup-lr.md`;
 - extrapolating the best LR against training length to production horizons in `mup-lr.md`;
 - the production data mix for the stable and decay phases in `data.md` (#58);
-- published checkpoint names (README models table, `inference.md`);
+- published checkpoint names, cadence and Hub locations (README models table, `inference.md`,
+  "Published checkpoints");
+- the HF repo and tag for the training set, and the build-procedure details that only the person
+  who ran it on the cluster has (deepclust70 shuffle, uniref70 processing);
 - the expected loss and P@L ranges in each "what to check" section. The reference runs are the
   170M long runs (#55). W&B links go in only if the project is made public; otherwise the docs
   state the numbers. *(Design call.)*
