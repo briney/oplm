@@ -50,7 +50,7 @@ train:
   # Canon kernels). Muon matrices are untouched. 1.0 = AdamW groups inherit `lr`.
   adamw_lr_mult: 0.333
   # Decoupled decay for what weight_decay skips (0 = off): the token embedding toward 0, and
-  # norm gains / residual gates / biases toward their initial values. See docs/TRAIN.md §7.
+  # norm gains / residual gates / biases toward their initial values. See docs/training.md, "Optimizer and schedule".
   # 0.1 bounds the sandwich post-norm gains (they otherwise drift upward without limit,
   # so the top layers swamp the stream on long runs) at no measurable loss cost.
   embedding_weight_decay: 0.01
@@ -89,7 +89,7 @@ train:
   resume_from: null           # path to a checkpoint to resume from
   # Branch off a checkpoint: full state (model, optimizer, counters, data position)
   # like resume_from, but LR / weight decay / schedule come from THIS config.
-  # Needs a fresh output_dir; see docs/TRAIN.md "Branching a run".
+  # Needs a fresh output_dir; see docs/training.md, "Branching a decay off a checkpoint".
   branch_from: null
   # Automatically resume from the newest committed checkpoint under output_dir at
   # trainer start, without an explicit resume_from (long Slurm runs set this true).
@@ -111,7 +111,7 @@ train:
   # ddp  — one full model replica per rank (default).
   # hsdp — FSDP2 over a 2-D mesh (shard within a node, replicate across nodes);
   #        required before ~24B, needs world size > 1, and is currently
-  #        incompatible with configured data.eval (see docs/TRAIN.md).
+  #        incompatible with configured data.eval (see docs/training.md, "Fault tolerance").
   parallelism: ddp            # ddp | hsdp
   # Process-group timeout (minutes); longer tolerates slow checkpoint writes or
   # requeue delays without a collective abort. Must be > 0.

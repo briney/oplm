@@ -145,7 +145,7 @@ class TrainConfig:
 
     # Exponential moving average of the trainable weights (fold stages set 0.999).
     # None = off (MLM runs unchanged). Updated once per successful optimizer step;
-    # every checkpoint then also writes ema.pt + hf_ema/ (docs/TRAIN.md §16).
+    # every checkpoint then also writes ema.pt + hf_ema/ (docs/training.md, "Fault tolerance").
     ema_decay: float | None = None
 
     # Parallelism strategy.
@@ -154,7 +154,7 @@ class TrainConfig:
     #   "hsdp" — FSDP2 (`fully_shard`) over a 2-D device mesh: shard within a node,
     #            replicate across nodes. Required before ~24B; needs world size > 1.
     # Checkpoints are parallelism-agnostic (DCP `get_state_dict`), so the same
-    # checkpoint resumes under either setting -- see docs/TRAIN.md.
+    # checkpoint resumes under either setting -- see docs/training.md, "Fault tolerance".
     parallelism: str = "ddp"
 
     # Infrastructure

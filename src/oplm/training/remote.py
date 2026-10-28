@@ -453,7 +453,7 @@ def _local_world_size(accelerator: Accelerator) -> int:
 
     Assumes ranks are laid out contiguously per node (rank ``0..k-1`` on node 0,
     ``k..2k-1`` on node 1, ...) -- true for the torchrun/Slurm homogeneous
-    allocations this codebase's Slurm generator produces (docs/SLURM.md), but not a
+    allocations this codebase's Slurm generator produces (docs/slurm.md), but not a
     universal guarantee for every possible launcher. Falls back to
     ``accelerator.num_processes`` (i.e. "everyone is on one node") when the
     environment doesn't expose ``LOCAL_WORLD_SIZE`` (torchrun/Accelerate set it; a

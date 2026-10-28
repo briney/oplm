@@ -1,27 +1,34 @@
-# Training OPLM
+# Training
 
-A practical guide to training an OPLM model end to end: prepare data, write a
-config, launch (single-GPU, multi-GPU, or DeepSpeed), monitor, checkpoint, and
-resume.
+How to train an OPLM model: write a config, launch it (single GPU, many GPUs, or Slurm),
+monitor it, checkpoint it, resume it, and branch a decay off a published checkpoint. Code
+lives in `src/oplm/training/`.
 
-This is the *how-to*. Related references:
+The recipe of record is [`configs/scaling.yaml`](../configs/scaling.yaml): token mode, a WSD
+schedule, packed sequences, auto-resume. It is the config behind the 170M long run, and this page
+points at it instead of copying its values. Its horizon, learning rate and data mix are
+still marked `PENDING` in the file, with the issue each waits on.
 
-- [CONFIG.md](CONFIG.md) — every `model.*` / `train.*` / `data.*` field.
-- [MUP.md](MUP.md) — μP learning-rate transfer across width (tune `lr` once, reuse at scale).
-- [SLURM.md](SLURM.md) — running training as a Slurm job (multi-node launch, arrays, resume).
-- [EVAL_HARNESS.md](EVAL_HARNESS.md) — evaluation during training.
-- [DATA_TOOLING.md](DATA_TOOLING.md) — dataset formats and the masking scheme.
-- [OVERVIEW.md](OVERVIEW.md) — Part IV documents the trainer's internal design.
-- [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md) — the model itself.
+Related pages:
+
+- [config.md](config.md): every `model.*` / `train.*` / `data.*` field.
+- [slurm.md](slurm.md): running training as a Slurm job (multi-node launch, arrays, requeue).
+- [data.md](data.md): the training set, dataset formats and the masking scheme.
+- [evaluation.md](evaluation.md): evaluation during training.
+- [architecture.md](architecture.md): the model itself.
+- [MUP.md](MUP.md): μP learning-rate transfer across width (tune `lr` once, reuse at scale).
 
 > Training builds a **fresh, randomly initialized** `OplmForMaskedLM` from
 > `model.*`. There is no "continue from a pretrained checkpoint" switch on the
-> training CLI — `train.resume_from` resumes an *interrupted run of the same
-> config*, not arbitrary pretrained weights.
+> training CLI. `train.resume_from` resumes an *interrupted run of the same
+> config*, and `train.branch_from` forks a new schedule off a checkpoint's full state
+> ([Branching a decay off a checkpoint](#branching-a-decay-off-a-checkpoint)). Neither takes
+> arbitrary pretrained weights. `train.init_from` does, for a new stage
+> ([Training a separate looped stage](#training-a-separate-looped-stage)).
 
 ---
 
-## 1. Install
+## Install
 
 ```bash
 pip install -e ".[train]"
@@ -33,41 +40,21 @@ with PyTorch, so no extra install is needed to use it.
 
 ---
 
-## 2. Prepare training data
+## Training data
 
-Training data is **parquet** with two required columns:
+`data.train` takes a parquet file, a directory of parquet shards, or a named map of sources with
+fractional sampling. The column contract and the loader are in
+[data.md, *Dataset formats*](data.md#dataset-formats), the `data.*` knobs in
+[config.md, *Data fields*](config.md#data-fields-data), and the training set itself in
+[data.md, *Training data*](data.md#training-data).
 
-| Column        | Type   | Required | Description |
-|---------------|--------|----------|-------------|
-| `sequence_id` | string | yes      | Unique identifier. |
-| `sequence`    | string | yes      | Amino-acid sequence (one-letter codes). |
-| `masking_weights` | list/array | only if `data.weighted_masking=true` | Per-residue masking weights. |
-
-`data.train` accepts:
-
-- a single `.parquet` file,
-- a **directory of shards** (many `.parquet` files), or
-- a **named multi-dataset map** with fractional sampling — sources are
-  interleaved by their fractions (normalized to 1.0; omitted fractions split the
-  remainder evenly):
-
-```yaml
-data:
-  train:
-    uniref50: { path: /data/uniref50/, fraction: 0.6 }
-    bfd:      { path: /data/bfd/,      fraction: 0.4 }
-```
-
-Masking is **dynamic** (re-drawn every epoch, RoBERTa-style): per sequence, a
-fixed count `round(mask_prob · n_eligible)` of positions is selected, then the
-BERT 80/10/10 split decides each masked token's replacement (`<mask>` / random
-amino acid / unchanged). See [DATA_TOOLING.md](DATA_TOOLING.md) for the full
-scheme and [CONFIG.md](CONFIG.md#data-fields-data) for the masking knobs
-(`mask_prob`, `mask_token_prob`, `random_token_prob`, `weighted_masking`).
+Masking is **dynamic**: it is re-drawn every epoch, RoBERTa-style. The scheme (fixed count
+`round(mask_prob · n_eligible)` per sequence, then the BERT 80/10/10 replacement split) is in
+[data.md, *Masking*](data.md#masking).
 
 ---
 
-## 3. Quick start
+## Quick start
 
 The smallest useful run — a size preset, one parquet file, and a few overrides:
 
@@ -80,14 +67,15 @@ oplm train --preset 50M \
 
 `oplm train` runs in a **single process** (one GPU, or CPU). It prints a one-line
 model summary, then starts the loop with a live progress bar. For multiple GPUs,
-see [§5](#5-launching).
+see [Launching](#launching).
 
 ---
 
-## 4. Configuring a run
+## Configuring a run
 
-Most real runs use a YAML config (plus optional CLI overrides). A representative
-masked-LM pretraining config:
+Most real runs use a YAML config (plus optional CLI overrides). The production recipe is
+[`configs/scaling.yaml`](../configs/scaling.yaml). A small, generic masked-LM pretraining config
+looks like this:
 
 ```yaml
 # my_run.yaml
@@ -133,14 +121,14 @@ oplm train --config my_run.yaml
 Config sources merge as **defaults → `--preset` → `--config` → CLI overrides**
 (later wins). `model.*` fields map to the HuggingFace `OplmConfig`; `train.*` and
 `data.*` map to the `TrainConfig` / `DataConfig` dataclasses. Every field, its
-default, and its validation rule is documented in [CONFIG.md](CONFIG.md).
+default, and its validation rule is documented in [config.md](config.md).
 
 `oplm info --config my_run.yaml` prints the resolved architecture and exact
 parameter count without training.
 
 ---
 
-## 5. Launching
+## Launching
 
 There are three entry points. They share the same argument parsing (`--config`,
 `--preset`, `--name`, and bare `key=value` overrides):
@@ -182,7 +170,7 @@ accelerate launch -m oplm.train --config my_run.yaml
 For multi-node training on a Slurm cluster, `oplm.slurm` turns any training config plus a
 `slurm:` block into ready-to-submit `sbatch` scripts (the same `accelerate launch` form as
 above, wired up with `srun`, container mounts, and job dependencies) — see
-[SLURM.md](SLURM.md) for the full schema and worked examples.
+[slurm.md](slurm.md) for the full schema and worked examples.
 
 ### DeepSpeed (opt-in)
 
@@ -198,7 +186,7 @@ OPLM_ENABLE_DEEPSPEED=1 accelerate launch -m oplm.train --config my_run.yaml
 
 ---
 
-## 6. What a training step does
+## What a training step does
 
 The trainer is a custom loop built on Accelerate (not the HuggingFace
 `Trainer`). Each optimizer step:
@@ -230,12 +218,38 @@ fragments each block's activation-checkpoint op so the SAC policy is dropped and
 case and sets `torch._dynamo.config.optimize_ddp = False` automatically before
 compiling; `full`/`none` are left untouched so they keep DDP comm/compute
 overlap. The only cost is that lost overlap — a few ms of allreduce on a ~500 ms
-step over NVLink, negligible next to the recompute SAC saves back. For internals,
-see [OVERVIEW.md](OVERVIEW.md) Part IV.
+step over NVLink, negligible next to the recompute SAC saves back.
+### Trainer internals
+
+- **Loop.** The loop is one `while self.global_step < self.total_steps`. Cadence work
+  (scheduler step, `global_step` increment, logging, eval, checkpoint) runs once per
+  **optimizer** step, not per micro-batch. Epoch rollover on `StopIteration` increments `epoch`,
+  calls `set_epoch(epoch)` (a deterministic reshuffle) and re-creates the iterator. The logged
+  loss is accumulation-aware: a detached running sum across micro-steps divided by
+  `gradient_accumulation_steps`, not the last micro-batch alone. A final checkpoint, progress-bar
+  stop, `on_train_end` and `accelerator.end_training()` run in a `finally`.
+- **Duration.** `train.max_steps` (the default) or `train.max_epochs` (steps per epoch derived
+  from the resolved dataset length and the global effective batch). Token mode needs `max_steps`.
+  Steps are the native clock. Epochs and tokens are derived overlays, and epoch-based eval cadence
+  is not supported ([evaluation.md, *Scheduling during training*](evaluation.md#scheduling-during-training)).
+- **Optimizer groups** (`partition_optimizer_params` in `src/oplm/training/optim.py`).
+  Trainable parameters split into three groups: no-decay (`ndim <= 1` or `"embed"` in the name:
+  biases, norms, embeddings), Muon (2-D weights when `optimizer=muon`, excluding the head by its
+  `lm_head.` prefix) and AdamW-decay (other 2-D weights). `build_optimizers` returns one AdamW
+  (decay and no-decay groups) or `[Muon, auxiliary AdamW]`. The tied decoder weight lands in
+  no-decay through the `"embed"` rule.
+- **Schedulers.** A three-phase multiplier (`get_schedule_fn`): warmup (linear 0 to 1), an
+  optional stable plateau (WSD only), then decay to `min_lr / lr`. It is wrapped in one `LambdaLR`
+  per optimizer and stepped manually each optimizer step, because the `Accelerator` is built with
+  `step_scheduler_with_optimizer=False`.
+- **FLOPs** (`estimate_flops_per_token`). No GQA (Q/K/V each `hidden_size` to `hidden_size`) and
+  an always-gated FFN (3 projections). Per layer: attention projections `2·H·(4H)` plus FFN
+  `3·2·H·I`. The head adds `2·H·H + 2·H·V`, and training is about `3×` forward. Attention-score
+  FLOPs, norms and embedding lookups are omitted.
 
 ---
 
-## 7. Optimizer and schedule
+## Optimizer and schedule
 
 **Optimizer** — `train.optimizer`:
 
@@ -257,13 +271,23 @@ moves a parameter `lr * wd` of the way to its target, with `lr` its AdamW group'
 `adamw_lr_mult` scales the decay too). Under Adam noise of size about `lr` per step, this
 holds a parameter within about `sqrt(lr / (2 * wd))` of its target.
 
-**Schedule** — `train.scheduler`: `warmup_linear` (default), `warmup_cosine`,
-`wsd_linear`, or `wsd_cosine`. All warm up linearly over `train.warmup_steps`;
-WSD variants then hold peak LR for `train.stable_steps` before decaying. Decay
-floors at `train.min_lr` (as a fraction `min_lr / lr` of peak). LR is stepped
-once per optimizer step, reaching the floor at the final step.
+**Schedule** (`train.scheduler`): `warmup_linear` (default), `warmup_cosine`,
+`wsd_linear`, or `wsd_cosine`. The multiplier on the peak LR has three phases:
 
-See [CONFIG.md](CONFIG.md#train-fields-train) for every optimizer and scheduler
+1. **Warmup**: linear from 0 to 1 over steps `0 .. warmup_steps`.
+2. **Stable** (WSD only): held at 1 for the next `stable_steps` steps. `stable_steps` counts
+   steps **after** warmup, so the plateau ends at step `warmup_steps + stable_steps`. It is ignored
+   by the non-WSD schedulers.
+3. **Decay**: linear or cosine from 1 to `min_lr / lr` over the remaining
+   `decay_steps = max_steps - warmup_steps - stable_steps` steps (at least 1), reaching the floor at
+   the final step.
+
+LR is stepped once per optimizer step. Keep `warmup_steps + stable_steps` strictly below
+`max_steps` so a decay phase exists. A WSD run is therefore a long plateau that can be cut into
+a decay at any step, which is what [Branching a decay off a checkpoint](#branching-a-decay-off-a-checkpoint)
+uses.
+
+See [config.md](config.md#train-fields-train) for every optimizer and scheduler
 field.
 
 **μP learning-rate transfer** — μP + Muon is the **default**, so `train.lr` is the
@@ -285,11 +309,10 @@ oplm train --preset 400M --config esmc-run.yaml
 ```
 
 See [MUP.md](MUP.md) for the full recipe, the coord-check gate, and the pilot LR
-sweep that produces the base LR.
 
 ---
 
-## 8. Evaluation during training
+## Evaluation during training
 
 Add datasets under `data.eval`; the trainer runs each on its own cadence and
 logs the metrics. A dataset's `every` is exactly one of `{steps: N}` or
@@ -311,12 +334,12 @@ data:
 ```
 
 Available types: `sequence`, `structure`, `proteingym`, `tape`, `proteinglue`,
-`everest`. See [EVAL_HARNESS.md](EVAL_HARNESS.md) for what each computes and
-[CONFIG.md](CONFIG.md#eval-datasets) for the per-task keys.
+`everest`. See [evaluation.md](evaluation.md) for what each computes and
+[config.md](config.md#eval-datasets) for the per-task keys.
 
 ---
 
-## 9. Checkpointing and resume
+## Checkpointing and resume
 
 The trainer writes a checkpoint every `train.save_every` optimizer steps (and
 once at the end) under `train.output_dir`:
@@ -324,19 +347,28 @@ once at the end) under `train.output_dir`:
 ```
 outputs/medium-uniref50/
 └── checkpoint-10000/
-    ├── trainer_state.json     # global_step, epoch, samples_seen, tokens_seen
+    ├── trainer_state.json     # global_step, epoch, samples_seen, tokens_seen, data cursor, W&B run id
     ├── config.yaml            # the full resolved run config (re-loadable)
     ├── hf/                    # HuggingFace export: config.json + model.safetensors + tokenizer
     ├── ema.pt                 # EMA tracker (averaged tensors + count); when `train.ema_decay` is set
     ├── hf_ema/                # HuggingFace export of the EMA weights; when `train.ema_decay` is set
-    └── <accelerate state>     # model, optimizer(s), scheduler(s), RNG — for resuming
+    ├── .metadata + shard files  # model, optimizer(s), scheduler(s): torch.distributed.checkpoint
+    └── rng_state_<rank>.pt    # per-rank RNG (Python, NumPy, torch CPU/CUDA), for resuming
 ```
+
+Alongside the checkpoints, `output_dir` holds a `latest` pointer to the newest committed one.
 
 - **`hf/`** is a standard HuggingFace model directory — load it for inference
   with `OplmForMaskedLM.from_pretrained("outputs/medium-uniref50/checkpoint-10000/hf")`
   (see the [README](../README.md#quick-start)).
 - **Rotation:** only the most recent `train.save_total_limit` checkpoints are
-  kept (oldest deleted by step number).
+  kept (oldest deleted by step number). `train.keep_every_n_steps` and `train.keep_every_n_hours`
+  mark checkpoints permanent, exempt from that rotation
+  ([Fault tolerance](#fault-tolerance)).
+- **Run config:** `config.yaml` is the resolved run config (`cfg.model.to_dict()` plus the
+  OmegaConf YAML for `train` and `data`), so a checkpoint is self-describing and re-loadable.
+  The `hf/` export is for downstream loading. Resume reads the DCP state and
+  `trainer_state.json` from the top level.
 
 **Resume** an interrupted run by pointing `train.resume_from` at a checkpoint
 directory. It restores model, optimizer, scheduler, RNG, and step counters and
@@ -349,39 +381,116 @@ oplm train --config my_run.yaml \
 
 Raise `train.max_steps` first if the original budget was already reached.
 
-### Branching a run (WSD decays and LR experiments)
+---
+## Published checkpoints
+
+Intermediate checkpoints of the production run are published so a reader can start from a
+stable-phase checkpoint instead of from step 0 (the entry
+point of the reproduce path).
+
+Each published checkpoint is a full checkpoint directory, not just weights:
+
+| Part | What it is |
+| --- | --- |
+| `hf/` | HuggingFace export: config, safetensors weights, tokenizer. Enough for inference and for `train.init_from`. |
+| `hf_ema/` and `ema.pt` | The EMA export and tracker, when the run set `train.ema_decay`. |
+| DCP shards and `.metadata` | Model and optimizer state, including Muon's moments, and the LR scheduler. |
+| `rng_state_<rank>.pt` | Per-rank RNG state. |
+| `trainer_state.json` | Step, epoch, samples and tokens seen, and the **data cursor** (epoch, batches consumed, and the layout it was recorded under: world size, worker count, per-rank batch size, seed). |
+| `config.yaml` | The resolved run config the checkpoint was written under. |
+
+The data cursor counts rows into the shard layout of the training set the run read, so it is
+exact only against that same set. Each published checkpoint names the training-set tag its cursor
+refers to (see [data.md, *Download the exact training set*](data.md#download-the-exact-training-set)).
+Resume or branch with a different set and the stream restarts from row 0 of the current epoch
+([Branching a decay off a checkpoint](#branching-a-decay-off-a-checkpoint)).
+
+> **Pending:** the list of published checkpoints (step, phase, Hub location), the cadence they are
+> published at, and the dataset tag their cursors refer to (waiting on #62).
+
+---
+
+## Branching a decay off a checkpoint
 
 `train.resume_from` refuses a changed `lr` / `min_lr` / `scheduler` / `warmup_steps` /
 `stable_steps` (and a shrunk `max_steps`) because a resume must continue the *same*
 schedule. A **branch** is the opposite intent: start a new run from a checkpoint's full
 state (weights, Muon/AdamW moments, step counters, data position) but under *this*
-config's LR, `adamw_lr_mult`, weight decay, and schedule — the WSD "decay from the stable
-phase" step, or an LR experiment forked mid-run.
+config's LR, `adamw_lr_mult`, weight decay, and schedule. This is the WSD "decay from the
+stable phase" step, and it is also how an LR experiment is forked mid-run.
 
-```bash
-# Decay branch: 250k -> 300k, linear to 0, everything else as in the main run.
-oplm train --config configs/scaling.yaml --preset 170M \
-  train.branch_from=/runs/170M/checkpoint-250000 train.output_dir=/runs/170M-decay-250k \
-  train.scheduler=wsd_linear train.warmup_steps=5000 train.stable_steps=245000 train.max_steps=300000
+Three fields define a WSD branch: `train.branch_from` (the checkpoint directory),
+`train.stable_steps` and `train.max_steps`. The schedule is
+[defined by the code](#optimizer-and-schedule) as warmup, then `stable_steps` steps at peak, then
+decay to `max_steps`, so with `W = train.warmup_steps`, branching off the checkpoint at step `N`
+with a decay of `D` steps means:
+
+```text
+stable_steps = N - W        # the plateau ends exactly at step N (stable_steps counts steps after warmup)
+max_steps    = N + D        # the decay runs from N to N + D
+decay_steps  = max_steps - W - stable_steps = D     # check
 ```
 
-Rules:
+The live schedule is evaluated at the checkpoint's step, so the first branch step is at peak LR
+and the LR falls to `min_lr` at step `N + D`. Keep `warmup_steps`, `lr`, `min_lr` and
+`scheduler` as in the main run.
 
-- `branch_from` points at the checkpoint **directory** (not its `hf/` export); the
-  optimizer state is what distinguishes a branch from `init_from`.
+### Worked example
+
+> **Example only.** This uses a hypothetical recipe of 2.5M stable steps plus a 500k decay
+> (`max_steps` 3,000,000), with `W = 2,000` as in `configs/scaling.yaml`. It is not a published run.
+> `<run>` is the downloaded or local run directory, and `<fresh>` a new output directory.
+
+The main run's own schedule is `stable_steps = 2,500,000 - 2,000 = 2,498,000` and
+`max_steps = 2,500,000 + 500,000 = 3,000,000`.
+
+**A 50k decay off the 2.5M checkpoint** (`N = 2,500,000`, `D = 50,000`):
+
+- `train.stable_steps = 2,500,000 - 2,000 = 2,498,000` (the same as the main run's own plateau)
+- `train.max_steps = 2,500,000 + 50,000 = 2,550,000`
+- check: `2,550,000 - 2,000 - 2,498,000 = 50,000` decay steps
+
+```bash
+oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/decay-50k \
+  --name decay-50k train.branch_from=<run>/checkpoint-2500000 train.output_dir=<fresh> \
+  train.stable_steps=2498000 train.max_steps=2550000
+```
+
+**A 20k decay off the 1.5M checkpoint** (`N = 1,500,000`, `D = 20,000`). Only the plateau end
+and the horizon move:
+
+- `train.stable_steps = 1,500,000 - 2,000 = 1,498,000`
+- `train.max_steps = 1,500,000 + 20,000 = 1,520,000`
+- check: `1,520,000 - 2,000 - 1,498,000 = 20,000` decay steps
+
+```bash
+oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/decay-20k \
+  --name decay-20k train.branch_from=<run>/checkpoint-1500000 train.output_dir=<fresh> \
+  train.stable_steps=1498000 train.max_steps=1520000
+```
+
+The checkpoint at `N` must exist: only the permanent ones survive rotation
+(`train.keep_every_n_steps`). The real long-run decay branches were built the same way, as
+`train.branch_from=<ckpt-dir> train.max_steps=N+decay train.stable_steps=N-warmup` with a warmup of
+2,000. Without Slurm, run the same overrides through `oplm train` or `accelerate launch -m oplm.train`.
+
+For a constant-LR branch (an LR experiment) set `stable_steps = max_steps - warmup_steps`; the one
+trailing decay step is harmless.
+
+### Rules
+
+- `branch_from` points at the checkpoint **directory** (not its `hf/` export). The
+  optimizer state is what distinguishes a branch from `init_from`. It is mutually exclusive with
+  `resume_from` and `init_from`.
 - `output_dir` must be fresh. If it already holds a committed checkpoint and
-  `auto_resume`/`resume_from` resolve it, that resume wins and `branch_from` is ignored —
-  this is what lets a requeued branch job continue as a plain resume of itself.
-- The live schedule is evaluated at the checkpoint's step: with `warmup 5000 / stable
-  245000 / max 300000` a branch from step 250 000 starts at peak LR and decays to
-  `min_lr` over the next 50k steps. For a constant-LR branch set
-  `stable_steps = max_steps - warmup_steps` (the one trailing decay step is harmless).
-- The data cursor is restored only when `data.train` is unchanged; a different mix (the
-  production decay-phase case) restarts the stream at row 0 of the current epoch with a
-  warning. The cursor's layout guard still applies (same world size, workers, per-rank
-  batch, seed), so branch with the same node count or set `resume_data_position=false`.
+  `auto_resume`/`resume_from` resolve it, that resume wins and `branch_from` is ignored.
+  This is what lets a requeued branch job continue as a plain resume of itself.
 - `max_steps` must exceed the checkpoint's step. All other config (model geometry, data
   layout) must match the checkpoint, exactly as for a resume.
+- The data cursor is restored only when `data.train` is unchanged. A different mix (the
+  production decay-phase case) restarts the stream at row 0 of the current epoch with a
+  warning. The cursor's layout guard still applies, so branch on the same layout or see
+  [Resuming on different hardware](#resuming-on-different-hardware).
 
 The branch gets its own W&B run; `train/lr` (Muon) and `train/lr_adamw` show the live
 schedule from the first logged step. The worked set of branch experiments for the
@@ -391,7 +500,33 @@ WSD branch-point comparison) lives in
 
 ---
 
-## 10. Logging and monitoring
+## Resuming on different hardware
+
+Resume is **data-exact** by default: `train.resume_data_position=true` replays the exact
+row-level position of the checkpoint, so no row is re-seen or skipped. That is only possible when
+the cursor's layout matches the live run. Data-exact resume currently requires the **same world
+size, worker count, per-rank batch size and seed**. `train.resume_data_position` validates this
+and **raises** on a mismatch, naming every differing field. In token mode (the production recipe)
+rows per worker do not depend on the batch size, so `per_rank_batch` drops out of the check, but the
+world size, worker count and seed must still match
+([Token-budget batching](#token-budget-batching-traintokens_per_step-trainbatch_tokens)).
+
+A user with fewer GPUs than the production run therefore cannot resume data-exactly. Set
+`train.resume_data_position=false` instead. That restarts the current epoch's data stream from
+row 0, so some rows are seen again; for a shuffled, many-epoch run that is an efficiency cost, not a
+correctness problem. Everything else (weights, optimizer, scheduler, counters) still restores, and
+the checkpoint itself is parallelism-agnostic, so it loads at any world size.
+
+One more constraint comes from the per-rank RNG files. A checkpoint saved by `N` ranks carries
+`rng_state_0.pt` to `rng_state_<N-1>.pt`. Resuming at a *smaller* world size works. A *larger* one
+raises, because the extra ranks have no RNG file; set the environment variable
+`OPLM_ALLOW_MISSING_RNG=1` to start those ranks' RNG fresh.
+
+> **Pending:** a data-exact resume that does not need the original world size (waiting on #63).
+
+---
+
+## Logging and monitoring
 
 **Console** — the main process shows a live `rich` progress bar with current
 step, training loss, and the most recent eval loss.
@@ -400,7 +535,7 @@ step, training loss, and the most recent eval loss.
 full flattened config is logged under `model/*`, `train/*`, `data/*`. Every
 `train.log_every` optimizer steps the trainer logs `train/loss`, `train/lr`,
 `train/epoch`, `train/samples`, `train/tokens`, and, when the task provides a FLOP
-estimate ([§17](#17-training-tasks-traintask)), `train/flops` (a cumulative estimate);
+estimate ([Training tasks](#training-tasks-traintask)), `train/flops` (a cumulative estimate);
 eval passes add `eval/<dataset>/<metric>`. Every row is logged at the training step, so
 W&B's `Step` axis equals `train/global_step` (also logged on every row). Set
 `train.wandb_project` and `train.wandb_run_name` (or `--name`) to organize runs. Disable W&B
@@ -446,7 +581,7 @@ from compute.
 
 ---
 
-## 11. Programmatic API
+## Programmatic API
 
 The CLI is a thin wrapper around `oplm.training.Trainer`. To drive training from
 Python — e.g. to attach custom callbacks:
@@ -471,7 +606,7 @@ Trainer(cfg, callbacks=[PrintLoss()]).train()
 
 ---
 
-## 12. Troubleshooting
+## Troubleshooting
 
 - **Out of memory.** Lower `train.batch_size` and raise
   `train.gradient_accumulation_steps` to keep the global batch constant; enable
@@ -492,7 +627,7 @@ Trainer(cfg, callbacks=[PrintLoss()]).train()
 
 ---
 
-## 13. torch.compile
+## torch.compile
 
 Pass `train.compile=true` to enable `torch.compile`.
 
@@ -553,7 +688,7 @@ torchrun --nproc_per_node=8 -m oplm.train --config my_run.yaml \
 
 ---
 
-## 14. Pad-to-multiple batching (`data.pad_to_multiple_of`)
+## Pad-to-multiple batching (`data.pad_to_multiple_of`)
 
 By default every batch is padded to the longest sequence it contains
 (`pad_to_multiple_of=null`). Setting `pad_to_multiple_of=N` instead pads each
@@ -668,13 +803,13 @@ than `batch_size × max_position_embeddings` once packed. Token mode fixes the t
   a GPU's workers' batches interleave can shift within one cycle.
 - Token mode often derives accumulation above 1, and the CUDA-graph compile modes
   (`train.compile_mode: max-autotune` or `reduce-overhead`) are incompatible with gradient
-  accumulation (see the CUDA-graph note in section 13); use `compile_mode: default` there.
+  accumulation (see the CUDA-graph note in [torch.compile](#torchcompile)); use `compile_mode: default` there.
 - Requires `data.pack_sequences: true` and `train.max_steps`. `oplm stream-replay` does not
   support token-mode runs.
 
 ---
 
-## 15. Throughput logging
+## Throughput logging
 
 The trainer logs steady-state throughput metrics once per `train.log_every`
 steps. The first `train.throughput_warmup_steps` optimizer steps (default `50`)
@@ -685,7 +820,7 @@ latency. Eval and checkpoint steps are also excluded from wall-time accounting.
 |--------|:-------------:|-------|
 | `train/tokens_per_sec` | yes | Tokens processed per second (headline metric). |
 | `train/step_time_s` | yes | Average optimizer-step wall time (seconds). |
-| `train/achieved_tflops` | only when the task provides a FLOP estimate ([§17](#17-training-tasks-traintask)) | Estimated TFLOPs/s based on `estimate_flops_per_token`. Note: omits attention-score FLOPs; use `tokens_per_sec` for throughput comparison. |
+| `train/achieved_tflops` | only when the task provides a FLOP estimate ([Training tasks](#training-tasks-traintask)) | Estimated TFLOPs/s based on `estimate_flops_per_token`. Note: omits attention-score FLOPs; use `tokens_per_sec` for throughput comparison. |
 | `train/mfu` | only when `peak_tflops` set | `achieved_tflops / peak_tflops`. Set `train.peak_tflops` to your device peak (e.g. `312.0` for an A100 SXM BF16, `989.5` for an H100 SXM BF16). |
 
 ```yaml
@@ -696,14 +831,14 @@ train:
 
 ---
 
-## 16. Fault tolerance
+## Fault tolerance
 
 Production runs are long enough that node failures, preemptions, and Slurm time limits are
 routine, not exceptional. The trainer, the checkpoint layer, and (on Slurm) the requeue wrapper
 cooperate so a failed or preempted run resumes automatically rather than losing progress. This
 section is the reference for the knobs involved, what actually gets restored on resume, and the
 end-to-end walkthrough. For the Slurm-side half (the requeue wrapper, `--signal`, the budget and
-no-progress guard), see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard).
+no-progress guard), see [slurm.md, *Requeue semantics*](slurm.md#requeue-semantics-drain-budget-and-the-no-progress-guard).
 
 ### Knobs (`train.*`)
 
@@ -712,15 +847,15 @@ no-progress guard), see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget
 | `save_every_minutes` | `null` | Also checkpoint every N wall-clock minutes, **in addition to** (not instead of) the `save_every` step cadence. `null` disables the timer. |
 | `keep_every_n_steps` | `null` | Checkpoints on a step multiple of this value are permanent: excluded from `save_total_limit` rotation entirely. `null` disables the exemption. |
 | `keep_every_n_hours` | `null` | Marks a checkpoint permanent at least this many wall-clock hours after the previous permanent one (independent of `keep_every_n_steps`). `null` disables the exemption. |
-| `auto_resume` | `false` | Resume from the newest **committed** checkpoint under `output_dir` automatically at trainer start, with no `resume_from` needed. An explicit `resume_from` always wins over `auto_resume`. `oplm slurm generate` injects `train.auto_resume=true` into every job it renders (see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard)); `configs/scaling.yaml` also sets it explicitly, since that config only ever runs under Slurm. |
-| `resume_data_position` | `true` | **Data-exact resume (Phase 3 — live).** When a checkpoint carries a data cursor and this is `true` (the default), a resume replays the exact row-level position the run was at when the checkpoint was taken — no row re-seen or skipped, same order as an uninterrupted run — instead of restarting the epoch's data stream from row 0. The cursor's layout (`world_size`, `num_workers`, per-rank batch size, seed) is validated against the live run; a mismatch raises, naming the escape hatch. Set `false` to opt back into the pre-Phase-3 behavior (restart the current epoch from row 0) — the escape hatch for resuming into a different world size/worker count, or a pre-Task-3.3 checkpoint with no cursor at all. See "What a resume restores" below. |
+| `auto_resume` | `false` | Resume from the newest **committed** checkpoint under `output_dir` automatically at trainer start, with no `resume_from` needed. An explicit `resume_from` always wins over `auto_resume`. `oplm slurm generate` injects `train.auto_resume=true` into every job it renders (see [slurm.md, *Requeue semantics*](slurm.md#requeue-semantics-drain-budget-and-the-no-progress-guard)); `configs/scaling.yaml` also sets it explicitly, since that config only ever runs under Slurm. |
+| `resume_data_position` | `true` | **Data-exact resume.** When a checkpoint carries a data cursor and this is `true` (the default), a resume replays the exact row-level position the run was at when the checkpoint was taken — no row re-seen or skipped, same order as an uninterrupted run — instead of restarting the epoch's data stream from row 0. The cursor's layout (`world_size`, `num_workers`, per-rank batch size, seed) is validated against the live run; a mismatch raises, naming the escape hatch. Set `false` to restart the current epoch from row 0 — the escape hatch for resuming into a different world size/worker count, or a checkpoint with no cursor at all. See "What a resume restores" below and [Resuming on different hardware](#resuming-on-different-hardware). |
 | `dist_timeout_minutes` | `15` | Timeout passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. A genuine hang raises within this window instead of wedging until the Slurm time limit; a no-op on a single process. |
-| `remote_checkpoint_uri` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background (Task 4.2) — durability beyond local/shared storage. `null` (default) disables it entirely: zero behavior change, no import of `oplm.training.remote`, no fsspec call. See "Remote checkpoint mirror" below. |
+| `remote_checkpoint_uri` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background — durability beyond local/shared storage. `null` (default) disables it entirely: zero behavior change, no import of `oplm.training.remote`, no fsspec call. See "Remote checkpoint mirror" below. |
 | `ema_decay` | `null` | EMA of the trainable weights (fold stages use `0.999`). One update per optimizer step. Each checkpoint adds `ema.pt` + `hf_ema/`; resume restores the tracker; a pre-EMA checkpoint resumed with this set logs a warning and restarts the average from the live weights. `ddp` only. |
-| `parallelism` | `ddp` | `ddp` (one full replica per rank, gradients all-reduced) or `hsdp` (FSDP2 `fully_shard` over a 2-D mesh: shard within a node, replicate across nodes). Checkpoints are parallelism-agnostic, so the same checkpoint resumes under either setting at any world size. `hsdp` requires world size > 1 and currently refuses three combinations, each of which would otherwise hang or silently diverge: **configured `data.eval`** (in-loop eval all-gathers on rank-striped forward counts and deadlocks — evaluate an HSDP run's checkpoints with a separate `ddp` job), `mixed_precision=fp16` (the GradScaler's inf-check is not shard-aware), and `stability_diagnostics` with `stability_probe_every > 0` (the probe's main-process-only forward all-gathers). See `oplm.training.parallel` for the full limitation list; deeper HSDP docs land with Task 5.3. |
+| `parallelism` | `ddp` | `ddp` (one full replica per rank, gradients all-reduced) or `hsdp` (FSDP2 `fully_shard` over a 2-D mesh: shard within a node, replicate across nodes). Checkpoints are parallelism-agnostic, so the same checkpoint resumes under either setting at any world size. `hsdp` requires world size > 1 and currently refuses three combinations, each of which would otherwise hang or silently diverge: **configured `data.eval`** (in-loop eval all-gathers on rank-striped forward counts and deadlocks — evaluate an HSDP run's checkpoints with a separate `ddp` job), `mixed_precision=fp16` (the GradScaler's inf-check is not shard-aware), and `stability_diagnostics` with `stability_probe_every > 0` (the probe's main-process-only forward all-gathers). See `oplm.training.parallel` for the full limitation list. |
 
 `save_every`, `save_total_limit`, and `resume_from` are the pre-existing checkpointing knobs —
-see [§9](#9-checkpointing-and-resume) and [CONFIG.md](CONFIG.md#train-fields-train).
+see [Checkpointing and resume](#checkpointing-and-resume) and [config.md](config.md#train-fields-train).
 
 ### Remote checkpoint mirror
 
@@ -800,7 +935,7 @@ failure as its *own* exit 1 (torchelastic's `ChildFailedError`), so on a real mu
 never survives to the sbatch script. The wrapper consumes (deletes) the marker on every requeue,
 and the trainer clears a stale one at startup (the batch node dying before the wrapper ran is the
 only way one survives), so a marker can never misclassify a later genuine crash as a drain — see
-[SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard).
+[slurm.md, *Requeue semantics*](slurm.md#requeue-semantics-drain-budget-and-the-no-progress-guard).
 
 ### Async checkpointing
 
@@ -828,7 +963,7 @@ model/optimizer state) plus per-rank sidecars (RNG, and the fp16 `GradScaler` wh
 - the trainer's own step counters (`global_step`, `epoch`, `samples_seen`, `tokens_seen`, plus the
   `keep_every_n_hours` bookkeeping and the persisted W&B run id — see below).
 
-**Dataloader position: data-exact resume (Phase 3).** Every checkpoint additionally carries a
+**Dataloader position: data-exact resume.** Every checkpoint additionally carries a
 data cursor (`{epoch, batches_consumed_this_epoch}` plus the layout it was recorded under —
 world size, worker count, per-rank batch size, seed). With `resume_data_position=true` (the
 default), a resume converts that cursor into a per-stream sample offset and skips there **by
@@ -841,12 +976,12 @@ RNG is untouched, so post-resume masks differ bit-for-bit from an uninterrupted 
 *data* stream is identical (data-exact, not bitwise). A cursor whose recorded layout doesn't match
 the live run's (different world size, worker count, batch size, or seed) raises rather than silently
 reproducing the wrong data order or coverage; the fix is either to resume at the original layout or
-set `resume_data_position=false` to fall back to the pre-Phase-3 behavior (restart the current
+set `resume_data_position=false` to restart the current
 epoch's data stream from row 0 — a minor efficiency cost, not a correctness issue, for a shuffled,
-many-epoch run). A checkpoint saved before Task 3.3 (no cursor at all) always takes that same
+many-epoch run). A checkpoint with no cursor at all always takes that same
 restart-from-row-0 fallback, regardless of `resume_data_position`. When the striping remainder gives
 ranks unequal batch counts, the single per-run cursor assumes lockstep ranks and the shorter rank's
-resume is exact only to within `num_workers` batches per epoch (tracked for milestone 3).
+resume is exact only to within `num_workers` batches per epoch.
 
 ### W&B continuity
 
@@ -893,12 +1028,12 @@ server behaviour (`OPLM_WANDB_ONLINE_DRILL=1`).
    nonzero (a clean drain writes the `.drained` marker and exits `85` — flattened to `1` by
    `accelerate launch`, which is why the marker exists; a crash exits with whatever it raised).
 2. Slurm requeues the job, subject to `slurm.max_requeues` and the requeue wrapper's no-progress
-   (crash-loop) guard — see [SLURM.md §8](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard).
+   (crash-loop) guard — see [slurm.md, *Requeue semantics*](slurm.md#requeue-semantics-drain-budget-and-the-no-progress-guard).
 3. The new attempt's `Trainer` scans `output_dir` for the newest **committed** checkpoint
    (`auto_resume`, or an explicit `resume_from`) and resumes from it.
 4. The same W&B run continues — no new run, no gap in the loss curve.
 
-**Guarantee:** after this phase of work, a requeued production job resumes from the newest
+**Guarantee:** a requeued production job resumes from the newest
 committed checkpoint automatically, with no operator intervention.
 
 ### Known limitations
@@ -918,7 +1053,7 @@ about before relying on it in production:
   `ddp` job against the same checkpoint.
 - **Muon's numerics on HSDP's sharded (DTensor) parameters are on the first-real-run watch
   list.** `torch.optim.Muon` has no DTensor-specific handling — its Newton–Schulz iteration runs
-  as real distributed matmuls over sharded operands. Task 0.3's spike established that this
+  as real distributed matmuls over sharded operands. An early spike established that this
   *runs* and checkpoints correctly (loss decreases, state round-trips), not that it is
   numerically identical to the unsharded computation; review measured ~3% divergence against a
   single-device oracle on a toy model. Nothing suggests it is wrong — distributed matmul is the
@@ -953,7 +1088,7 @@ about before relying on it in production:
 
 ---
 
-## 17. Training tasks (`TrainTask`)
+## Training tasks (`TrainTask`)
 
 The Trainer owns acceleration, optimization, accumulation, eval cadence, fault
 tolerance and checkpointing. The objective-specific third — building the model,
@@ -975,18 +1110,9 @@ window; the keys the trainer emits itself (`loss`, `lr`, `epoch`, `samples`,
 `FoldTask` (`oplm.fold.training`) is the second implementation: `oplm fold train` /
 `python -m oplm.fold.train` build `Trainer(cfg, task=FoldTask())`; batches are `FoldBatch` objects
 moved through their own `.to`, and `train/<term>` metrics come from `StepResult.metrics`
-([FOLD.md §9](FOLD.md#9-milestone-2b-losses-and-training-oplmfoldlosses-oplmfoldtraining)).
+([FOLD.md, *Milestone 2b: losses and training*](FOLD.md#9-milestone-2b-losses-and-training-oplmfoldlosses-oplmfoldtraining)).
 
 ---
-
-## See also
-
-- [CONFIG.md](CONFIG.md) — full configuration reference.
-- [SLURM.md](SLURM.md) — Slurm job generation and submission.
-- [EVAL_HARNESS.md](EVAL_HARNESS.md) — evaluation tasks and metrics.
-- [DATA_TOOLING.md](DATA_TOOLING.md) — data formats and masking.
-- [OVERVIEW.md](OVERVIEW.md) — Part IV: trainer internals and design rationale.
-- [README](../README.md) — installation and inference.
 
 ## Training a separate looped stage
 
@@ -1039,3 +1165,14 @@ according to `train.compile_dynamic`. Direct library users combining these featu
 with `torch.compile` should set `torch._dynamo.config.specialize_float = True`
 before the first compiled forward. This is a process-wide compiler setting;
 changing configuration floats can cause recompilation.
+
+---
+
+## See also
+
+- [config.md](config.md): full configuration reference.
+- [slurm.md](slurm.md): Slurm job generation and submission.
+- [evaluation.md](evaluation.md): evaluation tasks and metrics.
+- [data.md](data.md): the training set, data formats and masking.
+- [architecture.md](architecture.md): the model.
+- [README](../README.md): installation and inference.

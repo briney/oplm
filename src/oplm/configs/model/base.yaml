@@ -96,7 +96,7 @@ model:
   #              (less memory savings, much less extra compute). Inert unless
   #              gradient_checkpointing is true. On multi-GPU + train.compile the
   #              trainer auto-disables DDPOptimizer so SAC isn't collapsed to full
-  #              recompute (see docs/TRAIN.md).
+  #              recompute (see docs/training.md, "What a training step does").
   gradient_checkpointing_mode: full # full | selective
 
   # Special token ids (must match the tokenizer; see docs/data.md, Tokenizer)

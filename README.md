@@ -223,7 +223,7 @@ once and reuse it at every preset.
 oplm train --preset 1B data.train=/data/uniref50/
 ```
 
-See **[docs/TRAIN.md](docs/TRAIN.md)** for the full training guide, and
+See **[docs/training.md](docs/training.md)** for the full training guide, and
 **[docs/MUP.md](docs/MUP.md)** for μP learning-rate transfer (tune `lr` once on a
 small model, reuse it at scale; train an ESM-C-style comparison model via
 `esm-c.yaml`).

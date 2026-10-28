@@ -1,5 +1,5 @@
 """TrainTask seam: MLMTask reproduces the pre-seam step; a custom task's metrics and
-FLOP policy flow through the Trainer (docs/TRAIN.md §17)."""
+FLOP policy flow through the Trainer (docs/training.md, "Training tasks")."""
 
 from __future__ import annotations
 

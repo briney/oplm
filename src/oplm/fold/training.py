@@ -137,7 +137,10 @@ def load_initial_head(source: Path | str, target: FoldConfig) -> OplmForFolding:
 
 
 class FoldTask:
-    """The structure head's :class:`~oplm.training.task.TrainTask` (docs/TRAIN.md §17)."""
+    """The structure head's :class:`~oplm.training.task.TrainTask`.
+
+    See docs/training.md, "Training tasks".
+    """
 
     def __init__(self) -> None:
         self.settings = TrainSettings()

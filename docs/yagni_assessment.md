@@ -164,7 +164,7 @@ says there is no HuggingFace `datasets` integration. The live path uses PyArrow,
 `ShardedProteinDataset`/`InterleavedDataset`, and PyTorch `DataLoader`.
 
 **Smallest action:** Delete that requirement and update the training-install
-descriptions in [README.md](../README.md) and [TRAIN.md](TRAIN.md). No code or
+descriptions in [README.md](../README.md) and [training.md](training.md). No code or
 replacement dependency is needed.
 
 **Limit:** This saves one declared dependency; the resulting transitive package
@@ -178,7 +178,7 @@ verify that no tooling relies accidentally on packages supplied transitively by 
 **Evidence:** [pyproject.toml](../pyproject.toml), line 56, includes DeepSpeed in
 every `oplm[train]` install. [train.py](../src/oplm/train.py) explicitly disables its
 Accelerate environment settings unless `OPLM_ENABLE_DEEPSPEED` is enabled.
-[TRAIN.md](TRAIN.md) documents that opt-in and external Accelerate configuration.
+[training.md](training.md) documents that opt-in and external Accelerate configuration.
 There are no direct DeepSpeed imports in source/tests, but this is **not** evidence
 that the opt-in is unused: Accelerate provides the indirect integration.
 

@@ -114,9 +114,9 @@ must bucket shapes (crops are multiples of 128), accept a precomputed `BlockMask
 ## 4. Training seam and EMA
 
 The Trainer builds the model/dataloader and runs a step through a `TrainTask`
-(`docs/TRAIN.md` §17); the structure head's `FoldTask` is described in §9. `train.ema_decay`
+(`docs/training.md`, *Training tasks*); the structure head's `FoldTask` is described in §9. `train.ema_decay`
 keeps an EMA of the trainable weights, updated once per optimizer step, saved as `ema.pt` and
-exported as `hf_ema/` with every checkpoint (`docs/TRAIN.md` §16). The frozen LM is an
+exported as `hf_ema/` with every checkpoint (`docs/training.md`, *Fault tolerance*). The frozen LM is an
 unregistered attribute of the fold model that `__deepcopy__` shares instead of copying, so the
 EMA never holds a second LM (milestone 1).
 
@@ -540,10 +540,10 @@ bootstrap 95 % CI.
 - `valid` eval every 2000 steps, and once right after the first step, so a broken eval path
   fails within minutes instead of at step 2000.
 
-`oplm slurm generate` launches `oplm.fold.train` for them (docs/SLURM.md §9). Each attempt builds
+`oplm slurm generate` launches `oplm.fold.train` for them (`docs/slurm.md`, *`oplm slurm generate`, `submit` and `status`*). Each attempt builds
 or reuses a per-run Python 3.12 venv with `oplm[train,fold,esmc]` from the tag `fold-m2c-runs`,
 on each node's local `/tmp` because every node runs the install.
-A resume is forced once per run with `scancel --signal=USR1 <jobid>` (docs/SLURM.md §8).
+A resume is forced once per run with `scancel --signal=USR1 <jobid>` (`docs/slurm.md`, *Requeue semantics*).
 `docs/fold/b200-m2c-eval.sbatch` then scores every permanent checkpoint's `hf_ema/` on CAMEO and
 CASP14. Results, the width decision and the reproduction commands are in
 [`docs/fold/m2/README.md`](fold/m2/README.md).

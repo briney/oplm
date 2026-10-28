@@ -42,7 +42,8 @@ except ImportError:  # torch < 2.4
 # recompute but cheap to store. Saving these avoids re-running the expensive
 # kernels during the backward recompute, while everything else (norms, SiLU/GELU,
 # RoPE, softmax, dropout, residual scaling, reshapes) is recomputed to free
-# memory. See docs/TRAIN.md for the memory/compute tradeoff rationale.
+# memory. See docs/training.md, "What a training step does", for the memory/compute
+# tradeoff rationale.
 def _build_sac_save_ops() -> frozenset:
     """Collect the ops SAC keeps in memory (matmuls, SDPA backends, FlexAttention).
 
