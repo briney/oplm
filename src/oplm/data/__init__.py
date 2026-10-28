@@ -11,7 +11,12 @@ from __future__ import annotations
 from oplm.data.config import parse_eval_configs, parse_train_configs
 from oplm.data.sequence.batching import TokenBatcher
 from oplm.data.sequence.collate import MLMCollator, tokenize_and_pad
-from oplm.data.sequence.dataset import DataCursor, InterleavedDataset, ShardedProteinDataset
+from oplm.data.sequence.dataset import (
+    DataCursor,
+    InterleavedDataset,
+    Reshard,
+    ShardedProteinDataset,
+)
 from oplm.data.sequence.loaders import (
     DeviceDataLoader,
     build_sequence_eval_dataloader,
@@ -30,6 +35,7 @@ __all__ = [
     "DeviceDataLoader",
     "InterleavedDataset",
     "MLMCollator",
+    "Reshard",
     "ShardedProteinDataset",
     "StructureData",
     "TokenBatcher",

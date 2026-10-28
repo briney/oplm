@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pyarrow.parquet as pq
 import torch
 from torch import distributed as dist
@@ -202,6 +203,103 @@ class DataCursor:
     worker_rows: list[list[int]] | None = None
 
 
+@dataclass(frozen=True)
+class Reshard:
+    """A layout change: where every old ``(rank, worker)`` stream stood when it happened.
+
+    Replayed as a layer (see :func:`_resolve_layers`), it removes what the old streams had
+    consumed from the epoch's global order; the live stride then stripes what is left. Per-stream
+    lists are in joint-index order (``rank * num_workers + worker``).
+
+    Attributes:
+        stride: The old stream count, ``world_size * num_workers``.
+        epochs: Each old stream's epoch at the save.
+        rows: Each old stream's rows emitted in that epoch.
+        sources: Mix only: per old stream, per source ``[pass, offset]`` (``None`` for a stream
+            that had not produced a batch).
+    """
+
+    stride: int
+    epochs: list[int]
+    rows: list[int]
+    sources: list[list[list[int]] | None] | None = None
+
+
+# One applicable reshard event: (stride, consumed rows per old stream), unclamped.
+Layer = tuple[int, list[int]]
+
+# "Consumed everything" sentinel; the layer math clamps it to each stream's length.
+_FULL = 2**62
+
+
+def _resolve_layers(
+    reshards: Sequence[Reshard], epoch: int, *, source: int | None = None, pass_index: int = 0
+) -> list[Layer]:
+    """The layers that apply to ``epoch`` (or to one mix source's ``pass_index``-th pass of it).
+
+    An event applies iff ``min(epochs) <= epoch <= max(epochs)``. An old stream already in a
+    later epoch consumed all of ``epoch``; one still in an earlier epoch consumed none of it. For a
+    stream in ``epoch``, the count is its ``rows`` (or, with ``source``, its ``[pass, offset]`` for
+    that source: all of an earlier pass, ``offset`` of this one, none of a later one). Events that
+    consumed nothing are dropped: an identity layer would trim the ``drop_remainder`` tail twice.
+
+    Raises:
+        ValueError: ``source`` is given but an applicable event has no per-source positions.
+    """
+    layers: list[Layer] = []
+    for reshard in reshards:
+        if not min(reshard.epochs) <= epoch <= max(reshard.epochs):
+            continue
+        if source is None:
+            here = reshard.rows
+        elif reshard.sources is None:
+            raise ValueError("reshard event has no per-source positions for a mixed dataset")
+        else:
+            here = [
+                _FULL if pass_ > pass_index else offset if pass_ == pass_index else 0
+                for pass_, offset in (
+                    positions[source] if positions is not None else (0, 0)
+                    for positions in reshard.sources
+                )
+            ]
+        consumed = [
+            _FULL if stream_epoch > epoch else 0 if stream_epoch < epoch else count
+            for stream_epoch, count in zip(reshard.epochs, here, strict=True)
+        ]
+        if any(consumed):
+            layers.append((reshard.stride, consumed))
+    return layers
+
+
+def _stripe_lengths(size: int, stride: int, drop_remainder: bool) -> np.ndarray:
+    """Length of each of the ``stride`` stripes of ``size`` items."""
+    if drop_remainder:
+        return np.full(stride, size // stride, dtype=np.int64)
+    return (size - np.arange(stride) + stride - 1) // stride
+
+
+def _layer_bounds(size: int, layer: Layer, drop_remainder: bool) -> tuple[np.ndarray, np.ndarray]:
+    """``(lengths, consumed)`` of a layer's stripes over a level of ``size`` items, clamped."""
+    stride, consumed = layer
+    lengths = _stripe_lengths(size, stride, drop_remainder)
+    return lengths, np.minimum(np.asarray(consumed, dtype=np.int64), lengths)
+
+
+def _level_sizes(total: int, layers: Sequence[Layer], drop_remainder: bool) -> list[int]:
+    """The size of each level, starting with ``total``: what each layer leaves of the last."""
+    sizes = [total]
+    for layer in layers:
+        lengths, consumed = _layer_bounds(sizes[-1], layer, drop_remainder)
+        sizes.append(int((lengths - consumed).sum()))
+    return sizes
+
+
+def _survivors_before(x: int, stride: int, lengths: np.ndarray, consumed: np.ndarray) -> int:
+    """How many level indices below ``x`` survive a layer: ``x``'s index at the next level."""
+    before = (x - np.arange(stride) + stride - 1) // stride  # stripe items below x
+    return int(np.maximum(np.minimum(before, lengths) - consumed, 0).sum())
+
+
 class ShardedProteinDataset(IterableDataset[dict[str, object]]):
     """Iterable dataset over one or more parquet shards of protein sequences.
 
@@ -264,6 +362,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._resume_num_workers = 1
         # Token-mode resume skip: rows already emitted, one entry per DataLoader worker.
         self._resume_rows: list[int] | None = None
+        # Reshard events (layout changes) to replay; persist across epochs and resume skips.
+        self._reshards: list[Reshard] = []
 
         shard_paths = self._discover_shards(self._path)
 
@@ -311,20 +411,30 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         """
         self._epoch = epoch
 
-    def stream_length(self) -> int:
-        """Return the number of rows this (rank, worker) stream serves in one epoch.
+    def set_reshards(self, reshards: Sequence[Reshard]) -> None:
+        """Replay these reshard events in every later epoch they apply to.
 
-        Order-invariant: shard order only redistributes which rows land in which
-        shard, not which global row indices this ``(rank, worker)`` owns, so this
-        equals ``len(range(joint_index, total_rows, stride))`` — independent of
-        shuffling and the epoch. Must be called in-context (inside a DataLoader
-        worker, or single-process): it resolves the current ``(rank, worker)``
-        via :func:`_joint_stripe`.
+        Persists across epochs and is not cleared by :meth:`clear_resume_skip`.
+        """
+        self._reshards = list(reshards)
+
+    def _layers(self, layers: Sequence[Layer] | None) -> Sequence[Layer]:
+        return _resolve_layers(self._reshards, self._epoch) if layers is None else layers
+
+    def stream_length(self, layers: Sequence[Layer] | None = None) -> int:
+        """Return the number of rows this (rank, worker) stream serves in one epoch (or pass).
+
+        The live stride's share of the last level left by ``layers`` (``None``: this epoch's
+        reshard events); with no layers, ``len(range(joint_index, total_rows, stride))``.
+        Order-invariant, so independent of shuffling. Must be called in-context (inside a
+        DataLoader worker, or single-process): it resolves the current ``(rank, worker)`` via
+        :func:`_joint_stripe`.
         """
         joint_index, stride = _joint_stripe()
+        size = _level_sizes(self._total_rows, self._layers(layers), self._drop_remainder)[-1]
         if self._drop_remainder:
-            return self._total_rows // stride
-        return len(range(joint_index, self._total_rows, stride))
+            return size // stride
+        return len(range(joint_index, size, stride))
 
     def set_resume_skip(self, batches_in_epoch: int, per_rank_batch: int, num_workers: int) -> None:
         """Arm a one-epoch skip so the next ``__iter__`` (in every worker) resumes mid-epoch.
@@ -405,13 +515,13 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         generator.manual_seed(epoch_seed)
         return torch.randperm(n, generator=generator).tolist()
 
-    def _row_order(self, n_rows: int, epoch_seed: int, shard_idx: int) -> list[int]:
+    def _row_order(self, n_rows: int, epoch_seed: int, shard_idx: int) -> np.ndarray:
         """Return row indices for one shard in this epoch's (optional) row order."""
         if not self._shuffle_rows:
-            return list(range(n_rows))
+            return np.arange(n_rows)
         generator = torch.Generator()
         generator.manual_seed(_shard_row_seed(epoch_seed, shard_idx))
-        return torch.randperm(n_rows, generator=generator).tolist()
+        return torch.randperm(n_rows, generator=generator).numpy()
 
     def __iter__(self) -> Iterator[dict[str, object]]:
         # Straight to the stream, unlike a mixed source's per-pass arming: a skip equal to the
@@ -419,51 +529,64 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         # not wrap to the next pass.
         yield from self._iter_stream(self._resolved_skip())
 
-    def _iter_pass(self, pass_index: int, skip: int = 0) -> Iterator[dict[str, object]]:
+    def _iter_pass(
+        self, pass_index: int, skip: int = 0, layers: Sequence[Layer] | None = None
+    ) -> Iterator[dict[str, object]]:
         """This stream's ``pass_index``-th pass of the epoch, in that pass's own order.
 
         A source sampled above its row share in an :class:`InterleavedDataset` runs
         out mid-epoch and is read again; each pass gets a fresh shard and row order
         (pass 0 is the epoch's ordinary order), so repeats do not replay one sequence.
+        ``layers`` are the pass's reshard layers (``None``: this epoch's own events).
         """
-        return self._iter_stream(skip, pass_index=pass_index)
+        return self._iter_stream(skip, pass_index=pass_index, layers=layers)
 
-    def _iter_stream(self, skip: int, *, pass_index: int = 0) -> Iterator[dict[str, object]]:
+    def _iter_stream(
+        self, skip: int, *, pass_index: int = 0, layers: Sequence[Layer] | None = None
+    ) -> Iterator[dict[str, object]]:
         """Yield this (rank, worker) stream, skipping its first ``skip`` selected rows.
 
-        Walks the shard order computing each shard's selected-row COUNT from index
-        arithmetic alone (no ``pq.read_table``): a shard fully consumed by
-        ``skip`` is passed over without ever being read. Reading starts at the
-        shard where the running count first reaches ``skip``, applying the
-        remainder of the skip to that shard's (already-shuffled) selection only;
-        every later shard is read in full, exactly as when unarmed. With
-        ``skip=0`` this is behavior-identical to the pre-refactor ``__iter__``.
-        The stream stops after :meth:`stream_length` rows (which only binds with
-        ``drop_remainder``). ``pass_index`` selects the order of a refilled pass.
+        Each shard holds a contiguous run of global positions. Every layer removes the
+        positions its old streams consumed (and, with ``drop_remainder``, its tail); survivors
+        keep their order, so a shard's survivors are again a contiguous run at the next level.
+        At the last level a row is this stream's iff its index is ``joint_index`` mod the live
+        stride, up to :meth:`stream_length`. Unioned over every stream and layer this covers
+        each row exactly once. Selection is index arithmetic only (no ``pq.read_table``), so a
+        shard fully consumed by ``skip`` is never read. ``pass_index`` selects the order of a
+        refilled pass. With no layers this is the pre-layer stream, byte for byte.
         """
         epoch_seed = _pass_seed(_epoch_seed(self._seed, self._epoch), pass_index)
         joint_index, stride = _joint_stripe()
-        limit = self.stream_length()
+        layers = self._layers(layers)
+        limit = self.stream_length(layers)
+        sizes = _level_sizes(self._total_rows, layers, self._drop_remainder)
+        bounds = [
+            _layer_bounds(size, layer, self._drop_remainder)
+            for size, layer in zip(sizes[:-1], layers, strict=True)
+        ]
         consumed = 0  # selected rows passed so far, skipped or served
 
-        # `global_idx` runs across all shards in iteration order; a row is served
-        # to this (rank, worker) iff its global index is congruent to joint_index
-        # mod stride. Unioned over joint_index in [0, stride) this covers every
-        # row exactly once.
         global_idx = 0
         remaining_skip = skip
         for shard_idx in self._shard_order(epoch_seed):
+            if consumed >= limit:
+                return  # this stream has served its share
             n_rows = self._rows_per_shard[shard_idx]
             base = global_idx
             global_idx += n_rows
 
-            # Smallest offset o in [0, n_rows) with (base + o) % stride == joint_index,
-            # i.e. o ≡ (joint_index - base) (mod stride); the selected-row count for
-            # this shard follows without materializing row_order or reading it.
-            first_hit_offset = (joint_index - base) % stride
-            shard_count = min(len(range(first_hit_offset, n_rows, stride)), limit - consumed)
-            if consumed >= limit:
-                return  # drop_remainder: this stream has served its equal share
+            offsets = np.arange(n_rows)  # shard offsets still in play
+            start = base  # their first index at the current level
+            for (layer_stride, _), (lengths, used) in zip(layers, bounds, strict=True):
+                idx = np.arange(start, start + len(offsets))
+                quot = idx // layer_stride
+                rem = idx % layer_stride
+                offsets = offsets[(quot >= used[rem]) & (quot < lengths[rem])]
+                start = _survivors_before(start, layer_stride, lengths, used)
+            k = np.arange(start, start + len(offsets))
+            offsets = offsets[(k % stride == joint_index) & (k // stride < limit)]
+
+            shard_count = len(offsets)
             if shard_count == 0:
                 continue  # no rows in this shard belong to this (rank, worker)
             consumed += shard_count
@@ -472,17 +595,9 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                 remaining_skip -= shard_count
                 continue  # fully skipped by arithmetic — no read_table call
 
-            row_order = self._row_order(n_rows, epoch_seed, shard_idx)
-            selected = [
-                row_idx
-                for offset, row_idx in enumerate(row_order)
-                if (base + offset) % stride == joint_index
-            ][:shard_count]
-            if remaining_skip:
-                selected = selected[remaining_skip:]
-                remaining_skip = 0
-
-            yield from self._read_rows(shard_idx, selected)
+            selected = self._row_order(n_rows, epoch_seed, shard_idx)[offsets[remaining_skip:]]
+            remaining_skip = 0
+            yield from self._read_rows(shard_idx, selected.tolist())
 
     def _read_rows(self, shard_idx: int, row_indices: list[int]) -> Iterator[dict[str, object]]:
         """Read ``row_indices`` from one shard and yield them as row dicts."""
