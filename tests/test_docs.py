@@ -50,11 +50,13 @@ def _anchors(md: Path) -> set[str]:
 
 def test_relative_links_resolve() -> None:
     failures = []
+    checked = 0
     for doc in TREE_DOCS:
         text = _FENCE.sub("", doc.read_text(encoding="utf-8"))
         for target in _LINK.findall(text):
             if target.startswith(("http://", "https://", "mailto:", "tel:")):
                 continue
+            checked += 1
             path_part, _, anchor = target.partition("#")
             base = REPO if path_part.startswith("/") else doc.parent  # "/x" = repo root
             dest = (base / path_part.lstrip("/")).resolve() if path_part else doc
@@ -62,6 +64,7 @@ def test_relative_links_resolve() -> None:
                 failures.append(f"{doc.relative_to(REPO)}: {target}")
             elif anchor and dest.suffix == ".md" and anchor not in _anchors(dest):
                 failures.append(f"{doc.relative_to(REPO)}: {target} (no such heading)")
+    assert checked > 0, "scanner found no links"
     assert not failures, "\n".join(failures)
 
 
@@ -80,6 +83,7 @@ def test_no_references_to_retired_docs() -> None:
 def test_documented_cli_commands_exist() -> None:
     runner = CliRunner()
     failures = []
+    checked = 0
     for doc in TREE_DOCS:
         for block in re.findall(r"^```.*?^```", doc.read_text(encoding="utf-8"), re.M | re.S):
             for line in block.splitlines():
@@ -89,8 +93,10 @@ def test_documented_cli_commands_exist() -> None:
                 argv = [m.group(1)]
                 if argv[0] in {"sweep", "slurm", "fold"} and m.group(2) and m.group(2)[0] != "-":
                     argv.append(m.group(2))
+                checked += 1
                 if runner.invoke(app, [*argv, "--help"]).exit_code != 0:
                     failures.append(f"{doc.relative_to(REPO)}: oplm {' '.join(argv)}")
+    assert checked > 0, "scanner found no documented oplm commands"
     assert not failures, "\n".join(failures)
 
 
@@ -100,11 +106,14 @@ def test_documented_config_fields_exist() -> None:
     model = OplmConfig()
     pat = re.compile(r"(?:`|\s)(model|train|data|fold)\.([a-z_][a-z0-9_]*)(?=[`=.\[])")
     failures = []
+    checked = 0
     for doc in TREE_DOCS:
         for section, name in pat.findall(doc.read_text(encoding="utf-8")):
             if name in {"py", "yaml", "md", "json"}:
                 continue
+            checked += 1
             ok = hasattr(model, name) if section == "model" else name in fields[section]
             if not ok:
                 failures.append(f"{doc.relative_to(REPO)}: {section}.{name}")
+    assert checked > 0, "scanner found no documented config fields"
     assert not failures, "\n".join(failures)
