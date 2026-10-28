@@ -403,7 +403,7 @@ Each published checkpoint is a full checkpoint directory, not just weights:
 The data cursor counts rows into the shard layout of the training set the run read, so it is
 exact only against that same set. Each published checkpoint names the training-set tag its cursor
 refers to (see [data.md, *Download the exact training set*](data.md#download-the-exact-training-set)).
-Resume or branch with a different set and the stream restarts from row 0 of the current epoch
+Branch with a different set and the stream restarts from row 0 of the current epoch
 ([Branching a decay off a checkpoint](#branching-a-decay-off-a-checkpoint)).
 
 > **Pending:** the checkpoint list (step, phase, Hub repo, dataset tag) and cadence (waiting on #62).
@@ -531,7 +531,10 @@ run can change layout more than once. For a `data.train` mix the resume is exact
 no source row is served twice in a pass, and the epoch keeps its total draw count, but the mix
 order after the resume differs from an uninterrupted run. Resharding a mix needs each source's
 position in the cursor (`worker_sources`). An older cursor without it resumes a mix only at its own
-layout; at another layout it raises, naming `train.resume_data_position=false`.
+layout; at another layout it raises, naming `train.resume_data_position=false`. With
+`data.drop_last=true`, each reshard drops fewer than (new world size × workers) rows per epoch (per
+source pass for a mix) beyond what an uninterrupted run drops: rows are never repeated, but that
+handful is not served that epoch.
 
 A **sequence-mode** cursor still requires the **same world size, worker count, per-rank batch
 size and seed**. `train.resume_data_position` validates this and **raises** on a mismatch, naming

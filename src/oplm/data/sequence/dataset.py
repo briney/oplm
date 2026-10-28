@@ -682,8 +682,9 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
     Args:
         datasets: Source iterable datasets (typically :class:`ShardedProteinDataset`).
         fractions: Per-source sampling weights; normalized to sum to 1.0.
-        num_samples: Nominal samples per (full) epoch. Defaults to the sum of the
-            sources' ``len()`` when available, else ``0``.
+        num_samples: Nominal draws per (full) epoch; an epoch serves at most this many rows
+            (a draw whose source is exhausted even after a refill serves nothing). Defaults to the
+            sum of the sources' ``len()`` when available, else ``0``.
         seed: Base seed for deterministic source selection.
         reshuffle_on_refill: Read each refill of an exhausted source in a fresh order
             (sources that support it, e.g. :class:`ShardedProteinDataset`). Off, every
@@ -811,8 +812,9 @@ class InterleavedDataset(IterableDataset[dict[str, object]]):
         """Arm a one-epoch skip of ``rows_per_worker[worker_id]`` rows in each worker's stream.
 
         The token-mode counterpart of :meth:`set_resume_skip`. A worker's rows are draws from
-        the mix, so the count resolves through :meth:`_arm_source_skip` exactly like the
-        batch-count skip. Cleared by :meth:`clear_resume_skip`.
+        the mix. Without :meth:`set_resume_sources`, the count resolves through
+        :meth:`_arm_source_skip` like the batch-count skip; with sources armed it is just the
+        worker's draw count and bypasses that method. Cleared by :meth:`clear_resume_skip`.
         """
         self._resume_rows = list(rows_per_worker)
 

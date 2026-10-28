@@ -15,11 +15,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 import torch
 
@@ -726,11 +728,35 @@ def test_extra_rank_is_reseeded_without_env_var(
     assert not (committed / "rng_state_1.pt").exists()
 
     monkeypatch.delenv("OPLM_ALLOW_MISSING_RNG", raising=False)
-    with caplog.at_level(logging.WARNING):
-        _restore_rng_sidecar(committed, 1, 1234)
+    py_state, np_state, torch_state = (
+        random.getstate(),
+        np.random.get_state(),
+        torch.get_rng_state(),
+    )
+    try:
+        with caplog.at_level(logging.WARNING):
+            _restore_rng_sidecar(committed, 1, 1234)
+        assert torch.initial_seed() == 1235
+        assert "reseeding" in caplog.text
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
 
-    assert torch.initial_seed() == 1235
-    assert "reseeding" in caplog.text
+
+@pytest.mark.parametrize(("present", "rank"), [((1,), 0), ((0, 2), 1), ((0, 1), 0), ((0, 3), 2)])
+def test_missing_sidecar_below_count_still_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, present: tuple[int, ...], rank: int
+) -> None:
+    """A lost sidecar at/below the highest surviving index is corruption, not a larger world."""
+    from oplm.training.checkpoint import _restore_rng_sidecar
+
+    for i in present:
+        (tmp_path / f"rng_state_{i}.pt").touch()
+    (tmp_path / f"rng_state_{rank}.pt").unlink(missing_ok=True)
+    monkeypatch.delenv("OPLM_ALLOW_MISSING_RNG", raising=False)
+    with pytest.raises(RuntimeError, match="RNG sidecar not found"):
+        _restore_rng_sidecar(tmp_path, rank, 1234)
 
 
 # --- Task 2.3: async save --------------------------------------------------------------

@@ -177,16 +177,18 @@ def _write_rng_sidecar(tmp_dir: Path, rank: int) -> None:
 def _restore_rng_sidecar(checkpoint_dir: Path, rank: int, seed: int) -> None:
     """Restore this rank's RNG state from the sidecar written by :func:`_write_rng_sidecar`.
 
-    A missing sidecar is a **hard error** by default: silently skipping RNG restore was
-    a swallowed-failure hole (a resumed run would quietly diverge from what it would have
+    A missing sidecar is a **hard error** by default, except that a rank beyond the
+    checkpoint's sidecar count (a larger world size) is reseeded, below. Silently skipping
+    RNG restore was a swallowed-failure hole (a resumed run would quietly diverge from what it would have
     produced without the interruption, with no signal that anything was wrong). The
     likely cause is a world-size change across the resume -- a checkpoint saved with N
     ranks only has sidecars ``rng_state_0.pt``..``rng_state_<N-1>.pt``.
 
     The one forgiven case is a *larger* world size: a rank at or beyond the checkpoint's
-    sidecar count (``rank >= sidecar_count > 0``) has no prior RNG stream to continue, so
-    it is reseeded with ``set_seed(seed + rank)`` and a warning is logged. A checkpoint
-    with zero sidecars, or a sidecar missing below the count, still takes the error path.
+    sidecar count (``rank >= sidecar_count > 0``, the count being 1 + the highest sidecar
+    index) has no prior RNG stream to continue, so it is reseeded with ``set_seed(seed +
+    rank)`` and a warning is logged. A checkpoint with zero sidecars, or a sidecar missing
+    below the count, still takes the error path.
 
     The single escape hatch is the ``OPLM_ALLOW_MISSING_RNG=1`` environment variable: when
     set, a missing sidecar is logged and skipped (this rank's RNG starts fresh) instead of
@@ -196,7 +198,11 @@ def _restore_rng_sidecar(checkpoint_dir: Path, rank: int, seed: int) -> None:
     """
     sidecar_path = checkpoint_dir / f"{_RNG_SIDECAR_PREFIX}{rank}.pt"
     if not sidecar_path.is_file():
-        sidecar_count = len(list(checkpoint_dir.glob(f"{_RNG_SIDECAR_PREFIX}*.pt")))
+        indices = [
+            int(f.stem.removeprefix(_RNG_SIDECAR_PREFIX))
+            for f in checkpoint_dir.glob(f"{_RNG_SIDECAR_PREFIX}*.pt")
+        ]
+        sidecar_count = 1 + max(indices, default=-1)
         if rank >= sidecar_count > 0:
             logger.warning(
                 "Checkpoint %s has %d RNG sidecar(s) but this is rank %d; reseeding this "
@@ -1080,7 +1086,8 @@ def load_checkpoint(
         ValueError: If the checkpoint's LR schedule config disagrees with ``cfg`` (see
             :func:`validate_schedule_compat`).
         RuntimeError: If this rank's RNG sidecar is missing and
-            ``OPLM_ALLOW_MISSING_RNG=1`` is not set (see :func:`_restore_rng_sidecar`).
+            ``OPLM_ALLOW_MISSING_RNG=1`` is not set (see :func:`_restore_rng_sidecar`); a rank
+            beyond the checkpoint's sidecar count is reseeded instead of raising.
     """
     ckpt_path = Path(checkpoint_dir)
     if not ckpt_path.exists():

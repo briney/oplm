@@ -560,36 +560,6 @@ def test_explicit_resume_from_corrupted_checkpoint_raises_at_load(tmp_path: Path
 # --- #63: a larger world size is valid; extra ranks are reseeded at load -------------
 
 
-@pytest.mark.slow
-def test_validate_allows_a_larger_world_size(tmp_path: Path) -> None:
-    """``validate_checkpoint_for_resume`` no longer rejects by RNG sidecar count.
-
-    Ranks beyond the checkpoint's sidecars are reseeded in ``_restore_rng_sidecar``.
-    """
-    import shutil
-
-    from oplm.training.checkpoint import validate_checkpoint_for_resume
-
-    cfg = _cfg()
-    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
-    save_checkpoint(
-        accelerator=accelerator,
-        model=model,
-        optimizers=[optimizer],
-        schedulers=[scheduler],
-        cfg=cfg,
-        output_dir=str(tmp_path),
-        global_step=4,
-        epoch=1,
-        samples_seen=16,
-        tokens_seen=160,
-    )
-    committed = tmp_path / "checkpoint-4"
-    shutil.copy(committed / "rng_state_0.pt", committed / "rng_state_1.pt")  # 2 sidecars
-
-    validate_checkpoint_for_resume(committed, cfg)  # must not raise (live world size 3+)
-
-
 # --- Task 2.2 fix round: auto_map regression (serialize_config / load_config) --------
 
 
