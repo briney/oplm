@@ -47,7 +47,7 @@ ty check src/
 
 ```
 src/oplm/                      # main package (src layout)
-├── model/                     # transformer model package (see docs/MODEL_ARCHITECTURE.md)
+├── model/                     # transformer model package (see docs/architecture.md)
 │   ├── outputs.py             # LogitsConfig / LogitsOutput dataclasses (ESM-C-style API)
 │   ├── norm.py                # LayerNorm / RMSNorm (fp32 internals) + make_norm factory
 │   ├── masking.py             # pad-mask helpers, conv-input zeroing

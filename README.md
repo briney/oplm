@@ -237,7 +237,7 @@ Models and runs are configured through a layered system
 `PretrainedConfig`. Architecture toggles, optimizer/scheduler settings, and the
 dataset schema are all set here.
 
-See **[docs/CONFIG.md](docs/CONFIG.md)** for the field-by-field reference.
+See **[docs/config.md](docs/config.md)** for the field-by-field reference.
 
 ---
 
@@ -251,7 +251,7 @@ research features (Canon depthwise convolutions, partial-RoPE/NoPE, sandwich /
 hybrid / post-SDPA norm) layers on top, each off by default.
 
 For the complete specification, see
-**[docs/MODEL_ARCHITECTURE.md](docs/MODEL_ARCHITECTURE.md)**.
+**[docs/architecture.md](docs/architecture.md)**.
 
 ---
 

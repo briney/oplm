@@ -3,7 +3,7 @@
 How OPLM's training and evaluation data are defined, and how sequences (and
 structures, variants, labeled datasets) become model-ready batches. Code lives
 under `src/oplm/data/`. For the `data.*` field reference, see
-[CONFIG.md](CONFIG.md).
+[config.md](config.md).
 
 ## Training data
 
@@ -326,7 +326,7 @@ The sequence-eval builder also turns shard and row shuffling off.
 - **Padding**: batches pad to the batch-max length with `<pad>`; the emitted
   `attention_mask` marks real vs pad positions.
 - **Packing**: opt-in for training batches (`data.pack_sequences`; see
-  [CONFIG.md](CONFIG.md)). The model keeps packed sequences apart: a
+  [config.md](config.md)). The model keeps packed sequences apart: a
   block-diagonal attention mask, and Canon taps that would cross a sequence
   boundary contribute zero. Each sequence's logits and loss match its own padded
   row. Evaluation batches are never packed. `data.pack_sequences` is incompatible

@@ -1,7 +1,7 @@
 """OplmTokenizerFast — ESM-C-compatible 33-token WordLevel tokenizer.
 
 OPLM uses the ESM-C 33-token vocabulary, in the same token order and with the
-same special-token IDs (see docs/MODEL_ARCHITECTURE.md §3.1). A batch tokenized
+same special-token IDs (see docs/data.md, Tokenizer). A batch tokenized
 for ESM-C is bit-for-bit identical to one tokenized for OPLM, so switching
 between the two models is mechanical at the data layer.
 """

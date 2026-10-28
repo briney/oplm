@@ -47,7 +47,8 @@ class OplmConfig(PretrainedConfig):
 
     Maps 1:1 to the `model:` block of the project YAML schema and to the
     constructor kwargs of every `Oplm*` class. See
-    `docs/MODEL_ARCHITECTURE.md` §12 for the field reference and validation rules.
+    `docs/config.md` (Model fields, Derived and validated fields) for the field
+    reference and validation rules.
     """
 
     model_type = "oplm"
@@ -370,7 +371,7 @@ class OplmConfig(PretrainedConfig):
                 raise ValueError(
                     "Canon is not supported with norm_strategy='hybrid' (it has no "
                     "outer attention pre-norm for Canon-A); use 'pre', 'sandwich', "
-                    "or 'post_sdpa'. See docs/MODEL_ARCHITECTURE.md."
+                    "or 'post_sdpa'. See docs/architecture.md, Canon semantics."
                 )
             bad_positions = [p for p in self.canon_positions if p not in _VALID_CANON_POSITIONS]
             if bad_positions:

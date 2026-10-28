@@ -1,11 +1,11 @@
-# OPLM Config Reference
+# OPLM config reference
 
 The canonical, field-by-field reference for configuring OPLM models and training
 runs. For the *semantics* of the architecture toggles (what `norm_strategy`,
 Canon convolutions, or partial RoPE actually do), see
-[MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). For the eval harness, see
+[architecture.md](architecture.md). For the eval harness, see
 [EVAL_HARNESS.md](EVAL_HARNESS.md). For the training loop, see
-[TRAIN.md](TRAIN.md).
+[TRAIN.md](TRAIN.md). For the data behind `data.*`, see [data.md](data.md).
 
 ## Two config namespaces
 
@@ -26,7 +26,7 @@ describe a *run* and are not part of a published checkpoint.
 > **Unknown `model.*` keys are rejected.** `load_config()` validates `model.*`
 > keys against the `OplmConfig` constructor signature (plus the HuggingFace
 > metadata keys a serialized config carries), so a misspelled key such as
-> `model.hidden_dimm` or `model.cannon_enabled` raises at load time rather than
+> `hidden_dimm` or `cannon_enabled` under `model:` raises at load time rather than
 > being silently retained. `train.*` and `data.*` are likewise validated against
 > their dataclasses. (`OplmConfig.from_pretrained()` stays permissive so saved
 > checkpoints with extra metadata still load.)
@@ -46,8 +46,19 @@ Notes:
   are **derived** from the core dimensions unless you set them explicitly (see
   [Derived fields](#derived-and-validated-fields)).
 - `train.config_path` is populated automatically when `--config` is used.
-- `data.max_length` was **removed**. Use `model.max_position_embeddings` as the
-  sequence-length setting; passing `data.max_length` raises an error.
+- The `max_length` key under `data:` was **removed**. Use `model.max_position_embeddings` as the
+  sequence-length setting; passing `max_length` under `data:` raises an error.
+
+## Config assembly
+
+`oplm.config.OplmConfig` is the run config, composing `{model, train, data}` (plus the optional
+`fold`). `train` and `data` are OmegaConf-structured dataclasses. `model` is an untyped mapping so
+OmegaConf can carry arbitrary HF field keys without a parallel schema. `load_config` merges the
+sources in the order above, resolves the `model` subtree to a plain dict and instantiates
+`oplm.model.OplmConfig(**model_dict)`, so the HF config owns derivation and validation. Derived
+fields are simply omitted unless you set them. The root run config and the model config share a class
+name, so import sites alias the model one: `from oplm.model import OplmConfig as OplmModelConfig`.
+`train.eval_every` is the canonical global eval cadence.
 
 ## Override syntax
 
@@ -96,16 +107,16 @@ parameter count.
 ## Model fields (`model.*`)
 
 Backed by `oplm.model.OplmConfig`. Defaults shown are the effective defaults
-from `configs/model/base.yaml`.
+from `src/oplm/configs/model/base.yaml` (the `400M` preset dimensions). The bare `OplmConfig()` fallback is 768 hidden, 12 layers, 12 heads.
 
 ### Core dimensions
 
 | Override | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `model.vocab_size` | `int` | `33` | Tokenizer size. Values other than `33` warn (custom vocabularies are not yet supported). |
-| `model.hidden_size` | `int` | `768` | Residual-stream width. Must be divisible by `num_attention_heads`. |
-| `model.num_hidden_layers` | `int` | `12` | Number of transformer blocks. |
-| `model.num_attention_heads` | `int` | `12` | Standard multi-head attention (no GQA). |
+| `model.hidden_size` | `int` | `1024` | Residual-stream width. Must be divisible by `num_attention_heads`. |
+| `model.num_hidden_layers` | `int` | `32` | Number of transformer blocks. |
+| `model.num_attention_heads` | `int` | `16` | Standard multi-head attention (no GQA). |
 | `model.head_dim` | `int \| null` | derived | Defaults to `hidden_size // num_attention_heads`. |
 | `model.intermediate_size` | `int \| null` | derived | FFN inner width. Defaults to `round_up_to(8/3 · hidden_size, 256)`. |
 | `model.max_position_embeddings` | `int` | `1024` | Context length used by train, eval, and inference. |
@@ -178,7 +189,7 @@ are rejected, including for one loop. Effective depth is
 | --- | --- | --- | --- |
 | `model.canon_enabled` | `bool` | `true` | Master switch for Canon conv sublayers. Supported under `norm_strategy` in `{pre, sandwich, post_sdpa}`; `hybrid` raises at validation (no outer attention pre-norm for Canon-A). Run default `true`; dataclass fallback `false`. |
 | `model.canon_residual` | `bool` | `true` | Use residual Canon updates (`z + Canon(z)`) by default. |
-| `model.canon_positions` | `list[str]` | `[A, B, C, D]` | Subset of `{A, B, C, D}`; required and non-empty when `canon_enabled=true`. Position semantics are specified in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). Run default all four positions; dataclass fallback `[]`. |
+| `model.canon_positions` | `list[str]` | `[A, B, C, D]` | Subset of `{A, B, C, D}`; required and non-empty when `canon_enabled=true`. Position semantics are specified in [architecture.md, *Canon semantics*](architecture.md#canon-semantics). Run default all four positions; dataclass fallback `[]`. |
 | `model.canon_kernel_sizes` | `int \| list[int] \| dict` | `7` | `int` broadcasts to every layer; a `list[int]` must have length `num_hidden_layers`; a `dict` uses `schedule: linear` (`min`, `max`) or `schedule: constant` (`value`). All entries must be `≥ 2`. Run default `7`; dataclass fallback `4`. |
 | `model.canon_activation` | `str` | `none` | `none`, `silu`, or `gelu`. |
 
@@ -290,6 +301,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.wandb_project` | `str` | `oplm` | W&B project. |
 | `train.wandb_run_name` | `str \| null` | `null` | W&B run name (also settable via `--name`). |
 | `train.wandb_enabled` | `bool` | `true` | Toggle W&B logging. |
+| `train.save_final` | `bool` | `true` | Write a final checkpoint when training completes, even if the last step is not a multiple of `save_every`. Skipped when the last step already saved. |
 | `train.save_every` | `int` | `10_000` | Checkpoint cadence (optimizer steps). |
 | `train.save_total_limit` | `int` | `3` | Rolling checkpoints to keep. Permanent checkpoints (see `keep_every_n_steps` / `keep_every_n_hours`) are exempt from both the count and rotation. |
 | `train.resume_from` | `str \| null` | `null` | Path to an Accelerate checkpoint directory. Explicit; always wins over `auto_resume` when both are set. |
@@ -298,18 +310,22 @@ Backed by `oplm.config.TrainConfig`.
 | `train.keep_every_n_steps` | `int \| null` | `null` | Checkpoints whose step is a multiple of this value are permanent — excluded from `save_total_limit` rotation. `null` disables the exemption. Must be `> 0` when set. |
 | `train.keep_every_n_hours` | `float \| null` | `null` | Marks a checkpoint permanent at least this many wall-clock hours after the previous permanent one. Independent of `keep_every_n_steps`. `null` disables the exemption. Must be `> 0` when set. |
 | `train.auto_resume` | `bool` | `false` | Resume from the newest committed checkpoint under `output_dir` automatically at trainer start, with no `resume_from` needed. `oplm slurm generate` injects `true` into every rendered job (see [SLURM.md](SLURM.md#8-requeue-semantics-drain-budget-and-the-no-progress-guard)). |
-| `train.resume_data_position` | `bool` | `true` | **Data-exact resume (live, Phase 3).** When `true` and the checkpoint carries a data cursor, resume replays the exact row-level data position instead of restarting the current epoch from row 0 — no row re-seen or skipped, same order as an uninterrupted run. The cursor's recorded layout (world size, worker count, per-rank batch size, seed) must match the live run or resume raises. Set `false` to opt back into restart-from-row-0 (the escape hatch for a different layout, or a pre-Task-3.3 checkpoint with no cursor). See [TRAIN.md §16](TRAIN.md#16-fault-tolerance). |
+| `train.resume_data_position` | `bool` | `true` | **Data-exact resume (live, Phase 3).** When `true` and the checkpoint carries a data cursor, resume replays the exact row-level data position instead of restarting the current epoch from row 0 — no row re-seen or skipped, same order as an uninterrupted run. The cursor's recorded layout (world size, worker count, per-rank batch size, seed) must match the live run or resume raises. Set `false` to opt back into restart-from-row-0 (the escape hatch for a different layout, or a pre-Task-3.3 checkpoint with no cursor). See [TRAIN.md, *Fault tolerance*](TRAIN.md#16-fault-tolerance). |
 | `train.dist_timeout_minutes` | `int` | `15` | Timeout (minutes) passed to Accelerate's `InitProcessGroupKwargs`, bounding every NCCL/gloo collective's wait. Must be `> 0`. |
 | `train.remote_checkpoint_uri` | `str \| null` | `null` | An fsspec URI (`s3://`, `gs://`, `file://`, ...) that every committed checkpoint is additionally mirrored to in the background, and that `auto_resume` also consults. `null` disables it entirely (zero behavior change). See [TRAIN.md's "Remote checkpoint mirror"](TRAIN.md#remote-checkpoint-mirror). |
-| `train.ema_decay` | `float \| null` | `null` | Exponential moving average of the trainable weights, updated once per successful optimizer step (never on accumulation micro-steps or a skipped fp16 step). Every checkpoint then also writes `ema.pt` (tracker state + update count, restored on resume) and an `hf_ema/` export next to `hf/`; a later stage selects it with `train.init_from=<ckpt>/hf_ema`. Must be in `(0, 1)` when set. `ddp` only (refused under `hsdp`). See [TRAIN.md §16](TRAIN.md#16-fault-tolerance). |
-| `train.parallelism` | `str` | `ddp` | `ddp` (one full model replica per rank, gradients all-reduced) or `hsdp` (FSDP2 `fully_shard` over a 2-D mesh: shard within a node, replicate across nodes; requires world size `> 1`). Checkpoints are parallelism-agnostic, so the same checkpoint resumes under either setting at any world size. `hsdp` refuses three combinations that would otherwise hang or silently diverge: configured `data.eval`, `mixed_precision=fp16`, and `stability_diagnostics` with `stability_probe_every > 0`. See [TRAIN.md §16](TRAIN.md#16-fault-tolerance) for the full memory/limitation picture. |
+| `train.ema_decay` | `float \| null` | `null` | Exponential moving average of the trainable weights, updated once per successful optimizer step (never on accumulation micro-steps or a skipped fp16 step). Every checkpoint then also writes `ema.pt` (tracker state + update count, restored on resume) and an `hf_ema/` export next to `hf/`; a later stage selects it with `train.init_from=<ckpt>/hf_ema`. Must be in `(0, 1)` when set. `ddp` only (refused under `hsdp`). See [TRAIN.md, *Fault tolerance*](TRAIN.md#16-fault-tolerance). |
+| `train.parallelism` | `str` | `ddp` | `ddp` (one full model replica per rank, gradients all-reduced) or `hsdp` (FSDP2 `fully_shard` over a 2-D mesh: shard within a node, replicate across nodes; requires world size `> 1`). Checkpoints are parallelism-agnostic, so the same checkpoint resumes under either setting at any world size. `hsdp` refuses three combinations that would otherwise hang or silently diverge: configured `data.eval`, `mixed_precision=fp16`, and `stability_diagnostics` with `stability_probe_every > 0`. See [TRAIN.md, *Fault tolerance*](TRAIN.md#16-fault-tolerance) for the full memory/limitation picture. |
 | `train.seed` | `int` | `42` | Global seed. |
 | `train.output_dir` | `str` | `outputs` | Base dir for logs and checkpoints. |
 | `train.mixed_precision` | `str` | `bf16` | `bf16`, `fp16`, or `no`. |
 | `train.compile` | `bool` | `false` | Enable `torch.compile` (opt-in; adds first-step latency). |
 | `train.compile_mode` | `str` | `default` | Compile mode: `default` \| `reduce-overhead` \| `max-autotune`. |
 | `train.compile_dynamic` | `bool \| null` | `true` | `torch.compile(dynamic=...)`: `true` = one dynamic graph (default), `false` = static graph per shape (best with `data.pad_to_multiple_of` to bound shapes), `null` = Dynamo auto. When `false`, the trainer raises `torch._dynamo.config.cache_size_limit` to accommodate the expected number of shape buckets. |
-| `train.weight_diag_every` | `int` | `0` | Every N optimizer steps, log per-group weight RMS (`diag/weight_rms/<group>`) and update-RMS / weight-RMS (`diag/update_ratio/<group>`); groups are `embed`, `head_dense`, `head_decoder`, `attn`, `mlp`, `norm_gain`, `residual_gate`, `canon`, `bias`, `other`. `0` disables. Use a multiple of `log_every`. `ddp` only (refused under `hsdp`). Backfill from checkpoints offline with `oplm weight-rms <ckpt>...`. See [TRAIN.md §10](TRAIN.md#10-logging-and-monitoring). |
+| `train.weight_diag_every` | `int` | `0` | Every N optimizer steps, log per-group weight RMS (`diag/weight_rms/<group>`) and update-RMS / weight-RMS (`diag/update_ratio/<group>`); groups are `embed`, `head_dense`, `head_decoder`, `attn`, `mlp`, `norm_gain`, `residual_gate`, `canon`, `bias`, `other`. `0` disables. Use a multiple of `log_every`. `ddp` only (refused under `hsdp`). Backfill from checkpoints offline with `oplm weight-rms <ckpt>...`. See [TRAIN.md, *Logging and monitoring*](TRAIN.md#10-logging-and-monitoring). |
+| `train.stability_diagnostics` | `bool` | `false` | Attach the stability-diagnostics callback: logs the pre-clip global grad norm every log, and every `stability_probe_every` logs runs one eager diagnostic forward on the unwrapped model recording per-depth residual-stream RMS, output-logit RMS and attention entropy under `diag/*`. For deep-model μP debugging. Refused with `hsdp` when `stability_probe_every > 0`. |
+| `train.stability_probe_every` | `int` | `25` | Probe cadence in log emissions. `0` logs only the grad norm. Must be `≥ 0`; consulted only when `stability_diagnostics` is `true`. |
+| `train.profile_start` | `int \| null` | `null` | Opt-in profiling: from this optimizer step, CUDA-sync-time each phase of `profile_steps` steps, then `torch.profiler`-trace the next `profile_steps` steps; results go to `<output_dir>/profile/`. Also times all-reduces at train start. `null` disables. Must be `≥ 1` when set. |
+| `train.profile_steps` | `int` | `20` | Length of each profiling window; must be `≥ 1`. |
 | `train.throughput_warmup_steps` | `int` | `50` | Exclude the first N optimizer steps from throughput accounting (covers compile/warmup latency). Set to `0` to include all steps. Must be `≥ 0`. |
 | `train.peak_tflops` | `float \| null` | `null` | Device peak throughput in TFLOPs (e.g. `1979.0` for H100 BF16). When set, the trainer also logs `train/mfu` (achieved TFLOPs / peak). `null` → log only `train/achieved_tflops`. Must be `> 0` when set. |
 | `train.config_path` | `str \| null` | `null` | Auto-populated with the source path passed to `--config`. |
@@ -326,22 +342,21 @@ Backed by `oplm.config.DataConfig`.
 | `data.mask_token_prob` | `float` | `0.8` | Of masked positions, fraction replaced with `<mask>`. In `[0, 1]`. |
 | `data.random_token_prob` | `float` | `0.1` | Of masked positions, fraction replaced with a random amino acid. `mask_token_prob + random_token_prob ≤ 1`; the remainder is left unchanged. |
 | `data.weighted_masking` | `bool` | `false` | Honor a per-row `masking_weights` column when selecting positions. |
+| `data.pack_sequences` | `bool` | `false` | Training batches only: pack each batch's sequences back to back into as few rows of at most `model.max_position_embeddings` tokens as fit. The model keeps sequences apart (block-diagonal attention, Canon taps stop at boundaries), so the loss is unchanged. `train.batch_size` still counts sequences. Eval batches are never packed. See [data.md, *Truncation, padding, packing*](data.md#truncation-padding-packing). |
 | `data.pad_to_multiple_of` | `int \| null` | `null` | Pad each batch to the smallest multiple of N ≥ batch-longest sequence. `null` = pad to batch-longest (default behavior). Must be `≥ 1` when set. **Divisibility requirement:** `model.max_position_embeddings % pad_to_multiple_of == 0` is enforced at config load to prevent position-id overflow. Pairs with `train.compile_dynamic=false` + large N (64/128/256) to bound the Dynamo shape space to a small fixed set of static graphs. |
 | `data.num_workers` | `int` | `4` | DataLoader workers. |
 | `data.pin_memory` | `bool` | `true` | Pin host memory for batches. |
 | `data.prefetch_factor` | `int` | `4` | Batches prefetched per worker. |
 | `data.shuffle_shards` | `bool` | `true` | Shuffle shard order (sharded parquet directories). |
 | `data.shuffle_rows` | `bool` | `true` | Shuffle rows within each shard. |
+| `data.reshuffle_on_refill` | `bool` | `true` | A mixed source sampled above its row share runs out mid-epoch and is read again: `true` gives each such pass its own order, `false` replays the epoch's order every pass (the pre-October-2026 behavior, for replaying older runs' data streams). |
+| `data.drop_last` | `bool` | `true` | Give every (rank, worker) stream the same number of rows per epoch (dropping the remainder, fewer than `world_size × num_workers` rows) and drop each worker's partial last batch, so every rank runs the same number of full batches. `false` is the earlier behavior: up to one extra row per stream and short tail batches. |
 
 ### Training data format
 
-Training and sequence-eval data are parquet with these columns:
-
-| Column        | Type   | Required | Description |
-|---------------|--------|----------|-------------|
-| `sequence_id` | string | yes      | Unique identifier. |
-| `sequence`    | string | yes      | Amino-acid sequence. |
-| `masking_weights` | list/array | only if `weighted_masking=true` | Per-residue masking weights. |
+Training and sequence-eval data are parquet with `sequence_id` and `sequence` columns, plus
+`masking_weights` when `weighted_masking=true`; the column contract is in
+[data.md, *Dataset formats*](data.md#dataset-formats).
 
 `data.train` accepts a single `.parquet` file, a directory of shards, or a named
 multi-dataset map with fractional sampling (fractions normalize to 1.0; omitted
@@ -435,11 +450,11 @@ yet. See [EVAL_HARNESS.md](EVAL_HARNESS.md) for status.
 ## Fold fields (`fold.*`)
 
 Backed by `oplm.config.FoldRunConfig`; the structure-head training block
-([FOLD.md §9](FOLD.md#9-milestone-2b-losses-and-training-oplmfoldlosses-oplmfoldtraining)). The
+([FOLD.md, *Milestone 2b: losses and training*](FOLD.md#9-milestone-2b-losses-and-training-oplmfoldlosses-oplmfoldtraining)). The
 block is absent (`null`) for MLM runs, so `oplm train` is unchanged; `oplm fold train`,
 `python -m oplm.fold.train` and `oplm fold measure` require it and raise without it. Unknown
 `fold.*` keys are rejected at load time. In a fold run every `data.train` entry is a structure
-shard directory (see [FOLD.md §8](FOLD.md#8-milestone-2a-training-data-oplmfolddata)) and the
+shard directory (see [FOLD.md, *Milestone 2a: training data*](FOLD.md#8-milestone-2a-training-data-oplmfolddata)) and the
 top-level `model.*` block (the MLM architecture) is not used.
 
 | Override | Type | Default | Valid values / notes |

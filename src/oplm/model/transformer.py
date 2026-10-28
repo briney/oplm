@@ -213,7 +213,7 @@ class OplmBlock(nn.Module):
             kernel_size = kernel_sizes[layer_idx]
             activation = getattr(config, "canon_activation", "none")
             # A acts on the attention pre-norm stream, C on the FFN pre-norm
-            # stream (paper-exact insertion sites; see docs/MODEL_ARCHITECTURE.md).
+            # stream (paper-exact insertion sites; see docs/architecture.md, Canon semantics).
             if "A" in positions:
                 self.conv_a = CanonConv(config.hidden_size, kernel_size, activation=activation)
             if "C" in positions:

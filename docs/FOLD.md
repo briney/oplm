@@ -1,6 +1,6 @@
 # Structure Prediction Head (`oplm.fold`)
 
-Architecture contract for the folding head, in the role `MODEL_ARCHITECTURE.md`
+Architecture contract for the folding head, in the role [`architecture.md`](architecture.md)
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
 this file records what is implemented. **Status: milestone 2c (evaluation and proof runs) implemented, proof runs pending; milestone 2b (losses and training) accepted 2026-10-13 (measured on one B200; docs/fold/m2/); milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
@@ -461,7 +461,7 @@ so 600M gives 37 states of width 1152. `lm_hidden_size` and `lm_num_hidden_state
 from the loaded LM when `fold.model` does not set them.
 
 **Run config and CLI.** A run is an ordinary `OplmConfig` plus a `fold:` block
-([`CONFIG.md`](CONFIG.md#fold-fields-fold)); every `data.train` entry is a structure shard
+([`config.md`](config.md#fold-fields-fold)); every `data.train` entry is a structure shard
 directory. `oplm fold train --config run.yaml [overrides]` runs one process and
 `accelerate launch -m oplm.fold.train --config run.yaml` runs DDP; both build
 `Trainer(cfg, task=FoldTask())`. `FoldTask.build_model` builds the head from `fold.model`

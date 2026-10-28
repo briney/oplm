@@ -25,7 +25,7 @@ class LogitsConfig:
             one tensor per `OplmBlock`).
         return_attentions: When True, populate `LogitsOutput.attentions` with
             the per-layer attention weights. Forces the manual fallback
-            attention kernel (see `docs/MODEL_ARCHITECTURE.md` §6.5).
+            attention kernel (see `docs/architecture.md`, Attention).
     """
 
     sequence: bool = True
