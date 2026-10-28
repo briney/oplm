@@ -179,8 +179,8 @@ def _restore_rng_sidecar(checkpoint_dir: Path, rank: int, seed: int) -> None:
 
     A missing sidecar is a **hard error** by default, except that a rank beyond the
     checkpoint's sidecar count (a larger world size) is reseeded, below. Silently skipping
-    RNG restore was a swallowed-failure hole (a resumed run would quietly diverge from what it would have
-    produced without the interruption, with no signal that anything was wrong). The
+    RNG restore was a swallowed-failure hole (a resumed run would quietly diverge from what it
+    would have produced without the interruption, with no signal that anything was wrong). The
     likely cause is a world-size change across the resume -- a checkpoint saved with N
     ranks only has sidecars ``rng_state_0.pt``..``rng_state_<N-1>.pt``.
 
