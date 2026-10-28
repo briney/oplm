@@ -67,7 +67,7 @@ Rows and tokens per source are in *Training data* above.
 The held-out sequence eval is `uniref70/eval.parquet` (`type: sequence`), configured
 under `data.eval` in [`configs/scaling.yaml`](../configs/scaling.yaml). It is scored by
 masked-LM loss with deterministic masking (see *Deterministic eval masking*).
-For `data.eval` fields, see [EVAL_HARNESS.md](EVAL_HARNESS.md).
+For `data.eval` fields, see [evaluation.md](evaluation.md), *`data.eval` schema*.
 
 > **Pending:** how the held-out rows were selected and their count (waiting on #61).
 
@@ -339,7 +339,7 @@ The sequence-eval builder also turns shard and row shuffling off.
 The sequence path above is the pretraining substrate. Three further modalities
 reuse the canonical tokenizer (via `tokenize_and_pad`, **no masking**) and feed
 the eval harness. The harness owns task logic, scoring and metrics; the loaders
-below only load. See [EVAL_HARNESS.md](EVAL_HARNESS.md).
+below only load. See [evaluation.md](evaluation.md), *Tasks and metrics*.
 
 - **Structure** (`src/oplm/data/structure/`): parses `*.pdb`/`*.cif`/`*.ent`/
   `*.mmcif` with BioPython into `StructureData` (`name`, `sequence`, `coords`

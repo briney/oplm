@@ -4,7 +4,7 @@ The canonical, field-by-field reference for configuring OPLM models and training
 runs. For the *semantics* of the architecture toggles (what `norm_strategy`,
 Canon convolutions, or partial RoPE actually do), see
 [architecture.md](architecture.md). For the eval harness, see
-[EVAL_HARNESS.md](EVAL_HARNESS.md). For the training loop, see
+[evaluation.md](evaluation.md). For the training loop, see
 [TRAIN.md](TRAIN.md). For the data behind `data.*`, see [data.md](data.md).
 
 ## Two config namespaces
@@ -392,7 +392,7 @@ Shared keys on every entry:
 - `metrics` — optional list of metric names to keep.
 
 Task-specific keys sit at the **same level** as `path` and `type` (not nested
-under `extra:`). See [EVAL_HARNESS.md](EVAL_HARNESS.md) for the full harness
+under `extra:`). See [evaluation.md](evaluation.md) for the full harness
 documentation.
 
 ### sequence
@@ -445,7 +445,7 @@ clinical-substitution CSVs (`protein_sequence`, `mutant`, `DMS_bin_score`).
 ### tape, proteinglue, everest
 
 Registered but currently documented stubs; they consume no task-specific keys
-yet. See [EVAL_HARNESS.md](EVAL_HARNESS.md) for status.
+yet. See [evaluation.md](evaluation.md), *Tasks and metrics* for status.
 
 ## Fold fields (`fold.*`)
 

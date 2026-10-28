@@ -18,6 +18,7 @@ RETIRED: list[str] = [
     "DATA_MANIFEST.md",
     "MODEL_ARCHITECTURE.md",
     "CONFIG.md",
+    "EVAL_HARNESS.md",
 ]  # tasks append retired doc names as they delete them
 # New docs are lowercase; the old uppercase docs (about to be deleted) are never checked.
 TREE_DOCS = [

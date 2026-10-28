@@ -385,7 +385,7 @@ class TrainDatasetEntry:
     fraction: float
 
 
-_VALID_SCHEDULE_UNITS = ("steps", "tokens")  # "epochs" deferred — EVAL_HARNESS.md §4.6
+_VALID_SCHEDULE_UNITS = ("steps", "tokens")  # "epochs" deferred (docs/evaluation.md)
 _SCHEDULE_KEYS = frozenset({*_VALID_SCHEDULE_UNITS, "at_start", "at_end"})
 
 
@@ -423,8 +423,8 @@ def parse_schedule_block(raw: Any, label: str) -> ScheduleSpec:
         )
     if "epochs" in raw:
         raise ValueError(
-            f"{label}: epoch cadence is not yet supported (see docs/EVAL_HARNESS.md "
-            f"§4.6); use {{steps: N}} or {{tokens: N}}"
+            f"{label}: epoch cadence is not yet supported (see docs/evaluation.md, "
+            f"Scheduling during training); use {{steps: N}} or {{tokens: N}}"
         )
     unknown = [k for k in raw if k not in _SCHEDULE_KEYS]
     if unknown:

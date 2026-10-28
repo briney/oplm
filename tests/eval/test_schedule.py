@@ -1,4 +1,4 @@
-"""Pure scheduling tests — no model, no GPU. See docs/EVAL_HARNESS.md §4.5."""
+"""Pure scheduling tests — no model, no GPU. See docs/evaluation.md, Scheduling during training."""
 
 from __future__ import annotations
 

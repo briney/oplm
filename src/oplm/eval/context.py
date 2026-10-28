@@ -12,7 +12,7 @@ class EvalContext:
     INVARIANT: every field MUST be identical across all distributed ranks, so each
     rank independently computes the same ``Schedule.is_due`` without communicating.
     Tasks run collectives inside ``evaluate``; a rank disagreement would deadlock.
-    See docs/EVAL_HARNESS.md §3.2.
+    See docs/evaluation.md, Scheduling during training (rank-sync invariant).
     """
 
     global_step: int  # cumulative optimizer steps completed
