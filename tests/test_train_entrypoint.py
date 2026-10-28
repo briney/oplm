@@ -1,4 +1,4 @@
-"""G11 — training entrypoint e2e (docs/TESTING_E2E.md §5).
+"""G11 — training entrypoint e2e (docs/testing.md, End-to-end scenario gallery).
 
 Cross-cutting flow, so it lives at ``tests/`` top level rather than under
 ``tests/training/`` (the mirror convention). Two paths are exercised:

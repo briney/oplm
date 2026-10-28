@@ -15,7 +15,9 @@ message records the verdict; if it accepts them, the assertions below record
 the opposite verdict. See ``_fsdp2_muon_spike_worker.py`` for the subprocess
 entry point, and
 ``docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md`` §7
-plus ``TODOS.md`` Task 5.2 for the recorded outcome.
+plus
+``docs/superpowers/plans/2026-08-12-fault-tolerant-training.md``
+Task 5.2 for the recorded outcome.
 
 VERDICT: ``torch.optim.Muon`` works as-is on FSDP2 DTensor params (2-process
 CPU/gloo, 3 steps): construction and ``step()`` raised no exception, the loss

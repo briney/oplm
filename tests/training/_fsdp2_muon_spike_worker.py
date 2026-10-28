@@ -11,7 +11,7 @@ render the verdict.
 
 This is the spike artifact referenced by
 ``docs/superpowers/specs/2026-08-12-fault-tolerant-training-design.md`` §7 and
-``TODOS.md`` Task 0.3 / Task 5.2.
+``docs/superpowers/plans/2026-08-12-fault-tolerant-training.md`` Task 0.3 / Task 5.2.
 """
 
 from __future__ import annotations

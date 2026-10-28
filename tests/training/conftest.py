@@ -1,4 +1,4 @@
-"""Shared harness for the end-to-end training tests (docs/TESTING_E2E.md §4).
+"""Shared harness for the end-to-end training tests (docs/testing.md, Shared harness).
 
 These helpers drive the *real* :class:`~oplm.training.trainer.Trainer` over a tiny
 model and real data and assert observable contracts. The pieces are deliberately

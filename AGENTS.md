@@ -97,7 +97,7 @@ There is no unpackaged top-level `scripts/` directory anymore. Its former `mup_s
 - Mark slow tests with `@pytest.mark.slow`.
 - Prefer real data over synthetic data in tests.
 - End-to-end training-run tests (the slow, multi-step `Trainer` suite) follow the
-  plan in [docs/TESTING_E2E.md](docs/TESTING_E2E.md).
+  plan in [docs/testing.md](docs/testing.md).
 
 ## What Not To Do
 

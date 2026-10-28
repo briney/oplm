@@ -1,4 +1,4 @@
-"""G13 — wandb tracker path (docs/TESTING_E2E.md §5, optional).
+"""G13 — wandb tracker path (docs/testing.md, End-to-end scenario gallery, optional).
 
 Runs a tiny trainer with ``wandb_enabled=True`` under ``WANDB_MODE=offline`` so the
 real ``init_trackers`` + ``_config_to_flat_dict`` + ``accelerator.log`` path runs

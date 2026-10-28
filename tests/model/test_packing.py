@@ -218,9 +218,9 @@ def test_flex_block_mask_is_built_once_per_forward(monkeypatch: pytest.MonkeyPat
 def test_flex_switched_on_a_live_looped_model_builds_one_mask(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The kernel is read from the live config per forward (docs/perf/packing_check.py flips it
-    on a compiled model): one block mask per forward, one flex call per executed layer, which
-    with looping is more than the number of physical blocks."""
+    """The kernel is read from the live config per forward (https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/perf/packing_check.py
+    flips it on a compiled model): one block mask per forward, one flex call per executed
+    layer, which with looping is more than the number of physical blocks."""
     masks = _count_block_masks(monkeypatch)
     flex_calls = _spy_flex_kernel(monkeypatch)
     _, packed = _batches()

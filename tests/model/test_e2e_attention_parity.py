@@ -1,4 +1,5 @@
-"""G10 — full-model SDPA vs. manual-softmax attention parity (docs/TESTING_E2E.md §5).
+"""G10 — full-model SDPA vs. manual-softmax attention parity (docs/testing.md,
+End-to-end scenario gallery).
 
 Extends the module-level parity test (``tests/model/test_attention.py``) up to the
 whole ``OplmForMaskedLM`` + MLM loss: a single batch run with ``output_attentions``

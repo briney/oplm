@@ -1,4 +1,4 @@
-"""G12 — full train -> serve lifecycle (docs/TESTING_E2E.md §5).
+"""G12 — full train -> serve lifecycle (docs/testing.md, End-to-end scenario gallery).
 
 Cross-module flow (kept at ``tests/`` top level by design): train a tiny model
 through the real Trainer, reload its ``checkpoint-*/hf/`` export via both

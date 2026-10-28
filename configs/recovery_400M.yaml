@@ -1,6 +1,6 @@
 # Short recovery drills based on the 400M scaling job, not a production run config.
 # Use --preset 400M and --nodes 2 with oplm.slurm.recovery.<mode>.
-# See docs/RECOVERY_TESTS.md for preparation, installation, and submission.
+# See docs/testing.md (Cluster recovery drills) for preparation, installation, and submission.
 model:
   max_position_embeddings: 512
   gradient_checkpointing: false

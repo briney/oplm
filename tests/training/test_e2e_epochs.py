@@ -1,4 +1,4 @@
-"""G8 — epoch-bounded runs through the real Trainer (docs/TESTING_E2E.md §5).
+"""G8 — epoch-bounded runs through the real Trainer (docs/testing.md, End-to-end scenario gallery).
 
 Runs ``max_epochs=2`` over the 16-row tiny parquet with ``batch_size=4`` so an
 epoch is exactly four optimizer steps and the second epoch actually crosses the

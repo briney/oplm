@@ -765,8 +765,8 @@ Costs and limits:
 - `model.packed_attention: flex` runs packed batches through FlexAttention with a block mask
   built once per forward from `segment_ids`, skipping every 128×128 block between sequences.
   The intent is that attention cost follows each sequence's own length, so wide rows (2048)
-  cost about what narrow ones do; `docs/perf/attention_width_bench.py` measures that against
-  `sdpa` by row width, and `docs/perf/packing_check.py` checks its numbers against padded rows
+  cost about what narrow ones do; [`docs/perf/attention_width_bench.py`](https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/perf/attention_width_bench.py) measures that against
+  `sdpa` by row width, and [`docs/perf/packing_check.py`](https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/perf/packing_check.py) checks its numbers against padded rows
   at the bf16 floor. It is fast only under `train.compile` (the trainer warns on CUDA without
   it), has no attention dropout, and has no backward on CPU (the tests enable PyTorch's
   reference backward to check its gradients against `sdpa`). With sequence-count packing, rows

@@ -25,6 +25,12 @@ RETIRED: list[str] = [
     "LR_SWEEP.md",
     "LATE_LOSS_INVESTIGATION.md",
     "docs/late-loss",
+    "TESTING_E2E.md",
+    "RECOVERY_TESTS.md",
+    "NOTES.md",
+    "yagni_assessment",
+    "docs/perf/",
+    "TODOS.md",
 ]  # tasks append retired doc names as they delete them
 # New docs are lowercase; the old uppercase docs (about to be deleted) are never checked.
 TREE_DOCS = [

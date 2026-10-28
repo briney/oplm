@@ -1,4 +1,5 @@
-"""Phase 3 acceptance gate — data-exact resume (docs/TESTING_E2E.md; TODOS Task 3.4).
+"""Phase 3 acceptance gate — data-exact resume (docs/testing.md;
+fault-tolerant-training plan Task 3.4).
 
 Tasks 3.1-3.3 made resume *data-exact*: a checkpoint records a :class:`~oplm.data.DataCursor`
 (epoch, batches-in-epoch, layout) and, on a layout-compatible resume, the top-level dataset's
