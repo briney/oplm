@@ -2,8 +2,9 @@
 
 The path from raw data to a trained, evaluated model, in order. Each step says what to do, gives
 the command, and links to the doc that holds the details. This page does not repeat them. Every
-step uses the recipe config [`configs/scaling.yaml`](../configs/scaling.yaml); edit its cluster
-paths, partition and container for your site first (see [slurm.md](slurm.md)).
+step starts from the recipe config [`configs/scaling.yaml`](../configs/scaling.yaml); edit its
+cluster paths, partition and container for your site first (see [slurm.md](slurm.md)). The LR sweep
+in step 2 needs a derived copy of it, described there.
 
 Full-scale training needs a multi-node GPU cluster. If you only want to try a different decay, skip
 to [Starting from a published checkpoint](#starting-from-a-published-checkpoint), which is far
@@ -28,7 +29,9 @@ published separately. Point `data.train` and `data.eval` in the config at the do
 Tune `train.lr` once on the 170M proxy, rank candidates on loss after a decay, confirm at 800M, and
 reuse the result at every width. Run the coordinate check first. The recipe config already carries
 the learning rate from the last funnel, so this step is only needed to re-derive it (a different
-batch, context, mix or optimizer).
+batch, context, mix or optimizer). Make a sweep config from `configs/scaling.yaml` and set
+`CONFIG=...` and `SWEEP=...` (absolute paths) as in [mup-lr.md, *Sweep config*](mup-lr.md#sweep-config).
+The commands below are the first two of the funnel.
 
 ```bash
 oplm sweep coord-check --config $CONFIG --scaling width --widths 384,768,1536 --depth 24 \
@@ -42,11 +45,15 @@ The full funnel (coarse, refine, decay every cell, replicate, confirm at 800M) i
 
 > **Pending:** the production LR from the long runs (waiting on #55).
 
-## 3. Run the stable phase at production scale
+## 3. Run the stable phase at production scale (or the whole schedule)
 
 Generate and submit the sbatch for your preset. The job auto-resumes after preemption, so submitting
-once is enough. The WSD schedule (warmup, stable plateau, decay) comes from `train.warmup_steps`,
-`train.stable_steps` and `train.max_steps`.
+once is enough. The config's WSD schedule comes from `train.warmup_steps`, `train.stable_steps` and
+`train.max_steps`, and it includes its own decay tail at the 170M long-run horizon, so rendering it
+as-is runs the whole schedule. Splitting the stable phase from the decay is what the branching in
+step 4 does.
+
+> **Pending:** the production horizon (waiting on #55).
 
 ```bash
 oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/170M
