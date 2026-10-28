@@ -387,7 +387,7 @@ Raise `train.max_steps` first if the original budget was already reached.
 
 Intermediate checkpoints of the production run are published so a reader can start from a
 stable-phase checkpoint instead of from step 0 (the entry
-point of the reproduce path).
+point of the [reproduce path](reproduce.md#starting-from-a-published-checkpoint)).
 
 Each published checkpoint is a full checkpoint directory, not just weights:
 
