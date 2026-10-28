@@ -13,7 +13,10 @@ from oplm.config import DataConfig, FoldRunConfig, TrainConfig
 from oplm.model import OplmConfig
 
 REPO = Path(__file__).resolve().parents[1]
-RETIRED: list[str] = []  # tasks append retired doc names as they delete them
+RETIRED: list[str] = [
+    "DATA_TOOLING.md",
+    "DATA_MANIFEST.md",
+]  # tasks append retired doc names as they delete them
 # New docs are lowercase; the old uppercase docs (about to be deleted) are never checked.
 TREE_DOCS = [
     p

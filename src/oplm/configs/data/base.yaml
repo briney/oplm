@@ -34,7 +34,7 @@ data:
   # (block-diagonal attention, Canon stops at sequence boundaries). See docs/TRAIN.md §14.
   pack_sequences: false
 
-  # Sequence masking (see docs/DATA_TOOLING.md §4.5). Probabilities in [0, 1];
+  # Sequence masking (see docs/data.md, Masking). Probabilities in [0, 1];
   # mask_token_prob + random_token_prob <= 1 (the remainder keeps the original token).
   mask_prob: 0.15 # fraction of eligible positions selected for masking
   mask_token_prob: 0.8 # of masked positions -> <mask>

@@ -3,7 +3,7 @@
 Parses PDB/mmCIF files into :class:`StructureData` (sequence plus backbone
 N/CA/C coordinates) for the structure eval modality. Biopython is lazy-imported
 inside the parsing functions and is only required under the ``train`` extra; the
-core training install never hard-requires it (docs/DATA_TOOLING.md §5.5).
+core training install never hard-requires it (docs/data.md, Other modalities).
 
 PDB files whose residue numbers fit their SEQRES records load on the full
 sequence, with unmodeled residues as NaN rows (the ESM-C convention; ``oplm

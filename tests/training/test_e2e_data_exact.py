@@ -31,8 +31,8 @@ the true stop step makes the resumed run re-derive already-consumed data). ``sto
 chosen per ``num_workers`` to be exactly where a *correct* deferral commits (see the
 ``pytest.mark.parametrize`` comment) rather than backstopped by an unconditional final save.
 
-Masking is untouched by this tier: masks are dynamic (redrawn every call, docs/DATA_TOOLING.md
-§4.5) and may differ bit-for-bit between the control and the interrupted-then-resumed run even
+Masking is untouched by this tier: masks are dynamic (redrawn every call, docs/data.md,
+Masking) and may differ bit-for-bit between the control and the interrupted-then-resumed run even
 when the underlying rows match exactly. The assertion is on ``sequence_ids`` (which rows, in
 which order) and ``tokens_seen`` (how much real content), never on ``input_ids``/``labels``.
 

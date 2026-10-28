@@ -480,7 +480,7 @@ class DataConfig:
     # Parsed at runtime via oplm.data.config.parse_eval_configs().
     eval: Any = None
 
-    # Sequence masking (see docs/DATA_TOOLING.md §4.5)
+    # Sequence masking (see docs/data.md, Masking)
     mask_prob: float = 0.15  # fraction of eligible positions selected for masking
     mask_token_prob: float = 0.8  # of masked positions -> <mask>
     random_token_prob: float = 0.1  # of masked positions -> random canonical AA

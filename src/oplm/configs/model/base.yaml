@@ -99,7 +99,7 @@ model:
   #              recompute (see docs/TRAIN.md).
   gradient_checkpointing_mode: full # full | selective
 
-  # Special token ids (must match the tokenizer; see docs/DATA_TOOLING.md)
+  # Special token ids (must match the tokenizer; see docs/data.md, Tokenizer)
   pad_token_id: 1
   bos_token_id: 0
   eos_token_id: 2

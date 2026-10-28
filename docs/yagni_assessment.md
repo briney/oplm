@@ -66,7 +66,7 @@ benchmark requirements in documentation until an actual evaluation implementatio
 needs them. Do not replace the module with another abstraction or expand the stubs
 just to give it a caller.
 
-**Limit:** [DATA_TOOLING.md](DATA_TOOLING.md) advertises this modality for
+**Limit:** [data.md](data.md) advertises this modality for
 probing/fine-tuning. External callers must be considered before removal. If those
 users exist, keep the implementation and its validation/tests; “no internal calls”
 alone is insufficient grounds to break their API. The 335 test lines are not
@@ -159,7 +159,7 @@ accounting infrastructure in anticipation of one.
 
 **Evidence:** [pyproject.toml](../pyproject.toml), line 58, declares
 `datasets>=2.18`. AST import inventory and text searches found no HuggingFace
-`datasets` imports in source or tests. [DATA_TOOLING.md](DATA_TOOLING.md) explicitly
+`datasets` imports in source or tests. [data.md](data.md) explicitly
 says there is no HuggingFace `datasets` integration. The live path uses PyArrow,
 `ShardedProteinDataset`/`InterleavedDataset`, and PyTorch `DataLoader`.
 

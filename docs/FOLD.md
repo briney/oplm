@@ -566,7 +566,7 @@ curl -O https://predictioncenter.org/download_area/CASP16/targets/casp16.targets
 curl -O https://predictioncenter.org/download_area/CASP16/sequences/casp16.T1.seq.txt
 oplm fold eval-sets --fold-data $OPLM_DATA/hf/wwpdb/2026-10-12 --casp-sources $OPLM_DATA/casp \
     --out $OPLM_DATA/hf/structure-evals/2026-10-12 --mmseqs ~/micromamba/envs/mmseqs2/bin/mmseqs
-# CASP difficulty labels (not used by the build; listed in docs/DATA_MANIFEST.md)
+# CASP difficulty labels (not used by the build; listed in docs/data.md, Structure evaluation sets)
 cd $OPLM_DATA/hf/structure-evals/2026-10-12/sources
 curl -o casp15_domains_summary.html https://predictioncenter.org/casp15/domains_summary.cgi
 curl -o casp16_domains_summary.html https://predictioncenter.org/casp16/domains_summary.cgi
@@ -617,4 +617,4 @@ hf download brineylab/oplm-structure-evals --repo-type dataset --revision 2026-1
 **Published:** [`brineylab/oplm-structure-evals`](https://huggingface.co/datasets/brineylab/oplm-structure-evals)
 at tag `2026-10-12` (commit `08f188a3`), folder `2026-10-12/`; built at `c0b5f08`. The full
 `pdb40/` ships as `pdb40.tar.gz` (extract it in place); every other set is a plain folder.
-Provenance for the methods section: [`docs/DATA_MANIFEST.md`](DATA_MANIFEST.md).
+Provenance for the methods section: [`docs/data.md`](data.md), *Structure evaluation sets*.
