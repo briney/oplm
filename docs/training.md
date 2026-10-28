@@ -361,7 +361,7 @@ Alongside the checkpoints, `output_dir` holds a `latest` pointer to the newest c
 
 - **`hf/`** is a standard HuggingFace model directory — load it for inference
   with `OplmForMaskedLM.from_pretrained("outputs/medium-uniref50/checkpoint-10000/hf")`
-  (see the [README](../README.md#quick-start)).
+  (see [inference.md](inference.md)).
 - **Rotation:** only the most recent `train.save_total_limit` checkpoints are
   kept (oldest deleted by step number). `train.keep_every_n_steps` and `train.keep_every_n_hours`
   mark checkpoints permanent, exempt from that rotation
@@ -406,8 +406,7 @@ refers to (see [data.md, *Download the exact training set*](data.md#download-the
 Resume or branch with a different set and the stream restarts from row 0 of the current epoch
 ([Branching a decay off a checkpoint](#branching-a-decay-off-a-checkpoint)).
 
-> **Pending:** the list of published checkpoints (step, phase, Hub location), the cadence they are
-> published at, and the dataset tag their cursors refer to (waiting on #62).
+> **Pending:** the checkpoint list (step, phase, Hub repo, dataset tag) and cadence (waiting on #62).
 
 ---
 

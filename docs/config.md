@@ -561,7 +561,7 @@ out.sequence_logits   # (1, T, 33)
 out.embeddings        # (1, T, hidden_size)
 ```
 
-See the [README](../README.md#quick-start) for more inference examples.
+See [inference.md](inference.md) for more inference examples.
 
 `train.init_from` (default `null`) initializes a fresh training stage from a local
 HF export or a checkpoint directory containing `hf/`. Only weights and persistent

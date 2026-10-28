@@ -60,7 +60,7 @@ src/oplm/                      # main package (src layout)
 │   ├── configuration_oplm.py  # OplmConfig (PretrainedConfig)
 │   ├── tokenization_oplm.py   # OplmTokenizerFast (33-token ESM-C-compatible)
 │   └── modeling_oplm.py       # all public Oplm* model classes
-├── fold/                       # structure prediction head: kernels, model, data, training, predict, eval/ (held-out metrics, `fold_monomer` task), evalsets/ (`oplm fold eval-sets`: CASP/CAMEO/PDB40 contact-eval sets); parity tests need OPLM_FOLD_FIXTURES (docs/FOLD.md §7–§9)
+├── fold/                       # structure prediction head: kernels, model, data, training, predict, eval/ (held-out metrics, `fold_monomer` task), evalsets/ (`oplm fold eval-sets`: CASP/CAMEO/PDB40 contact-eval sets); parity tests need OPLM_FOLD_FIXTURES (docs/FOLD.md, Milestone 1 through Milestone 2b)
 ├── slurm/                      # general Slurm job generation/submission (docs/slurm.md)
 │   ├── config.py               # `slurm:` block schema, PhaseTable, resolve_batch_plan
 │   ├── render.py                # JobSpec -> sbatch script text, submit.sh, job arrays
@@ -96,8 +96,40 @@ There is no unpackaged top-level `scripts/` directory anymore. Its former `mup_s
 - Use `pytest.fixture` for setup, `@pytest.mark.parametrize` for input variation.
 - Mark slow tests with `@pytest.mark.slow`.
 - Prefer real data over synthetic data in tests.
-- End-to-end training-run tests (the slow, multi-step `Trainer` suite) follow the
-  plan in [docs/testing.md](docs/testing.md).
+- End-to-end training-run tests (the slow, multi-step `Trainer` suite) and the cluster
+  recovery drills are described in [docs/testing.md](docs/testing.md).
+
+## Releases and versions
+
+Git tags are the version source: `hatch-vcs` builds a clean checkout tagged `vX.Y.Z` as package
+version `X.Y.Z`. To release, publish a GitHub release with a new `vX.Y.Z` tag on the desired
+commit; the publishing workflow builds it and uploads it to PyPI. There is no version constant to
+update in `pyproject.toml` or Python source, and docs never hardcode a version.
+
+`oplm.__version__` reads the installed distribution metadata. Untagged commits get a development
+version; after changing commits or tags, reinstall an editable checkout to refresh it. Build from a
+Git checkout with tags available, or from a published sdist. GitHub's auto-generated source
+archives are not sdists.
+
+## Documentation
+
+[docs/README.md](docs/README.md) is the map of the docs, grouped by what the reader wants to do.
+The README is for people using the models; the docs under `docs/` hold the detail.
+
+1. **One fact, one home.** Other docs link to that home and don't restate it.
+2. **Docs describe `main` today.** Superseded material is deleted, not archived.
+3. **Docs point to configs instead of copying numbers.** Name the YAML file and field; state the
+   formula for derived numbers.
+4. **Method docs use one section order:** Recipe, Commands, What to check, How to change it, Why
+   and what was ruled out.
+
+- Update the home doc in the same PR as the behavior change.
+- Superseded material is deleted and, where evidence is needed, cited at a pinned commit
+  (`https://github.com/briney/oplm/blob/<sha>/<path>`). There is no archive folder.
+- Cite other docs by heading name ("training.md, *Checkpointing and resume*"), never by section
+  number. Mark missing content with `> **Pending:** <what is missing> (waiting on <issue or run>).`
+- `tests/test_docs.py` guards links, retired doc names, documented `oplm` commands, config fields
+  and Pending markers.
 
 ## What Not To Do
 

@@ -202,5 +202,4 @@ all-gathers. The group hangs until `dist_timeout_minutes`. `load_config` refuses
 combination up front (`validate_parallelism_compat` in `src/oplm/config.py`), so an
 HSDP run must have an empty `data.eval`.
 
-> **Pending:** standalone eval of a saved checkpoint, so HSDP runs can be scored
-> offline (waiting on #57).
+> **Pending:** standalone eval of a saved checkpoint, to score HSDP runs offline (waiting on #57).

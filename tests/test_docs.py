@@ -31,6 +31,7 @@ RETIRED: list[str] = [
     "yagni_assessment",
     "docs/perf/",
     "TODOS.md",
+    "OVERVIEW.md",
 ]  # tasks append retired doc names as they delete them
 # New docs are lowercase; the old uppercase docs (about to be deleted) are never checked.
 TREE_DOCS = [
@@ -135,3 +136,21 @@ def test_documented_config_fields_exist() -> None:
                 failures.append(f"{doc.relative_to(REPO)}: {section}.{name}")
     assert checked > 0, "scanner found no documented config fields"
     assert not failures, "\n".join(failures)
+
+
+PENDING = "> **Pending:**"
+
+
+def test_pending_markers_present() -> None:
+    expect = {  # doc → issue numbers whose Pending markers must appear in it
+        "docs/data.md": ["#61"],
+        "docs/training.md": ["#62", "#63"],
+        "docs/mup-lr.md": ["#55"],
+        "docs/inference.md": ["#62"],
+        "docs/evaluation.md": ["#57"],
+        "docs/reproduce.md": ["#55"],  # decay recipe + expected loss / P@L ranges
+    }
+    for doc, issues in expect.items():
+        lines = [ln for ln in (REPO / doc).read_text().splitlines() if ln.startswith(PENDING)]
+        for issue in issues:
+            assert any(issue in ln for ln in lines), f"{doc}: no Pending marker for {issue}"
