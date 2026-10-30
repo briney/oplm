@@ -10,11 +10,11 @@ import shutil
 import time
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
+import pyarrow.compute as _pc
 import pyarrow.parquet as pq
 
 from oplm.data.build.mmseqs import mmseqs_version, run_mmseqs_cmd
@@ -24,6 +24,8 @@ from oplm.data.sequence.dataset import (
     MEMBER_SEQUENCES_COLUMN,
     ShardedProteinDataset,
 )
+
+pc: Any = _pc  # the pyarrow stubs omit the generated compute kernels
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -280,7 +282,7 @@ def screen_against(
     h = hashlib.sha256()
     with target_fa.open("rb") as fh:
         for block in iter(lambda: fh.read(1 << 20), b""):
-            h.update(block)
+            h.update(block)  # ty: ignore[invalid-argument-type]  # binary mode yields bytes
     h.update(f"{chunk_rows} {SCREEN_ARGS} {[(p.name, n) for p, _, n in shards]}".encode())
     key, key_file = h.hexdigest(), workdir / "screen.key"
     if not key_file.exists() or key_file.read_text() != key:
@@ -386,7 +388,7 @@ class _Tally:
     def summary(self) -> dict:
         rows = sum(self.sizes.values())
         member_rows = sum(k * v for k, v in self.sizes.items())
-        out = {
+        out: dict[str, Any] = {
             "rows": rows,
             "member_rows": member_rows,
             "rep_residues": self.rep_residues,
@@ -453,6 +455,7 @@ def write_dataset(
     def flush_group() -> None:
         nonlocal group, in_group
         if group:
+            assert writer is not None
             writer.write_table(pa.Table.from_batches(group, schema=_SCHEMA))
             group, in_group = [], 0
 
@@ -584,7 +587,7 @@ def build_uniref70(
     summary: dict = {"uniref90_release": release, "stages": {}}
 
     # cluster
-    cl = _done(workdir, "cluster")
+    cl: dict[str, Any] | None = _done(workdir, "cluster")
     if cl is None:
         _need_space("cluster", spaces, 2.5 * in_bytes)
         t0 = time.monotonic()
@@ -605,7 +608,7 @@ def build_uniref70(
     # shuffle
     sh_params = {"seed": seed, "n_buckets": n_buckets}
     shuf_dir = workdir / "shuffled"
-    sh = _done(workdir, "shuffle", sh_params)
+    sh: dict[str, Any] | None = _done(workdir, "shuffle", sh_params)
     if sh is None:
         _need_space("shuffle", spaces, 1.2 * in_bytes)
         t0 = time.monotonic()
@@ -636,7 +639,7 @@ def build_uniref70(
         "screen_args": list(SCREEN_ARGS),
         "deepclust70": str(deepclust70),
     }
-    sc = _done(workdir, "screen", sc_params)
+    sc: dict[str, Any] | None = _done(workdir, "screen", sc_params)
     if sc is None:
         _need_space("screen", spaces, _SCREEN_MIN_FREE)
         t0 = time.monotonic()
@@ -664,8 +667,13 @@ def build_uniref70(
 
     # write
     wr_params = {"rows_per_shard": rows_per_shard, "n_eval": n_eval}
-    wr = _done(workdir, "write", wr_params)
+    wr: dict[str, Any] | None = _done(workdir, "write", wr_params)
     if wr is None:
+        _need_space("write", [out], 1.2 * sum(p.stat().st_size for p in parts))
+        # a crashed earlier attempt may have left partial output: start clean
+        shutil.rmtree(out / "train", ignore_errors=True)
+        for stale in (*out.glob("eval.parquet*"), out / "summary.json"):
+            stale.unlink(missing_ok=True)
         eval_ids = set(sc["eval_ids"])
         eval_rows = [
             r for r in itertools.islice(iter_rows(parts), pool) if r["sequence_id"] in eval_ids

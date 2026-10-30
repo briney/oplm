@@ -160,3 +160,14 @@ def test_manifest_counts_and_limit(tmp_path):
     small.mkdir()
     (small / "a").write_text("x")
     assert runner.invoke(app, ["manifest", str(small)]).exit_code == 0
+
+
+def test_uniref70_rerun_after_crash_before_write_done(tmp_path, calls):
+    assert runner.invoke(app, _args(tmp_path)).exit_code == 0
+    first = _rows(tmp_path / "out")
+    (tmp_path / "wd" / "write.done").unlink()
+    (tmp_path / "out" / "train" / "stale.parquet.tmp").write_text("x")
+    r = runner.invoke(app, _args(tmp_path))
+    assert r.exit_code == 0, r.output
+    assert _rows(tmp_path / "out") == first
+    assert not list((tmp_path / "out" / "train").glob("*.tmp"))
