@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import shutil
+import time
 from collections import Counter
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -14,7 +17,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from oplm.data.build.mmseqs import run_mmseqs_cmd
+from oplm.data.build.mmseqs import mmseqs_version, run_mmseqs_cmd
 from oplm.data.build.reshard import _COMPRESSION
 from oplm.data.sequence.dataset import (
     MEMBER_IDS_COLUMN,
@@ -24,9 +27,9 @@ from oplm.data.sequence.dataset import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
-    from pathlib import Path
 
 __all__ = [
+    "build_uniref70",
     "SCREEN_ARGS",
     "Cluster",
     "LowSurvivalError",
@@ -496,3 +499,201 @@ def write_dataset(
         "row_group_size": row_group_size,
         "compression": _COMPRESSION,
     }
+
+
+# ---- staged pipeline (`oplm data uniref70`) ----
+
+_SCREEN_MIN_FREE = 200e9  # bytes: mmseqs index/tmp for the chunked screen
+
+
+def _done(workdir: Path, stage: str, params: dict | None = None) -> dict | None:
+    """Contents of ``workdir/<stage>.done``, or None. Refuses if recorded params differ."""
+    p = workdir / f"{stage}.done"
+    if not p.exists():
+        return None
+    d = json.loads(p.read_text())
+    if params is not None:
+        old = d.get("params")
+        if old != params:
+            raise ValueError(
+                f"{p} was written with different parameters ({old} vs {params}); "
+                f"delete it (and later stages' .done files) to redo the stage"
+            )
+    return d
+
+
+def _mark(workdir: Path, stage: str, data: dict) -> None:
+    p = workdir / f"{stage}.done"
+    tmp = workdir / f"{stage}.done.tmp"
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.rename(p)
+
+
+def _need_space(stage: str, dirs: Sequence[Path], need: float) -> None:
+    for d in dirs:
+        free = shutil.disk_usage(d).free
+        if free < need:
+            raise RuntimeError(
+                f"{stage}: {d} has {free / 1e9:.0f} GB free, needs ~{need / 1e9:.0f} GB"
+            )
+
+
+def _input_sha256(fasta: Path, workdir: Path) -> str:
+    """sha256 of the UniRef90 FASTA, computed once and cached in the workdir."""
+    from oplm.data.build.manifest import sha256_file
+
+    cache = workdir / "input.sha256"
+    if not cache.exists():
+        tmp = workdir / "input.sha256.tmp"
+        tmp.write_text(sha256_file(fasta))
+        tmp.rename(cache)
+    return cache.read_text().strip()
+
+
+def build_uniref70(
+    *,
+    uniref90: Path,
+    release: str,
+    deepclust70: Path,
+    workdir: Path,
+    out: Path,
+    seed: int = 0,
+    threads: int = 32,
+    mmseqs: str = "mmseqs",
+    mmseqs_extra: Sequence[str] = (),
+    pool: int = 200_000,
+    n_eval: int = 10_000,
+    rows_per_shard: int = 100_000,
+    n_buckets: int = 512,
+    chunk_rows: int = 500_000_000,
+    keep_workdir: bool = False,
+) -> dict | None:
+    """Run cluster -> shuffle -> screen -> write, resuming from ``workdir/<stage>.done``.
+
+    Returns the summary dict, or None when ``deepclust70`` does not exist yet (the run stops
+    after ``shuffle``).
+
+    Raises:
+        ValueError: a finished stage was run with different parameters.
+        RuntimeError: not enough free disk space for the next stage.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    spaces = (workdir, out)
+    in_bytes = uniref90.stat().st_size
+    summary: dict = {"uniref90_release": release, "stages": {}}
+
+    # cluster
+    cl = _done(workdir, "cluster")
+    if cl is None:
+        _need_space("cluster", spaces, 2.5 * in_bytes)
+        t0 = time.monotonic()
+        fasta = cluster_uniref90(
+            uniref90, workdir, mmseqs=mmseqs, threads=threads, extra_args=mmseqs_extra
+        )
+        _input_sha256(uniref90, workdir)
+        cl = {
+            "all_seqs_fasta": str(fasta),
+            "mmseqs_version": mmseqs_version(mmseqs),
+            "threads": threads,
+            "extra_args": list(mmseqs_extra),
+            "seconds": int(time.monotonic() - t0),
+        }
+        _mark(workdir, "cluster", cl)
+    summary["stages"]["cluster"] = cl
+
+    # shuffle
+    sh_params = {"seed": seed, "n_buckets": n_buckets}
+    shuf_dir = workdir / "shuffled"
+    sh = _done(workdir, "shuffle", sh_params)
+    if sh is None:
+        _need_space("shuffle", spaces, 1.2 * in_bytes)
+        t0 = time.monotonic()
+        parts = shuffle_clusters(
+            iter_clusters(Path(cl["all_seqs_fasta"])), shuf_dir, seed=seed, n_buckets=n_buckets
+        )
+        sh = {
+            "params": sh_params,
+            "parts": [p.name for p in parts],
+            "seconds": int(time.monotonic() - t0),
+        }
+        _mark(workdir, "shuffle", sh)
+    if not keep_workdir:  # mmseqs outputs only; the shuffled parts and .done markers stay
+        for p in workdir.glob("uniref70_*"):
+            p.unlink()
+        shutil.rmtree(workdir / "tmp", ignore_errors=True)
+    summary["stages"]["shuffle"] = sh
+    parts = [shuf_dir / n for n in sh["parts"]]
+
+    if not deepclust70.exists():
+        return None
+
+    # screen
+    sc_params = {
+        "pool": pool,
+        "n_eval": n_eval,
+        "chunk_rows": chunk_rows,
+        "screen_args": list(SCREEN_ARGS),
+        "deepclust70": str(deepclust70),
+    }
+    sc = _done(workdir, "screen", sc_params)
+    if sc is None:
+        _need_space("screen", spaces, _SCREEN_MIN_FREE)
+        t0 = time.monotonic()
+        eval_rows, stats = select_eval(
+            iter_rows(parts),
+            pool=pool,
+            n_eval=n_eval,
+            screen=lambda cand: screen_against(
+                cand,
+                deepclust70,
+                workdir / "screen",
+                mmseqs=mmseqs,
+                threads=threads,
+                chunk_rows=chunk_rows,
+            ),
+        )
+        sc = {
+            "params": sc_params,
+            "eval_ids": [r["sequence_id"] for r in eval_rows],
+            "stats": stats,
+            "seconds": int(time.monotonic() - t0),
+        }
+        _mark(workdir, "screen", sc)
+    summary["stages"]["screen"] = sc["stats"]
+
+    # write
+    wr_params = {"rows_per_shard": rows_per_shard, "n_eval": n_eval}
+    wr = _done(workdir, "write", wr_params)
+    if wr is None:
+        eval_ids = set(sc["eval_ids"])
+        eval_rows = [
+            r for r in itertools.islice(iter_rows(parts), pool) if r["sequence_id"] in eval_ids
+        ]
+        stats = write_dataset(parts, eval_rows, out, rows_per_shard=rows_per_shard)
+        wr = {"params": wr_params, "stats": stats}
+        _mark(workdir, "write", wr)
+    summary["stages"]["write"] = wr["stats"]
+
+    from oplm import __version__
+
+    summary.update(
+        input_sha256=_input_sha256(uniref90, workdir),
+        mmseqs_version=cl["mmseqs_version"],
+        oplm_version=__version__,
+        parameters={
+            "seed": seed,
+            "threads": threads,
+            "mmseqs": mmseqs,
+            "mmseqs_extra": list(mmseqs_extra),
+            "pool": pool,
+            "n_eval": n_eval,
+            "rows_per_shard": rows_per_shard,
+            "n_buckets": n_buckets,
+            "chunk_rows": chunk_rows,
+            "screen_args": list(SCREEN_ARGS),
+            "deepclust70": str(deepclust70),
+        },
+    )
+    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+    return summary
