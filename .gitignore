@@ -10,7 +10,6 @@ __pycache__/
 .Python
 build/
 !src/oplm/data/build/
-!tests/data/build/
 develop-eggs/
 dist/
 downloads/
