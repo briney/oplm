@@ -12,7 +12,13 @@ runner = CliRunner()
 
 
 def _fasta(path, n=40):
-    path.write_text("".join(f">R{i}\n>R{i}\nACDEFGHIKL{'A' * i}\n" for i in range(n)))
+    # odd clusters have a second member (gte2); even ones are singletons
+    path.write_text(
+        "".join(
+            f">R{i}\n>R{i}\nACDEFGHIKL{'A' * i}\n" + (f">M{i}\nACDEFGHIKLW\n" if i % 2 else "")
+            for i in range(n)
+        )
+    )
 
 
 @pytest.fixture
@@ -57,7 +63,7 @@ def _args(tmp_path, deep=True, **extra):
         "--deepclust70": tmp_path / "deep",
         "--workdir": tmp_path / "wd",
         "--out": tmp_path / "out",
-        "--pool": 30,
+        "--pool": 15,
         "--n-eval": 5,
         "--n-test": 3,
         "--rows-per-shard": 10,
@@ -79,7 +85,7 @@ def test_uniref70_stages_resume(tmp_path, calls):
     r = runner.invoke(app, _args(tmp_path))
     assert r.exit_code == 0, r.output
     first = _rows(tmp_path / "out")
-    assert len(first) == 32
+    assert len(first) == 24
     assert not list((tmp_path / "wd").glob("uniref70_*"))  # mmseqs outputs cleaned
     assert not (tmp_path / "wd" / "tmp").exists()
     assert (tmp_path / "wd" / "shuffled").is_dir()
@@ -140,10 +146,17 @@ def test_uniref70_summary_fields(tmp_path, calls):
     assert len(s["input_sha256"]) == 64
     assert s["parameters"]["seed"] == 3 and s["mmseqs_version"] == "fake-1"
     assert s["stages"]["screen"]["survivors"] == 30
-    assert s["stages"]["write"]["eval"]["rows"] == 5 and s["stages"]["write"]["train"]["rows"] == 32
-    assert s["stages"]["write"]["test"]["rows"] == 3 and s["parameters"]["n_test"] == 3
+    assert s["stages"]["screen"]["singletons"]["survival_rate"] == 1.0
+    assert s["stages"]["screen"]["gte2"]["pool"] == 15
+    w = s["stages"]["write"]
+    assert w["eval"]["rows"] == 10 and w["train"]["rows"] == 24
+    assert w["test"]["rows"] == 6 and s["parameters"]["n_test"] == 3
+    for k in ("eval_singletons", "eval_gte2"):
+        assert w[k]["rows"] == 5
+    for k in ("test_singletons", "test_gte2"):
+        assert w[k]["rows"] == 3
     assert "oplm_version" in s
-    assert s["uniref90_sequences_in"] == 40 and s["clusters_out"] == 40
+    assert s["uniref90_sequences_in"] == 60 and s["clusters_out"] == 40
     assert s["screen_mmseqs_version"] == "fake-1"
     assert s["deepclust70"]["rows"] == 7 and s["deepclust70"]["sha256_out"] == "d" * 64
 
@@ -211,7 +224,7 @@ def test_uniref70_refuses_out_over_deepclust70(tmp_path, calls):
 
 @pytest.fixture
 def tsv_lines(calls, monkeypatch):
-    lines = {"n": 40}
+    lines = {"n": 60}
     fake = u.cluster_uniref90
 
     def with_tsv(fasta, workdir, **k):
@@ -226,7 +239,7 @@ def tsv_lines(calls, monkeypatch):
 def test_uniref70_reconciles_cluster_tsv(tmp_path, tsv_lines):
     assert runner.invoke(app, _args(tmp_path)).exit_code == 0
     sh = json.loads((tmp_path / "wd" / "shuffle.done").read_text())
-    assert (sh["clusters"], sh["members"], sh["cluster_tsv_lines"]) == (40, 40, 40)
+    assert (sh["clusters"], sh["members"], sh["cluster_tsv_lines"]) == (40, 60, 60)
 
 
 def test_uniref70_tsv_mismatch_raises(tmp_path, tsv_lines):
@@ -261,15 +274,16 @@ def test_uniref70_screen_unions_deepclust70_and_uniref70(tmp_path, calls, monkey
     assert sc["params"]["screen_uniref70"] is True
     assert sc["stats"]["hits"] == 2 and sc["stats"]["survivors"] == 28
     assert sc["stats"]["hits_deepclust70"] == 1 and sc["stats"]["hits_uniref70"] == 1
-    pool = [r["sequence_id"] for r in u.iter_rows(sorted((wd / "shuffled").glob("*.parquet")))]
-    assert not set(sc["eval_ids"]) & set(pool[:2])
+    walk = [r["sequence_id"] for r in u.iter_rows(sorted((wd / "shuffled").glob("*.parquet")))]
+    held = {i for ids in sc["held_ids"].values() for i in ids}
+    assert not held & set(walk[:2])
 
 
 def _read(f):
     return [r["sequence_id"] for r in pq.read_table(f).to_pylist()]
 
 
-def test_uniref70_test_split_follows_eval(tmp_path, calls, monkeypatch):
+def test_uniref70_balanced_strata_and_late_held_rows(tmp_path, calls, monkeypatch):
     wd, out = tmp_path / "wd", tmp_path / "out"
     hit = {}
 
@@ -278,34 +292,41 @@ def test_uniref70_test_split_follows_eval(tmp_path, calls, monkeypatch):
         return set(hit["ids"]) if not members else set()
 
     monkeypatch.setattr(u, "screen_against", fake_screen)
-    r = runner.invoke(app, _args(tmp_path, **{"--n-eval": 3, "--n-test": 2}))
+    r = runner.invoke(app, _args(tmp_path, **{"--n-eval": 3, "--n-test": 2, "--pool": 12}))
     assert r.exit_code == 0, r.output
-    pool = [r["sequence_id"] for r in u.iter_rows(sorted((wd / "shuffled").glob("*.parquet")))]
-    surv = [i for i in pool[:30] if i not in hit["ids"]]
+    rows = list(u.iter_rows(sorted((wd / "shuffled").glob("*.parquet"))))
+    strata = {
+        "singletons": [r["sequence_id"] for r in rows if len(r["member_ids"]) == 1],
+        "gte2": [r["sequence_id"] for r in rows if len(r["member_ids"]) > 1],
+    }
     sc = json.loads((wd / "screen.done").read_text())
     assert sc["params"]["n_test"] == 2
-    assert sc["eval_ids"] == surv[:3] and sc["test_ids"] == surv[3:5]
-
-    def held(name):
-        return {
-            i
-            for k in ("singletons", "gte2")
-            if (out / f"{name}_{k}.parquet").exists()
-            for i in _read(out / f"{name}_{k}.parquet")
-        }
-
-    assert held("eval") == set(surv[:3]) and held("test") == set(surv[3:5])
-    assert not (out / "eval.parquet").exists()
-    assert not set(_rows(out)) & set(surv[:5])
+    for k, ids in strata.items():
+        surv = [i for i in ids[:12] if i not in hit["ids"]]
+        assert sc["held_ids"][f"eval_{k}"] == surv[:3]
+        assert sc["held_ids"][f"test_{k}"] == surv[3:5]
+        assert _read(out / f"eval_{k}.parquet") == surv[:3]
+        assert _read(out / f"test_{k}.parquet") == surv[3:5]
+    # the walk spans ~2*pool rows, i.e. beyond the first ``pool`` rows
+    held = {i for ids in sc["held_ids"].values() for i in ids}
+    assert len(held) == 10 and any(
+        i not in {r for r in [x["sequence_id"] for x in rows[:12]]} for i in held
+    )
+    assert not set(_rows(out)) & held
     s = json.loads((out / "summary.json").read_text())
-    assert s["stages"]["write"]["test"]["rows"] == 2
+    assert s["stages"]["write"]["test"]["rows"] == 4
+    assert s["stages"]["write"]["eval"]["rows"] == 6
 
 
 def test_uniref70_n_test_zero_writes_no_test(tmp_path, calls):
     r = runner.invoke(app, _args(tmp_path, **{"--n-test": 0}))
     assert r.exit_code == 0, r.output
     assert not list((tmp_path / "out").glob("test*"))
-    assert len(_rows(tmp_path / "out")) == 35
+    assert sorted(p.name for p in (tmp_path / "out").glob("eval*")) == [
+        "eval_gte2.parquet",
+        "eval_singletons.parquet",
+    ]
+    assert len(_rows(tmp_path / "out")) == 30
 
 
 def test_uniref70_restart_removes_stale_test(tmp_path, calls):
@@ -326,10 +347,10 @@ def test_uniref70_write_raises_on_missing_test_id(tmp_path, calls):
     assert runner.invoke(app, _args(tmp_path)).exit_code == 0
     wd = tmp_path / "wd"
     sc = json.loads((wd / "screen.done").read_text())
-    sc["test_ids"].append("BOGUS")
+    sc["held_ids"]["test_gte2"].append("BOGUS")
     (wd / "screen.done").write_text(json.dumps(sc))
     (wd / "write.done").unlink()
     (wd / "write.started").write_text(str((tmp_path / "out").resolve()))
     r = runner.invoke(app, _args(tmp_path))
     assert r.exit_code != 0 and isinstance(r.exception, ValueError)
-    assert "not in the pool" in str(r.exception)
+    assert "not in the parts" in str(r.exception)

@@ -28,7 +28,7 @@ from oplm.data.sequence.dataset import (
 pc: Any = _pc  # the pyarrow stubs omit the generated compute kernels
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
 __all__ = [
     "build_uniref70",
@@ -391,35 +391,73 @@ class LowSurvivalError(RuntimeError):
     """Too few eval candidates survive the leakage screen; the user decides how to proceed."""
 
 
+STRATA = ("singletons", "gte2")
+
+
+def _stratum(row: dict) -> str:
+    return "singletons" if len(row[MEMBER_IDS_COLUMN]) == 1 else "gte2"
+
+
 def select_eval(
     rows: Iterable[dict],
     *,
     pool: int,
     n_eval: int,
+    n_test: int,
     screen: Callable[[Sequence[dict]], set[str]],
     min_survival: float = 0.05,
-) -> tuple[list[dict], dict]:
-    """First ``n_eval`` of the first ``pool`` rows that ``screen`` does not flag, plus stats.
+) -> tuple[dict[str, list[dict]], dict]:
+    """Per stratum (singletons / gte2), ``n_eval`` then ``n_test`` rows that ``screen`` spares.
+
+    Walks ``rows`` taking each row into its stratum's candidate pool until both hold ``pool``
+    rows (or ``rows`` runs out), screens all candidates in one call, and gives each stratum's
+    survivors, in walk order, to ``eval_<stratum>`` then ``test_<stratum>``.
+
+    Returns:
+        ``({"eval_singletons": ..., "eval_gte2": ..., "test_singletons": ..., "test_gte2":
+        ...}, stats)``; stats hold ``{pool, hits, survivors, survival_rate}`` per stratum
+        and in total.
 
     Raises:
-        LowSurvivalError: ``survivors / pool < min_survival``.
-        ValueError: fewer than ``n_eval`` survivors (grow ``pool``).
+        LowSurvivalError: a stratum's ``survivors / pool < min_survival``.
+        ValueError: a stratum has fewer than ``n_eval + n_test`` survivors (grow ``pool``).
     """
-    candidates = list(itertools.islice(rows, pool))
+    candidates: list[dict] = []
+    count = dict.fromkeys(STRATA, 0)
+    for row in rows:
+        k = _stratum(row)
+        if count[k] < pool:
+            count[k] += 1
+            candidates.append(row)
+            if all(c >= pool for c in count.values()):
+                break
     hits = screen(candidates)
-    survivors = [r for r in candidates if r["sequence_id"] not in hits]
-    n = len(candidates)
-    stats = {
-        "pool": n,
-        "hits": n - len(survivors),
-        "survivors": len(survivors),
-        "survival_rate": len(survivors) / n if n else 0.0,
-    }
-    if stats["survival_rate"] < min_survival:
-        raise LowSurvivalError(f"eval screen survival below {min_survival}: {stats}")
-    if len(survivors) < n_eval:
-        raise ValueError(f"{len(survivors)} survivors < n_eval={n_eval}; grow pool: {stats}")
-    return survivors[:n_eval], stats
+    chosen: dict[str, list[dict]] = {}
+    stats: dict[str, Any] = {}
+    for k in STRATA:
+        cands = [r for r in candidates if _stratum(r) == k]
+        survivors = [r for r in cands if r["sequence_id"] not in hits]
+        n = len(cands)
+        stats[k] = {
+            "pool": n,
+            "hits": n - len(survivors),
+            "survivors": len(survivors),
+            "survival_rate": len(survivors) / n if n else 0.0,
+        }
+        if stats[k]["survival_rate"] < min_survival:
+            raise LowSurvivalError(f"{k} eval screen survival below {min_survival}: {stats[k]}")
+        if len(survivors) < n_eval + n_test:
+            raise ValueError(
+                f"{k}: {len(survivors)} survivors < n_eval + n_test = {n_eval + n_test}; "
+                f"grow pool: {stats[k]}"
+            )
+        chosen[f"eval_{k}"] = survivors[:n_eval]
+        chosen[f"test_{k}"] = survivors[n_eval : n_eval + n_test]
+    total = sum(stats[k]["pool"] for k in STRATA)
+    surv = sum(stats[k]["survivors"] for k in STRATA)
+    stats.update(pool=total, hits=total - surv, survivors=surv)
+    stats["survival_rate"] = surv / total if total else 0.0
+    return chosen, stats
 
 
 class _Tally:
@@ -471,54 +509,53 @@ class _Tally:
 
 def write_dataset(
     parts: Sequence[Path],
-    eval_rows: list[dict],
+    held: Mapping[str, Sequence[dict]],
     out: Path,
     *,
     rows_per_shard: int,
-    test_rows: Sequence[dict] = (),
     row_group_size: int = 10_000,
 ) -> dict:
-    """Write ``out/{eval,test}_{singletons,gte2}.parquet`` and train shards
+    """Write ``out/{name}.parquet`` for each non-empty ``held`` list and train shards
     ``out/train/shard-{i:05d}.parquet``.
 
-    Each of eval and test is split by cluster size: ``singletons`` has one member, ``gte2``
-    more. Order is kept within a file; an empty partition (and all test files when
-    ``test_rows`` is empty) is not written and is tallied as 0 rows.
+    ``held`` maps file names like ``eval_singletons`` / ``test_gte2`` to rows; the name's
+    suffix must match each row's stratum (one member = ``singletons``, else ``gte2``). Order
+    is kept within a file; empty lists are not written and tally as 0 rows. Tallies are
+    reported per file and as ``eval`` / ``test`` totals.
 
-    Train is ``parts`` in order with the eval and test rep ids removed, cut every
-    ``rows_per_shard`` rows. Files are written as ``*.tmp`` and renamed when complete.
+    Train is ``parts`` in order with every held rep id removed, cut every ``rows_per_shard``
+    rows. Files are written as ``*.tmp`` and renamed when complete.
 
     Raises:
         FileExistsError: ``out/train`` is not empty.
-        ValueError: ``rows_per_shard < 1``, or some eval/test rep id is not in ``parts``.
+        ValueError: ``rows_per_shard < 1``, a row is in the wrong stratum's file, or some
+            held rep id is not in ``parts``.
     """
     if rows_per_shard < 1:
         raise ValueError(f"rows_per_shard must be >= 1, got {rows_per_shard}")
+    for name, rows in held.items():
+        for r in rows:
+            if _stratum(r) != name.split("_", 1)[1]:
+                raise ValueError(f"{name}: row {r['sequence_id']} is {_stratum(r)}")
     train_dir = out / "train"
     train_dir.mkdir(parents=True, exist_ok=True)
     if any(train_dir.iterdir()):
         raise FileExistsError(f"output directory {train_dir} is not empty")
 
-    held: dict[str, _Tally] = {}
+    tallies: dict[str, _Tally] = {}
     held_ids = []
-    for name, rows in (("eval", eval_rows), ("test", test_rows)):
-        if name == "test" and not rows:
+    for name, rows in held.items():
+        tallies[name] = _Tally()
+        tallies.setdefault(name.split("_", 1)[0], _Tally())
+        if not rows:
             continue
-        held[name] = _Tally()
-        for kind, part_rows in (
-            ("singletons", [r for r in rows if len(r[MEMBER_IDS_COLUMN]) == 1]),
-            ("gte2", [r for r in rows if len(r[MEMBER_IDS_COLUMN]) != 1]),
-        ):
-            held[f"{name}_{kind}"] = _Tally()
-            if not part_rows:
-                continue
-            table = pa.Table.from_pylist(part_rows, schema=_SCHEMA)
-            tmp = out / f"{name}_{kind}.parquet.tmp"
-            pq.write_table(table, tmp, compression=_COMPRESSION)
-            tmp.rename(out / f"{name}_{kind}.parquet")
-            held[name].add(table)
-            held[f"{name}_{kind}"].add(table)
-            held_ids.append(table["sequence_id"].combine_chunks())
+        table = pa.Table.from_pylist(list(rows), schema=_SCHEMA)
+        tmp = out / f"{name}.parquet.tmp"
+        pq.write_table(table, tmp, compression=_COMPRESSION)
+        tmp.rename(out / f"{name}.parquet")
+        tallies[name].add(table)
+        tallies[name.split("_", 1)[0]].add(table)
+        held_ids.append(table["sequence_id"].combine_chunks())
     eval_ids = pa.chunked_array(held_ids, type=pa.string())
 
     train_tally = _Tally()
@@ -570,7 +607,7 @@ def write_dataset(
         raise ValueError(f"{len(eval_ids) - skipped} eval/test rep ids are not in the parts")
 
     return {
-        **{name: tally.summary() for name, tally in held.items()},
+        **{name: tally.summary() for name, tally in tallies.items()},
         "train": train_tally.summary(),
         "train_shards": n_shards,
         "rows_per_shard": rows_per_shard,
@@ -647,9 +684,9 @@ def build_uniref70(
     threads: int = 32,
     mmseqs: str = "mmseqs",
     mmseqs_extra: Sequence[str] = (),
-    pool: int = 400_000,
-    n_eval: int = 10_000,
-    n_test: int = 10_000,
+    pool: int = 250_000,
+    n_eval: int = 5_000,
+    n_test: int = 5_000,
     rows_per_shard: int = 100_000,
     n_buckets: int = 512,
     chunk_rows: int = 200_000_000,
@@ -771,12 +808,11 @@ def build_uniref70(
             return deep_hits | u70_hits
 
         chosen, stats = select_eval(
-            iter_rows(parts), pool=pool, n_eval=n_eval + n_test, screen=screen
+            iter_rows(parts), pool=pool, n_eval=n_eval, n_test=n_test, screen=screen
         )
         sc = {
             "params": sc_params,
-            "eval_ids": [r["sequence_id"] for r in chosen[:n_eval]],
-            "test_ids": [r["sequence_id"] for r in chosen[n_eval:]],
+            "held_ids": {k: [r["sequence_id"] for r in v] for k, v in chosen.items()},
             "stats": {**stats, **screen_hits},
             "mmseqs_version": mmseqs_version(mmseqs),
             "seconds": int(time.monotonic() - t0),
@@ -804,21 +840,21 @@ def build_uniref70(
         tmp = workdir / "write.started.tmp"
         tmp.write_text(owner)
         tmp.rename(started)
-        held = {*sc["eval_ids"], *sc["test_ids"]}
-        by_id = {
-            r["sequence_id"]: r
-            for r in itertools.islice(iter_rows(parts), pool)
-            if r["sequence_id"] in held
-        }
-        missing = [i for i in (*sc["eval_ids"], *sc["test_ids"]) if i not in by_id]
+        want = {i for ids in sc["held_ids"].values() for i in ids}
+        by_id: dict[str, dict] = {}
+        for r in iter_rows(parts):  # the per-stratum walk spans far more than ``pool`` rows
+            if r["sequence_id"] in want:
+                by_id[r["sequence_id"]] = r
+                if len(by_id) == len(want):
+                    break
+        missing = want - by_id.keys()
         if missing:
-            raise ValueError(f"{len(missing)} eval/test rep ids are not in the pool")
+            raise ValueError(f"{len(missing)} held rep ids are not in the parts")
         stats = write_dataset(
             parts,
-            [by_id[i] for i in sc["eval_ids"]],
+            {k: [by_id[i] for i in ids] for k, ids in sc["held_ids"].items()},
             out,
             rows_per_shard=rows_per_shard,
-            test_rows=[by_id[i] for i in sc["test_ids"]],
         )
         wr = {"params": wr_params, "stats": stats}
         _mark(workdir, "write", wr)

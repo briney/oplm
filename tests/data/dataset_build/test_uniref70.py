@@ -143,7 +143,7 @@ def test_guards_reject_nonpositive_sizes(tmp_path):
     with pytest.raises(ValueError, match="n_buckets"):
         shuffle_clusters(_clusters(3), tmp_path / "s", seed=0, n_buckets=0)
     with pytest.raises(ValueError, match="rows_per_shard"):
-        write_dataset([], [], tmp_path / "o", rows_per_shard=0)
+        write_dataset([], {}, tmp_path / "o", rows_per_shard=0)
 
 
 def _rows(n):
@@ -158,30 +158,68 @@ def _rows(n):
     ]
 
 
-def test_select_eval_skips_hits_and_keeps_order():
-    rows = _rows(20)
+def _mixed(n):
+    # even i: singleton, odd i: gte2 (2 members)
+    return [
+        {
+            "sequence_id": f"R{i}",
+            "sequence": "A",
+            "member_ids": [f"R{i}"] + ([f"M{i}"] if i % 2 else []),
+            "member_sequences": ["A"] * (2 if i % 2 else 1),
+        }
+        for i in range(n)
+    ]
+
+
+def _ids(rows):
+    return [r["sequence_id"] for r in rows]
+
+
+def test_select_eval_per_stratum_first_n_then_next_n():
     seen = []
+    walked = []
+
+    def rows():
+        for r in _mixed(100):
+            walked.append(r["sequence_id"])
+            yield r
 
     def screen(cands):
-        seen.append([c["sequence_id"] for c in cands])
-        return {"R1", "R4", "R5"}
+        seen.append(_ids(cands))
+        return {"R2", "R3", "R9"}
 
-    chosen, stats = select_eval(iter(rows), pool=10, n_eval=4, screen=screen, min_survival=0.05)
-    assert seen == [[f"R{i}" for i in range(10)]]
-    assert [r["sequence_id"] for r in chosen] == ["R0", "R2", "R3", "R6"]
-    assert stats == {"pool": 10, "hits": 3, "survivors": 7, "survival_rate": 0.7}
+    chosen, stats = select_eval(rows(), pool=4, n_eval=2, n_test=1, screen=screen)
+    # singletons: R0 R2 R4 R6 -> survivors R0 R4 R6; gte2: R1 R3 R5 R7 -> survivors R1 R5 R7
+    assert seen == [["R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7"]]
+    assert walked == [f"R{i}" for i in range(8)]  # stopped as soon as both pools filled
+    assert _ids(chosen["eval_singletons"]) == ["R0", "R4"]
+    assert _ids(chosen["test_singletons"]) == ["R6"]
+    assert _ids(chosen["eval_gte2"]) == ["R1", "R5"] and _ids(chosen["test_gte2"]) == ["R7"]
+    assert stats["singletons"] == {"pool": 4, "hits": 1, "survivors": 3, "survival_rate": 0.75}
+    assert stats["gte2"] == {"pool": 4, "hits": 1, "survivors": 3, "survival_rate": 0.75}
+    assert (stats["pool"], stats["hits"], stats["survivors"]) == (8, 2, 6)
+    assert stats["survival_rate"] == 6 / 8
 
 
-def test_select_eval_low_survival_raises():
-    hit_all_but_one = lambda cands: {c["sequence_id"] for c in cands[1:]}  # noqa: E731
-    with pytest.raises(LowSurvivalError):
-        select_eval(_rows(100), pool=100, n_eval=1, screen=hit_all_but_one, min_survival=0.05)
+def test_select_eval_n_test_zero_gives_empty_test():
+    chosen, _ = select_eval(
+        iter(_mixed(20)), pool=5, n_eval=2, n_test=0, screen=lambda c: {"R0", "R1"}
+    )
+    assert _ids(chosen["eval_singletons"]) == ["R2", "R4"]
+    assert chosen["test_singletons"] == [] and chosen["test_gte2"] == []
+
+
+def test_select_eval_low_survival_in_one_stratum_raises():
+    odd = lambda cands: {c["sequence_id"] for c in cands if len(c["member_ids"]) > 1}  # noqa: E731
+    with pytest.raises(LowSurvivalError, match="gte2"):
+        select_eval(iter(_mixed(100)), pool=50, n_eval=1, n_test=0, screen=odd)
     assert issubclass(LowSurvivalError, RuntimeError)
 
 
-def test_select_eval_too_few_survivors_raises():
-    with pytest.raises(ValueError, match="grow"):
-        select_eval(_rows(10), pool=10, n_eval=8, screen=lambda c: {"R0", "R1", "R2"})
+def test_select_eval_too_few_survivors_names_stratum():
+    hit = lambda cands: {c["sequence_id"] for c in cands if c["sequence_id"] in {"R1", "R3"}}  # noqa: E731
+    with pytest.raises(ValueError, match=r"gte2.*grow"):
+        select_eval(iter(_mixed(20)), pool=5, n_eval=2, n_test=2, screen=hit)
 
 
 def _multi_clusters(n):
@@ -193,50 +231,82 @@ def _multi_clusters(n):
     return out
 
 
+def _split(rows):
+    return [r for r in rows if len(r["member_ids"]) == 1], [
+        r for r in rows if len(r["member_ids"]) > 1
+    ]
+
+
 def test_write_dataset_partitions(tmp_path):
     parts = shuffle_clusters(_multi_clusters(200), tmp_path / "parts", seed=0, n_buckets=4)
     shuffled = list(iter_rows(parts))
-    eval_rows = [shuffled[i] for i in (0, 3, 50, 199)]
+    one, many = _split(shuffled)
+    held = {
+        "eval_singletons": [one[0], one[9]],
+        "eval_gte2": [many[0], many[5], many[2]],
+        "test_singletons": [one[3], one[1]],
+        "test_gte2": [many[7], many[1]],
+    }
+    all_held = [r for rows in held.values() for r in rows]
     out = tmp_path / "out"
-    summary = write_dataset(parts, eval_rows, out, rows_per_shard=30, row_group_size=7)
+    summary = write_dataset(parts, held, out, rows_per_shard=30, row_group_size=7)
 
-    ev = [
-        r
-        for k in ("singletons", "gte2")
-        for r in pq.read_table(out / f"eval_{k}.parquet").to_pylist()
-    ]
-    assert sorted(r["sequence_id"] for r in ev) == sorted(r["sequence_id"] for r in eval_rows)
+    for name, rows in held.items():
+        assert pq.read_table(out / f"{name}.parquet").to_pylist() == rows
+        assert summary[name]["rows"] == len(rows)
+    assert sorted(p.name for p in out.glob("*.parquet")) == sorted(f"{n}.parquet" for n in held)
+    assert summary["eval"]["rows"] == 5 and summary["test"]["rows"] == 4
+    assert summary["test"]["member_rows"] == sum(
+        len(r["member_ids"]) for r in held["test_singletons"] + held["test_gte2"]
+    )
+    assert summary["eval_gte2"]["rep_residues"] == sum(
+        len(r["sequence"]) for r in held["eval_gte2"]
+    )
     shards = sorted((out / "train").iterdir())
-    assert [p.name for p in shards] == [f"shard-{i:05d}.parquet" for i in range(7)]
     sizes = [pq.ParquetFile(p).metadata.num_rows for p in shards]
-    assert sizes == [30] * 6 + [16]
+    assert sizes == [30] * 6 + [11] and sum(sizes) == 191
     assert max(pq.ParquetFile(shards[0]).metadata.row_group(g).num_rows for g in range(5)) <= 7
     train = list(iter_rows(shards))
-    eval_ids = {r["sequence_id"] for r in eval_rows}
-    assert [r["sequence_id"] for r in train] == [
-        r["sequence_id"] for r in shuffled if r["sequence_id"] not in eval_ids
-    ]
-    reps = [r["sequence_id"] for r in train] + [r["sequence_id"] for r in ev]
-    assert sorted(reps) == sorted(c.rep_id for c in _multi_clusters(200))
-    eval_members = {m for r in ev for m in r["member_ids"]}
-    assert not eval_members & {m for r in train for m in r["member_ids"]}
+    held_ids = set(_ids(all_held))
+    assert _ids(train) == [i for i in _ids(shuffled) if i not in held_ids]
+    assert sorted(_ids(train) + _ids(all_held)) == sorted(c.rep_id for c in _multi_clusters(200))
+    held_members = {m for r in all_held for m in r["member_ids"]}
+    assert not held_members & {m for r in train for m in r["member_ids"]}
     assert not list(out.rglob("*.tmp"))
-
     t = summary["train"]
-    assert t["rows"] == 196 and summary["eval"]["rows"] == 4 and summary["train_shards"] == 7
+    assert t["rows"] == 191 and summary["train_shards"] == 7
     assert t["member_rows"] == sum(len(r["member_ids"]) for r in train)
     assert t["rep_residues"] == sum(len(r["sequence"]) for r in train)
     assert t["member_residues"] == sum(len(s) for r in train for s in r["member_sequences"])
-    sizes = sorted(len(r["member_ids"]) for r in train)
+    sz = sorted(len(r["member_ids"]) for r in train)
     mpc = t["members_per_cluster"]
     assert (mpc["min"], mpc["max"]) == (1, 4)
-    assert mpc["median"] == (sizes[97] + sizes[98]) / 2
-    assert mpc["mean"] == pytest.approx(sum(sizes) / len(sizes))
+    assert mpc["median"] == (sz[95] + sz[96]) / 2
+    assert mpc["mean"] == pytest.approx(sum(sz) / len(sz))
     assert mpc["log2_histogram"] == {
-        "1": sizes.count(1),
-        "2-3": sizes.count(2) + sizes.count(3),
-        "4-7": sizes.count(4),
+        "1": sz.count(1),
+        "2-3": sz.count(2) + sz.count(3),
+        "4-7": sz.count(4),
     }
+
+
+def test_write_dataset_wrong_stratum_raises(tmp_path):
+    parts = shuffle_clusters(_multi_clusters(20), tmp_path / "parts", seed=0, n_buckets=2)
+    _, many = _split(list(iter_rows(parts)))
+    with pytest.raises(ValueError, match="eval_singletons"):
+        write_dataset(parts, {"eval_singletons": many[:1]}, tmp_path / "out", rows_per_shard=30)
+
+
+def test_write_dataset_skips_empty_lists(tmp_path):
+    parts = shuffle_clusters(_multi_clusters(20), tmp_path / "parts", seed=0, n_buckets=2)
+    _, many = _split(list(iter_rows(parts)))
+    out = tmp_path / "out"
+    summary = write_dataset(
+        parts, {"eval_singletons": [], "eval_gte2": many[:3]}, out, rows_per_shard=30
+    )
+    assert not (out / "eval_singletons.parquet").exists() and not list(out.glob("test*"))
+    assert (out / "eval_gte2.parquet").exists() and "test" not in summary
+    assert summary["eval_singletons"]["rows"] == 0 and summary["eval"]["rows"] == 3
 
 
 def test_chunk_fasta_spans_shards_in_order(tmp_path):
@@ -444,64 +514,3 @@ def test_screen_against_members_end_to_end(tmp_path):
     kw = {"mmseqs": "mmseqs", "threads": 1, "chunk_rows": 2, "members": True}
     assert screen_against(cands, ref, wd, **kw) == {"A"}
     assert sorted(p.name for p in wd.glob("hits-*.txt")) == ["hits-00000.txt", "hits-00001.txt"]
-
-
-def test_write_dataset_test_split(tmp_path):
-    parts = shuffle_clusters(_multi_clusters(200), tmp_path / "parts", seed=0, n_buckets=4)
-    shuffled = list(iter_rows(parts))
-    one = [r for r in shuffled if len(r["member_ids"]) == 1]
-    many = [r for r in shuffled if len(r["member_ids"]) > 1]
-    # interleave so original order within each file is not just a sorted slice
-    eval_rows = [many[0], one[0], many[5], one[9], many[2]]
-    test_rows = [one[3], many[7], many[1], one[1]]
-    out = tmp_path / "out"
-    summary = write_dataset(
-        parts, eval_rows, out, rows_per_shard=30, test_rows=test_rows, row_group_size=7
-    )
-
-    def one(r):
-        return len(r["member_ids"]) == 1
-
-    for name, rows in (("eval", eval_rows), ("test", test_rows)):
-        assert pq.read_table(out / f"{name}_singletons.parquet").to_pylist() == [
-            r for r in rows if one(r)
-        ]
-        assert pq.read_table(out / f"{name}_gte2.parquet").to_pylist() == [
-            r for r in rows if not one(r)
-        ]
-        t = summary[f"{name}_singletons"], summary[f"{name}_gte2"]
-        assert t[0]["rows"] == sum(map(one, rows)) and t[1]["rows"] == len(rows) - t[0]["rows"]
-        assert t[1]["member_rows"] == sum(len(r["member_ids"]) for r in rows if not one(r))
-        assert t[0]["rep_residues"] == sum(len(r["sequence"]) for r in rows if one(r))
-    assert not (out / "eval.parquet").exists() and not (out / "test.parquet").exists()
-    train = list(iter_rows(sorted((out / "train").iterdir())))
-    held = {r["sequence_id"] for r in eval_rows + test_rows}
-    assert [r["sequence_id"] for r in train] == [
-        r["sequence_id"] for r in shuffled if r["sequence_id"] not in held
-    ]
-    reps = [r["sequence_id"] for r in train] + [r["sequence_id"] for r in eval_rows + test_rows]
-    assert sorted(reps) == sorted(c.rep_id for c in _multi_clusters(200))
-    held_members = {m for r in eval_rows + test_rows for m in r["member_ids"]}
-    assert not held_members & {m for r in train for m in r["member_ids"]}
-    assert not list(out.rglob("*.tmp"))
-    assert summary["test"]["rows"] == 4 and summary["train"]["rows"] == 191
-    assert summary["test"]["member_rows"] == sum(len(r["member_ids"]) for r in test_rows)
-    assert summary["test"]["rep_residues"] == sum(len(r["sequence"]) for r in test_rows)
-
-
-def test_write_dataset_no_test_file_without_test_rows(tmp_path):
-    parts = shuffle_clusters(_multi_clusters(20), tmp_path / "parts", seed=0, n_buckets=2)
-    out = tmp_path / "out"
-    summary = write_dataset(parts, [], out, rows_per_shard=30)
-    assert not list(out.glob("test*")) and "test" not in summary
-
-
-def test_write_dataset_skips_empty_partition(tmp_path):
-    parts = shuffle_clusters(_multi_clusters(20), tmp_path / "parts", seed=0, n_buckets=2)
-    gte2 = [r for r in iter_rows(parts) if len(r["member_ids"]) > 1][:3]
-    out = tmp_path / "out"
-    summary = write_dataset(parts, gte2, out, rows_per_shard=30)
-    assert not (out / "eval_singletons.parquet").exists()
-    assert (out / "eval_gte2.parquet").exists()
-    assert summary["eval_singletons"]["rows"] == 0 and summary["eval_gte2"]["rows"] == 3
-    assert summary["eval"]["rows"] == 3
