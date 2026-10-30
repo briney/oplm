@@ -47,7 +47,7 @@ which is the "exact training set + rebuild procedure" promise of #61.
 - A dataset sorted or clustered by shard. The late-loss investigation showed cluster-ordered
   shards read in lockstep give near-duplicate batches and flattered loss (`docs/data.md`, *Why
   the data is shuffled*). Rows must be globally shuffled before sharding.
-- Eval leaking into training. Eval clusters, and every member of them, are absent from
+- Eval or test leaking into training. Eval and test clusters, and every member of them, are absent from
   `uniref70/train/`, and have no hit at the clustering thresholds in deepclust70 or in any
   other uniref70 cluster.
 - A member choice that depends on rank, worker or world size. Resume at a different topology
@@ -97,10 +97,12 @@ One dataset folder, both sources:
   manifest.parquet             # one row per file: path, rows, bytes, sha256
   uniref70/
     train/shard-00000.parquet  # ~100k clusters per shard (~1,300 shards)
-    eval.parquet               # held-out clusters
+    eval.parquet               # held-out clusters (10,000)
+    test.parquet               # independent held-out clusters (10,000)
   deepclust70/
     train/shard-00000.parquet  # 1,000,000 rows per shard (~5,355 shards)
-    eval.parquet               # copied as-is, if the user's dump has one
+    eval.parquet               # copied as-is from the user's dump
+    test.parquet               # copied as-is (~150k sequences)
 ```
 
 uniref70 row schema (one row per uniref70 cluster):
@@ -134,6 +136,10 @@ deepclust70 keeps its current schema.
    - Of the survivors, keep the first **10,000** in the seeded random order (my call on size; see
      *Calls made*). They go to `uniref70/eval.parquet` (same schema) and appear nowhere in
      `uniref70/train/`. Unused candidates go back into `train/`.
+   - **Test split (user, 2026-10-30).** The next **10,000** survivors in the same order go to
+     `uniref70/test.parquet` (same schema): an independent held-out set, screened exactly like
+     eval, disjoint from eval and absent from `train/`. The pool default is 400,000, so 5%
+     survival still yields 20,000 (eval + test).
    - Record the pool size, survival rate and search parameters in `summary.json`. If survival is
      very low (say under 5%), stop and report before building: survivors would be a biased slice
      (clusters with no deepclust70 relative at all), and the user decides whether that eval is
