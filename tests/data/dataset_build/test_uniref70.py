@@ -216,6 +216,19 @@ def test_select_eval_low_survival_in_one_stratum_raises():
     assert issubclass(LowSurvivalError, RuntimeError)
 
 
+def test_select_eval_low_survival_beats_shortfall():
+    # singletons: 2 survivors < n_eval; gte2: survival 0 -> LowSurvivalError first
+    def screen(cands):
+        return {
+            c["sequence_id"]
+            for c in cands
+            if len(c["member_ids"]) > 1 or c["sequence_id"] in {"R0", "R2", "R4"}
+        }
+
+    with pytest.raises(LowSurvivalError, match="gte2"):
+        select_eval(iter(_mixed(20)), pool=5, n_eval=4, n_test=0, screen=screen)
+
+
 def test_select_eval_too_few_survivors_names_stratum():
     hit = lambda cands: {c["sequence_id"] for c in cands if c["sequence_id"] in {"R1", "R3"}}  # noqa: E731
     with pytest.raises(ValueError, match=r"gte2.*grow"):

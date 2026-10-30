@@ -434,18 +434,21 @@ def select_eval(
     hits = screen(candidates)
     chosen: dict[str, list[dict]] = {}
     stats: dict[str, Any] = {}
+    survivors_of: dict[str, list[dict]] = {}
     for k in STRATA:
         cands = [r for r in candidates if _stratum(r) == k]
-        survivors = [r for r in cands if r["sequence_id"] not in hits]
+        survivors_of[k] = [r for r in cands if r["sequence_id"] not in hits]
         n = len(cands)
         stats[k] = {
             "pool": n,
-            "hits": n - len(survivors),
-            "survivors": len(survivors),
-            "survival_rate": len(survivors) / n if n else 0.0,
+            "hits": n - len(survivors_of[k]),
+            "survivors": len(survivors_of[k]),
+            "survival_rate": len(survivors_of[k]) / n if n else 0.0,
         }
-        if stats[k]["survival_rate"] < min_survival:
-            raise LowSurvivalError(f"{k} eval screen survival below {min_survival}: {stats[k]}")
+    if any(stats[k]["survival_rate"] < min_survival for k in STRATA):
+        raise LowSurvivalError(f"eval screen survival below {min_survival}: {stats}")
+    for k in STRATA:
+        survivors = survivors_of[k]
         if len(survivors) < n_eval + n_test:
             raise ValueError(
                 f"{k}: {len(survivors)} survivors < n_eval + n_test = {n_eval + n_test}; "
@@ -543,7 +546,7 @@ def write_dataset(
         raise FileExistsError(f"output directory {train_dir} is not empty")
 
     tallies: dict[str, _Tally] = {}
-    held_ids = []
+    held_chunks = []
     for name, rows in held.items():
         tallies[name] = _Tally()
         tallies.setdefault(name.split("_", 1)[0], _Tally())
@@ -555,8 +558,8 @@ def write_dataset(
         tmp.rename(out / f"{name}.parquet")
         tallies[name].add(table)
         tallies[name.split("_", 1)[0]].add(table)
-        held_ids.append(table["sequence_id"].combine_chunks())
-    eval_ids = pa.chunked_array(held_ids, type=pa.string())
+        held_chunks.append(table["sequence_id"].combine_chunks())
+    held_ids = pa.chunked_array(held_chunks, type=pa.string())
 
     train_tally = _Tally()
     n_shards = in_shard = in_group = skipped = 0
@@ -573,7 +576,7 @@ def write_dataset(
 
     for part in parts:
         for batch in pq.ParquetFile(part).iter_batches(batch_size=row_group_size):
-            keep = pc.invert(pc.is_in(batch["sequence_id"], value_set=eval_ids))
+            keep = pc.invert(pc.is_in(batch["sequence_id"], value_set=held_ids))
             skipped += batch.num_rows
             batch = batch.filter(keep)
             skipped -= batch.num_rows
@@ -603,8 +606,8 @@ def write_dataset(
         flush_group()
         writer.close()
         tmp.rename(final)
-    if skipped != len(eval_ids):
-        raise ValueError(f"{len(eval_ids) - skipped} eval/test rep ids are not in the parts")
+    if skipped != len(held_ids):
+        raise ValueError(f"{len(held_ids) - skipped} eval/test rep ids are not in the parts")
 
     return {
         **{name: tally.summary() for name, tally in tallies.items()},
@@ -777,6 +780,7 @@ def build_uniref70(
         "pool": pool,
         "n_eval": n_eval,
         "n_test": n_test,
+        "per_stratum": True,
         "chunk_rows": chunk_rows,
         "screen_args": list(SCREEN_ARGS),
         "deepclust70": str(deepclust70),

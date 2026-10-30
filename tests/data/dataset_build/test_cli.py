@@ -354,3 +354,13 @@ def test_uniref70_write_raises_on_missing_test_id(tmp_path, calls):
     r = runner.invoke(app, _args(tmp_path))
     assert r.exit_code != 0 and isinstance(r.exception, ValueError)
     assert "not in the parts" in str(r.exception)
+
+
+def test_uniref70_refuses_old_total_pool_screen_marker(tmp_path, calls):
+    assert runner.invoke(app, _args(tmp_path)).exit_code == 0
+    wd = tmp_path / "wd"
+    sc = json.loads((wd / "screen.done").read_text())
+    del sc["params"]["per_stratum"]
+    (wd / "screen.done").write_text(json.dumps(sc))
+    r = runner.invoke(app, _args(tmp_path))
+    assert r.exit_code != 0 and "different parameters" in str(r.exception)
