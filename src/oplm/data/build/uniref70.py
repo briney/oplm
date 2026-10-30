@@ -792,10 +792,11 @@ def build_uniref70(
         tmp = workdir / "write.started.tmp"
         tmp.write_text(owner)
         tmp.rename(started)
+        held = {*sc["eval_ids"], *sc["test_ids"]}
         by_id = {
             r["sequence_id"]: r
             for r in itertools.islice(iter_rows(parts), pool)
-            if r["sequence_id"] in {*sc["eval_ids"], *sc["test_ids"]}
+            if r["sequence_id"] in held
         }
         missing = [i for i in (*sc["eval_ids"], *sc["test_ids"]) if i not in by_id]
         if missing:

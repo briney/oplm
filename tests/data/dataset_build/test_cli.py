@@ -307,3 +307,16 @@ def test_uniref70_restart_removes_stale_test(tmp_path, calls):
     (tmp_path / "out" / "test.parquet").unlink()
     assert runner.invoke(app, _args(tmp_path)).exit_code == 0
     assert not stale.exists() and (tmp_path / "out" / "test.parquet").exists()
+
+
+def test_uniref70_write_raises_on_missing_test_id(tmp_path, calls):
+    assert runner.invoke(app, _args(tmp_path)).exit_code == 0
+    wd = tmp_path / "wd"
+    sc = json.loads((wd / "screen.done").read_text())
+    sc["test_ids"].append("BOGUS")
+    (wd / "screen.done").write_text(json.dumps(sc))
+    (wd / "write.done").unlink()
+    (wd / "write.started").write_text(str((tmp_path / "out").resolve()))
+    r = runner.invoke(app, _args(tmp_path))
+    assert r.exit_code != 0 and isinstance(r.exception, ValueError)
+    assert "not in the pool" in str(r.exception)
