@@ -138,10 +138,10 @@ deepclust70 keeps its current schema.
      the search is symmetric at `--cov-mode 0`, so the small candidate set can be the indexed
      side and deepclust70 the streamed side.
    - Of the survivors, keep the first **10,000** in the seeded random order (my call on size; see
-     *Calls made*). They go to `uniref70/eval.parquet` (same schema) and appear nowhere in
+     *Calls made*). They are the eval split (`uniref70/eval_{singletons,gte2}.parquet`, same schema) and appear nowhere in
      `uniref70/train/`. Unused candidates go back into `train/`.
-   - **Test split (user, 2026-10-30).** The next **10,000** survivors in the same order go to
-     `uniref70/test.parquet` (same schema): an independent held-out set, screened exactly like
+   - **Test split (user, 2026-10-30).** The next **10,000** survivors in the same order are the
+     test split (`uniref70/test_{singletons,gte2}.parquet`, same schema): an independent held-out set, screened exactly like
      eval, disjoint from eval and absent from `train/`. The pool default is 400,000, so 5%
      survival still yields 20,000 (eval + test).
    - **Split by cluster size (user, 2026-10-30), mirroring deepclust70.** Eval and test are each
@@ -240,7 +240,7 @@ if both are set.
 decay branch that also changes fractions changes the fingerprint and drops the cursor, as it does
 today.
 
-**Eval** (my call). Sequence eval stays on representatives: `uniref70/eval.parquet` is read with
+**Eval** (my call). Sequence eval stays on representatives: `uniref70/eval_*.parquet` are read with
 the current eval loader, which reads `sequence_id` and `sequence` only. No phase-2 eval.
 
 ### Build code (agreed in conversation)
