@@ -62,3 +62,36 @@ def test_cli_reshard(tmp_path):
     )
     assert r.exit_code == 0, r.output
     assert (tmp_path / "o/shard-00004.parquet").exists()
+
+
+def test_reshard_rejects_nonpositive_rows_per_shard(tmp_path):
+    with pytest.raises(ValueError, match="rows_per_shard"):
+        reshard(_src(tmp_path), tmp_path / "out", rows_per_shard=0)
+
+
+def test_reshard_checks_free_space(tmp_path, monkeypatch):
+    import shutil
+    from collections import namedtuple
+
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: usage(0, 0, 10))
+    with pytest.raises(RuntimeError, match="free"):
+        reshard(_src(tmp_path), tmp_path / "out", rows_per_shard=5)
+    assert not list((tmp_path / "out").iterdir())
+
+
+def test_reshard_verify_failure_leaves_marker(tmp_path, monkeypatch):
+    import oplm.data.build.reshard as r
+
+    monkeypatch.setattr(r, "stream_digest", lambda paths: (21, "bad"))
+    with pytest.raises(RuntimeError, match="VERIFY_FAILED"):
+        reshard(_src(tmp_path), tmp_path / "out", rows_per_shard=5)
+    assert "bad" in (tmp_path / "out" / "VERIFY_FAILED").read_text()
+    assert not (tmp_path / "out" / "summary.json").exists()
+
+
+def test_cli_rejects_zero_rows_per_shard(tmp_path):
+    r = CliRunner().invoke(
+        app, ["data", "reshard", str(_src(tmp_path)), str(tmp_path / "o"), "--rows-per-shard", "0"]
+    )
+    assert r.exit_code != 0

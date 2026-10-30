@@ -83,6 +83,9 @@ def iter_clusters(all_seqs_fasta: Path) -> Iterator[Cluster]:
 
     A header directly followed by another header opens a cluster (it carries only the rep
     id); header+sequence pairs then list the members, rep first. Sequences may be wrapped.
+
+    Raises:
+        ValueError: a cluster's first member is not its representative.
     """
     rep: str | None = None
     ids: list[str] = []
@@ -95,6 +98,11 @@ def iter_clusters(all_seqs_fasta: Path) -> Iterator[Cluster]:
             seqs.append("".join(parts))
         parts.clear()
 
+    def cluster(rep: str) -> Cluster:
+        if not ids or ids[0] != rep:
+            raise ValueError(f"cluster {rep}: first member is {ids[:1]}, not the representative")
+        return Cluster(rep, ids, seqs)
+
     with all_seqs_fasta.open() as handle:
         for raw in handle:
             line = raw.rstrip("\n")
@@ -102,7 +110,7 @@ def iter_clusters(all_seqs_fasta: Path) -> Iterator[Cluster]:
                 if pending_header is not None:
                     # two headers in a row: the earlier one opens a new cluster
                     if rep is not None:
-                        yield Cluster(rep, ids, seqs)
+                        yield cluster(rep)
                     rep, ids, seqs = pending_header, [], []
                 else:
                     flush_member()
@@ -114,7 +122,7 @@ def iter_clusters(all_seqs_fasta: Path) -> Iterator[Cluster]:
             parts.append(line.strip())
     flush_member()
     if rep is not None:
-        yield Cluster(rep, ids, seqs)
+        yield cluster(rep)
 
 
 _SCHEMA = pa.schema(
@@ -150,13 +158,32 @@ def shuffle_clusters(
     shuffled order. Output depends only on the input order, ``seed`` and ``n_buckets``.
     Pass 2 is resumable per bucket (finished parts are kept; an interrupted bucket restarts
     from its pass-1 file). Pass 1 is skipped if every bucket already has a pass-1 or final file.
+    ``out_dir/params.json`` records ``seed`` / ``n_buckets``; pass 1 records the cluster and
+    member counts it read in ``out_dir/counts.json``.
+
+    Raises:
+        ValueError: ``n_buckets < 1``, or ``out_dir`` holds parts of a shuffle with other
+            (or unrecorded) parameters.
     """
+    if n_buckets < 1:
+        raise ValueError(f"n_buckets must be >= 1, got {n_buckets}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    params, params_file = {"seed": seed, "n_buckets": n_buckets}, out_dir / "params.json"
+    if any(out_dir.glob("part-*.parquet")) or any(out_dir.glob("part-*.pass1")):
+        old = json.loads(params_file.read_text()) if params_file.exists() else None
+        if old != params:
+            raise ValueError(
+                f"{out_dir} holds parts of another shuffle ({old} vs {params}); "
+                f"delete it to reshuffle"
+            )
+    else:
+        params_file.write_text(json.dumps(params))
     finals = [out_dir / f"part-{b:05d}.parquet" for b in range(n_buckets)]
     pass1 = [f.with_suffix(".pass1") for f in finals]
 
     if not all(f.exists() or p.exists() for f, p in zip(finals, pass1, strict=True)):
         rng = np.random.default_rng(seed)
+        n_clusters = n_members = 0
         tmps = [p.with_suffix(".pass1.tmp") for p in pass1]
         writers = [pq.ParquetWriter(t, _SCHEMA) for t in tmps]
         bufs: list[list[Cluster]] = [[] for _ in range(n_buckets)]
@@ -173,8 +200,13 @@ def shuffle_clusters(
                 draws = iter(rng.integers(0, n_buckets, _DRAW_CHUNK).tolist())
                 b = next(draws)
             bufs[b].append(c)
+            n_clusters += 1
+            n_members += len(c.member_ids)
             if len(bufs[b]) >= _FLUSH_ROWS:
                 flush(b)
+        tmp = out_dir / "counts.json.tmp"  # before the renames: a crash there redoes pass 1
+        tmp.write_text(json.dumps({"clusters": n_clusters, "members": n_members}))
+        tmp.rename(out_dir / "counts.json")
         for b in range(n_buckets):
             flush(b)
             writers[b].close()
@@ -431,8 +463,10 @@ def write_dataset(
 
     Raises:
         FileExistsError: ``out/train`` is not empty.
-        ValueError: some eval rep id is not in ``parts``.
+        ValueError: ``rows_per_shard < 1``, or some eval rep id is not in ``parts``.
     """
+    if rows_per_shard < 1:
+        raise ValueError(f"rows_per_shard must be >= 1, got {rows_per_shard}")
     train_dir = out / "train"
     train_dir.mkdir(parents=True, exist_ok=True)
     if any(train_dir.iterdir()):
@@ -541,6 +575,14 @@ def _need_space(stage: str, dirs: Sequence[Path], need: float) -> None:
             )
 
 
+def _count_lines(path: Path) -> int:
+    n = 0
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 24), b""):
+            n += block.count(b"\n")
+    return n
+
+
 def _input_sha256(fasta: Path, workdir: Path) -> str:
     """sha256 of the UniRef90 FASTA, computed once and cached in the workdir."""
     from oplm.data.build.manifest import sha256_file
@@ -568,28 +610,35 @@ def build_uniref70(
     n_eval: int = 10_000,
     rows_per_shard: int = 100_000,
     n_buckets: int = 512,
-    chunk_rows: int = 500_000_000,
+    chunk_rows: int = 200_000_000,
     keep_workdir: bool = False,
 ) -> dict | None:
     """Run cluster -> shuffle -> screen -> write, resuming from ``workdir/<stage>.done``.
 
-    Returns the summary dict, or None when ``deepclust70`` does not exist yet (the run stops
-    after ``shuffle``).
+    Returns the summary dict, or None when ``deepclust70/summary.json`` (written by
+    ``oplm data reshard`` after verification) does not exist yet (the run stops after
+    ``shuffle``).
 
     Raises:
-        ValueError: a finished stage was run with different parameters.
-        RuntimeError: not enough free disk space for the next stage.
+        ValueError: a finished stage was run with different parameters, or ``out`` would
+            overwrite ``deepclust70``.
+        RuntimeError: not enough free disk space for the next stage, or the parsed member
+            count disagrees with ``uniref70_cluster.tsv``.
+        FileExistsError: ``out/train`` is not empty and was not written by this build.
     """
+    if out.resolve() == deepclust70.resolve().parent or (
+        (out / "train").resolve() == deepclust70.resolve()
+    ):
+        raise ValueError(f"--out {out} would overwrite --deepclust70 {deepclust70}")
     workdir.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
     spaces = (workdir, out)
-    in_bytes = uniref90.stat().st_size
     summary: dict = {"uniref90_release": release, "stages": {}}
 
     # cluster
     cl: dict[str, Any] | None = _done(workdir, "cluster")
     if cl is None:
-        _need_space("cluster", spaces, 2.5 * in_bytes)
+        _need_space("cluster", spaces, 4 * uniref90.stat().st_size)
         t0 = time.monotonic()
         fasta = cluster_uniref90(
             uniref90, workdir, mmseqs=mmseqs, threads=threads, extra_args=mmseqs_extra
@@ -610,14 +659,25 @@ def build_uniref70(
     shuf_dir = workdir / "shuffled"
     sh: dict[str, Any] | None = _done(workdir, "shuffle", sh_params)
     if sh is None:
-        _need_space("shuffle", spaces, 1.2 * in_bytes)
+        _need_space("shuffle", spaces, 1.2 * uniref90.stat().st_size)
+        _input_sha256(uniref90, workdir)  # cached so later stages never need the input
         t0 = time.monotonic()
         parts = shuffle_clusters(
             iter_clusters(Path(cl["all_seqs_fasta"])), shuf_dir, seed=seed, n_buckets=n_buckets
         )
+        counts = json.loads((shuf_dir / "counts.json").read_text())
+        tsv = workdir / "uniref70_cluster.tsv"  # easy-linclust: one line per member
+        tsv_lines = _count_lines(tsv) if tsv.exists() else None
+        if tsv_lines is not None and tsv_lines != counts["members"]:
+            raise RuntimeError(
+                f"parsed {counts['members']} members from {cl['all_seqs_fasta']} but {tsv} "
+                f"has {tsv_lines} lines"
+            )
         sh = {
             "params": sh_params,
             "parts": [p.name for p in parts],
+            **counts,
+            "cluster_tsv_lines": tsv_lines,
             "seconds": int(time.monotonic() - t0),
         }
         _mark(workdir, "shuffle", sh)
@@ -628,8 +688,10 @@ def build_uniref70(
     summary["stages"]["shuffle"] = sh
     parts = [shuf_dir / n for n in sh["parts"]]
 
-    if not deepclust70.exists():
+    deep_summary = deepclust70 / "summary.json"
+    if not deep_summary.exists():
         return None
+    deep = json.loads(deep_summary.read_text())
 
     # screen
     sc_params = {
@@ -660,6 +722,7 @@ def build_uniref70(
             "params": sc_params,
             "eval_ids": [r["sequence_id"] for r in eval_rows],
             "stats": stats,
+            "mmseqs_version": mmseqs_version(mmseqs),
             "seconds": int(time.monotonic() - t0),
         }
         _mark(workdir, "screen", sc)
@@ -669,11 +732,18 @@ def build_uniref70(
     wr_params = {"rows_per_shard": rows_per_shard, "n_eval": n_eval}
     wr: dict[str, Any] | None = _done(workdir, "write", wr_params)
     if wr is None:
+        started, owner = workdir / "write.started", str(out.resolve())
+        if started.exists() and started.read_text() == owner:
+            # our own crashed earlier attempt left partial output: start clean
+            shutil.rmtree(out / "train", ignore_errors=True)
+            for stale in (*out.glob("eval.parquet*"), out / "summary.json"):
+                stale.unlink(missing_ok=True)
+        elif (out / "train").exists() and any((out / "train").iterdir()):
+            raise FileExistsError(f"{out / 'train'} is not empty and was not written by this build")
         _need_space("write", [out], 1.2 * sum(p.stat().st_size for p in parts))
-        # a crashed earlier attempt may have left partial output: start clean
-        shutil.rmtree(out / "train", ignore_errors=True)
-        for stale in (*out.glob("eval.parquet*"), out / "summary.json"):
-            stale.unlink(missing_ok=True)
+        tmp = workdir / "write.started.tmp"
+        tmp.write_text(owner)
+        tmp.rename(started)
         eval_ids = set(sc["eval_ids"])
         eval_rows = [
             r for r in itertools.islice(iter_rows(parts), pool) if r["sequence_id"] in eval_ids
@@ -681,13 +751,22 @@ def build_uniref70(
         stats = write_dataset(parts, eval_rows, out, rows_per_shard=rows_per_shard)
         wr = {"params": wr_params, "stats": stats}
         _mark(workdir, "write", wr)
+        started.unlink()
     summary["stages"]["write"] = wr["stats"]
 
     from oplm import __version__
 
     summary.update(
         input_sha256=_input_sha256(uniref90, workdir),
+        uniref90_sequences_in=sh.get("members"),
+        clusters_out=sh.get("clusters"),
         mmseqs_version=cl["mmseqs_version"],
+        screen_mmseqs_version=sc.get("mmseqs_version"),
+        deepclust70={
+            "path": str(deepclust70),
+            "rows": deep["rows"],
+            "sha256_out": deep["sha256_out"],
+        },
         oplm_version=__version__,
         parameters={
             "seed": seed,

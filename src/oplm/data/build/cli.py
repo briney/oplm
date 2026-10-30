@@ -14,7 +14,7 @@ app = typer.Typer(help="Dataset build tools", no_args_is_help=True)
 def reshard(
     src: Annotated[Path, typer.Argument(help="Directory of source parquet shards")],
     out: Annotated[Path, typer.Argument(help="Empty output directory")],
-    rows_per_shard: Annotated[int, typer.Option(help="Rows per output shard")] = 1_000_000,
+    rows_per_shard: Annotated[int, typer.Option(min=1, help="Rows per output shard")] = 1_000_000,
 ) -> None:
     """Re-cut shards to a fixed row count, keeping every row and the global order."""
     from oplm.data.build.reshard import reshard as run
@@ -37,13 +37,13 @@ def uniref70(
         list[str] | None,
         typer.Option(help="Extra mmseqs arg, repeatable (--mmseqs-extra=--split-memory-limit)"),
     ] = None,
-    pool: Annotated[int, typer.Option(help="Eval candidate pool (rows)")] = 200_000,
-    n_eval: Annotated[int, typer.Option()] = 10_000,
-    rows_per_shard: Annotated[int, typer.Option()] = 100_000,
-    n_buckets: Annotated[int, typer.Option()] = 512,
+    pool: Annotated[int, typer.Option(min=1, help="Eval candidate pool (rows)")] = 200_000,
+    n_eval: Annotated[int, typer.Option(min=1)] = 10_000,
+    rows_per_shard: Annotated[int, typer.Option(min=1)] = 100_000,
+    n_buckets: Annotated[int, typer.Option(min=1)] = 512,
     chunk_rows: Annotated[
-        int, typer.Option(help="deepclust70 rows per screen chunk")
-    ] = 500_000_000,
+        int, typer.Option(min=1, help="deepclust70 rows per screen chunk")
+    ] = 200_000_000,
     keep_workdir: Annotated[bool, typer.Option(help="Keep mmseqs outputs after shuffle")] = False,
 ) -> None:
     """Build the uniref70 dataset: cluster, shuffle, leakage screen, write."""
@@ -67,7 +67,10 @@ def uniref70(
         keep_workdir=keep_workdir,
     )
     if s is None:
-        typer.echo(f"shuffle done; screen waits for {deepclust70} (rerun once it exists)")
+        typer.echo(
+            f"shuffle done; screen waits for {deepclust70 / 'summary.json'} "
+            f"(written by `oplm data reshard` once verified; rerun then)"
+        )
     else:
         typer.echo(f"wrote {out} ({s['stages']['write']['train']['rows']} train rows)")
 

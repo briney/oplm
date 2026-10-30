@@ -46,8 +46,11 @@ def calls(monkeypatch):
 
 def _args(tmp_path, deep=True, **extra):
     (tmp_path / "u90.fa").write_text(">a\nAC\n")
-    if deep:
+    if deep:  # a finished, verified `oplm data reshard` output
         (tmp_path / "deep").mkdir(exist_ok=True)
+        (tmp_path / "deep" / "summary.json").write_text(
+            json.dumps({"rows": 7, "sha256_out": "d" * 64})
+        )
     a = {
         "--uniref90": tmp_path / "u90.fa",
         "--release": "2026_03",
@@ -95,6 +98,10 @@ def test_uniref70_waits_for_deepclust70(tmp_path, calls):
     assert "waits" in r.output
     assert (tmp_path / "wd" / "shuffle.done").exists()
     assert not (tmp_path / "wd" / "screen.done").exists()
+    (tmp_path / "mid").mkdir()  # reshard still running: shards but no summary.json yet
+    r = runner.invoke(app, _args(tmp_path, deep=False, **{"--deepclust70": tmp_path / "mid"}))
+    assert r.exit_code == 0 and "waits" in r.output
+    assert calls["screen"] == 0
 
 
 def test_uniref70_accepts_handwritten_cluster_done(tmp_path, calls):
@@ -134,6 +141,9 @@ def test_uniref70_summary_fields(tmp_path, calls):
     assert s["stages"]["screen"]["survivors"] == 30
     assert s["stages"]["write"]["eval"]["rows"] == 5 and s["stages"]["write"]["train"]["rows"] == 35
     assert "oplm_version" in s
+    assert s["uniref90_sequences_in"] == 40 and s["clusters_out"] == 40
+    assert s["screen_mmseqs_version"] == "fake-1"
+    assert s["deepclust70"]["rows"] == 7 and s["deepclust70"]["sha256_out"] == "d" * 64
 
 
 def test_manifest_counts_and_limit(tmp_path):
@@ -165,9 +175,66 @@ def test_manifest_counts_and_limit(tmp_path):
 def test_uniref70_rerun_after_crash_before_write_done(tmp_path, calls):
     assert runner.invoke(app, _args(tmp_path)).exit_code == 0
     first = _rows(tmp_path / "out")
+    assert not (tmp_path / "wd" / "write.started").exists()
+    # the state a crash mid-write leaves: write.started, partial train/, no write.done
     (tmp_path / "wd" / "write.done").unlink()
+    (tmp_path / "wd" / "write.started").write_text(str((tmp_path / "out").resolve()))
     (tmp_path / "out" / "train" / "stale.parquet.tmp").write_text("x")
     r = runner.invoke(app, _args(tmp_path))
     assert r.exit_code == 0, r.output
     assert _rows(tmp_path / "out") == first
     assert not list((tmp_path / "out" / "train").glob("*.tmp"))
+
+
+def test_uniref70_write_keeps_foreign_train(tmp_path, calls):
+    train = tmp_path / "out" / "train"
+    train.mkdir(parents=True)
+    (train / "precious.parquet").write_text("x")
+    r = runner.invoke(app, _args(tmp_path))
+    assert isinstance(r.exception, FileExistsError)
+    assert (train / "precious.parquet").read_text() == "x"
+    assert not (tmp_path / "wd" / "write.started").exists()
+    # a marker left for a different --out does not license cleaning this one
+    (tmp_path / "wd" / "write.started").write_text(str(tmp_path / "elsewhere"))
+    assert isinstance(runner.invoke(app, _args(tmp_path)).exception, FileExistsError)
+    assert (train / "precious.parquet").exists()
+
+
+def test_uniref70_refuses_out_over_deepclust70(tmp_path, calls):
+    a = _args(tmp_path, **{"--deepclust70": tmp_path / "out" / "train"})
+    r = runner.invoke(app, a)
+    assert isinstance(r.exception, ValueError) and "overwrite" in str(r.exception)
+    assert calls["cluster"] == 0
+
+
+@pytest.fixture
+def tsv_lines(calls, monkeypatch):
+    lines = {"n": 40}
+    fake = u.cluster_uniref90
+
+    def with_tsv(fasta, workdir, **k):
+        p = fake(fasta, workdir, **k)
+        (workdir / "uniref70_cluster.tsv").write_text("R\tR\n" * lines["n"])
+        return p
+
+    monkeypatch.setattr(u, "cluster_uniref90", with_tsv)
+    return lines
+
+
+def test_uniref70_reconciles_cluster_tsv(tmp_path, tsv_lines):
+    assert runner.invoke(app, _args(tmp_path)).exit_code == 0
+    sh = json.loads((tmp_path / "wd" / "shuffle.done").read_text())
+    assert (sh["clusters"], sh["members"], sh["cluster_tsv_lines"]) == (40, 40, 40)
+
+
+def test_uniref70_tsv_mismatch_raises(tmp_path, tsv_lines):
+    tsv_lines["n"] = 41
+    r = runner.invoke(app, _args(tmp_path))
+    assert isinstance(r.exception, RuntimeError) and "41 lines" in str(r.exception)
+    assert not (tmp_path / "wd" / "shuffle.done").exists()
+
+
+@pytest.mark.parametrize("opt", ["--rows-per-shard", "--n-buckets", "--pool", "--chunk-rows"])
+def test_uniref70_rejects_nonpositive_counts(tmp_path, calls, opt):
+    assert runner.invoke(app, _args(tmp_path, **{opt: 0})).exit_code != 0
+    assert calls["cluster"] == 0

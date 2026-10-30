@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -43,11 +44,25 @@ def reshard(src: Path, out: Path, *, rows_per_shard: int) -> dict:
     """Re-cut ``src`` shards into ``out`` shards of ``rows_per_shard`` rows.
 
     Global row order (sorted source filename order) is preserved; every column is kept.
+
+    Raises:
+        ValueError: ``rows_per_shard < 1``.
+        FileExistsError: ``out`` is not empty.
+        RuntimeError: too little free space in ``out``, or the output digest does not match
+            the input (``out/VERIFY_FAILED`` then records both digests).
     """
+    if rows_per_shard < 1:
+        raise ValueError(f"rows_per_shard must be >= 1, got {rows_per_shard}")
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         raise FileExistsError(f"output directory {out} is not empty")
     shards = ShardedProteinDataset._discover_shards(src)
+    need = 1.05 * sum(p.stat().st_size for p in shards)
+    free = shutil.disk_usage(out).free
+    if free < need:
+        raise RuntimeError(
+            f"reshard: {out} has {free / 1e9:.1f} GB free, needs ~{need / 1e9:.1f} GB"
+        )
     schema = pq.ParquetFile(shards[0]).schema_arrow
 
     h_in = hashlib.sha256()
@@ -94,6 +109,12 @@ def reshard(src: Path, out: Path, *, rows_per_shard: int) -> dict:
         "sha256_out": sha_out,
     }
     if rows_out != rows or sha_out != summary["sha256_in"]:
-        raise RuntimeError(f"reshard verification failed: {rows} rows in, {rows_out} out")
+        (out / "VERIFY_FAILED").write_text(
+            f"rows in {rows} out {rows_out}\nsha256 in {summary['sha256_in']} out {sha_out}\n"
+        )
+        raise RuntimeError(
+            f"reshard verification failed: {rows} rows in, {rows_out} out; the shards in {out} "
+            f"are NOT a faithful copy (see {out / 'VERIFY_FAILED'}): delete them"
+        )
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary

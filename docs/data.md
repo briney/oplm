@@ -196,7 +196,9 @@ Cluster-per-row datasets (one row per cluster, the representative in
 `member_ids` and `member_sequences`. Phase 1 trains on the representatives and ignores
 them; phase 2 sets `sample_members: true` on that `data.train` source, and each served
 row yields one uniformly chosen member, a pure hash of (pass seed, shard, row), so resume,
-reshard and any topology serve the same member and every epoch redraws it.
+loader reshard layers (any-topology resume) and any topology serve the same member and every
+epoch redraws it. Re-cutting the files with `oplm data reshard` changes shard and row indices,
+and so the members drawn.
 
 Only the needed columns are read (`pq.read_table(columns=[...])`). There is no
 HuggingFace `datasets` integration; parquet is the only on-disk format.

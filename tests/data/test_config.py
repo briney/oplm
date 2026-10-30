@@ -309,6 +309,11 @@ def test_parse_train_sample_members_must_be_bool() -> None:
         parse_train_configs({"a": {"path": "/a", "sample_members": "yes"}})
 
 
+def test_parse_train_unknown_key_raises() -> None:
+    with pytest.raises(ValueError, match=r"unknown keys \['sample_member'\]"):
+        parse_train_configs({"a": {"path": "/a", "sample_member": True}})
+
+
 def test_fingerprint_ignores_sample_members(tmp_path: Path) -> None:
     from oplm.data.sequence.dataset import train_data_fingerprint
     from tests.data.conftest import write_sequence_shards

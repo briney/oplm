@@ -16,6 +16,7 @@ import oplm.data.sequence.dataset as dataset_mod
 from oplm.data.sequence.dataset import (
     MEMBER_IDS_COLUMN,
     MEMBER_SEQUENCES_COLUMN,
+    Reshard,
     ShardedProteinDataset,
     _member_index,
 )
@@ -51,10 +52,17 @@ def _write(tmp_path: Path) -> Path:
     return d
 
 
-def _rows(ds: ShardedProteinDataset, rank: int = 0, world: int = 1) -> list[dict[str, object]]:
+def _rows(
+    ds: ShardedProteinDataset, rank: int = 0, world: int = 1, pass_index: int = 0
+) -> list[dict[str, object]]:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(dataset_mod, "_resolve_distributed_context", lambda: (rank, world, 0, 1))
-        return list(ds._iter_stream(0))
+        return list(ds._iter_pass(pass_index))
+
+
+def _by_cluster(rows: list[dict[str, object]]) -> dict[str, str]:
+    """Physical row (cluster) -> served member id."""
+    return {str(r["sequence_id"]).rsplit("m", 1)[0]: str(r["sequence_id"]) for r in rows}
 
 
 def test_flag_off_is_unchanged(tmp_path: Path) -> None:
@@ -113,6 +121,30 @@ def test_members_change_across_epochs(tmp_path: Path) -> None:
     assert len(seen) > 1
 
 
+def test_resume_and_reshard_serve_the_same_member(tmp_path: Path) -> None:
+    d = _write(tmp_path)
+    ds = ShardedProteinDataset(d, seed=7, sample_members=True)
+    fresh = _rows(ds)
+    ds.set_resume_rows([2])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dataset_mod, "_resolve_distributed_context", lambda: (0, 1, 0, 1))
+        resumed = list(ds)
+    assert resumed == fresh[2:]
+    ds.clear_resume_skip()
+    ds.set_reshards([Reshard(stride=2, epochs=[0, 0], rows=[1, 2])])
+    layered = _by_cluster(_rows(ds))
+    assert 0 < len(layered) < len(fresh)
+    full = _by_cluster(fresh)
+    assert all(full[c] == m for c, m in layered.items())
+
+
+def test_refill_pass_redraws_members(tmp_path: Path) -> None:
+    d = _write(tmp_path)
+    ds = ShardedProteinDataset(d, sample_members=True)
+    seen = {_by_cluster(_rows(ds, pass_index=p))["s0c2"] for p in range(10)}
+    assert len(seen) > 1
+
+
 def test_member_choice_is_uniform() -> None:
     counts = [0, 0, 0]
     for shard in range(300):
@@ -134,9 +166,13 @@ def test_masking_weights_with_members_raise(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("ids", "seqs"), [(["a", "b"], ["AC", "AD", "AE"]), ([], [])], ids=["mismatch", "empty"]
+    ("ids", "seqs"),
+    [(["a", "b"], ["AC", "AD", "AE"]), ([], []), (["a"], None)],
+    ids=["mismatch", "empty", "null-seqs"],
 )
-def test_mismatched_member_lists_raise(tmp_path: Path, ids: list[str], seqs: list[str]) -> None:
+def test_mismatched_member_lists_raise(
+    tmp_path: Path, ids: list[str], seqs: list[str] | None
+) -> None:
     table = pa.table(
         {
             "sequence_id": ["r0", "r1"],

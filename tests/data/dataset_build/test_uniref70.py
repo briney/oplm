@@ -1,3 +1,4 @@
+import json
 import shutil
 
 import numpy as np
@@ -45,6 +46,14 @@ def test_rep_is_first_member(tmp_path):
     f.write_text(">R\n>R\nAC\n>Q\nAD\n>S\nAE\n")
     (c,) = iter_clusters(f)
     assert c.rep_id == "R" and c.member_ids[0] == "R"
+
+
+@pytest.mark.parametrize("text", [">R\n>Q\nAD\n>R\nAC\n", ">R\n>S\n>S\nAC\n"])
+def test_rep_not_first_raises(tmp_path, text):
+    f = tmp_path / "a.fasta"
+    f.write_text(text)
+    with pytest.raises(ValueError, match="cluster R"):
+        list(iter_clusters(f))
 
 
 @pytest.mark.slow
@@ -107,6 +116,33 @@ def test_shuffle_resumes_and_ignores_flush_size(tmp_path, monkeypatch):
         r["sequence_id"]
         for r in iter_rows(shuffle_clusters(_clusters(1000), d, seed=3, n_buckets=8))
     ] == base
+
+
+def test_shuffle_refuses_stale_parts(tmp_path):
+    d = tmp_path / "s"
+    shuffle_clusters(_clusters(100), d, seed=0, n_buckets=8)
+    assert json.loads((d / "params.json").read_text()) == {"seed": 0, "n_buckets": 8}
+    with pytest.raises(ValueError, match="another shuffle"):
+        shuffle_clusters(_clusters(100), d, seed=1, n_buckets=8)
+    with pytest.raises(ValueError, match="another shuffle"):
+        shuffle_clusters(_clusters(100), d, seed=0, n_buckets=4)
+    (d / "params.json").unlink()  # parts without a record (e.g. an older build)
+    with pytest.raises(ValueError, match="another shuffle"):
+        shuffle_clusters(_clusters(100), d, seed=0, n_buckets=8)
+
+
+def test_shuffle_records_counts(tmp_path):
+    d = tmp_path / "s"
+    shuffle_clusters(_multi_clusters(10), d, seed=0, n_buckets=2)
+    counts = json.loads((d / "counts.json").read_text())
+    assert counts == {"clusters": 10, "members": sum(1 + i % 4 for i in range(10))}
+
+
+def test_guards_reject_nonpositive_sizes(tmp_path):
+    with pytest.raises(ValueError, match="n_buckets"):
+        shuffle_clusters(_clusters(3), tmp_path / "s", seed=0, n_buckets=0)
+    with pytest.raises(ValueError, match="rows_per_shard"):
+        write_dataset([], [], tmp_path / "o", rows_per_shard=0)
 
 
 def _rows(n):

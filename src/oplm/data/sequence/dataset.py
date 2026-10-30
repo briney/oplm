@@ -715,7 +715,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         for row_idx in row_indices:
             ids = id_lists[row_idx].as_py()
             seqs = seq_lists[row_idx].as_py()
-            if not ids or len(ids) != len(seqs):
+            if not ids or not seqs or len(ids) != len(seqs):
                 raise ValueError(
                     f"{path} row {row_idx}: member_ids ({len(ids or [])}) and "
                     f"member_sequences ({len(seqs or [])}) must be non-empty and equal length"
