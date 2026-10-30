@@ -191,6 +191,13 @@ columns:
 | `sequence` | `str` | Raw one-letter amino acids, **no special tokens**. |
 | `masking_weights` | `list[float]` | Optional, one weight per residue. Read only when `data.weighted_masking=true`. |
 
+Cluster-per-row datasets (one row per cluster, the representative in
+`sequence_id` / `sequence`) add two optional parallel `list[str]` columns,
+`member_ids` and `member_sequences`. Phase 1 trains on the representatives and ignores
+them; phase 2 sets `sample_members: true` on that `data.train` source, and each served
+row yields one uniformly chosen member, a pure hash of (pass seed, shard, row), so resume,
+reshard and any topology serve the same member and every epoch redraws it.
+
 Only the needed columns are read (`pq.read_table(columns=[...])`). There is no
 HuggingFace `datasets` integration; parquet is the only on-disk format.
 

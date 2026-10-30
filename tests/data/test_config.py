@@ -7,10 +7,15 @@ added to :class:`oplm.config.DataConfig`.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 from oplm.config import DataConfig, ScheduleSpec
 from oplm.data.config import parse_eval_configs, parse_train_configs
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # Fallback cadence used by the parse_eval_configs tests below (was an int
 # ``default_eval_every``; the cadence is now a structured ScheduleSpec).
@@ -289,3 +294,26 @@ def test_dataconfig_random_token_prob_out_of_range_raises(value: float) -> None:
 def test_dataconfig_split_sum_above_one_raises() -> None:
     with pytest.raises(ValueError, match=r"must be <= 1"):
         DataConfig(mask_token_prob=0.7, random_token_prob=0.5)
+
+
+def test_parse_train_sample_members() -> None:
+    entries = parse_train_configs(
+        {"a": {"path": "/a", "sample_members": True}, "b": {"path": "/b"}}
+    )
+    assert [e.sample_members for e in entries] == [True, False]
+    assert parse_train_configs({"a": "/a"})[0].sample_members is False
+
+
+def test_parse_train_sample_members_must_be_bool() -> None:
+    with pytest.raises(ValueError, match="sample_members"):
+        parse_train_configs({"a": {"path": "/a", "sample_members": "yes"}})
+
+
+def test_fingerprint_ignores_sample_members(tmp_path: Path) -> None:
+    from oplm.data.sequence.dataset import train_data_fingerprint
+    from tests.data.conftest import write_sequence_shards
+
+    d = write_sequence_shards(tmp_path, [("a", "AC"), ("b", "AD")], n_shards=1)
+    off = train_data_fingerprint({"a": {"path": str(d)}})
+    on = train_data_fingerprint({"a": {"path": str(d), "sample_members": True}})
+    assert on == off
