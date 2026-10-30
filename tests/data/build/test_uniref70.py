@@ -6,6 +6,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from oplm.data.build.uniref70 import (
+    SCREEN_ARGS,
     Cluster,
     LowSurvivalError,
     cluster_uniref90,
@@ -215,6 +216,44 @@ def test_chunk_fasta_spans_shards_in_order(tmp_path):
         _write_chunk_fasta(shards, lo, lo + 2, fa)
         got += [line[1:] for line in fa.read_text().splitlines() if line.startswith(">")]
     assert got == ids
+
+
+def test_screen_args_do_not_cap_hits():
+    args = dict(zip(SCREEN_ARGS[::2], SCREEN_ARGS[1::2], strict=True))
+    assert int(args["--max-seqs"]) >= 100_000 and float(args["-e"]) >= 1e6
+    assert (args["--min-seq-id"], args["-c"], args["--cov-mode"]) == ("0.7", "0.8", "0")
+
+
+_CANDS = [{"sequence_id": "A", "sequence": "MK", "member_ids": ["A"], "member_sequences": ["MK"]}]
+
+
+def _no_mmseqs(ref, wd):  # runs up to the first mmseqs call (key handling happens before it)
+    with pytest.raises(RuntimeError, match="not found"):
+        screen_against(_CANDS, ref, wd, mmseqs="/nonexistent/mmseqs", threads=1, chunk_rows=2)
+
+
+def test_screen_key_covers_reference(tmp_path):
+    ref, wd = tmp_path / "ref", tmp_path / "wd"
+    ref.mkdir()
+    pq.write_table(pa.table({"sequence_id": ["u"], "sequence": ["MK"]}), ref / "a.parquet")
+    _no_mmseqs(ref, wd)
+    (wd / "hits-00000.txt").write_text("A\n")
+    _no_mmseqs(ref, wd)
+    assert (wd / "hits-00000.txt").exists()  # same inputs: finished chunks kept
+    pq.write_table(pa.table({"sequence_id": ["v"], "sequence": ["MK"]}), ref / "b.parquet")
+    _no_mmseqs(ref, wd)
+    assert not (wd / "hits-00000.txt").exists()  # reference changed: hits discarded
+
+
+def test_screen_empty_reference_raises(tmp_path):
+    ref = tmp_path / "ref"
+    ref.mkdir()
+    pq.write_table(
+        pa.table({"sequence_id": pa.array([], pa.string()), "sequence": pa.array([], pa.string())}),
+        ref / "a.parquet",
+    )
+    with pytest.raises(ValueError, match="no rows"):
+        screen_against(_CANDS, ref, tmp_path / "wd", mmseqs="mmseqs", threads=1, chunk_rows=2)
 
 
 @pytest.mark.slow

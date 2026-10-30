@@ -197,8 +197,12 @@ def iter_rows(parts: Sequence[Path]) -> Iterator[dict]:
 
 # Clustering thresholds (symmetric at --cov-mode 0, so query/target roles can swap). -s 4 is
 # below the 5.7 default: hits at >=70% identity share many exact k-mers, so the cheaper
-# prefilter still finds them.
-SCREEN_ARGS = ("--min-seq-id", "0.7", "-c", "0.8", "--cov-mode", "0", "-s", "4")
+# prefilter still finds them. Huge --max-seqs / -e so neither the per-query prefilter cap
+# (the targets are the candidates) nor the e-value drops a hit: identity and coverage decide.
+SCREEN_ARGS = (
+    *("--min-seq-id", "0.7", "-c", "0.8", "--cov-mode", "0"),
+    *("-s", "4", "--max-seqs", "100000", "-e", "1e6"),
+)
 
 
 def _ref_shards(reference: Path) -> list[tuple[Path, int, int]]:
@@ -250,8 +254,17 @@ def screen_against(
     The candidate members are the indexed target; the reference (a parquet dir, e.g.
     deepclust70) is streamed as queries in chunks of ``chunk_rows`` rows. Each finished chunk
     leaves ``workdir/hits-{k:05d}.txt``; a rerun skips those chunks. Changing the candidates,
-    ``chunk_rows`` or ``SCREEN_ARGS`` discards earlier hits files.
+    the reference shards (names, row counts), ``chunk_rows`` or ``SCREEN_ARGS`` discards
+    earlier hits files.
+
+    Raises:
+        ValueError: the reference has no rows.
+        RuntimeError: ``mmseqs`` is missing or exits non-zero.
     """
+    shards = _ref_shards(reference)
+    total = shards[-1][1] + shards[-1][2]
+    if total == 0:
+        raise ValueError(f"reference {reference} has no rows")
     workdir.mkdir(parents=True, exist_ok=True)
     _rm_prefix(workdir, "candidates")  # the target DB is rebuilt every call (it is small)
     _rm_prefix(workdir, "chunk-")  # leftovers of a crashed chunk
@@ -265,7 +278,7 @@ def screen_against(
     with target_fa.open("rb") as fh:
         for block in iter(lambda: fh.read(1 << 20), b""):
             h.update(block)
-    h.update(f"{chunk_rows} {SCREEN_ARGS}".encode())
+    h.update(f"{chunk_rows} {SCREEN_ARGS} {[(p.name, n) for p, _, n in shards]}".encode())
     key, key_file = h.hexdigest(), workdir / "screen.key"
     if not key_file.exists() or key_file.read_text() != key:
         _rm_prefix(workdir, "hits-")
@@ -278,8 +291,6 @@ def screen_against(
         ["createindex", str(target), str(workdir / "candidates.tmp"), "--threads", str(threads)],
     )
 
-    shards = _ref_shards(reference)
-    total = shards[-1][1] + shards[-1][2]
     n_chunks = -(-total // chunk_rows)
     hits_files = [workdir / f"hits-{k:05d}.txt" for k in range(n_chunks)]
     for k, hits in enumerate(hits_files):
@@ -308,7 +319,8 @@ def screen_against(
             mmseqs,
             ["convertalis", str(qdb), str(target), str(aln), str(tsv), "--format-output", "target"],
         )
-        ids = sorted(set(tsv.read_text().split()))
+        with tsv.open() as fh:
+            ids = sorted({line.strip() for line in fh} - {""})
         tmp = hits.with_name(f"{hits.name}.tmp")
         tmp.write_text("".join(f"{i}\n" for i in ids))
         tmp.rename(hits)
