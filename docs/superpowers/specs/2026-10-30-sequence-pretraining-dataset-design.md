@@ -97,12 +97,16 @@ One dataset folder, both sources:
   manifest.parquet             # one row per file: path, rows, bytes, sha256
   uniref70/
     train/shard-00000.parquet  # ~100k clusters per shard (~1,300 shards)
-    eval.parquet               # held-out clusters (10,000)
-    test.parquet               # independent held-out clusters (10,000)
+    eval_singletons.parquet    # held-out eval clusters with 1 member  } 10,000 eval
+    eval_gte2.parquet          # held-out eval clusters with 2+ members }
+    test_singletons.parquet    # independent test clusters, 1 member    } 10,000 test
+    test_gte2.parquet          # independent test clusters, 2+ members  }
   deepclust70/
     train/shard-00000.parquet  # 1,000,000 rows per shard (~5,355 shards)
-    eval.parquet               # copied as-is from the user's dump
-    test.parquet               # copied as-is (~150k sequences)
+    eval_singletons.parquet    # copied as-is: 15,000 reps of singleton clusters
+    eval_gte2.parquet          # copied as-is: 15,000 reps of 2+-member clusters
+    test_singletons.parquet    # copied as-is: 150,000
+    test_gte2.parquet          # copied as-is: 150,000
 ```
 
 uniref70 row schema (one row per uniref70 cluster):
@@ -140,6 +144,11 @@ deepclust70 keeps its current schema.
      `uniref70/test.parquet` (same schema): an independent held-out set, screened exactly like
      eval, disjoint from eval and absent from `train/`. The pool default is 400,000, so 5%
      survival still yields 20,000 (eval + test).
+   - **Split by cluster size (user, 2026-10-30), mirroring deepclust70.** Eval and test are each
+     written as two files: `_singletons` (clusters with exactly 1 member) and `_gte2` (2+
+     members), e.g. `eval_singletons.parquet` / `eval_gte2.parquet`. The split partitions the
+     clusters the screen chose (no re-selection), so the two files' sizes follow the data and
+     sum to 10,000 per split; record each file's count.
    - Record the pool size, survival rate and search parameters in `summary.json`. If survival is
      very low (say under 5%), stop and report before building: survivors would be a biased slice
      (clusters with no deepclust70 relative at all), and the user decides whether that eval is
