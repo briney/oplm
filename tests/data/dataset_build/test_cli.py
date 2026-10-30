@@ -285,7 +285,17 @@ def test_uniref70_test_split_follows_eval(tmp_path, calls, monkeypatch):
     sc = json.loads((wd / "screen.done").read_text())
     assert sc["params"]["n_test"] == 2
     assert sc["eval_ids"] == surv[:3] and sc["test_ids"] == surv[3:5]
-    assert _read(out / "eval.parquet") == surv[:3] and _read(out / "test.parquet") == surv[3:5]
+
+    def held(name):
+        return {
+            i
+            for k in ("singletons", "gte2")
+            if (out / f"{name}_{k}.parquet").exists()
+            for i in _read(out / f"{name}_{k}.parquet")
+        }
+
+    assert held("eval") == set(surv[:3]) and held("test") == set(surv[3:5])
+    assert not (out / "eval.parquet").exists()
     assert not set(_rows(out)) & set(surv[:5])
     s = json.loads((out / "summary.json").read_text())
     assert s["stages"]["write"]["test"]["rows"] == 2
@@ -294,7 +304,7 @@ def test_uniref70_test_split_follows_eval(tmp_path, calls, monkeypatch):
 def test_uniref70_n_test_zero_writes_no_test(tmp_path, calls):
     r = runner.invoke(app, _args(tmp_path, **{"--n-test": 0}))
     assert r.exit_code == 0, r.output
-    assert not (tmp_path / "out" / "test.parquet").exists()
+    assert not list((tmp_path / "out").glob("test*"))
     assert len(_rows(tmp_path / "out")) == 35
 
 
@@ -302,11 +312,14 @@ def test_uniref70_restart_removes_stale_test(tmp_path, calls):
     assert runner.invoke(app, _args(tmp_path)).exit_code == 0
     (tmp_path / "wd" / "write.done").unlink()
     (tmp_path / "wd" / "write.started").write_text(str((tmp_path / "out").resolve()))
-    stale = tmp_path / "out" / "test.parquet.tmp"
-    stale.write_text("x")
-    (tmp_path / "out" / "test.parquet").unlink()
+    stale = [tmp_path / "out" / n for n in ("test_gte2.parquet.tmp", "eval_gte2.parquet.tmp")]
+    for f in stale:
+        f.write_text("x")
+    final = sorted((tmp_path / "out").glob("test_*.parquet"))
+    assert final
+    final[0].unlink()
     assert runner.invoke(app, _args(tmp_path)).exit_code == 0
-    assert not stale.exists() and (tmp_path / "out" / "test.parquet").exists()
+    assert not any(f.exists() for f in stale) and final[0].exists()
 
 
 def test_uniref70_write_raises_on_missing_test_id(tmp_path, calls):

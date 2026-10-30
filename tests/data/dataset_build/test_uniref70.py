@@ -200,8 +200,12 @@ def test_write_dataset_partitions(tmp_path):
     out = tmp_path / "out"
     summary = write_dataset(parts, eval_rows, out, rows_per_shard=30, row_group_size=7)
 
-    ev = pq.read_table(out / "eval.parquet").to_pylist()
-    assert ev == eval_rows
+    ev = [
+        r
+        for k in ("singletons", "gte2")
+        for r in pq.read_table(out / f"eval_{k}.parquet").to_pylist()
+    ]
+    assert sorted(r["sequence_id"] for r in ev) == sorted(r["sequence_id"] for r in eval_rows)
     shards = sorted((out / "train").iterdir())
     assert [p.name for p in shards] == [f"shard-{i:05d}.parquet" for i in range(7)]
     sizes = [pq.ParquetFile(p).metadata.num_rows for p in shards]
@@ -445,14 +449,31 @@ def test_screen_against_members_end_to_end(tmp_path):
 def test_write_dataset_test_split(tmp_path):
     parts = shuffle_clusters(_multi_clusters(200), tmp_path / "parts", seed=0, n_buckets=4)
     shuffled = list(iter_rows(parts))
-    eval_rows = [shuffled[i] for i in (0, 3, 50)]
-    test_rows = [shuffled[i] for i in (7, 60, 199, 100)]
+    one = [r for r in shuffled if len(r["member_ids"]) == 1]
+    many = [r for r in shuffled if len(r["member_ids"]) > 1]
+    # interleave so original order within each file is not just a sorted slice
+    eval_rows = [many[0], one[0], many[5], one[9], many[2]]
+    test_rows = [one[3], many[7], many[1], one[1]]
     out = tmp_path / "out"
     summary = write_dataset(
         parts, eval_rows, out, rows_per_shard=30, test_rows=test_rows, row_group_size=7
     )
-    assert pq.read_table(out / "eval.parquet").to_pylist() == eval_rows
-    assert pq.read_table(out / "test.parquet").to_pylist() == test_rows
+
+    def one(r):
+        return len(r["member_ids"]) == 1
+
+    for name, rows in (("eval", eval_rows), ("test", test_rows)):
+        assert pq.read_table(out / f"{name}_singletons.parquet").to_pylist() == [
+            r for r in rows if one(r)
+        ]
+        assert pq.read_table(out / f"{name}_gte2.parquet").to_pylist() == [
+            r for r in rows if not one(r)
+        ]
+        t = summary[f"{name}_singletons"], summary[f"{name}_gte2"]
+        assert t[0]["rows"] == sum(map(one, rows)) and t[1]["rows"] == len(rows) - t[0]["rows"]
+        assert t[1]["member_rows"] == sum(len(r["member_ids"]) for r in rows if not one(r))
+        assert t[0]["rep_residues"] == sum(len(r["sequence"]) for r in rows if one(r))
+    assert not (out / "eval.parquet").exists() and not (out / "test.parquet").exists()
     train = list(iter_rows(sorted((out / "train").iterdir())))
     held = {r["sequence_id"] for r in eval_rows + test_rows}
     assert [r["sequence_id"] for r in train] == [
@@ -463,7 +484,7 @@ def test_write_dataset_test_split(tmp_path):
     held_members = {m for r in eval_rows + test_rows for m in r["member_ids"]}
     assert not held_members & {m for r in train for m in r["member_ids"]}
     assert not list(out.rglob("*.tmp"))
-    assert summary["test"]["rows"] == 4 and summary["train"]["rows"] == 193
+    assert summary["test"]["rows"] == 4 and summary["train"]["rows"] == 191
     assert summary["test"]["member_rows"] == sum(len(r["member_ids"]) for r in test_rows)
     assert summary["test"]["rep_residues"] == sum(len(r["sequence"]) for r in test_rows)
 
@@ -472,4 +493,15 @@ def test_write_dataset_no_test_file_without_test_rows(tmp_path):
     parts = shuffle_clusters(_multi_clusters(20), tmp_path / "parts", seed=0, n_buckets=2)
     out = tmp_path / "out"
     summary = write_dataset(parts, [], out, rows_per_shard=30)
-    assert not (out / "test.parquet").exists() and "test" not in summary
+    assert not list(out.glob("test*")) and "test" not in summary
+
+
+def test_write_dataset_skips_empty_partition(tmp_path):
+    parts = shuffle_clusters(_multi_clusters(20), tmp_path / "parts", seed=0, n_buckets=2)
+    gte2 = [r for r in iter_rows(parts) if len(r["member_ids"]) > 1][:3]
+    out = tmp_path / "out"
+    summary = write_dataset(parts, gte2, out, rows_per_shard=30)
+    assert not (out / "eval_singletons.parquet").exists()
+    assert (out / "eval_gte2.parquet").exists()
+    assert summary["eval_singletons"]["rows"] == 0 and summary["eval_gte2"]["rows"] == 3
+    assert summary["eval"]["rows"] == 3

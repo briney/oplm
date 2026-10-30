@@ -478,8 +478,12 @@ def write_dataset(
     test_rows: Sequence[dict] = (),
     row_group_size: int = 10_000,
 ) -> dict:
-    """Write ``out/eval.parquet``, ``out/test.parquet`` (if ``test_rows``) and train shards
+    """Write ``out/{eval,test}_{singletons,gte2}.parquet`` and train shards
     ``out/train/shard-{i:05d}.parquet``.
+
+    Each of eval and test is split by cluster size: ``singletons`` has one member, ``gte2``
+    more. Order is kept within a file; an empty partition (and all test files when
+    ``test_rows`` is empty) is not written and is tallied as 0 rows.
 
     Train is ``parts`` in order with the eval and test rep ids removed, cut every
     ``rows_per_shard`` rows. Files are written as ``*.tmp`` and renamed when complete.
@@ -500,13 +504,21 @@ def write_dataset(
     for name, rows in (("eval", eval_rows), ("test", test_rows)):
         if name == "test" and not rows:
             continue
-        table = pa.Table.from_pylist(list(rows), schema=_SCHEMA)
-        tmp = out / f"{name}.parquet.tmp"
-        pq.write_table(table, tmp, compression=_COMPRESSION)
-        tmp.rename(out / f"{name}.parquet")
         held[name] = _Tally()
-        held[name].add(table)
-        held_ids.append(table["sequence_id"].combine_chunks())
+        for kind, part_rows in (
+            ("singletons", [r for r in rows if len(r[MEMBER_IDS_COLUMN]) == 1]),
+            ("gte2", [r for r in rows if len(r[MEMBER_IDS_COLUMN]) != 1]),
+        ):
+            held[f"{name}_{kind}"] = _Tally()
+            if not part_rows:
+                continue
+            table = pa.Table.from_pylist(part_rows, schema=_SCHEMA)
+            tmp = out / f"{name}_{kind}.parquet.tmp"
+            pq.write_table(table, tmp, compression=_COMPRESSION)
+            tmp.rename(out / f"{name}_{kind}.parquet")
+            held[name].add(table)
+            held[f"{name}_{kind}"].add(table)
+            held_ids.append(table["sequence_id"].combine_chunks())
     eval_ids = pa.chunked_array(held_ids, type=pa.string())
 
     train_tally = _Tally()
@@ -781,8 +793,8 @@ def build_uniref70(
             # our own crashed earlier attempt left partial output: start clean
             shutil.rmtree(out / "train", ignore_errors=True)
             for stale in (
-                *out.glob("eval.parquet*"),
-                *out.glob("test.parquet*"),
+                *out.glob("eval*.parquet*"),
+                *out.glob("test*.parquet*"),
                 out / "summary.json",
             ):
                 stale.unlink(missing_ok=True)

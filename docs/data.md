@@ -66,7 +66,9 @@ Rows and tokens per source are in *Training data* above.
 
 ### Held-out sequences
 
-The held-out sequence eval is `uniref70/eval.parquet` (`type: sequence`), configured
+`oplm data uniref70` writes the held-out clusters as `eval_singletons.parquet` and
+`eval_gte2.parquet` (and `test_*` likewise), split by whether the cluster has one member.
+The held-out sequence eval is one of these (`type: sequence`), configured
 under `data.eval` in [`configs/scaling.yaml`](../configs/scaling.yaml). It is scored by
 masked-LM loss with deterministic masking (see *Deterministic eval masking*).
 For `data.eval` fields, see [evaluation.md](evaluation.md), *`data.eval` schema*.
