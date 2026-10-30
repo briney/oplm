@@ -131,26 +131,25 @@ deepclust70 keeps its current schema.
 2. **Eval split (user: held out of the whole mix, not just uniref70).** Eval clusters must have no
    close relative in deepclust70 either, so eval loss isn't flattered by cross-source leakage.
    deepclust70 itself is not changed.
-   - Draw a candidate pool of clusters uniformly at random with a fixed, recorded seed (pool size
-     is the builder's call; start around 100,000 and grow it if too few survive).
+   - **Strata (user, 2026-10-30), mirroring deepclust70's held-out files.** A cluster is a
+     *singleton* (exactly 1 member) or *gte2* (2+ members). About 79.6% of the 75.7M clusters
+     are singletons and 20.4% are gte2 (measured from the cluster TSV).
+   - Draw a candidate pool **per stratum**: walking the seeded shuffled order, the first
+     **250,000** singleton clusters and the first **250,000** gte2 clusters are candidates
+     (uniform within each stratum). Per-stratum pools keep the scarcer gte2 stratum from
+     running short.
    - Search every member of every candidate against deepclust70 with MMseqs2 at the clustering
      thresholds (`--min-seq-id 0.7 -c 0.8 --cov-mode 0`). Drop any candidate with a hit. Hint:
      the search is symmetric at `--cov-mode 0`, so the small candidate set can be the indexed
      side and deepclust70 the streamed side.
-   - Of the survivors, keep the first **10,000** in the seeded random order (my call on size; see
-     *Calls made*). They are the eval split (`uniref70/eval_{singletons,gte2}.parquet`, same schema) and appear nowhere in
-     `uniref70/train/`. Unused candidates go back into `train/`.
-   - **Test split (user, 2026-10-30).** The next **10,000** survivors in the same order are the
-     test split (`uniref70/test_{singletons,gte2}.parquet`, same schema): an independent held-out set, screened exactly like
-     eval, disjoint from eval and absent from `train/`. The pool default is 400,000, so 5%
-     survival still yields 20,000 (eval + test).
-   - **Split by cluster size (user, 2026-10-30), mirroring deepclust70.** Eval and test are each
-     written as two files: `_singletons` (clusters with exactly 1 member) and `_gte2` (2+
-     members), e.g. `eval_singletons.parquet` / `eval_gte2.parquet`. The split partitions the
-     clusters the screen chose (no re-selection), so the two files' sizes follow the data and
-     sum to 10,000 per split; record each file's count.
-   - Record the pool size, survival rate and search parameters in `summary.json`. If survival is
-     very low (say under 5%), stop and report before building: survivors would be a biased slice
+   - **Eval and test, 5,000 per stratum each (user, 2026-10-30).** Within each stratum, in the
+     seeded order, the first **5,000** survivors are eval and the next **5,000** are test:
+     `uniref70/eval_singletons.parquet`, `eval_gte2.parquet`, `test_singletons.parquet`,
+     `test_gte2.parquet` (same schema), 10,000 eval and 10,000 test in all. Eval and test are
+     disjoint and appear nowhere in `uniref70/train/`. Candidates not chosen go back into
+     `train/` at their shuffled position.
+   - Record pool sizes, survival rates (overall and per stratum) and search parameters in
+     `summary.json`. If either stratum's survival is under 5%, stop and report before building: survivors would be a biased slice
      (clusters with no deepclust70 relative at all), and the user decides whether that eval is
      still wanted.
    - **Also screen against uniref70 itself (user, 2026-10-30).** `linclust` under-clusters, so
