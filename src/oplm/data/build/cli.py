@@ -37,8 +37,9 @@ def uniref70(
         list[str] | None,
         typer.Option(help="Extra mmseqs arg, repeatable (--mmseqs-extra=--split-memory-limit)"),
     ] = None,
-    pool: Annotated[int, typer.Option(min=1, help="Eval candidate pool (rows)")] = 200_000,
+    pool: Annotated[int, typer.Option(min=1, help="Eval/test candidate pool (rows)")] = 400_000,
     n_eval: Annotated[int, typer.Option(min=1)] = 10_000,
+    n_test: Annotated[int, typer.Option(min=0, help="0 disables the test split")] = 10_000,
     rows_per_shard: Annotated[int, typer.Option(min=1)] = 100_000,
     n_buckets: Annotated[int, typer.Option(min=1)] = 512,
     chunk_rows: Annotated[
@@ -61,6 +62,7 @@ def uniref70(
         mmseqs_extra=mmseqs_extra or [],
         pool=pool,
         n_eval=n_eval,
+        n_test=n_test,
         rows_per_shard=rows_per_shard,
         n_buckets=n_buckets,
         chunk_rows=chunk_rows,

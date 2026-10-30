@@ -59,6 +59,7 @@ def _args(tmp_path, deep=True, **extra):
         "--out": tmp_path / "out",
         "--pool": 30,
         "--n-eval": 5,
+        "--n-test": 3,
         "--rows-per-shard": 10,
         "--n-buckets": 4,
         **extra,
@@ -78,7 +79,7 @@ def test_uniref70_stages_resume(tmp_path, calls):
     r = runner.invoke(app, _args(tmp_path))
     assert r.exit_code == 0, r.output
     first = _rows(tmp_path / "out")
-    assert len(first) == 35
+    assert len(first) == 32
     assert not list((tmp_path / "wd").glob("uniref70_*"))  # mmseqs outputs cleaned
     assert not (tmp_path / "wd" / "tmp").exists()
     assert (tmp_path / "wd" / "shuffled").is_dir()
@@ -139,7 +140,8 @@ def test_uniref70_summary_fields(tmp_path, calls):
     assert len(s["input_sha256"]) == 64
     assert s["parameters"]["seed"] == 3 and s["mmseqs_version"] == "fake-1"
     assert s["stages"]["screen"]["survivors"] == 30
-    assert s["stages"]["write"]["eval"]["rows"] == 5 and s["stages"]["write"]["train"]["rows"] == 35
+    assert s["stages"]["write"]["eval"]["rows"] == 5 and s["stages"]["write"]["train"]["rows"] == 32
+    assert s["stages"]["write"]["test"]["rows"] == 3 and s["parameters"]["n_test"] == 3
     assert "oplm_version" in s
     assert s["uniref90_sequences_in"] == 40 and s["clusters_out"] == 40
     assert s["screen_mmseqs_version"] == "fake-1"
@@ -261,3 +263,47 @@ def test_uniref70_screen_unions_deepclust70_and_uniref70(tmp_path, calls, monkey
     assert sc["stats"]["hits_deepclust70"] == 1 and sc["stats"]["hits_uniref70"] == 1
     pool = [r["sequence_id"] for r in u.iter_rows(sorted((wd / "shuffled").glob("*.parquet")))]
     assert not set(sc["eval_ids"]) & set(pool[:2])
+
+
+def _read(f):
+    return [r["sequence_id"] for r in pq.read_table(f).to_pylist()]
+
+
+def test_uniref70_test_split_follows_eval(tmp_path, calls, monkeypatch):
+    wd, out = tmp_path / "wd", tmp_path / "out"
+    hit = {}
+
+    def fake_screen(cand, ref, wd_, *, members=False, **k):
+        hit.setdefault("ids", {cand[1]["sequence_id"], cand[4]["sequence_id"]})
+        return set(hit["ids"]) if not members else set()
+
+    monkeypatch.setattr(u, "screen_against", fake_screen)
+    r = runner.invoke(app, _args(tmp_path, **{"--n-eval": 3, "--n-test": 2}))
+    assert r.exit_code == 0, r.output
+    pool = [r["sequence_id"] for r in u.iter_rows(sorted((wd / "shuffled").glob("*.parquet")))]
+    surv = [i for i in pool[:30] if i not in hit["ids"]]
+    sc = json.loads((wd / "screen.done").read_text())
+    assert sc["params"]["n_test"] == 2
+    assert sc["eval_ids"] == surv[:3] and sc["test_ids"] == surv[3:5]
+    assert _read(out / "eval.parquet") == surv[:3] and _read(out / "test.parquet") == surv[3:5]
+    assert not set(_rows(out)) & set(surv[:5])
+    s = json.loads((out / "summary.json").read_text())
+    assert s["stages"]["write"]["test"]["rows"] == 2
+
+
+def test_uniref70_n_test_zero_writes_no_test(tmp_path, calls):
+    r = runner.invoke(app, _args(tmp_path, **{"--n-test": 0}))
+    assert r.exit_code == 0, r.output
+    assert not (tmp_path / "out" / "test.parquet").exists()
+    assert len(_rows(tmp_path / "out")) == 35
+
+
+def test_uniref70_restart_removes_stale_test(tmp_path, calls):
+    assert runner.invoke(app, _args(tmp_path)).exit_code == 0
+    (tmp_path / "wd" / "write.done").unlink()
+    (tmp_path / "wd" / "write.started").write_text(str((tmp_path / "out").resolve()))
+    stale = tmp_path / "out" / "test.parquet.tmp"
+    stale.write_text("x")
+    (tmp_path / "out" / "test.parquet").unlink()
+    assert runner.invoke(app, _args(tmp_path)).exit_code == 0
+    assert not stale.exists() and (tmp_path / "out" / "test.parquet").exists()

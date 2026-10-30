@@ -440,3 +440,36 @@ def test_screen_against_members_end_to_end(tmp_path):
     kw = {"mmseqs": "mmseqs", "threads": 1, "chunk_rows": 2, "members": True}
     assert screen_against(cands, ref, wd, **kw) == {"A"}
     assert sorted(p.name for p in wd.glob("hits-*.txt")) == ["hits-00000.txt", "hits-00001.txt"]
+
+
+def test_write_dataset_test_split(tmp_path):
+    parts = shuffle_clusters(_multi_clusters(200), tmp_path / "parts", seed=0, n_buckets=4)
+    shuffled = list(iter_rows(parts))
+    eval_rows = [shuffled[i] for i in (0, 3, 50)]
+    test_rows = [shuffled[i] for i in (7, 60, 199, 100)]
+    out = tmp_path / "out"
+    summary = write_dataset(
+        parts, eval_rows, out, rows_per_shard=30, test_rows=test_rows, row_group_size=7
+    )
+    assert pq.read_table(out / "eval.parquet").to_pylist() == eval_rows
+    assert pq.read_table(out / "test.parquet").to_pylist() == test_rows
+    train = list(iter_rows(sorted((out / "train").iterdir())))
+    held = {r["sequence_id"] for r in eval_rows + test_rows}
+    assert [r["sequence_id"] for r in train] == [
+        r["sequence_id"] for r in shuffled if r["sequence_id"] not in held
+    ]
+    reps = [r["sequence_id"] for r in train] + [r["sequence_id"] for r in eval_rows + test_rows]
+    assert sorted(reps) == sorted(c.rep_id for c in _multi_clusters(200))
+    held_members = {m for r in eval_rows + test_rows for m in r["member_ids"]}
+    assert not held_members & {m for r in train for m in r["member_ids"]}
+    assert not list(out.rglob("*.tmp"))
+    assert summary["test"]["rows"] == 4 and summary["train"]["rows"] == 193
+    assert summary["test"]["member_rows"] == sum(len(r["member_ids"]) for r in test_rows)
+    assert summary["test"]["rep_residues"] == sum(len(r["sequence"]) for r in test_rows)
+
+
+def test_write_dataset_no_test_file_without_test_rows(tmp_path):
+    parts = shuffle_clusters(_multi_clusters(20), tmp_path / "parts", seed=0, n_buckets=2)
+    out = tmp_path / "out"
+    summary = write_dataset(parts, [], out, rows_per_shard=30)
+    assert not (out / "test.parquet").exists() and "test" not in summary

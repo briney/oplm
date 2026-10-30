@@ -475,16 +475,18 @@ def write_dataset(
     out: Path,
     *,
     rows_per_shard: int,
+    test_rows: Sequence[dict] = (),
     row_group_size: int = 10_000,
 ) -> dict:
-    """Write ``out/eval.parquet`` and ``out/train/shard-{i:05d}.parquet``.
+    """Write ``out/eval.parquet``, ``out/test.parquet`` (if ``test_rows``) and train shards
+    ``out/train/shard-{i:05d}.parquet``.
 
-    Train is ``parts`` in order with the eval rep ids removed, cut every ``rows_per_shard``
-    rows. Files are written as ``*.tmp`` and renamed when complete.
+    Train is ``parts`` in order with the eval and test rep ids removed, cut every
+    ``rows_per_shard`` rows. Files are written as ``*.tmp`` and renamed when complete.
 
     Raises:
         FileExistsError: ``out/train`` is not empty.
-        ValueError: ``rows_per_shard < 1``, or some eval rep id is not in ``parts``.
+        ValueError: ``rows_per_shard < 1``, or some eval/test rep id is not in ``parts``.
     """
     if rows_per_shard < 1:
         raise ValueError(f"rows_per_shard must be >= 1, got {rows_per_shard}")
@@ -493,13 +495,19 @@ def write_dataset(
     if any(train_dir.iterdir()):
         raise FileExistsError(f"output directory {train_dir} is not empty")
 
-    eval_table = pa.Table.from_pylist(eval_rows, schema=_SCHEMA)
-    tmp = out / "eval.parquet.tmp"
-    pq.write_table(eval_table, tmp, compression=_COMPRESSION)
-    tmp.rename(out / "eval.parquet")
-    eval_tally = _Tally()
-    eval_tally.add(eval_table)
-    eval_ids = eval_table["sequence_id"].combine_chunks()
+    held: dict[str, _Tally] = {}
+    held_ids = []
+    for name, rows in (("eval", eval_rows), ("test", test_rows)):
+        if name == "test" and not rows:
+            continue
+        table = pa.Table.from_pylist(list(rows), schema=_SCHEMA)
+        tmp = out / f"{name}.parquet.tmp"
+        pq.write_table(table, tmp, compression=_COMPRESSION)
+        tmp.rename(out / f"{name}.parquet")
+        held[name] = _Tally()
+        held[name].add(table)
+        held_ids.append(table["sequence_id"].combine_chunks())
+    eval_ids = pa.chunked_array(held_ids, type=pa.string())
 
     train_tally = _Tally()
     n_shards = in_shard = in_group = skipped = 0
@@ -547,10 +555,10 @@ def write_dataset(
         writer.close()
         tmp.rename(final)
     if skipped != len(eval_ids):
-        raise ValueError(f"{len(eval_ids) - skipped} eval rep ids are not in the parts")
+        raise ValueError(f"{len(eval_ids) - skipped} eval/test rep ids are not in the parts")
 
     return {
-        "eval": eval_tally.summary(),
+        **{name: tally.summary() for name, tally in held.items()},
         "train": train_tally.summary(),
         "train_shards": n_shards,
         "rows_per_shard": rows_per_shard,
@@ -627,8 +635,9 @@ def build_uniref70(
     threads: int = 32,
     mmseqs: str = "mmseqs",
     mmseqs_extra: Sequence[str] = (),
-    pool: int = 200_000,
+    pool: int = 400_000,
     n_eval: int = 10_000,
+    n_test: int = 10_000,
     rows_per_shard: int = 100_000,
     n_buckets: int = 512,
     chunk_rows: int = 200_000_000,
@@ -718,6 +727,7 @@ def build_uniref70(
     sc_params = {
         "pool": pool,
         "n_eval": n_eval,
+        "n_test": n_test,
         "chunk_rows": chunk_rows,
         "screen_args": list(SCREEN_ARGS),
         "deepclust70": str(deepclust70),
@@ -748,10 +758,13 @@ def build_uniref70(
             screen_hits.update(hits_deepclust70=len(deep_hits), hits_uniref70=len(u70_hits))
             return deep_hits | u70_hits
 
-        eval_rows, stats = select_eval(iter_rows(parts), pool=pool, n_eval=n_eval, screen=screen)
+        chosen, stats = select_eval(
+            iter_rows(parts), pool=pool, n_eval=n_eval + n_test, screen=screen
+        )
         sc = {
             "params": sc_params,
-            "eval_ids": [r["sequence_id"] for r in eval_rows],
+            "eval_ids": [r["sequence_id"] for r in chosen[:n_eval]],
+            "test_ids": [r["sequence_id"] for r in chosen[n_eval:]],
             "stats": {**stats, **screen_hits},
             "mmseqs_version": mmseqs_version(mmseqs),
             "seconds": int(time.monotonic() - t0),
@@ -760,14 +773,18 @@ def build_uniref70(
     summary["stages"]["screen"] = sc["stats"]
 
     # write
-    wr_params = {"rows_per_shard": rows_per_shard, "n_eval": n_eval}
+    wr_params = {"rows_per_shard": rows_per_shard, "n_eval": n_eval, "n_test": n_test}
     wr: dict[str, Any] | None = _done(workdir, "write", wr_params)
     if wr is None:
         started, owner = workdir / "write.started", str(out.resolve())
         if started.exists() and started.read_text() == owner:
             # our own crashed earlier attempt left partial output: start clean
             shutil.rmtree(out / "train", ignore_errors=True)
-            for stale in (*out.glob("eval.parquet*"), out / "summary.json"):
+            for stale in (
+                *out.glob("eval.parquet*"),
+                *out.glob("test.parquet*"),
+                out / "summary.json",
+            ):
                 stale.unlink(missing_ok=True)
         elif (out / "train").exists() and any((out / "train").iterdir()):
             raise FileExistsError(f"{out / 'train'} is not empty and was not written by this build")
@@ -775,11 +792,21 @@ def build_uniref70(
         tmp = workdir / "write.started.tmp"
         tmp.write_text(owner)
         tmp.rename(started)
-        eval_ids = set(sc["eval_ids"])
-        eval_rows = [
-            r for r in itertools.islice(iter_rows(parts), pool) if r["sequence_id"] in eval_ids
-        ]
-        stats = write_dataset(parts, eval_rows, out, rows_per_shard=rows_per_shard)
+        by_id = {
+            r["sequence_id"]: r
+            for r in itertools.islice(iter_rows(parts), pool)
+            if r["sequence_id"] in {*sc["eval_ids"], *sc["test_ids"]}
+        }
+        missing = [i for i in (*sc["eval_ids"], *sc["test_ids"]) if i not in by_id]
+        if missing:
+            raise ValueError(f"{len(missing)} eval/test rep ids are not in the pool")
+        stats = write_dataset(
+            parts,
+            [by_id[i] for i in sc["eval_ids"]],
+            out,
+            rows_per_shard=rows_per_shard,
+            test_rows=[by_id[i] for i in sc["test_ids"]],
+        )
         wr = {"params": wr_params, "stats": stats}
         _mark(workdir, "write", wr)
         started.unlink()
@@ -806,6 +833,7 @@ def build_uniref70(
             "mmseqs_extra": list(mmseqs_extra),
             "pool": pool,
             "n_eval": n_eval,
+            "n_test": n_test,
             "rows_per_shard": rows_per_shard,
             "n_buckets": n_buckets,
             "chunk_rows": chunk_rows,
