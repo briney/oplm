@@ -1,14 +1,20 @@
 import shutil
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from oplm.data.build.uniref70 import (
     Cluster,
+    LowSurvivalError,
     cluster_uniref90,
     iter_clusters,
     iter_rows,
+    screen_against,
+    select_eval,
     shuffle_clusters,
+    write_dataset,
 )
 
 
@@ -100,3 +106,144 @@ def test_shuffle_resumes_and_ignores_flush_size(tmp_path, monkeypatch):
         r["sequence_id"]
         for r in iter_rows(shuffle_clusters(_clusters(1000), d, seed=3, n_buckets=8))
     ] == base
+
+
+def _rows(n):
+    return [
+        {
+            "sequence_id": f"R{i}",
+            "sequence": "A",
+            "member_ids": [f"R{i}"],
+            "member_sequences": ["A"],
+        }
+        for i in range(n)
+    ]
+
+
+def test_select_eval_skips_hits_and_keeps_order():
+    rows = _rows(20)
+    seen = []
+
+    def screen(cands):
+        seen.append([c["sequence_id"] for c in cands])
+        return {"R1", "R4", "R5"}
+
+    chosen, stats = select_eval(iter(rows), pool=10, n_eval=4, screen=screen, min_survival=0.05)
+    assert seen == [[f"R{i}" for i in range(10)]]
+    assert [r["sequence_id"] for r in chosen] == ["R0", "R2", "R3", "R6"]
+    assert stats == {"pool": 10, "hits": 3, "survivors": 7, "survival_rate": 0.7}
+
+
+def test_select_eval_low_survival_raises():
+    hit_all_but_one = lambda cands: {c["sequence_id"] for c in cands[1:]}  # noqa: E731
+    with pytest.raises(LowSurvivalError):
+        select_eval(_rows(100), pool=100, n_eval=1, screen=hit_all_but_one, min_survival=0.05)
+    assert issubclass(LowSurvivalError, RuntimeError)
+
+
+def test_select_eval_too_few_survivors_raises():
+    with pytest.raises(ValueError, match="grow"):
+        select_eval(_rows(10), pool=10, n_eval=8, screen=lambda c: {"R0", "R1", "R2"})
+
+
+def _multi_clusters(n):
+    # cluster i has 1 + i % 4 members; ids unique across clusters
+    out = []
+    for i in range(n):
+        ids = [f"R{i:05d}"] + [f"M{i}_{j}" for j in range(i % 4)]
+        out.append(Cluster(ids[0], ids, ["ACD" * (j + 1) for j in range(len(ids))]))
+    return out
+
+
+def test_write_dataset_partitions(tmp_path):
+    parts = shuffle_clusters(_multi_clusters(200), tmp_path / "parts", seed=0, n_buckets=4)
+    shuffled = list(iter_rows(parts))
+    eval_rows = [shuffled[i] for i in (0, 3, 50, 199)]
+    out = tmp_path / "out"
+    summary = write_dataset(parts, eval_rows, out, rows_per_shard=30, row_group_size=7)
+
+    ev = pq.read_table(out / "eval.parquet").to_pylist()
+    assert ev == eval_rows
+    shards = sorted((out / "train").iterdir())
+    assert [p.name for p in shards] == [f"shard-{i:05d}.parquet" for i in range(7)]
+    sizes = [pq.ParquetFile(p).metadata.num_rows for p in shards]
+    assert sizes == [30] * 6 + [16]
+    assert max(pq.ParquetFile(shards[0]).metadata.row_group(g).num_rows for g in range(5)) <= 7
+    train = list(iter_rows(shards))
+    eval_ids = {r["sequence_id"] for r in eval_rows}
+    assert [r["sequence_id"] for r in train] == [
+        r["sequence_id"] for r in shuffled if r["sequence_id"] not in eval_ids
+    ]
+    reps = [r["sequence_id"] for r in train] + [r["sequence_id"] for r in ev]
+    assert sorted(reps) == sorted(c.rep_id for c in _multi_clusters(200))
+    eval_members = {m for r in ev for m in r["member_ids"]}
+    assert not eval_members & {m for r in train for m in r["member_ids"]}
+    assert not list(out.rglob("*.tmp"))
+
+    t = summary["train"]
+    assert t["rows"] == 196 and summary["eval"]["rows"] == 4 and summary["train_shards"] == 7
+    assert t["member_rows"] == sum(len(r["member_ids"]) for r in train)
+    assert t["rep_residues"] == sum(len(r["sequence"]) for r in train)
+    assert t["member_residues"] == sum(len(s) for r in train for s in r["member_sequences"])
+    sizes = sorted(len(r["member_ids"]) for r in train)
+    mpc = t["members_per_cluster"]
+    assert (mpc["min"], mpc["max"]) == (1, 4)
+    assert mpc["median"] == (sizes[97] + sizes[98]) / 2
+    assert mpc["mean"] == pytest.approx(sum(sizes) / len(sizes))
+    assert mpc["log2_histogram"] == {
+        "1": sizes.count(1),
+        "2-3": sizes.count(2) + sizes.count(3),
+        "4-7": sizes.count(4),
+    }
+
+
+def test_chunk_fasta_spans_shards_in_order(tmp_path):
+    ref = tmp_path / "ref"
+    ref.mkdir()
+    ids = [f"S{i}" for i in range(7)]
+    for k, (a, b) in enumerate([(0, 3), (3, 4), (4, 7)]):
+        pq.write_table(
+            pa.table({"sequence_id": ids[a:b], "sequence": ["MK"] * (b - a)}),
+            ref / f"x-{k}.parquet",
+        )
+    from oplm.data.build.uniref70 import _ref_shards, _write_chunk_fasta
+
+    shards = _ref_shards(ref)
+    got = []
+    for lo in range(0, 7, 2):
+        fa = tmp_path / "c.fa"
+        _write_chunk_fasta(shards, lo, lo + 2, fa)
+        got += [line[1:] for line in fa.read_text().splitlines() if line.startswith(">")]
+    assert got == ids
+
+
+@pytest.mark.slow
+def test_screen_against_end_to_end(tmp_path):
+    if shutil.which("mmseqs") is None:
+        pytest.skip("mmseqs not on PATH")
+    a1 = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAA"
+    a2 = "MDEFHRKLNQSTVWYACMDEFHRKLNQSTVWYACMDEFHRKLNQSTVWYACMDEFHRKLNQSTVW"
+    b1 = "WWWWPPPPGGGGHHHHCCCCWWWWPPPPGGGGHHHHCCCCWWWWPPPPGGGGHHHHCCCCWWWW"
+    near_a2 = a2[:20] + "LLL" + a2[23:]  # ~95% identical to a2
+    cands = [
+        {
+            "sequence_id": "A",
+            "sequence": a1,
+            "member_ids": ["A", "A2"],
+            "member_sequences": [a1, a2],
+        },
+        {"sequence_id": "B", "sequence": b1, "member_ids": ["B"], "member_sequences": [b1]},
+    ]
+    ref = tmp_path / "ref"
+    ref.mkdir()
+    unrelated = ["MSTNPKPQRKTKRNTNRRPQDVKFPGG" * 2, "MGSSHHHHHHSSGLVPRGSHMASMTGGQQMG" * 2]
+    pq.write_table(
+        pa.table({"sequence_id": ["u0", "u1"], "sequence": unrelated}), ref / "a.parquet"
+    )
+    pq.write_table(pa.table({"sequence_id": ["hit"], "sequence": [near_a2]}), ref / "b.parquet")
+    wd = tmp_path / "wd"
+    assert screen_against(cands, ref, wd, mmseqs="mmseqs", threads=1, chunk_rows=2) == {"A"}
+    assert sorted(p.name for p in wd.glob("hits-*.txt")) == ["hits-00000.txt", "hits-00001.txt"]
+    assert not list(wd.glob("chunk-*"))
+    (wd / "hits-00000.txt").unlink()  # restart: only the missing chunk reruns
+    assert screen_against(cands, ref, wd, mmseqs="mmseqs", threads=1, chunk_rows=2) == {"A"}

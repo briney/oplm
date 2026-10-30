@@ -1,21 +1,43 @@
-"""UniRef90 -> 70% identity linclust stage and a streaming parser for its cluster output."""
+"""uniref70 build: UniRef90 linclust, cluster parsing, global shuffle, deepclust70 leakage
+screen, eval selection and shard writing."""
 
 from __future__ import annotations
 
+import hashlib
+import itertools
+import shutil
+from collections import Counter
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from oplm.data.build.mmseqs import run_mmseqs_cmd
-from oplm.data.sequence.dataset import MEMBER_IDS_COLUMN, MEMBER_SEQUENCES_COLUMN
+from oplm.data.build.reshard import _COMPRESSION
+from oplm.data.sequence.dataset import (
+    MEMBER_IDS_COLUMN,
+    MEMBER_SEQUENCES_COLUMN,
+    ShardedProteinDataset,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
     from pathlib import Path
 
-__all__ = ["Cluster", "cluster_uniref90", "iter_clusters", "iter_rows", "shuffle_clusters"]
+__all__ = [
+    "SCREEN_ARGS",
+    "Cluster",
+    "LowSurvivalError",
+    "cluster_uniref90",
+    "iter_clusters",
+    "iter_rows",
+    "screen_against",
+    "select_eval",
+    "shuffle_clusters",
+    "write_dataset",
+]
 
 
 class Cluster(NamedTuple):
@@ -171,3 +193,294 @@ def iter_rows(parts: Sequence[Path]) -> Iterator[dict]:
     for part in parts:
         for batch in pq.ParquetFile(part).iter_batches(batch_size=1024):
             yield from batch.to_pylist()
+
+
+# Clustering thresholds (symmetric at --cov-mode 0, so query/target roles can swap). -s 4 is
+# below the 5.7 default: hits at >=70% identity share many exact k-mers, so the cheaper
+# prefilter still finds them.
+SCREEN_ARGS = ("--min-seq-id", "0.7", "-c", "0.8", "--cov-mode", "0", "-s", "4")
+
+
+def _ref_shards(reference: Path) -> list[tuple[Path, int, int]]:
+    """``(shard, first_row, n_rows)`` in ``_discover_shards`` order (from parquet metadata)."""
+    out, start = [], 0
+    for p in ShardedProteinDataset._discover_shards(reference):
+        n = pq.ParquetFile(p).metadata.num_rows
+        out.append((p, start, n))
+        start += n
+    return out
+
+
+def _write_chunk_fasta(shards: list[tuple[Path, int, int]], lo: int, hi: int, path: Path) -> None:
+    """Stream global reference rows ``[lo, hi)`` to a FASTA, one record batch at a time."""
+    with path.open("w") as fh:
+        for shard, start, n in shards:
+            if start + n <= lo or start >= hi:
+                continue
+            pos = start
+            for b in pq.ParquetFile(shard).iter_batches(
+                batch_size=65536, columns=["sequence_id", "sequence"]
+            ):
+                a, z = max(lo - pos, 0), min(hi - pos, b.num_rows)
+                if a < z:
+                    ids = b.column("sequence_id").slice(a, z - a).to_pylist()
+                    seqs = b.column("sequence").slice(a, z - a).to_pylist()
+                    fh.write("".join(f">{i}\n{s}\n" for i, s in zip(ids, seqs, strict=True)))
+                pos += b.num_rows
+                if pos >= hi:
+                    break
+
+
+def _rm_prefix(workdir: Path, prefix: str) -> None:
+    for p in workdir.glob(f"{prefix}*"):
+        shutil.rmtree(p) if p.is_dir() else p.unlink()
+
+
+def screen_against(
+    candidates: Sequence[dict],
+    reference: Path,
+    workdir: Path,
+    *,
+    mmseqs: str,
+    threads: int,
+    chunk_rows: int = 200_000_000,
+) -> set[str]:
+    """Rep ids of candidates with any member hitting any ``reference`` sequence (``SCREEN_ARGS``).
+
+    The candidate members are the indexed target; the reference (a parquet dir, e.g.
+    deepclust70) is streamed as queries in chunks of ``chunk_rows`` rows. Each finished chunk
+    leaves ``workdir/hits-{k:05d}.txt``; a rerun skips those chunks. Changing the candidates,
+    ``chunk_rows`` or ``SCREEN_ARGS`` discards earlier hits files.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    _rm_prefix(workdir, "candidates")  # the target DB is rebuilt every call (it is small)
+    _rm_prefix(workdir, "chunk-")  # leftovers of a crashed chunk
+    rep_of = {m: c["sequence_id"] for c in candidates for m in c[MEMBER_IDS_COLUMN]}
+    target_fa = workdir / "candidates.fasta"
+    with target_fa.open("w") as fh:
+        for c in candidates:
+            for i, s in zip(c[MEMBER_IDS_COLUMN], c[MEMBER_SEQUENCES_COLUMN], strict=True):
+                fh.write(f">{i}\n{s}\n")
+    h = hashlib.sha256()
+    with target_fa.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    h.update(f"{chunk_rows} {SCREEN_ARGS}".encode())
+    key, key_file = h.hexdigest(), workdir / "screen.key"
+    if not key_file.exists() or key_file.read_text() != key:
+        _rm_prefix(workdir, "hits-")
+        key_file.write_text(key)
+
+    target = workdir / "candidates"
+    run_mmseqs_cmd(mmseqs, ["createdb", str(target_fa), str(target), "--dbtype", "1"])
+    run_mmseqs_cmd(
+        mmseqs,
+        ["createindex", str(target), str(workdir / "candidates.tmp"), "--threads", str(threads)],
+    )
+
+    shards = _ref_shards(reference)
+    total = shards[-1][1] + shards[-1][2]
+    n_chunks = -(-total // chunk_rows)
+    hits_files = [workdir / f"hits-{k:05d}.txt" for k in range(n_chunks)]
+    for k, hits in enumerate(hits_files):
+        if hits.exists():
+            continue
+        prefix = f"chunk-{k:05d}"
+        fa, qdb, aln = (workdir / f"{prefix}{x}" for x in (".fasta", "", ".aln"))
+        _write_chunk_fasta(shards, k * chunk_rows, (k + 1) * chunk_rows, fa)
+        run_mmseqs_cmd(mmseqs, ["createdb", str(fa), str(qdb), "--dbtype", "1"])
+        fa.unlink()  # disk: the FASTA and the DB do not need to coexist past createdb
+        run_mmseqs_cmd(
+            mmseqs,
+            [
+                "search",
+                str(qdb),
+                str(target),
+                str(aln),
+                str(workdir / f"{prefix}.tmp"),
+                *SCREEN_ARGS,
+                "--threads",
+                str(threads),
+            ],
+        )
+        tsv = workdir / f"{prefix}.tsv"
+        run_mmseqs_cmd(
+            mmseqs,
+            ["convertalis", str(qdb), str(target), str(aln), str(tsv), "--format-output", "target"],
+        )
+        ids = sorted(set(tsv.read_text().split()))
+        tmp = hits.with_name(f"{hits.name}.tmp")
+        tmp.write_text("".join(f"{i}\n" for i in ids))
+        tmp.rename(hits)
+        _rm_prefix(workdir, prefix)
+    _rm_prefix(workdir, "candidates.tmp")
+    return {rep_of[i] for hits in hits_files for i in hits.read_text().split()}
+
+
+class LowSurvivalError(RuntimeError):
+    """Too few eval candidates survive the leakage screen; the user decides how to proceed."""
+
+
+def select_eval(
+    rows: Iterable[dict],
+    *,
+    pool: int,
+    n_eval: int,
+    screen: Callable[[Sequence[dict]], set[str]],
+    min_survival: float = 0.05,
+) -> tuple[list[dict], dict]:
+    """First ``n_eval`` of the first ``pool`` rows that ``screen`` does not flag, plus stats.
+
+    Raises:
+        LowSurvivalError: ``survivors / pool < min_survival``.
+        ValueError: fewer than ``n_eval`` survivors (grow ``pool``).
+    """
+    candidates = list(itertools.islice(rows, pool))
+    hits = screen(candidates)
+    survivors = [r for r in candidates if r["sequence_id"] not in hits]
+    n = len(candidates)
+    stats = {
+        "pool": n,
+        "hits": n - len(survivors),
+        "survivors": len(survivors),
+        "survival_rate": len(survivors) / n if n else 0.0,
+    }
+    if stats["survival_rate"] < min_survival:
+        raise LowSurvivalError(f"eval screen survival below {min_survival}: {stats}")
+    if len(survivors) < n_eval:
+        raise ValueError(f"{len(survivors)} survivors < n_eval={n_eval}; grow pool: {stats}")
+    return survivors[:n_eval], stats
+
+
+class _Tally:
+    """Streaming row / residue counts and the exact members-per-cluster distribution."""
+
+    def __init__(self) -> None:
+        self.sizes: Counter[int] = Counter()
+        self.rep_residues = self.member_residues = 0
+
+    def add(self, b: pa.RecordBatch | pa.Table) -> None:
+        sizes, counts = np.unique(
+            pc.list_value_length(b[MEMBER_IDS_COLUMN]).to_numpy(), return_counts=True
+        )
+        self.sizes.update(dict(zip(sizes.tolist(), counts.tolist(), strict=True)))
+        self.rep_residues += pc.sum(pc.utf8_length(b["sequence"])).as_py() or 0
+        members = pc.list_flatten(b[MEMBER_SEQUENCES_COLUMN])
+        self.member_residues += pc.sum(pc.utf8_length(members)).as_py() or 0
+
+    def summary(self) -> dict:
+        rows = sum(self.sizes.values())
+        member_rows = sum(k * v for k, v in self.sizes.items())
+        out = {
+            "rows": rows,
+            "member_rows": member_rows,
+            "rep_residues": self.rep_residues,
+            "member_residues": self.member_residues,
+        }
+        if not rows:
+            return out
+        ordered = sorted(self.sizes.items())
+        cum = list(itertools.accumulate(v for _, v in ordered))
+
+        def nth(i: int) -> int:  # i-th smallest cluster size, 0-based
+            return next(k for (k, _), c in zip(ordered, cum, strict=True) if c > i)
+
+        hist: Counter[str] = Counter()
+        for k, v in ordered:
+            lo = 1 << (k.bit_length() - 1) if k else 0
+            hist[str(lo) if lo < 2 else f"{lo}-{2 * lo - 1}"] += v
+        out["members_per_cluster"] = {
+            "min": ordered[0][0],
+            "median": (nth((rows - 1) // 2) + nth(rows // 2)) / 2,
+            "mean": member_rows / rows,
+            "max": ordered[-1][0],
+            "log2_histogram": dict(hist),
+        }
+        return out
+
+
+def write_dataset(
+    parts: Sequence[Path],
+    eval_rows: list[dict],
+    out: Path,
+    *,
+    rows_per_shard: int,
+    row_group_size: int = 10_000,
+) -> dict:
+    """Write ``out/eval.parquet`` and ``out/train/shard-{i:05d}.parquet``.
+
+    Train is ``parts`` in order with the eval rep ids removed, cut every ``rows_per_shard``
+    rows. Files are written as ``*.tmp`` and renamed when complete.
+
+    Raises:
+        FileExistsError: ``out/train`` is not empty.
+        ValueError: some eval rep id is not in ``parts``.
+    """
+    train_dir = out / "train"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    if any(train_dir.iterdir()):
+        raise FileExistsError(f"output directory {train_dir} is not empty")
+
+    eval_table = pa.Table.from_pylist(eval_rows, schema=_SCHEMA)
+    tmp = out / "eval.parquet.tmp"
+    pq.write_table(eval_table, tmp, compression=_COMPRESSION)
+    tmp.rename(out / "eval.parquet")
+    eval_tally = _Tally()
+    eval_tally.add(eval_table)
+    eval_ids = eval_table["sequence_id"].combine_chunks()
+
+    train_tally = _Tally()
+    n_shards = in_shard = in_group = skipped = 0
+    writer: pq.ParquetWriter | None = None
+    group: list[pa.RecordBatch] = []
+    tmp = final = out
+
+    def flush_group() -> None:
+        nonlocal group, in_group
+        if group:
+            writer.write_table(pa.Table.from_batches(group, schema=_SCHEMA))
+            group, in_group = [], 0
+
+    for part in parts:
+        for batch in pq.ParquetFile(part).iter_batches(batch_size=row_group_size):
+            keep = pc.invert(pc.is_in(batch["sequence_id"], value_set=eval_ids))
+            skipped += batch.num_rows
+            batch = batch.filter(keep)
+            skipped -= batch.num_rows
+            train_tally.add(batch)
+            start = 0
+            while start < batch.num_rows:
+                if writer is None:
+                    final = train_dir / f"shard-{n_shards:05d}.parquet"
+                    tmp = train_dir / f"{final.name}.tmp"
+                    writer = pq.ParquetWriter(tmp, _SCHEMA, compression=_COMPRESSION)
+                    n_shards += 1
+                    in_shard = 0
+                take = min(rows_per_shard - in_shard, row_group_size - in_group)
+                take = min(take, batch.num_rows - start)
+                group.append(batch.slice(start, take))
+                in_group += take
+                in_shard += take
+                start += take
+                if in_group == row_group_size:
+                    flush_group()
+                if in_shard == rows_per_shard:
+                    flush_group()
+                    writer.close()
+                    tmp.rename(final)
+                    writer = None
+    if writer is not None:
+        flush_group()
+        writer.close()
+        tmp.rename(final)
+    if skipped != len(eval_ids):
+        raise ValueError(f"{len(eval_ids) - skipped} eval rep ids are not in the parts")
+
+    return {
+        "eval": eval_tally.summary(),
+        "train": train_tally.summary(),
+        "train_shards": n_shards,
+        "rows_per_shard": rows_per_shard,
+        "row_group_size": row_group_size,
+        "compression": _COMPRESSION,
+    }
