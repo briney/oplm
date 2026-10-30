@@ -252,21 +252,31 @@ def _ref_shards(reference: Path) -> list[tuple[Path, int, int]]:
     return out
 
 
-def _write_chunk_fasta(shards: list[tuple[Path, int, int]], lo: int, hi: int, path: Path) -> None:
-    """Stream global reference rows ``[lo, hi)`` to a FASTA, one record batch at a time."""
+def _write_chunk_fasta(
+    shards: list[tuple[Path, int, int]], lo: int, hi: int, path: Path, *, members: bool = False
+) -> None:
+    """Stream global reference rows ``[lo, hi)`` to a FASTA, one record batch at a time.
+
+    ``members``: write every member sequence of each row, headed by the row's rep id.
+    """
+    seq_col = MEMBER_SEQUENCES_COLUMN if members else "sequence"
     with path.open("w") as fh:
         for shard, start, n in shards:
             if start + n <= lo or start >= hi:
                 continue
             pos = start
             for b in pq.ParquetFile(shard).iter_batches(
-                batch_size=65536, columns=["sequence_id", "sequence"]
+                batch_size=65536, columns=["sequence_id", seq_col]
             ):
                 a, z = max(lo - pos, 0), min(hi - pos, b.num_rows)
                 if a < z:
                     ids = b.column("sequence_id").slice(a, z - a).to_pylist()
-                    seqs = b.column("sequence").slice(a, z - a).to_pylist()
-                    fh.write("".join(f">{i}\n{s}\n" for i, s in zip(ids, seqs, strict=True)))
+                    seqs = b.column(seq_col).slice(a, z - a).to_pylist()
+                    if members:
+                        recs = ((i, s) for i, ms in zip(ids, seqs, strict=True) for s in ms)
+                    else:
+                        recs = zip(ids, seqs, strict=True)
+                    fh.write("".join(f">{i}\n{s}\n" for i, s in recs))
                 pos += b.num_rows
                 if pos >= hi:
                     break
@@ -285,14 +295,19 @@ def screen_against(
     mmseqs: str,
     threads: int,
     chunk_rows: int = 200_000_000,
+    members: bool = False,
 ) -> set[str]:
     """Rep ids of candidates with any member hitting any ``reference`` sequence (``SCREEN_ARGS``).
 
     The candidate members are the indexed target; the reference (a parquet dir, e.g.
     deepclust70) is streamed as queries in chunks of ``chunk_rows`` rows. Each finished chunk
     leaves ``workdir/hits-{k:05d}.txt``; a rerun skips those chunks. Changing the candidates,
-    the reference shards (names, row counts), ``chunk_rows`` or ``SCREEN_ARGS`` discards
-    earlier hits files.
+    the reference shards (names, row counts), ``chunk_rows``, ``SCREEN_ARGS`` or ``members``
+    discards earlier hits files.
+
+    ``members``: the reference is uniref70 cluster rows (e.g. the shuffle parts, which hold
+    the candidates too); every member of each row is a query named by the row's rep id, and a
+    candidate's hits from its own cluster are ignored (hits from other candidates count).
 
     Raises:
         ValueError: the reference has no rows.
@@ -316,6 +331,8 @@ def screen_against(
         for block in iter(lambda: fh.read(1 << 20), b""):
             h.update(block)  # ty: ignore[invalid-argument-type]  # binary mode yields bytes
     h.update(f"{chunk_rows} {SCREEN_ARGS} {[(p.name, n) for p, _, n in shards]}".encode())
+    if members:  # appended only here: keeps the deepclust70 key of earlier builds valid
+        h.update(b" members")
     key, key_file = h.hexdigest(), workdir / "screen.key"
     if not key_file.exists() or key_file.read_text() != key:
         _rm_prefix(workdir, "hits-")
@@ -335,7 +352,7 @@ def screen_against(
             continue
         prefix = f"chunk-{k:05d}"
         fa, qdb, aln = (workdir / f"{prefix}{x}" for x in (".fasta", "", ".aln"))
-        _write_chunk_fasta(shards, k * chunk_rows, (k + 1) * chunk_rows, fa)
+        _write_chunk_fasta(shards, k * chunk_rows, (k + 1) * chunk_rows, fa, members=members)
         run_mmseqs_cmd(mmseqs, ["createdb", str(fa), str(qdb), "--dbtype", "1"])
         fa.unlink()  # disk: the FASTA and the DB do not need to coexist past createdb
         run_mmseqs_cmd(
@@ -354,10 +371,14 @@ def screen_against(
         tsv = workdir / f"{prefix}.tsv"
         run_mmseqs_cmd(
             mmseqs,
-            ["convertalis", str(qdb), str(target), str(aln), str(tsv), "--format-output", "target"],
+            [
+                *("convertalis", str(qdb), str(target), str(aln), str(tsv)),
+                *("--format-output", "query,target"),
+            ],
         )
         with tsv.open() as fh:
-            ids = sorted({line.strip() for line in fh} - {""})
+            pairs = (line.rstrip("\n").split("\t") for line in fh if line.strip())
+            ids = sorted({t for q, t in pairs if not members or q != rep_of[t]})
         tmp = hits.with_name(f"{hits.name}.tmp")
         tmp.write_text("".join(f"{i}\n" for i in ids))
         tmp.rename(hits)
@@ -700,28 +721,38 @@ def build_uniref70(
         "chunk_rows": chunk_rows,
         "screen_args": list(SCREEN_ARGS),
         "deepclust70": str(deepclust70),
+        "screen_uniref70": True,
     }
     sc: dict[str, Any] | None = _done(workdir, "screen", sc_params)
     if sc is None:
-        _need_space("screen", spaces, _SCREEN_MIN_FREE)
+        # the uniref70 query DB is ~2.5x the parts' (compressed) size
+        _need_space("screen", spaces, _SCREEN_MIN_FREE + 2.5 * sum(p.stat().st_size for p in parts))
         t0 = time.monotonic()
-        eval_rows, stats = select_eval(
-            iter_rows(parts),
-            pool=pool,
-            n_eval=n_eval,
-            screen=lambda cand: screen_against(
-                cand,
-                deepclust70,
-                workdir / "screen",
-                mmseqs=mmseqs,
-                threads=threads,
-                chunk_rows=chunk_rows,
-            ),
-        )
+        screen_hits: dict[str, int] = {}
+
+        def screen(cand: Sequence[dict]) -> set[str]:
+            def run(ref: Path, wd: str, members: bool) -> set[str]:
+                return screen_against(
+                    cand,
+                    ref,
+                    workdir / wd,
+                    mmseqs=mmseqs,
+                    threads=threads,
+                    chunk_rows=chunk_rows,
+                    members=members,
+                )
+
+            deep_hits = run(deepclust70, "screen", False)
+            # linclust under-clusters: candidates can be >=70% identical to other clusters
+            u70_hits = run(shuf_dir, "screen-uniref70", True)
+            screen_hits.update(hits_deepclust70=len(deep_hits), hits_uniref70=len(u70_hits))
+            return deep_hits | u70_hits
+
+        eval_rows, stats = select_eval(iter_rows(parts), pool=pool, n_eval=n_eval, screen=screen)
         sc = {
             "params": sc_params,
             "eval_ids": [r["sequence_id"] for r in eval_rows],
-            "stats": stats,
+            "stats": {**stats, **screen_hits},
             "mmseqs_version": mmseqs_version(mmseqs),
             "seconds": int(time.monotonic() - t0),
         }

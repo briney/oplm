@@ -1,5 +1,6 @@
 import json
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -322,3 +323,120 @@ def test_screen_against_end_to_end(tmp_path):
     assert not list(wd.glob("chunk-*"))
     (wd / "hits-00000.txt").unlink()  # restart: only the missing chunk reruns
     assert screen_against(cands, ref, wd, mmseqs="mmseqs", threads=1, chunk_rows=2) == {"A"}
+
+
+def _cluster_parts(ref, groups):
+    """Write uniref70 cluster rows; ``groups`` is one list of ``(rep, members)`` per part."""
+    ref.mkdir()
+    for k, rows in enumerate(groups):
+        pq.write_table(
+            pa.table(
+                {
+                    "sequence_id": [r for r, _ in rows],
+                    "sequence": [m[0][1] for _, m in rows],
+                    "member_ids": [[i for i, _ in m] for _, m in rows],
+                    "member_sequences": [[s for _, s in m] for _, m in rows],
+                }
+            ),
+            ref / f"part-{k:05d}.parquet",
+        )
+    (ref / "params.json").write_text("{}")  # the shuffle dir's sidecars are not shards
+    (ref / "counts.json").write_text("{}")
+
+
+def test_chunk_fasta_members_mode(tmp_path):
+    from oplm.data.build.uniref70 import _ref_shards, _write_chunk_fasta
+
+    ref = tmp_path / "ref"
+    _cluster_parts(
+        ref,
+        [
+            [("A", [("A", "MA"), ("a1", "MB")]), ("B", [("B", "MC")])],
+            [("C", [("C", "MD"), ("c1", "ME"), ("c2", "MF")]), ("D", [("D", "MG")])],
+        ],
+    )
+    shards = _ref_shards(ref)
+    fa = tmp_path / "c.fa"
+    _write_chunk_fasta(shards, 1, 3, fa, members=True)
+    assert fa.read_text() == ">B\nMC\n>C\nMD\n>C\nME\n>C\nMF\n"
+
+
+def _fake_mmseqs(monkeypatch, tsv_lines):
+    import oplm.data.build.uniref70 as u
+
+    seen = []
+
+    def run(mmseqs, args):
+        seen.append(args)
+        if args[0] == "convertalis":
+            Path(args[4]).write_text("".join(f"{q}\t{t}\n" for q, t in tsv_lines))
+
+    monkeypatch.setattr(u, "run_mmseqs_cmd", run)
+    return seen
+
+
+_MEMBER_CANDS = [
+    {
+        "sequence_id": "A",
+        "sequence": "MA",
+        "member_ids": ["A", "A_member", "A_member2"],
+        "member_sequences": ["MA", "MB", "MC"],
+    }
+]
+
+
+@pytest.mark.parametrize(
+    ("tsv", "want"),
+    [
+        ([("A", "A_member"), ("X", "A_member2")], {"A"}),
+        ([("A", "A_member")], set()),
+    ],
+)
+def test_screen_members_ignores_self_hits(tmp_path, monkeypatch, tsv, want):
+    seen = _fake_mmseqs(monkeypatch, tsv)
+    ref = tmp_path / "ref"
+    _cluster_parts(
+        ref, [[("A", [("A", "MA"), ("A_member", "MB"), ("A_member2", "MC")]), ("X", [("X", "MD")])]]
+    )
+    got = screen_against(
+        _MEMBER_CANDS, ref, tmp_path / "wd", mmseqs="m", threads=1, chunk_rows=2, members=True
+    )
+    assert got == want
+    assert [a[a.index("--format-output") + 1] for a in seen if a[0] == "convertalis"] == [
+        "query,target"
+    ]
+
+
+def test_screen_key_covers_members_mode(tmp_path, monkeypatch):
+    _fake_mmseqs(monkeypatch, [])
+    ref, wd = tmp_path / "ref", tmp_path / "wd"
+    _cluster_parts(ref, [[("A", [("A", "MA")])]])
+    kw = {"mmseqs": "m", "threads": 1, "chunk_rows": 2}
+    screen_against(_MEMBER_CANDS, ref, wd, **kw)
+    (wd / "hits-00000.txt").write_text("A_member\n")  # pretend the deepclust70-mode chunk hit
+    assert screen_against(_MEMBER_CANDS, ref, wd, **kw) == {"A"}  # same mode: reused
+    assert screen_against(_MEMBER_CANDS, ref, wd, **kw, members=True) == set()  # rerun
+
+
+@pytest.mark.slow
+def test_screen_against_members_end_to_end(tmp_path):
+    if shutil.which("mmseqs") is None:
+        pytest.skip("mmseqs not on PATH")
+    a1 = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAA"
+    a2 = "MDEFHRKLNQSTVWYACMDEFHRKLNQSTVWYACMDEFHRKLNQSTVWYACMDEFHRKLNQSTVW"
+    b1 = "WWWWPPPPGGGGHHHHCCCCWWWWPPPPGGGGHHHHCCCCWWWWPPPPGGGGHHHHCCCCWWWW"
+    near_a2 = a2[:20] + "LLL" + a2[23:]  # ~95% identical to a2
+    u0 = "MSTNPKPQRKTKRNTNRRPQDVKFPGG" * 2
+    ref = tmp_path / "ref"
+    _cluster_parts(
+        ref,
+        [
+            [("A", [("A", a1), ("A2", a2)]), ("B", [("B", b1)])],
+            [("U", [("U", u0)]), ("X", [("X", near_a2)])],
+        ],
+    )
+    cands = [r for r in iter_rows(sorted(ref.glob("*.parquet"))) if r["sequence_id"] in ("A", "B")]
+    wd = tmp_path / "wd"
+    kw = {"mmseqs": "mmseqs", "threads": 1, "chunk_rows": 2, "members": True}
+    assert screen_against(cands, ref, wd, **kw) == {"A"}
+    assert sorted(p.name for p in wd.glob("hits-*.txt")) == ["hits-00000.txt", "hits-00001.txt"]

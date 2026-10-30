@@ -88,7 +88,7 @@ def test_uniref70_stages_resume(tmp_path, calls):
     shutil.rmtree(tmp_path / "out")
     r = runner.invoke(app, _args(tmp_path))
     assert r.exit_code == 0, r.output
-    assert calls == {"cluster": 1, "shuffle": 1, "screen": 1}
+    assert calls == {"cluster": 1, "shuffle": 1, "screen": 2}  # deepclust70 + uniref70, once
     assert _rows(tmp_path / "out") == first
 
 
@@ -238,3 +238,26 @@ def test_uniref70_tsv_mismatch_raises(tmp_path, tsv_lines):
 def test_uniref70_rejects_nonpositive_counts(tmp_path, calls, opt):
     assert runner.invoke(app, _args(tmp_path, **{opt: 0})).exit_code != 0
     assert calls["cluster"] == 0
+
+
+def test_uniref70_screen_unions_deepclust70_and_uniref70(tmp_path, calls, monkeypatch):
+    refs = {}
+
+    def fake_screen(cand, ref, wd, *, members=False, **k):
+        refs[members] = (ref, wd)
+        return {cand[0 if members else 1]["sequence_id"]}  # different hit per screen
+
+    monkeypatch.setattr(u, "screen_against", fake_screen)
+    r = runner.invoke(app, _args(tmp_path))
+    assert r.exit_code == 0, r.output
+    wd = tmp_path / "wd"
+    assert refs == {
+        False: (tmp_path / "deep", wd / "screen"),
+        True: (wd / "shuffled", wd / "screen-uniref70"),
+    }
+    sc = json.loads((wd / "screen.done").read_text())
+    assert sc["params"]["screen_uniref70"] is True
+    assert sc["stats"]["hits"] == 2 and sc["stats"]["survivors"] == 28
+    assert sc["stats"]["hits_deepclust70"] == 1 and sc["stats"]["hits_uniref70"] == 1
+    pool = [r["sequence_id"] for r in u.iter_rows(sorted((wd / "shuffled").glob("*.parquet")))]
+    assert not set(sc["eval_ids"]) & set(pool[:2])
