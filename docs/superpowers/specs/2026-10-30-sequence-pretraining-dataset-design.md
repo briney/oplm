@@ -48,7 +48,8 @@ which is the "exact training set + rebuild procedure" promise of #61.
   shards read in lockstep give near-duplicate batches and flattered loss (`docs/data.md`, *Why
   the data is shuffled*). Rows must be globally shuffled before sharding.
 - Eval leaking into training. Eval clusters, and every member of them, are absent from
-  `uniref70/train/`, and have no deepclust70 hit at the clustering thresholds.
+  `uniref70/train/`, and have no hit at the clustering thresholds in deepclust70 or in any
+  other uniref70 cluster.
 - A member choice that depends on rank, worker or world size. Resume at a different topology
   must give the same members.
 - Losing or reordering deepclust70 rows during the re-cut.
@@ -137,6 +138,13 @@ deepclust70 keeps its current schema.
      very low (say under 5%), stop and report before building: survivors would be a biased slice
      (clusters with no deepclust70 relative at all), and the user decides whether that eval is
      still wanted.
+   - **Also screen against uniref70 itself (user, 2026-10-30).** `linclust` under-clusters, so
+     an eval cluster can have a member ≥ 70% identical to a member of another uniref70 cluster
+     that stays in train. Search every candidate member against every member of every other
+     uniref70 cluster at the same thresholds; a candidate's hits against its own cluster don't
+     count. Hits against other candidates do count (conservative: a non-chosen candidate goes
+     back to train). A candidate survives only with no hit in either screen; record the hit
+     counts of each screen separately.
    - This step needs the deepclust70 dump. Clustering and assembly can run before it arrives.
 
    The old `uniref70/eval.parquet` is dropped (user): its provenance is unknown, and it is not
