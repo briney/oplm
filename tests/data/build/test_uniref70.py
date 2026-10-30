@@ -1,8 +1,15 @@
 import shutil
 
+import numpy as np
 import pytest
 
-from oplm.data.build.uniref70 import cluster_uniref90, iter_clusters
+from oplm.data.build.uniref70 import (
+    Cluster,
+    cluster_uniref90,
+    iter_clusters,
+    iter_rows,
+    shuffle_clusters,
+)
 
 
 def test_iter_clusters_parses_all_seqs_format(tmp_path):
@@ -50,3 +57,46 @@ def test_cluster_uniref90_end_to_end(tmp_path):
     ids = [i for c in clusters for i in c.member_ids]
     assert sorted(ids) == sorted(seqs)
     assert len(clusters) == 4
+
+
+def _clusters(n):
+    return [Cluster(f"R{i:05d}", [f"R{i:05d}", f"M{i}"], ["AAA", "CCC"]) for i in range(n)]
+
+
+def _order(tmp_path, name, seed, n=1000, n_buckets=8):
+    parts = shuffle_clusters(_clusters(n), tmp_path / name, seed=seed, n_buckets=n_buckets)
+    return [r["sequence_id"] for r in iter_rows(parts)]
+
+
+def test_shuffle_is_a_permutation(tmp_path):
+    order = _order(tmp_path, "a", 0)
+    inp = [c.rep_id for c in _clusters(1000)]
+    assert sorted(order) == inp and order != inp
+    row = next(iter_rows(sorted((tmp_path / "a").glob("*.parquet"))))
+    assert row["sequence"] == "AAA" and row["member_ids"][0] == row["sequence_id"]
+    assert not list((tmp_path / "a").glob("*.tmp")) and not list((tmp_path / "a").glob("*.pass1"))
+
+
+def test_shuffle_is_deterministic(tmp_path):
+    assert _order(tmp_path, "a", 1) == _order(tmp_path, "b", 1)
+    assert _order(tmp_path, "c", 2) != _order(tmp_path, "a", 1)
+
+
+def test_shuffle_breaks_input_order(tmp_path):
+    pos = {f"R{i:05d}": i for i in range(1000)}
+    out = np.array([pos[r] for r in _order(tmp_path, "a", 0)])
+    assert abs(np.corrcoef(np.arange(1000), out)[0, 1]) < 0.1
+
+
+def test_shuffle_resumes_and_ignores_flush_size(tmp_path, monkeypatch):
+    base = _order(tmp_path, "a", 3)
+    import oplm.data.build.uniref70 as u
+
+    monkeypatch.setattr(u, "_FLUSH_ROWS", 7)
+    assert _order(tmp_path, "b", 3) == base
+    d = tmp_path / "b"
+    (d / "part-00002.parquet").unlink()  # lost bucket: pass 1 reruns, finished buckets kept
+    assert [
+        r["sequence_id"]
+        for r in iter_rows(shuffle_clusters(_clusters(1000), d, seed=3, n_buckets=8))
+    ] == base
