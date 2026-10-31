@@ -232,13 +232,15 @@ def iter_rows(parts: Sequence[Path]) -> Iterator[dict]:
             yield from batch.to_pylist()
 
 
-# Clustering thresholds (symmetric at --cov-mode 0, so query/target roles can swap). -s 4 is
-# below the 5.7 default: hits at >=70% identity share many exact k-mers, so the cheaper
-# prefilter still finds them. Huge --max-seqs / -e so neither the per-query prefilter cap
-# (the targets are the candidates) nor the e-value drops a hit: identity and coverage decide.
+# Clustering thresholds (symmetric at --cov-mode 0, so query/target roles can swap). -s 1 is
+# far below the 5.7 default: hits at >=70% identity share many exact k-mers, so the cheapest
+# prefilter still finds nearly all of them (user, 2026-10-30: -s 4 projected ~2 days over
+# deepclust70; the few hits it might add aren't worth it). Huge --max-seqs / -e so neither the
+# per-query prefilter cap (the targets are the candidates) nor the e-value drops a hit: identity
+# and coverage decide.
 SCREEN_ARGS = (
     *("--min-seq-id", "0.7", "-c", "0.8", "--cov-mode", "0"),
-    *("-s", "4", "--max-seqs", "100000", "-e", "1e6"),
+    *("-s", "1", "--max-seqs", "100000", "-e", "1e6"),
 )
 
 
