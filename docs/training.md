@@ -309,7 +309,8 @@ oplm train --preset 400M --config esmc-run.yaml
 ```
 
 See [mup-lr.md](mup-lr.md) for the full recipe, the coordinate-check gate, and how the LR
-was tuned.
+was tuned. The ESM-C `train.lr` and `model.mup_output_mult` are placeholders until the
+[ESM-C funnel](mup-lr.md#esm-c-funnel) runs.
 
 ---
 
