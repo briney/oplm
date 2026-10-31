@@ -324,6 +324,82 @@ W&B run names are `<phase>-<preset>-lr<lr>-om<output_mult>-a<depth_exponent>-s<s
 runs every cell of a phase sequentially on one node and ranks it, for checking a new sweep config
 before committing an allocation; it is mutually exclusive with `--submit`.
 
+## ESM-C funnel
+
+The ESM-C comparison model (`src/oplm/configs/train/esm-c.yaml`) gets its own run of the same
+funnel, in AdamW-only μP mode. Its `train.lr` and `model.mup_output_mult` are placeholders until
+this campaign fills them in. An OPLM result can't be reused: the optimizer, the norms, the residual
+scaling and the FFN all differ, and an AdamW base LR isn't on the same scale as a Muon one.
+
+Run every phase as in [Commands](#commands), with these differences.
+
+### ESM-C sweep config
+
+Build the sweep config exactly as in [Sweep config](#sweep-config), so data, context, batch,
+eval and `slurm:` match the OPLM funnel. Then merge `esm-c.yaml` over it, ESM-C winning, and give
+the result its own W&B project and sweep directory:
+
+```bash
+python -c "import sys; from omegaconf import OmegaConf as O; \
+  O.save(O.merge(O.load(sys.argv[1]), O.load(sys.argv[2])), sys.argv[3])" \
+  $HOME/oplm-sweep/sweep.yaml src/oplm/configs/train/esm-c.yaml $HOME/oplm-sweep/sweep-esmc.yaml
+```
+
+Set `train.wandb_project` in `sweep-esmc.yaml` to a new project (for example `oplm-mup-esmc-4M`).
+`esm-c.yaml` pins every architecture and optimizer knob, so nothing from the OPLM recipe leaks
+through the merge; data, batch, schedule and `slurm:` come from the sweep config. The sweep's
+`train.weight_decay=0.01` requirement holds (ESM-C pins 0.01), and the Muon-only
+`muon_adjust_lr_fn` check doesn't apply. Keep the same `oplm` version pin for every phase.
+
+```bash
+CONFIG=$HOME/oplm-sweep/sweep-esmc.yaml
+SWEEP=$HOME/oplm-sweep/sweeps-esmc
+```
+
+### ESM-C coordinate check
+
+`coord-check` takes the optimizer from `--optimizer` (default `muon`), not from the config, so pass
+`--optimizer adamw` to every run:
+
+```bash
+oplm sweep coord-check --config $CONFIG --optimizer adamw \
+  --scaling width --widths 384,768,1536 --depth 24 --base-width 768 --out $SWEEP/coord-width
+oplm sweep coord-check --config $CONFIG --optimizer adamw --no-mup \
+  --scaling width --widths 384,768,1536 --depth 24 --base-width 768 --out $SWEEP/coord-width-control
+oplm sweep coord-check --config $CONFIG --optimizer adamw \
+  --scaling preset_ray --widths 512,768,1024,1280 --base-width 768 --out $SWEEP/coord-ray
+```
+
+Read it as in [Coordinate check](#coordinate-check).
+
+### ESM-C LR grid
+
+Run `smoke` with its default LRs (0.0004, 0.0016, 0.0063), then pick the `coarse` grid from the
+result. The coarse winner must be interior, or `refine` gets nothing:
+
+- smoke best at 0.0016: the built-in default grid (0.0004 to 0.0063, 1.6× spacing) is fine, so
+  `--lrs` can be left off;
+- smoke best at 0.0004: shift the grid down, for example
+  `--lrs 0.0001,0.00016,0.00025,0.0004,0.00063,0.001,0.0016,0.0025`;
+- smoke best at 0.0063: use the OPLM refresh grid
+  `--lrs 0.00063,0.001,0.0016,0.0025,0.004,0.0063,0.01,0.016`.
+
+`refine`, the decays, `replicate` and `confirm` then run with the same commands and the same
+decayed-loss ranking. Pick the replicate and confirm candidates from the ESM-C results. In
+`confirm`, keep the depth exponent at 0.5. ESM-C's `esmc` residual scaling (`1/√(L/36)`) is a
+constant times `1/√L`, so the derivation in [Depth correction](#depth-correction) still gives
+`e = 0.5`.
+
+### Where the ESM-C result goes
+
+Write the winning `train.lr` and `model.mup_output_mult` into `src/oplm/configs/train/esm-c.yaml`
+and drop their `PLACEHOLDER` comments. Leave `base.yaml` and `configs/scaling.yaml` alone; they
+hold the OPLM recipe.
+
+Like the OPLM value, the ESM-C winner is a 24k-horizon LR. The OPLM LR-vs-length trend
+([LR vs training length](#lr-vs-training-length)) was measured with Muon, so it isn't known
+whether AdamW's best LR falls at the same rate.
+
 ## What to check
 
 ### Coordinate check
@@ -427,11 +503,8 @@ The mechanics of running a decay off a stable-phase checkpoint are in
   these. Re-run the funnel with the new values in the sweep config (`--global-tokens` for the
   batch).
 - **A different optimizer or architecture recipe.** Re-run the coordinate check and the funnel with
-  that recipe as `--config`. For the ESM-C comparison model (AdamW-only μP), merge
-  `src/oplm/configs/train/esm-c.yaml` over the sweep config as shown in
-  [training.md, *Optimizer and schedule*](training.md#optimizer-and-schedule), pass
-  `--optimizer adamw` to `coord-check`, and write the winning `train.lr` and `model.mup_output_mult`
-  back into `esm-c.yaml`. Its current values are placeholders until that campaign runs.
+  that recipe as `--config`. The ESM-C comparison model (AdamW-only μP) has its own funnel:
+  [ESM-C funnel](#esm-c-funnel).
 - **`model.mup_base_width`, `model.mup_output_mult`, `train.adamw_lr_mult`,
   `train.mup_depth_lr_exponent` or `train.weight_decay_to_init`.** These were tuned together.
   Changing the base width moves the anchor, so results tuned at one base width don't carry over to
