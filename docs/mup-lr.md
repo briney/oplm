@@ -355,7 +355,7 @@ Final `eval/uniref70/loss` from the refresh. A re-run on the same data should la
   refine cell was 0.0063 at output multiplier 2 (2.0771). The recipe keeps 1.
 - **The optimum is bracketed.** 0.004 is clearly worse. At output multiplier 1, 0.01 finished 0.002
   behind 0.0063 on seed 42 (0.0009 behind the 3-seed mean), and within 0.0005 at 0.5 and 2. The
-  basin is flat between 0.0063 and 0.01 (vertex ≈0.007), consistent with ~0.008 at 24k in
+  basin is flat between 0.0063 and 0.01 (vertex ≈0.007), consistent with ~0.007 at 24k in
   [LR vs training length](#lr-vs-training-length).
 - **Replicate (3 seeds, decayed, output multiplier 1):** 0.0063 2.0786 against 0.004 2.0812, a gap
   of 0.0026 (about 4.5 standard errors). Undecayed, the order reverses.
@@ -376,27 +376,42 @@ the reason the residual gate was dropped (see [Why and what was ruled out](#why-
 
 ## LR vs training length
 
-The best LR falls as training gets longer. Estimated best LR, on decayed loss:
+The best LR falls as training gets longer. The long 170M campaign (W&B `thebrineylab/oplm-170M-long`,
+current recipe, seed 42) ran 0.0016, 0.004 and 0.0063 to 300k steps, decaying over the last 50k
+steps, plus 20% decay branches off the 50k and 100k checkpoints. The best LR is the vertex of a
+parabola in log LR through the three decayed losses (`eval/uniref70/loss`):
 
-| Training length (steps at 4,194,304 tokens) | Estimated best LR |
-| ---: | ---: |
-| 24k | ~0.008 |
-| 60k | ~0.0043 |
-| 120k | ~0.0033 |
+| Training length (steps at 4,194,304 tokens) | 0.0016 | 0.004 | 0.0063 | Estimated best LR |
+| ---: | ---: | ---: | ---: | ---: |
+| 24k (funnel) | — | — | — | ~0.007 |
+| 60k (50k → 60k decay) | 2.0355 | **2.0256** | 2.0265 | 0.0045 |
+| 120k (100k → 120k decay) | 1.9974 | **1.9910** | 1.9927 | 0.0040 |
+| 300k (250k → 300k decay) | 1.9537 | **1.9516** | 1.9549 | 0.0030 |
+
+A power law through these points falls as steps^−0.33 (steps^−0.26 without the 24k point), which
+puts the best LR at **~0.0017–0.002 for 1.5M steps** and **~0.0014–0.0017 for 3M steps**. That is a
+5–10× extrapolation from the last measured point; the step-to-step slope is noisy (−0.17 from 60k
+to 120k, −0.31 from 120k to 300k), and each long-horizon point is a single seed.
+
+The basin is flat: at 300k the whole 4× bracket spans 0.0033, and a 2× miss costs about
+0.002–0.003, roughly symmetric in log LR. As in the funnel, rank only after decay. Undecayed, 0.0016
+led at every horizon and by more the longer the run (2.0138 against 2.0289 for 0.004 at 250k), but
+its decay gain was only 75–80% of 0.004's, so it finished behind.
 
 The funnel ranks at 24k, so `train.lr` in `src/oplm/configs/train/base.yaml` (and in
 `configs/scaling.yaml`) is a 24k-horizon value, too high for a production run of millions of steps.
-The production LR comes from extrapolating this trend to the production length. Width transfer still
-holds: the extrapolated value is a base LR, used unchanged at every preset.
+Width transfer still holds: the extrapolated value is a base LR, used unchanged at every preset.
+The full analysis is on #55.
 
-> **Pending:** the long-run LR-vs-length results and the extrapolated production LR (waiting on #55).
+> **Pending:** the production LR, set from this trend once the production horizon is fixed
+> (waiting on #70).
 
 ## Decay recipe
 
 The 20% linear tail in the funnel is a ranking device: it makes each cell's loss comparable to the
 end of a real run. It is not the production decay.
 
-> **Pending:** the production decay shape, length fraction and LR floor (waiting on #55).
+> **Pending:** the production decay shape, length fraction and LR floor (waiting on #58).
 
 Whatever the decay recipe turns out to be, keep the optimizer state through the stable-to-decay
 transition, including the data-mix change there: no momentum reset and no second warmup. A branch

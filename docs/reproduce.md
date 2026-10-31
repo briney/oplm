@@ -44,7 +44,12 @@ The full funnel (coarse, refine, decay every cell, replicate, confirm at 800M) i
 [mup-lr.md, *Commands*](mup-lr.md#commands). How the best LR falls with training length is in
 [*LR vs training length*](mup-lr.md#lr-vs-training-length).
 
-> **Pending:** the production LR from the long runs (waiting on #55).
+The current `train.lr` (0.0063) is tuned for 24k steps. For a production run of 1.5M–3M steps the
+long runs put the best LR at ~0.0014–0.002; see
+[*LR vs training length*](mup-lr.md#lr-vs-training-length).
+
+> **Pending:** the production LR, set from that trend once the production horizon is fixed
+> (waiting on #70).
 
 ## 3. Run the stable phase at production scale (or the whole schedule)
 
@@ -54,7 +59,7 @@ once is enough. The config's WSD schedule comes from `train.warmup_steps`, `trai
 as-is runs the whole schedule. Splitting the stable phase from the decay is what the branching in
 step 4 does.
 
-> **Pending:** the production horizon (waiting on #55).
+> **Pending:** the production horizon (waiting on #70).
 
 ```bash
 oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/170M
@@ -100,7 +105,7 @@ The example is hypothetical, not a published run. Mechanics and rules:
 [training.md, *Branching a decay off a checkpoint*](training.md#branching-a-decay-off-a-checkpoint).
 Decay shape, length and floor: [mup-lr.md, *Decay recipe*](mup-lr.md#decay-recipe).
 
-> **Pending:** the production decay recipe (shape, length fraction, LR floor) (waiting on #55).
+> **Pending:** the production decay recipe (shape, length fraction, LR floor) (waiting on #58).
 
 > **Pending:** the production data mix for the stable and decay phases (waiting on #58).
 
@@ -114,7 +119,7 @@ step 1, then read the logged metrics. What each task computes and how to schedul
 [config.md, *Eval datasets*](config.md#eval-datasets). To embed sequences with the result, see
 [inference.md](inference.md).
 
-> **Pending:** the expected loss and precision@L ranges for the reference run (waiting on #55).
+> **Pending:** the expected loss and precision@L ranges for the reference run (waiting on #70).
 
 Before you trust a changed setup, run the tests in [testing.md](testing.md).
 
