@@ -628,7 +628,9 @@ class StructureDataset(ShardedProteinDataset):
         self._rows_per_shard = [len(rows) for rows in self._eligible_rows]
         self._total_rows = sum(self._rows_per_shard)
 
-    def _read_rows(self, shard_idx: int, row_indices: list[int]) -> Iterator[dict[str, object]]:
+    def _read_rows(
+        self, shard_idx: int, row_indices: list[int], epoch_seed: int
+    ) -> Iterator[dict[str, object]]:
         """Yield one example per eligible-row position, reading one row group at a time.
 
         ponytail: random access with a one-group cache; small row groups (manifest

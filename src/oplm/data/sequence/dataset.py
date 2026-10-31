@@ -36,6 +36,10 @@ _PARQUET_SUFFIXES = frozenset({".parquet", ".parq", ".pq"})
 # Optional per-residue masking-weight column (read only when requested).
 _WEIGHTS_COLUMN = "masking_weights"
 
+# Optional per-cluster member columns (list[str], parallel), read only with ``sample_members``.
+MEMBER_IDS_COLUMN = "member_ids"
+MEMBER_SEQUENCES_COLUMN = "member_sequences"
+
 # --------------------------------------------------------------------------- #
 # Seed mixing (fixed constants — reproducibility contract, do not change)
 # --------------------------------------------------------------------------- #
@@ -43,6 +47,10 @@ _WEIGHTS_COLUMN = "masking_weights"
 _PHI = 0x9E3779B97F4A7C15  # golden-ratio mix
 _PRIME = 0x0100_0003
 _MASK32 = 0xFFFF_FFFF
+_MASK64 = 0xFFFF_FFFF_FFFF_FFFF
+# Member-choice hash: splitmix64 finalizer constants (also part of the reproducibility contract).
+_SM_MUL1 = 0xBF58476D1CE4E5B9
+_SM_MUL2 = 0x94D049BB133111EB
 
 
 def train_data_fingerprint(raw_train: Any) -> str:
@@ -84,6 +92,22 @@ def _pass_seed(epoch_seed: int, pass_index: int) -> int:
 def _shard_row_seed(epoch_seed: int, s: int) -> int:
     """Derive a per-shard row-shuffle seed so different shards permute differently."""
     return (epoch_seed + 1009 + s) & _MASK32
+
+
+def _member_index(epoch_seed: int, shard_idx: int, row_idx: int, n: int) -> int:
+    """Uniform member of an ``n``-member cluster row, a pure hash of its stream coordinates.
+
+    Folds ``epoch_seed``, ``shard_idx`` and ``row_idx`` through the splitmix64 finalizer, so the
+    choice depends on neither rank, worker nor cursor: resume, reshard and any topology serve
+    the same member, and every pass (epoch seed) redraws it.
+    """
+    z = epoch_seed & _MASK64
+    for v in (shard_idx, row_idx):
+        z = ((z ^ v) + _PHI) & _MASK64
+        z = ((z ^ (z >> 30)) * _SM_MUL1) & _MASK64
+        z = ((z ^ (z >> 27)) * _SM_MUL2) & _MASK64
+        z ^= z >> 31
+    return z % n
 
 
 # --------------------------------------------------------------------------- #
@@ -344,7 +368,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
     Each shard must contain columns ``sequence_id`` (str) and ``sequence`` (str,
     raw one-letter amino acids). An optional ``masking_weights`` column
     (``list[float]``, one weight per residue) is read only when
-    ``load_masking_weights`` is set.
+    ``load_masking_weights`` is set. With ``sample_members`` each shard instead needs the
+    parallel list columns ``member_ids`` / ``member_sequences`` (one row per cluster).
 
     Args:
         path: A single ``.parquet``/``.parq``/``.pq`` file, or a directory of such
@@ -359,10 +384,16 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             ``total_rows // (world_size * num_workers)``, dropping the epoch's last
             few rows (fewer than one per stream) instead of handing some streams one
             extra row. Uneven streams make ranks finish an epoch at different steps.
+        sample_members: Yield one uniformly chosen cluster member per served row (phase-2
+            training on cluster-per-row data) instead of the representative. The choice is
+            a pure hash of ``(pass seed, shard, row)`` (:func:`_member_index`), so cursors
+            are unaffected. Incompatible with ``load_masking_weights``.
 
     Raises:
         FileNotFoundError: If ``path`` is neither a parquet file nor a directory
             containing parquet shards.
+        ValueError: If ``sample_members`` is set with ``load_masking_weights``, or a shard
+            lacks the member columns.
     """
 
     def __init__(
@@ -374,14 +405,18 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         seed: int = 0,
         load_masking_weights: bool = False,
         drop_remainder: bool = False,
+        sample_members: bool = False,
     ) -> None:
         super().__init__()
+        if sample_members and load_masking_weights:
+            raise ValueError("sample_members is incompatible with load_masking_weights")
         self._path = Path(path)
         self._shuffle_shards = shuffle_shards
         self._shuffle_rows = shuffle_rows
         self._seed = seed
         self._load_masking_weights = load_masking_weights
         self._drop_remainder = drop_remainder
+        self._sample_members = sample_members
         self._epoch = 0
 
         # Armed resume skip (Task 3.1): plain instance state, so it pickles into
@@ -407,6 +442,13 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             self._shards.append(shard)
             self._rows_per_shard.append(pf.metadata.num_rows)
             self._shard_has_weights.append(_WEIGHTS_COLUMN in pf.schema_arrow.names)
+            if sample_members:
+                missing = {MEMBER_IDS_COLUMN, MEMBER_SEQUENCES_COLUMN} - set(pf.schema_arrow.names)
+                if missing:
+                    raise ValueError(
+                        f"sample_members needs columns {MEMBER_IDS_COLUMN!r} and "
+                        f"{MEMBER_SEQUENCES_COLUMN!r}; {shard} lacks {sorted(missing)}"
+                    )
 
         self._total_rows = sum(self._rows_per_shard)
 
@@ -629,10 +671,18 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
 
             selected = self._row_order(n_rows, epoch_seed, shard_idx)[offsets[remaining_skip:]]
             remaining_skip = 0
-            yield from self._read_rows(shard_idx, selected.tolist())
+            yield from self._read_rows(shard_idx, selected.tolist(), epoch_seed)
 
-    def _read_rows(self, shard_idx: int, row_indices: list[int]) -> Iterator[dict[str, object]]:
-        """Read ``row_indices`` from one shard and yield them as row dicts."""
+    def _read_rows(
+        self, shard_idx: int, row_indices: list[int], epoch_seed: int
+    ) -> Iterator[dict[str, object]]:
+        """Read ``row_indices`` from one shard and yield them as row dicts.
+
+        With ``sample_members`` each row is one hash-chosen member of its cluster instead.
+        """
+        if self._sample_members:
+            yield from self._read_members(shard_idx, row_indices, epoch_seed)
+            return
         has_weights = self._load_masking_weights and self._shard_has_weights[shard_idx]
         columns = ["sequence_id", "sequence"]
         if has_weights:
@@ -653,6 +703,25 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                 # collator falls back to uniform weights with a one-time warning.
                 row["masking_weights"] = weights[row_idx].as_py() if weights is not None else None
             yield row
+
+    def _read_members(
+        self, shard_idx: int, row_indices: list[int], epoch_seed: int
+    ) -> Iterator[dict[str, object]]:
+        """Yield one member per cluster row, chosen by :func:`_member_index`."""
+        path = self._shards[shard_idx]
+        table = pq.read_table(path, columns=[MEMBER_IDS_COLUMN, MEMBER_SEQUENCES_COLUMN])
+        id_lists = table.column(MEMBER_IDS_COLUMN)
+        seq_lists = table.column(MEMBER_SEQUENCES_COLUMN)
+        for row_idx in row_indices:
+            ids = id_lists[row_idx].as_py()
+            seqs = seq_lists[row_idx].as_py()
+            if not ids or not seqs or len(ids) != len(seqs):
+                raise ValueError(
+                    f"{path} row {row_idx}: member_ids ({len(ids or [])}) and "
+                    f"member_sequences ({len(seqs or [])}) must be non-empty and equal length"
+                )
+            j = _member_index(epoch_seed, shard_idx, row_idx, len(ids))
+            yield {"sequence_id": ids[j], "sequence": seqs[j]}
 
 
 # Returned by `_next_or_refill` when a source yields nothing for this (rank,

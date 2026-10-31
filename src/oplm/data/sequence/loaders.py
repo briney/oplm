@@ -124,6 +124,7 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
             seed=cfg.train.seed,
             load_masking_weights=cfg.data.weighted_masking,
             drop_remainder=cfg.data.drop_last,
+            sample_members=entry.sample_members,
         )
         for entry in entries
     ]

@@ -66,7 +66,9 @@ Rows and tokens per source are in *Training data* above.
 
 ### Held-out sequences
 
-The held-out sequence eval is `uniref70/eval.parquet` (`type: sequence`), configured
+`oplm data uniref70` writes the held-out clusters as `eval_singletons.parquet` and
+`eval_gte2.parquet` (and `test_*` likewise), split by whether the cluster has one member.
+The held-out sequence eval is one of these (`type: sequence`), configured
 under `data.eval` in [`configs/scaling.yaml`](../configs/scaling.yaml). It is scored by
 masked-LM loss with deterministic masking (see *Deterministic eval masking*).
 For `data.eval` fields, see [evaluation.md](evaluation.md), *`data.eval` schema*.
@@ -190,6 +192,15 @@ columns:
 | `sequence_id` | `str` | Stable identifier. |
 | `sequence` | `str` | Raw one-letter amino acids, **no special tokens**. |
 | `masking_weights` | `list[float]` | Optional, one weight per residue. Read only when `data.weighted_masking=true`. |
+
+Cluster-per-row datasets (one row per cluster, the representative in
+`sequence_id` / `sequence`) add two optional parallel `list[str]` columns,
+`member_ids` and `member_sequences`. Phase 1 trains on the representatives and ignores
+them; phase 2 sets `sample_members: true` on that `data.train` source, and each served
+row yields one uniformly chosen member, a pure hash of (pass seed, shard, row), so resume,
+loader reshard layers (any-topology resume) and any topology serve the same member and every
+epoch redraws it. Re-cutting the files with `oplm data reshard` changes shard and row indices,
+and so the members drawn.
 
 Only the needed columns are read (`pq.read_table(columns=[...])`). There is no
 HuggingFace `datasets` integration; parquet is the only on-disk format.

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import subprocess
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import pyarrow.parquet as pq
 
+from oplm.data.build.mmseqs import mmseqs_version, run_mmseqs_cmd
 from oplm.fold.eval.targets import load_targets, read_targets
 from oplm.fold.evalsets.chain import STANDARD_AMINO_ACIDS, EvalChain, from_eval_target, rejection
 
@@ -97,27 +97,6 @@ def write_cluster_fasta(root: Path, path: Path) -> dict[str, str]:
     return ids
 
 
-def _run_mmseqs_cmd(mmseqs: str, args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run mmseqs with args, raising clear RuntimeError on missing or failing binary.
-
-    Args:
-        mmseqs: Path or name of mmseqs executable.
-        args: Command and arguments, e.g. ["version"] or ["easy-cluster", ...].
-
-    Returns:
-        CompletedProcess with stdout and stderr as strings.
-
-    Raises:
-        RuntimeError: mmseqs binary not found or exited non-zero.
-    """
-    try:
-        return subprocess.run([mmseqs, *args], check=True, capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"MMseqs2 executable not found: {mmseqs}") from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"{mmseqs} {args[0]} failed:\n{exc.stderr}") from exc
-
-
 def run_mmseqs(fasta: Path, workdir: Path, *, mmseqs: str = "mmseqs", threads: int = 1) -> Path:
     """Cluster ``fasta`` at 40% identity and 80% coverage; return the cluster TSV.
 
@@ -134,14 +113,8 @@ def run_mmseqs(fasta: Path, workdir: Path, *, mmseqs: str = "mmseqs", threads: i
         "--threads",
         str(threads),
     ]
-    _run_mmseqs_cmd(mmseqs, args)
+    run_mmseqs_cmd(mmseqs, args)
     return workdir / "pdb40_cluster.tsv"
-
-
-def mmseqs_version(mmseqs: str = "mmseqs") -> str:
-    """The ``mmseqs version`` string, recorded in the README."""
-    result = _run_mmseqs_cmd(mmseqs, ["version"])
-    return result.stdout.strip()
 
 
 def read_clusters(tsv: Path) -> dict[str, str]:
