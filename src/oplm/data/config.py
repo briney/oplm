@@ -19,6 +19,8 @@ from oplm.config import EvalDatasetEntry, ScheduleSpec, TrainDatasetEntry, parse
 # Eval-entry keys with dedicated handling; everything else is folded into
 # ``EvalDatasetEntry.extra`` so task-specific config travels with the entry.
 _KNOWN_EVAL_KEYS = frozenset({"path", "type", "every", "metrics"})
+# Keys of one ``data.train`` mapping entry; anything else is a typo (e.g. ``sample_member``).
+_KNOWN_TRAIN_KEYS = frozenset({"path", "fraction", "sample_members"})
 
 
 def parse_train_configs(raw: Any) -> list[TrainDatasetEntry]:
@@ -44,7 +46,7 @@ def parse_train_configs(raw: Any) -> list[TrainDatasetEntry]:
     Raises:
         ValueError: If a specified fraction is negative, the resolved fractions do
             not sum to a positive value, an entry is missing ``path``, or the raw
-            value is neither a string nor a mapping.
+            value is neither a string nor a mapping, or an entry has an unknown key.
     """
     if raw is None:
         return []
@@ -73,15 +75,24 @@ def _parse_train_mapping(raw: dict[Any, Any]) -> list[TrainDatasetEntry]:
     paths: list[str] = []
     # None marks an omitted fraction (resolved by splitting the remainder).
     fractions: list[float | None] = []
+    sample_members: list[bool] = []
     for name, value in raw.items():
         if value is None:
             continue
         if isinstance(value, str):
             path: Any = value
             frac: Any = None
+            members: Any = False
         elif isinstance(value, dict):
+            unknown = sorted(str(k) for k in value if k not in _KNOWN_TRAIN_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"data.train.{name}: unknown keys {unknown}; "
+                    f"allowed: {sorted(_KNOWN_TRAIN_KEYS)}"
+                )
             path = value.get("path")
             frac = value.get("fraction")
+            members = value.get("sample_members", False)
         else:
             raise ValueError(
                 f"data.train.{name}: expected a path string or a "
@@ -91,7 +102,13 @@ def _parse_train_mapping(raw: dict[Any, Any]) -> list[TrainDatasetEntry]:
         if path is None or (isinstance(path, str) and not path.strip()):
             raise ValueError(f"data.train.{name} is missing required 'path'")
 
+        if not isinstance(members, bool):
+            raise ValueError(
+                f"data.train.{name}.sample_members must be a bool, got {type(members).__name__}"
+            )
+
         names.append(str(name))
+        sample_members.append(members)
         paths.append(str(path).strip())
         fractions.append(float(frac) if frac is not None else None)
 
@@ -116,8 +133,8 @@ def _parse_train_mapping(raw: dict[Any, Any]) -> list[TrainDatasetEntry]:
         raise ValueError(f"data.train fractions must sum to > 0, got {total}")
 
     return [
-        TrainDatasetEntry(name=name, path=path, fraction=frac / total)
-        for name, path, frac in zip(names, paths, resolved, strict=True)
+        TrainDatasetEntry(name=name, path=path, fraction=frac / total, sample_members=members)
+        for name, path, frac, members in zip(names, paths, resolved, sample_members, strict=True)
     ]
 
 

@@ -369,6 +369,12 @@ data:
     bfd:      { path: /data/bfd/,      fraction: 0.4 }
 ```
 
+`data.train.<name>.sample_members` (`bool`, default `false`) is phase-2 member sampling: each
+served row of a cluster-per-row dataset yields one uniformly chosen cluster member instead of
+the representative. The shards must carry the `member_ids` / `member_sequences` columns and
+it cannot be combined with `data.weighted_masking`. It is not part of the data fingerprint, so
+a `branch_from` that only flips the flag keeps the data cursor.
+
 ## Eval datasets
 
 Each entry under `data.eval` is keyed by a name you choose:
