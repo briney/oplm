@@ -53,7 +53,7 @@ __all__ = [
 class FwdConfig(NamedTuple):
     """Forward launch: one (block_t, block_d) output tile per program."""
 
-    block_t: int = 64
+    block_t: int = 128
     block_d: int = 64
     num_warps: int = 4
     num_stages: int = 3
@@ -64,20 +64,26 @@ class BwdConfig(NamedTuple):
     per dw partial. `defer_dw` keeps the dw products elementwise across the tiles and reduces
     over tokens once per program (more registers); otherwise once per tile."""
 
-    block_t: int = 16
-    block_d: int = 64
-    tiles: int = 16
+    block_t: int = 8
+    block_d: int = 32
+    tiles: int = 32
     defer_dw: bool = True
-    num_warps: int = 8
+    num_warps: int = 2
     num_stages: int = 3
 
 
-# Per `(D, x dtype, conv dtype)` launch configs, pasted from the B200 sweep; other shapes take the
-# defaults. A fixed table, not `triton.autotune`: autotune picks by timing at the first call (in
-# the self-check, on every rank), so ranks and reruns could pick different tilings, and the
-# tiling sets dw's summation order: training would stop being reproducible run to run.
+# The defaults are the B200 sweep's best (2026-11-01, job 33519, D 768 and 2048, packed B=32
+# T=2048 k=7): the forward default is within 4% of the best at every width and dtype, the backward
+# default is the best for bf16 x. fp32 x (Canon A/C, after LayerNorm) does 16-27% better with a
+# wider tile and per-tile dw, hence the entries below. Per `(D, x dtype, conv dtype)`; other
+# shapes take the defaults. A fixed table, not `triton.autotune`: autotune picks by timing at the
+# first call (in the self-check, on every rank), so ranks and reruns could pick different tilings,
+# and the tiling sets dw's summation order: training would stop being reproducible run to run.
 FWD_CONFIGS: dict[tuple[int, torch.dtype, torch.dtype], FwdConfig] = {}
-BWD_CONFIGS: dict[tuple[int, torch.dtype, torch.dtype], BwdConfig] = {}
+BWD_CONFIGS: dict[tuple[int, torch.dtype, torch.dtype], BwdConfig] = {
+    (768, torch.float32, torch.bfloat16): BwdConfig(block_d=64, defer_dw=False),
+    (2048, torch.float32, torch.bfloat16): BwdConfig(block_d=128, defer_dw=False),
+}
 
 # Default tilings, as the tests see them: forward token tile, and a backward program's span of
 # `BLOCK_T * BWD_TILES` tokens (its token tiles divide BLOCK_T).
