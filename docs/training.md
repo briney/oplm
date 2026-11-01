@@ -596,7 +596,7 @@ checks the kernel once at start, a resume included, before its first optimizer s
 eager forward of the unwrapped model on the first `min(4, B)` rows of the first micro-batch, and at
 every Canon call compares the kernel with the reference implementation on that call's real inputs
 in fp32: the output, and both gradients for one random upstream gradient. Every rank checks its own
-micro-batch. Rank 0 then logs `Canon self-check passed: N calls`; a mismatch raises
+micro-batch. Rank 0 then prints `Canon self-check passed: N calls`; a mismatch raises
 `CanonKernelMismatch` (module name, input shape, max error per tensor) and stops the run. The check
 leaves no gradients and does not change the random number streams, so training is unchanged.
 

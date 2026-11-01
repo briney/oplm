@@ -2275,6 +2275,8 @@ class Trainer:
         `StepResult.samples`, which is discarded). The uncompiled, unwrapped model runs eagerly
         (no DDP collectives; eager flex attention is why the rows are capped).
         """
+        from rich.console import Console
+
         from oplm.model.canon_kernel import canon_self_check
 
         rows = batch["input_ids"].shape[0]
@@ -2294,7 +2296,8 @@ class Trainer:
                 "kernel is in use, but the first micro-batch's forward never reached them"
             )
         if self.accelerator.is_main_process:
-            logger.info("Canon self-check passed: %d calls", calls)
+            # Console, like the other startup status lines: INFO logging is not shown by default.
+            Console().print(f"[dim]Canon self-check passed: {calls} calls[/dim]")
 
     def _emit_train_start(self) -> None:
         """Notify callbacks that training is starting."""
