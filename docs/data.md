@@ -9,7 +9,9 @@ under `src/oplm/data/`. For the `data.*` field reference, see
 
 The training set is two UniRef-derived sequence sets, mixed by rows:
 
-- **uniref70**: UniRef70 sequences, 129M rows, about 40B tokens.
+- **uniref70**: UniRef90 release 2026_03 clustered at 70% identity, one row per cluster,
+  75.7M train rows, about 27.5B tokens. Built by `oplm data uniref70` (see
+  *How the training set was built*).
 - **deepclust70**: the deep-clustered 70% identity set, 5.35B rows, about 730B tokens.
 
 The mix is set in `data.train` of [`configs/scaling.yaml`](../configs/scaling.yaml):
@@ -23,44 +25,162 @@ Rows to tokens: `tokens = rows x mean tokens per row`, with the mean taken per s
 
 | source | rows | tokens | mean tokens per row |
 | --- | --: | --: | --: |
-| uniref70 | 129M | about 40B | about 310 |
+| uniref70 | 75.7M | about 27.5B | about 363 |
 | deepclust70 | 5.35B | about 730B | about 136 |
 
-With 0.05 / 0.95 as row fractions, `0.05 x 310 / (0.05 x 310 + 0.95 x 136)` is about
-11% of tokens from uniref70. One epoch of the natural mix (every row of both sources
-once) is about 770B tokens, which is `770B / 4,194,304 tokens per step`, about 183k
-steps at 4M tokens per step (`train.tokens_per_step`).
+uniref70 tokens come from `uniref70/summary.json` (`stages.write.train`), before
+truncation. The tokenizer adds `<cls>` and `<eos>` to each sequence, so a row is its
+residues plus 2 tokens:
+
+- **Phase 1** (representatives): `27,363,613,505 residues / 75,718,236 rows` = 361.4
+  residues, so about 363.4 tokens per row and `27,363,613,505 + 2 x 75,718,236` =
+  27,515,049,977 tokens per epoch.
+- **Phase 2** (`sample_members: true`): each row serves one member, drawn uniformly
+  within its cluster. The expected member length per row is 361.5 residues (measured
+  over the train shards; not in `summary.json`), so about 363.5 tokens per row and
+  about 27.5B tokens per epoch, the same as phase 1. The member-weighted mean,
+  `45,532,832,579 member residues / 121,461,869 members` = 374.9 residues, is higher,
+  but it weights each cluster by its size, and the loader draws per cluster.
+
+With 0.05 / 0.95 as row fractions, `0.05 x 363 / (0.05 x 363 + 0.95 x 136)` is about
+12% of tokens from uniref70. One epoch of the natural mix (every row of both sources
+once) is about 758B tokens (27.5B + 730B), which is `758B / 4,194,304 tokens per step`,
+about 181k steps at 4M tokens per step (`train.tokens_per_step`).
 
 ## Download the exact training set
 
-> **Pending:** the published training set and its layout (waiting on #61).
+The dataset is built but not yet published.
+
+> **Pending:** the Hugging Face location of the published training set (waiting on #61).
+
+The dataset folder (`$OPLM_DATA/hf/oplm-sequence-data/`) holds both sources. Its dataset
+card (`README.md`) has the rebuild commands; `manifest.parquet` (one row per file: path,
+rows, bytes, sha256; written by `oplm data manifest`) sits beside it.
+
+```
+oplm-sequence-data/
+  README.md
+  manifest.parquet
+  uniref70/
+    summary.json                 # build record: every uniref70 number below
+    train/shard-00000.parquet    # 758 shards, 100,000 rows each (the last has 18,236)
+    eval_singletons.parquet      # 5,000 held-out clusters with 1 member
+    eval_gte2.parquet            # 5,000 held-out clusters with 2+ members
+    test_singletons.parquet      # 5,000
+    test_gte2.parquet            # 5,000
+  deepclust70/
+    train/summary.json           # re-cut record
+    train/shard-00000.parquet    # 5,354 shards, 1,000,000 rows each (the last has 586,520)
+    eval_singletons.parquet      # 15,000
+    eval_gte2.parquet            # 15,000
+    test_singletons.parquet      # 150,000
+    test_gte2.parquet            # 150,000
+```
+
+uniref70 rows have `sequence_id`, `sequence` (the representative), `member_ids` and
+`member_sequences`; deepclust70 rows have `sequence_id` and `sequence`. See
+*Dataset formats*. Training reads only the two `train/` folders.
 
 ## How the training set was built
 
+Provenance for the methods section: every value is copied from the build artifact
+named beside it. uniref70 values come from `uniref70/summary.json` unless another
+artifact is named; deepclust70 re-cut values come from `deepclust70/train/summary.json`.
+
+uniref70 was built by `oplm data uniref70` (oplm 0.4.1.dev252+ga400dfede; MMseqs2
+18.8cc5c), seed 0, 32 threads. Clustering ran 2026-10-30 at commit `ea4b33a`; the eval
+screen ran at `e6f331c` and the write at `a400dfe`; output written 2026-11-01. The
+`oplm_version` in `summary.json` was corrected by hand: the editable install's metadata
+was stale (`summary.json`, `oplm_version_note`). Design and rationale:
+`docs/superpowers/specs/2026-10-30-sequence-pretraining-dataset-design.md`.
+
 ### Primary sources
 
-> **Pending:** source databases, release versions and download dates (waiting on #61).
+| source | origin | obtained | version, size, checksum |
+|---|---|---|---|
+| UniRef90 | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` | 2026-10-30, 19:31:50–19:54:09 UTC | release 2026_03 (02-Sep-2026), 121,494,192 clusters; 32,107,879,019 bytes; sha256 `f6fa665e27d14fa3dadcff39df6db0052f125ffcf40ba7806f0863c1f262b8dc`; CC BY 4.0 (UniProt Consortium) |
+| deepclust70 | the shuffled deepclust70 copy, 10,708 shards (`source_shards`) | 2026-10-20 (shuffled copy) | 5,353,586,520 rows |
+
+UniRef90 values are from `$OPLM_DATA/uniref90/SOURCES.txt`, `SHA256SUMS`,
+`download_started_utc.txt`, `download_finished_utc.txt` and `uniref90.release_note`.
+`summary.json` records the same input sha256 (`input_sha256`).
+
+> **Pending:** deepclust70's upstream sources, release versions and build procedure
+> (waiting on #61).
 
 ### Filtering
 
-> **Pending:** filters applied to the raw sequences (waiting on #61).
+uniref70: none beyond UniRef's own. Every UniRef90 2026_03 entry is in exactly one
+uniref70 cluster: 121,494,192 sequences in (`uniref90_sequences_in`), 121,494,192 member
+rows out (train 121,461,869 + eval 16,119 + test 16,204). No length, residue or
+taxonomy filter is applied.
+
+> **Pending:** filters applied to deepclust70's raw sequences (waiting on #61).
 
 ### Clustering
 
-> **Pending:** clustering tool, parameters and cluster counts (waiting on #61).
+uniref70: the UniRef90 sequences were clustered with MMseqs2 18.8cc5c `easy-linclust`:
+
+```
+mmseqs easy-linclust uniref90.fasta.gz <prefix> <tmp> \
+  --min-seq-id 0.7 -c 0.8 --cov-mode 0 --dbtype 1 --threads 32 --split-memory-limit 80G
+```
+
+`-c 0.8 --cov-mode 0` follows UniRef's own rule (members overlap the seed by at least
+80%). `--dbtype 1` forces amino-acid input. The run took 2,473 s. It ran through
+`oplm.data.build.uniref70.cluster_uniref90` at commit `ea4b33a`, not through the full
+CLI, so its `summary.json` entry was written by hand from that run's record
+(`cluster.manual.json`; `stages.cluster.note`).
+
+A cluster's representative is the sequence MMseqs2 picks as the cluster center; its
+members are the UniRef90 entries assigned to it, representative included. Result:
+75,738,236 clusters (`clusters_out`).
+
+Members per train cluster (`stages.write.train.members_per_cluster`): min 1, median 1,
+mean 1.604, max 2,370.
+
+| members | 1 | 2–3 | 4–7 | 8–15 | 16–31 | 32–63 | 64–127 | 128–255 | 256–511 | 512–1023 | 1024–2047 | 2048–4095 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| clusters | 60,298,749 | 11,193,570 | 3,011,528 | 842,621 | 262,141 | 80,833 | 22,036 | 5,458 | 1,128 | 153 | 17 | 2 |
+
+> **Pending:** deepclust70's clustering tool, parameters and cluster counts (waiting on #61).
 
 ### Shuffling
 
-deepclust70 was shuffled globally across shards, and the published copy is the
-shuffled one. See *Why the data is shuffled* below.
+uniref70 was shuffled once, before the eval split, by a seeded out-of-core shuffle
+(`shuffle_clusters`; `stages.shuffle.params`: seed 0, 512 buckets). Pass 1 sends each
+cluster to a uniformly random bucket (`numpy.random.default_rng(0)`); pass 2 permutes
+each bucket `b` with `default_rng([0, b])`. The buckets, in order, are the shuffled
+order. It shuffled 75,738,236 clusters (121,494,192 members) in 2,645 s. Eval and test
+candidates are drawn in this order, and train is written in it, so shard and row order
+carry no cluster order.
 
-> **Pending:** the shuffle procedure and seed (waiting on #61).
+deepclust70 was shuffled globally across shards, and the published copy is the
+shuffled one. See *Why the data is shuffled* below. The re-cut to 1,000,000-row shards
+(`oplm data reshard`) kept every row and the global row order: the sha256 of the
+`(sequence_id, sequence)` stream is
+`dbf6da39210da1dbbe1f1e63794d91f0b94debbe30a556ccca56e612220a44a4` before and after
+(`sha256_in`, `sha256_out`), over 5,353,586,520 rows from 10,708 source shards.
+
+> **Pending:** deepclust70's shuffle procedure and seed (waiting on #61).
 
 ### Final counts
 
-Rows and tokens per source are in *Training data* above.
+| file | rows (clusters) | member rows | representative residues | member residues |
+|---|--:|--:|--:|--:|
+| `uniref70/train/` | 75,718,236 | 121,461,869 | 27,363,613,505 | 45,532,832,579 |
+| `uniref70/eval_singletons.parquet` | 5,000 | 5,000 | 1,749,551 | 1,749,551 |
+| `uniref70/eval_gte2.parquet` | 5,000 | 11,119 | 1,973,383 | 4,469,677 |
+| `uniref70/test_singletons.parquet` | 5,000 | 5,000 | 1,701,713 | 1,701,713 |
+| `uniref70/test_gte2.parquet` | 5,000 | 11,204 | 1,891,172 | 4,295,018 |
+| `deepclust70/train/` | 5,353,586,520 | | | |
+| `deepclust70/eval_singletons.parquet`, `eval_gte2.parquet` | 15,000 each | | | |
+| `deepclust70/test_singletons.parquet`, `test_gte2.parquet` | 150,000 each | | | |
 
-> **Pending:** train/eval split sizes and shard counts (waiting on #61).
+uniref70 train is 758 shards of 100,000 rows (`stages.write`: row groups of 10,000,
+zstd). deepclust70 train is 5,354 shards of 1,000,000 rows (zstd). deepclust70 row counts
+are read from the parquet metadata; its held-out files were copied as-is. Tokens per
+source are in *Training data* above.
 
 ## Evaluation data
 
@@ -68,12 +188,52 @@ Rows and tokens per source are in *Training data* above.
 
 `oplm data uniref70` writes the held-out clusters as `eval_singletons.parquet` and
 `eval_gte2.parquet` (and `test_*` likewise), split by whether the cluster has one member.
-The held-out sequence eval is one of these (`type: sequence`), configured
-under `data.eval` in [`configs/scaling.yaml`](../configs/scaling.yaml). It is scored by
-masked-LM loss with deterministic masking (see *Deterministic eval masking*).
-For `data.eval` fields, see [evaluation.md](evaluation.md), *`data.eval` schema*.
+The held-out sequence evals are `uniref70_singletons` and `uniref70_gte2` (`type: sequence`),
+configured under `data.eval` in [`configs/scaling.yaml`](../configs/scaling.yaml). They are
+scored by masked-LM loss with deterministic masking on the representatives (see
+*Deterministic eval masking*). For `data.eval` fields, see [evaluation.md](evaluation.md),
+*`data.eval` schema*.
 
-> **Pending:** how the held-out rows were selected and their count (waiting on #61).
+**Selection** (`select_eval`; values from `uniref70/summary.json`, `parameters` and
+`stages.screen`). Walking the shuffled order, the first 250,000 singleton clusters and
+the first 250,000 gte2 clusters are candidates. Every member of every candidate is
+searched with MMseqs2 18.8cc5c against deepclust70 `train/` and against every member of
+every other uniref70 cluster (a candidate's hits against its own cluster don't count;
+hits against other candidates do):
+
+```
+--min-seq-id 0.7 -c 0.8 --cov-mode 0 -s 1 --max-seqs 100000 -e 1e6
+```
+
+These are the clustering thresholds. `-s 1` is the cheapest prefilter: hits at ≥ 70%
+identity share many exact k-mers, so it still finds nearly all of them (`-s 4` was
+projected at about 2 days over deepclust70). `--max-seqs` and `-e` are set so identity
+and coverage alone decide a hit. A candidate with any hit is dropped. Within each stratum
+the first 5,000 survivors, in shuffled order, are eval and the next 5,000 are test.
+Eval and test are disjoint and are not in `train/`; candidates not chosen go back into
+`train/` at their shuffled position.
+
+| stratum | candidates | hits | survivors | survival |
+|---|--:|--:|--:|--:|
+| singletons | 250,000 | 185,247 | 64,753 | 25.9% |
+| gte2 | 250,000 | 239,168 | 10,832 | 4.3% |
+| total | 500,000 | 424,415 | 75,585 | 15.1% |
+
+Of the 500,000 candidates, 412,231 hit deepclust70 and 214,223 hit another uniref70
+cluster (a candidate can hit both).
+
+The build stops if a stratum's survival is under 5%, because the survivors are then a
+narrow slice. gte2 tripped it. On 2026-11-01 the user chose to use the survivors anyway,
+since 10,832 is enough for 5,000 eval and 5,000 test, and reran with
+`--min-survival 0.04` (commit `a400dfe`). So the gte2 eval and test sets come from the
+4.3% of multi-member clusters with no ≥ 70%-identity relative anywhere in training. They
+are a narrower slice than a random gte2 draw: clusters with a close relative elsewhere
+in training are excluded. A bigger pool would not help: the pool is a uniform draw from the
+stratum, so 4.3% estimates the share of all gte2 clusters with no relative, and more
+candidates give more survivors at the same rate and of the same kind.
+
+The old `uniref70/eval.parquet` is dropped: its provenance is unknown and it is not
+published. Loss on the new evals is not comparable with earlier runs' curves.
 
 ### Structure evaluation sets
 
