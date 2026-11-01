@@ -933,11 +933,14 @@ class Trainer:
         step_loss_sum = 0.0
         last_step_did_save = False
         # Canon kernel self-check: once per run (a resume included), on the first micro-batch,
-        # when the model's Canon calls will take the Triton kernel.
+        # when the model's Canon calls will take the Triton kernel (autocast sets their dtype).
         from oplm.model.conv import CanonConv, _use_kernel
 
+        autocast_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(
+            self.accelerator.mixed_precision, torch.float32
+        )
         canon_check = _use_kernel(
-            torch.empty(0, device=self.accelerator.device), torch.float32
+            torch.empty(0, device=self.accelerator.device), autocast_dtype
         ) and any(isinstance(m, CanonConv) for m in self._unwrapped_model.modules())
 
         try:
@@ -2263,7 +2266,8 @@ class Trainer:
             callback.on_log(self, dict(metrics), self.global_step)
 
     def _canon_self_check(self, batch: dict[str, Any]) -> None:
-        """Run `canon_self_check` on the first `min(4, B)` rows of `batch`; a mismatch raises.
+        """Run `canon_self_check` on the first `min(4, B)` rows of `batch`; a mismatch, or no
+        Canon call checked, raises.
 
         Every `(B, ...)` tensor (`input_ids`, `attention_mask`, `labels`, `segment_ids`) keeps its
         first rows, so packed rows stay whole and the model builds its masks from the slice;
@@ -2284,6 +2288,11 @@ class Trainer:
                 self.task.step(self._unwrapped_model, small)
 
         calls = canon_self_check(self._unwrapped_model, run_forward)
+        if calls == 0:
+            raise RuntimeError(
+                "Canon self-check ran no Canon calls: the model has CanonConv modules and the "
+                "kernel is in use, but the first micro-batch's forward never reached them"
+            )
         if self.accelerator.is_main_process:
             logger.info("Canon self-check passed: %d calls", calls)
 
