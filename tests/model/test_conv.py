@@ -295,3 +295,18 @@ def test_reference_function_matches_module(kernel_size: int):
     for s in (None, seg):
         ref = canon_conv_reference(x, conv.conv.weight.squeeze(1), mask, s, x.dtype, residual=False)
         assert torch.equal(ref, conv(x, mask, s))
+
+
+def test_reference_residual_is_raw_x_plus_conv():
+    # fp32 `x`, bf16 conv: the residual is `x + conv` with normal promotion (fp32), raw pads kept.
+    torch.manual_seed(0)
+    x = torch.randn(2, 9, 8)
+    w = torch.randn(8, 3)
+    mask = torch.ones(2, 9, dtype=torch.long)
+    mask[:, -2:] = 0
+    seg = torch.tensor([[1, 1, 1, 2, 2, 2, 2, 0, 0]] * 2)
+    for s in (None, seg):
+        out = canon_conv_reference(x, w, mask, s, torch.bfloat16, residual=True)
+        conv = canon_conv_reference(x, w, mask, s, torch.bfloat16, residual=False)
+        assert conv.dtype == torch.bfloat16 and out.dtype == torch.float32
+        assert torch.equal(out, x + conv)
