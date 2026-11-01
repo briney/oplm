@@ -1,5 +1,7 @@
 #!/bin/bash
-# Canon kernel first-GPU validation: GPU tests, then the kernel-vs-compiled-reference benchmark.
+# Canon kernel GPU validation: GPU tests, then the kernel-vs-compiled-reference benchmark and the
+# launch-config sweep (fwd and bwd timed separately per config; ~120 configs x 2 dtypes, each
+# compiled once, checked against the reference, then timed at D=768 and 2048: ~15-20 min).
 # Tests failing stops the job (the benchmark is meaningless on a broken kernel). Submit from the
 # login node with the pushed commit of branch perf/fused-canon:
 #   OPLM_REF=<commit> sbatch canon-kernel.sbatch      (sbatch exports the environment)
@@ -45,4 +47,4 @@ srun --export=ALL \
     } | tee "$OUT/versions.txt"
     python -m pytest tests/model/test_canon_kernel.py tests/model/test_conv.py \
       tests/model/test_canon_semantics.py -q -rs 2>&1 | tee "$OUT/pytest.log"
-    python docs/perf/canon_kernel_bench.py --out "$OUT/bench.json" 2>&1 | tee "$OUT/bench.log"'
+    python docs/perf/canon_kernel_bench.py --sweep --out "$OUT/bench.json" 2>&1 | tee "$OUT/bench.log"'
