@@ -57,7 +57,8 @@ def test_custom_code_files_copied(saved_model_dir: Path) -> None:
 
     # Helper modules imported by modeling_oplm.py must come along too, or the
     # remote import fails.
-    for helper in ("attention.py", "transformer.py", "norm.py", "rope.py", "ffn.py", "looping.py"):
+    helpers = ("attention.py", "transformer.py", "norm.py", "rope.py", "ffn.py", "looping.py")
+    for helper in (*helpers, "conv.py", "canon_kernel.py", "masking.py"):
         assert helper in names, f"missing helper module {helper}"
 
     # auto_map entries must be present in the written config.
