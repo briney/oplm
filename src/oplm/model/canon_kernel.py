@@ -8,13 +8,21 @@ after. Kernels run on CUDA tensors, or on CPU tensors under `TRITON_INTERPRET=1`
 
 `torch.ops.oplm.canon_conv` wraps them as one custom op with its own autograd, opaque to
 `torch.compile` (no graph break, no tracing into Triton): `canon_conv_kernel` is its entry point.
+`canon_self_check` compares it with the reference on a model's real Canon inputs (run start).
 """
 
 from __future__ import annotations
 
+import inspect
 import os
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from torch import nn
 
 try:
     import triton
@@ -28,9 +36,11 @@ __all__ = [
     "BLOCK_T",
     "BWD_TILES",
     "TRITON_AVAILABLE",
+    "CanonKernelMismatch",
     "canon_backward",
     "canon_conv_kernel",
     "canon_forward",
+    "canon_self_check",
 ]
 
 BLOCK_T = 64  # tokens per program
@@ -403,3 +413,70 @@ def canon_conv_kernel(
     """`torch.ops.oplm.canon_conv`: Triton Canon conv with autograd; same signature and function
     as `conv.canon_conv_reference`."""
     return torch.ops.oplm.canon_conv(x, weight, attention_mask, segment_ids, out_dtype, residual)
+
+
+class CanonKernelMismatch(RuntimeError):
+    """The Canon kernel disagreed with `canon_conv_reference` on a model's real inputs."""
+
+
+def canon_self_check(
+    model: nn.Module,
+    run_forward: Callable[[], object],
+    kernel: Callable[..., torch.Tensor] = canon_conv_kernel,
+) -> int:
+    """Check `kernel` against the reference on every Canon call of one `run_forward()`.
+
+    Each `CanonConv` call's `x`, `attention_mask` and `segment_ids` go through `kernel` and
+    `canon_conv_reference` in fp32 with the residual flag `CanonConv.forward` gives the op (the
+    conv before any activation); one random `dy` is backpropagated through both, and the output,
+    `dx` and `dW` must agree within `rtol = atol = 1e-4` or `CanonKernelMismatch` is raised. The
+    forward runs under `no_grad` on detached inputs (no parameter `.grad`), the RNG state (CPU and
+    the model's CUDA device) is restored after, and the hooks are always removed. Returns the
+    number of calls checked.
+    """
+    from .conv import CanonConv, canon_conv_reference  # conv.py imports this module
+
+    convs = [(n, m) for n, m in model.named_modules() if isinstance(m, CanonConv)]
+    if not convs:
+        return 0
+    calls = 0
+
+    def make_hook(name: str) -> Callable[..., None]:
+        def hook(module: CanonConv, args: tuple, kwargs: dict) -> None:
+            nonlocal calls
+            call = inspect.signature(module.forward).bind(*args, **kwargs)
+            call.apply_defaults()
+            a = call.arguments
+            residual = bool(a["residual"]) and module._activation is None  # as forward does
+            x = a["x"].detach().float().requires_grad_()
+            w = module.conv.weight.detach().squeeze(1).float().requires_grad_()
+            results = []
+            with torch.enable_grad(), torch.autocast(x.device.type, enabled=False):
+                dy = torch.randn_like(x)
+                for fn in (kernel, canon_conv_reference):
+                    out = fn(x, w, a["attention_mask"], a["segment_ids"], torch.float32, residual)
+                    results.append((out.detach(), *torch.autograd.grad(out, (x, w), dy)))
+            pairs = list(zip(("out", "dx", "dW"), *results, strict=True))
+            if not all(
+                torch.allclose(got, ref, rtol=1e-4, atol=1e-4, equal_nan=True)
+                for _, got, ref in pairs
+            ):
+                errors = ", ".join(f"{n} {(g - r).abs().max().item():.3g}" for n, g, r in pairs)
+                raise CanonKernelMismatch(
+                    f"Canon kernel != reference at {name} (input {tuple(x.shape)}, "
+                    f"k={module.kernel_size}, residual={residual}); max abs error: {errors}"
+                )
+            calls += 1
+
+        return hook
+
+    device = convs[0][1].conv.weight.device
+    handles = [m.register_forward_pre_hook(make_hook(n), with_kwargs=True) for n, m in convs]
+    try:
+        rng_devices = [device] if device.type == "cuda" else []
+        with torch.random.fork_rng(devices=rng_devices), torch.no_grad():
+            run_forward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    return calls

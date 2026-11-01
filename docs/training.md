@@ -591,6 +591,15 @@ can be backfilled from existing checkpoints' `hf/` exports:
 oplm weight-rms /runs/170M/checkpoint-100000 /runs/170M/checkpoint-400000
 ```
 
+**Canon self-check.** A run whose Canon convs use the Triton kernel (CUDA, `canon_enabled`)
+checks the kernel once at start, a resume included, before its first optimizer step. It runs one
+eager forward of the unwrapped model on the first `min(4, B)` rows of the first micro-batch, and at
+every Canon call compares the kernel with the reference implementation on that call's real inputs
+in fp32: the output, and both gradients for one random upstream gradient. Every rank checks its own
+micro-batch. Rank 0 then logs `Canon self-check passed: N calls`; a mismatch raises
+`CanonKernelMismatch` (module name, input shape, max error per tensor) and stops the run. The check
+leaves no gradients and does not change the random number streams, so training is unchanged.
+
 **Profiling** (`train.profile_start=S`, off by default; `train.profile_steps=N`,
 default 20). It writes everything to `<output_dir>/profile/`:
 

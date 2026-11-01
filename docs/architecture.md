@@ -254,7 +254,8 @@ accumulation and, when `canon_activation` is `none`, the residual add; the weigh
 reduced deterministically. Everywhere else (CPU, or no Triton) the same function runs as
 `canon_conv_reference`, `k` shifted multiply-adds, which is also the kernel's test oracle. There is
 no config switch between the two. A training run that uses the kernel first checks it against the
-reference on its first real batch (output and both gradients, in fp32) and stops on a mismatch.
+reference on the first rows (up to 4) of its first micro-batch: every Canon call's output and both
+gradients, in fp32. A mismatch stops the run (see the Canon self-check in [training.md](training.md)).
 
 The library default kernel size is 4 (the paper's choice) and the run default in `base.yaml` is 7.
 For even kernels, exact token-centered symmetry is impossible in a same-length convolution. OPLM pads

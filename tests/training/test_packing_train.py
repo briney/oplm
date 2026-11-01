@@ -76,3 +76,44 @@ def test_compiled_packed_training_counts_sequences(training_parquet: Path, tmp_p
     losses = [m["train/loss"] for m in logged if "train/loss" in m]
     assert len(losses) == 4 and all(loss == loss for loss in losses)  # finite, not NaN
     assert trainer._samples_seen == 4 * 8
+
+
+@pytest.mark.slow
+def test_canon_self_check_runs_once_on_first_rows(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trainer checks the Canon kernel once, on the first micro-batch's first 4 rows.
+
+    CPU stand-in for a CUDA run: the dispatch predicate says "kernel" and the kernel is the
+    reference, so the check runs and training is unchanged.
+    """
+    from oplm.model import canon_kernel, conv
+    from oplm.training.trainer import Trainer
+
+    cfg = tiny_train_cfg(tmp_path, training_parquet, max_steps=3, batch_size=16)
+    cfg.data.pack_sequences = True
+    cfg.model.canon_enabled, cfg.model.canon_positions = True, ["A", "B", "C", "D"]
+    cfg.model.canon_kernel_sizes = [3, 4]
+    monkeypatch.setattr(conv, "_use_kernel", lambda x, out_dtype: True)
+    monkeypatch.setattr(conv, "canon_conv_kernel", conv.canon_conv_reference)
+    checked: list[int] = []
+    real_check = canon_kernel.canon_self_check
+
+    def check(model, run_forward):  # noqa: ANN001, ANN202
+        checked.append(real_check(model, run_forward, kernel=conv.canon_conv_reference))
+        return checked[-1]
+
+    monkeypatch.setattr(canon_kernel, "canon_self_check", check)
+    trainer = Trainer(cfg)
+    rows: list[tuple[int, ...]] = []
+    step = trainer.task.step
+
+    def spy(model, batch):  # noqa: ANN001, ANN202
+        rows.append(tuple(v.shape[0] for v in batch.values() if hasattr(v, "shape")))
+        return step(model, batch)
+
+    trainer.task.step = spy  # ty: ignore[invalid-assignment]
+    trainer.train()
+    assert checked == [2 * 6]  # 2 layers x (A, B-q, B-k, B-v, C, D), once
+    assert rows[0] == (4, 4, 4, 4) and rows[1][0] > 4  # the check's slice, then the full batch
+    assert len(rows) == 1 + 3

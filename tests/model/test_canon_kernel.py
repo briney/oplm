@@ -559,3 +559,94 @@ def test_compiled_block_no_graph_breaks(monkeypatch, autocast):
         # case above is the precision check.
         for g, r in zip(got, ref, strict=True):
             assert (g - r).abs().max() <= 3e-2 * r.abs().max()
+
+
+# --- startup self-check -------------------------------------------------------------------------
+
+
+def _self_check_model_and_batch():
+    """2-layer `OplmModel`, Canon A-D (k = 3 then 4), dropout on, train mode; a packed batch."""
+    from oplm import OplmConfig, OplmModel
+
+    torch.manual_seed(0)
+    cfg = OplmConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        max_position_embeddings=64,
+        hidden_dropout=0.1,
+        canon_enabled=True,
+        canon_positions=["A", "B", "C", "D"],
+        canon_kernel_sizes=[3, 4],
+        packed_attention="sdpa",
+    )
+    model = OplmModel(cfg).to(DEVICE).train()
+    seg = torch.stack([_segments_from_lengths(n, 24) for n in ([5, 9, 6], [12, 3])])
+    batch = {
+        "input_ids": torch.randint(5, 25, seg.shape, generator=torch.Generator().manual_seed(1)),
+        "attention_mask": seg.ne(0).long(),
+        "segment_ids": seg,
+    }
+    return model, {k: v.to(DEVICE) for k, v in batch.items()}
+
+
+def test_self_check_passes_with_reference_kernel():
+    from oplm.model.canon_kernel import canon_self_check
+
+    model, batch = _self_check_model_and_batch()
+    rng = torch.get_rng_state()
+    assert canon_self_check(model, lambda: model(**batch), kernel=canon_conv_reference) == 2 * 6
+    assert torch.equal(torch.get_rng_state(), rng)  # dropout and dy draws do not shift the run
+    assert all(p.grad is None for p in model.parameters())
+
+
+def _layer1_canon_d(model):  # noqa: ANN001, ANN202
+    """The qualified name of layer 1's Canon-D: the only conv with k = 4 at intermediate_size."""
+    (name,) = (
+        n
+        for n, m in model.named_modules()
+        if isinstance(m, CanonConv) and m.kernel_size == 4 and m.channels == 64
+    )
+    return name
+
+
+def test_self_check_raises_on_mismatch():
+    from oplm.model.canon_kernel import CanonKernelMismatch, canon_self_check
+
+    model, batch = _self_check_model_and_batch()
+
+    def bad(x, weight, *args):  # noqa: ANN001, ANN002, ANN202
+        out = canon_conv_reference(x, weight, *args)
+        return out + 1e-2 if weight.shape == (64, 4) else out
+
+    with pytest.raises(CanonKernelMismatch, match=_layer1_canon_d(model)):
+        canon_self_check(model, lambda: model(**batch), kernel=bad)
+
+
+def test_self_check_removes_hooks():
+    from oplm.model.canon_kernel import CanonKernelMismatch, canon_self_check
+
+    model, batch = _self_check_model_and_batch()
+    calls = []
+
+    def bad(*args):  # noqa: ANN002, ANN202
+        calls.append(1)
+        return canon_conv_reference(*args) + 1e-2
+
+    with pytest.raises(CanonKernelMismatch):
+        canon_self_check(model, lambda: model(**batch), kernel=bad)
+    assert len(calls) == 1  # the first call raised
+    with torch.no_grad():
+        model(**batch)
+    assert len(calls) == 1
+    assert all(not m._forward_pre_hooks for m in model.modules() if isinstance(m, CanonConv))
+
+
+@kernel
+def test_self_check_with_kernel():
+    # The default kernel (the Triton op), on CUDA or under the interpreter.
+    from oplm.model.canon_kernel import canon_self_check
+
+    model, batch = _self_check_model_and_batch()
+    assert canon_self_check(model, lambda: model(**batch)) == 2 * 6
