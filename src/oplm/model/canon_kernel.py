@@ -5,7 +5,7 @@ source is inside the row, not a pad, and (packed rows) in the output's segment; 
 cast to `out_dtype`, then optionally `x + conv` with the raw `x`. The backward is one pass giving
 `dx` (the transposed conv, plus `dy` for the residual) and per-program fp32 `dw` partials, summed
 after. Kernels run on CUDA tensors, or on CPU tensors under `TRITON_INTERPRET=1`. Launch shapes
-come from `FWD_CONFIGS` / `BWD_CONFIGS` (picked by `docs/perf/canon_kernel_bench.py --sweep`).
+come from `FWD_CONFIGS` / `BWD_CONFIGS` (picked by `canon_kernel_bench.py --sweep`).
 
 `torch.ops.oplm.canon_conv` wraps them as one custom op with its own autograd, opaque to
 `torch.compile` (no graph break, no tracing into Triton): `canon_conv_kernel` is its entry point.
