@@ -130,6 +130,8 @@ if TRITON_AVAILABLE:
         LEFT: tl.constexpr,
         HAS_SEG: tl.constexpr,
         RESIDUAL: tl.constexpr,
+        CONV_DTYPE: tl.constexpr,
+        ROUND_G: tl.constexpr,
         ROUND_DX: tl.constexpr,
         BLOCK_T: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -172,6 +174,11 @@ if TRITON_AVAILABLE:
                     mask=ok[:, None] & d_ok[None, :],
                     other=0.0,
                 ).to(tl.float32)
+                # The conv's gradient is dy in the conv's dtype (autograd casts it through the
+                # forward's `.to(out_dtype)`); the residual path below keeps the raw dy.
+                if ROUND_G:
+                    g = _round_bf16(g)
+                g = g.to(CONV_DTYPE).to(tl.float32)
                 wv = tl.load(w_ptr + d * stride_wd + i * stride_wk, mask=d_ok, other=0.0)
                 acc += g * wv.to(tl.float32)[None, :]
                 dw_acc += tl.where(taps[None, :] == i, tl.sum(xv * g, axis=0)[:, None], 0.0)
@@ -263,12 +270,15 @@ def canon_backward(
     weight: torch.Tensor,
     attention_mask: torch.Tensor,
     segment_ids: torch.Tensor | None,
+    out_dtype: torch.dtype,
     residual: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gradients of `canon_forward` for its output gradient `dy`: `(dx, dw)`.
 
-    `dx` is `(B, T, D)` in `x.dtype`; `dw` is `(D, k)` in `weight.dtype`, reduced
-    deterministically (per-program fp32 partials, then a sum).
+    `out_dtype` is the forward's conv dtype: the conv path sees `dy` rounded to it, as autograd's
+    cast backward does; the residual path sees the raw `dy`. `dx` is `(B, T, D)` in `x.dtype`;
+    `dw` is `(D, k)` in `weight.dtype`, reduced deterministically (per-program fp32 partials,
+    then a sum).
     """
     B, T, D = x.shape
     _check_row_size(T, D)
@@ -276,6 +286,7 @@ def canon_backward(
     dy = dy.contiguous()
     k = weight.shape[1]
     dx = torch.empty_like(x)
+    interpret = os.environ.get("TRITON_INTERPRET") == "1"
     if x.numel() == 0:
         return dx, torch.zeros_like(weight)
     seg = segment_ids if segment_ids is not None else attention_mask  # unread when None
@@ -302,7 +313,9 @@ def canon_backward(
         LEFT=k // 2,
         HAS_SEG=segment_ids is not None,
         RESIDUAL=residual,
-        ROUND_DX=os.environ.get("TRITON_INTERPRET") == "1" and x.dtype == torch.bfloat16,
+        CONV_DTYPE=_TL_DTYPES[out_dtype],
+        ROUND_G=interpret and out_dtype == torch.bfloat16,
+        ROUND_DX=interpret and x.dtype == torch.bfloat16,
         BLOCK_T=BLOCK_T,
         BLOCK_D=BLOCK_D,
         TILES=BWD_TILES,

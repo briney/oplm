@@ -200,7 +200,7 @@ def test_row_size_guard():
     with pytest.raises(ValueError, match="2\\*\\*31"):
         canon_forward(x, w, mask, None, torch.float32, False)
     with pytest.raises(ValueError, match="2\\*\\*31"):
-        canon_backward(x, x, w, mask, None, False)
+        canon_backward(x, x, w, mask, None, torch.float32, False)
 
 
 def _grads(x, w, mask, seg, out_dtype, residual, seed=0):
@@ -214,7 +214,7 @@ def _grads(x, w, mask, seg, out_dtype, residual, seed=0):
     xr = x.detach().requires_grad_()
     wr = w.detach().requires_grad_()
     canon_conv_reference(xr, wr, mask, seg, out_dtype, residual).backward(dy)
-    dx, dw = canon_backward(dy, x, w, mask, seg, residual)
+    dx, dw = canon_backward(dy, x, w, mask, seg, out_dtype, residual)
     assert dx.dtype == x.dtype and dx.shape == x.shape
     assert dw.dtype == w.dtype and dw.shape == w.shape
     return dx, dw, xr.grad, wr.grad, dy
@@ -253,6 +253,26 @@ def test_backward_bf16(packed, residual):
     _assert_pad_grads(dx, dy, mask, residual)
 
 
+@pytest.mark.parametrize("residual", [True, False])
+@pytest.mark.parametrize("packed", [True, False])
+def test_backward_mixed_dtypes(packed, residual):
+    # fp32 x under bf16 autocast (LayerNorm output into Canon): the conv-path gradient sees dy
+    # rounded to bf16, as autograd does through the conv's cast; the residual path sees raw dy.
+    x, w, mask, seg = _case(2, 37, 100, 7, packed, seed=8, interior_pads=not packed)
+    dx, dw, ref_dx, ref_dw, dy = _grads(x, w, mask, seg, torch.bfloat16, residual)
+    assert dy.dtype == (torch.float32 if residual else torch.bfloat16)
+    torch.testing.assert_close(dx, ref_dx, **FP32_TOL)
+    torch.testing.assert_close(dw, ref_dw, **FP32_TOL)
+    _assert_pad_grads(dx, dy, mask, residual)
+
+
+def test_backward_bool_mask():
+    x, w, mask, seg = _case(2, 37, 64, 3, False, seed=3, interior_pads=True)
+    dx, dw, ref_dx, ref_dw, _ = _grads(x, w, mask.bool(), seg, torch.float32, False)
+    torch.testing.assert_close(dx, ref_dx, **FP32_TOL)
+    torch.testing.assert_close(dw, ref_dw, **FP32_TOL)
+
+
 def test_backward_tile_edges():
     # Boundaries on token-tile edges and on the edges of a program's span of BWD_TILES tiles.
     span = BLOCK_T * BWD_TILES
@@ -271,18 +291,20 @@ def test_backward_degenerate_rows(packed):
     x, w, _, _ = _case(1, 5, 64, 3, packed, seed=1)
     mask = torch.zeros(1, 5, dtype=torch.long, device=DEVICE)
     seg = torch.zeros_like(mask) if packed else None
+    gen = torch.Generator().manual_seed(0)
     for residual in (True, False):
-        dy = torch.randn_like(x)
-        dx, dw = canon_backward(dy, x, w, mask, seg, residual)
+        dy = torch.randn(x.shape, generator=gen).to(DEVICE)
+        dx, dw = canon_backward(dy, x, w, mask, seg, torch.float32, residual)
         assert torch.equal(dx, dy if residual else torch.zeros_like(x))
         assert torch.equal(dw, torch.zeros_like(w))
 
     # An all-pad row adds nothing to dw: same dw with and without it in the batch.
     x, w, mask, seg = _case(3, 37, 64, 7, packed, seed=2)
     assert mask[-1].eq(0).all()
-    dy = torch.randn_like(x)
-    dw_all = canon_backward(dy, x, w, mask, seg, False)[1]
-    dw_two = canon_backward(dy[:2], x[:2], w, mask[:2], None if seg is None else seg[:2], False)[1]
+    dy = torch.randn(x.shape, generator=gen).to(DEVICE)
+    dw_all = canon_backward(dy, x, w, mask, seg, torch.float32, False)[1]
+    seg_two = None if seg is None else seg[:2]
+    dw_two = canon_backward(dy[:2], x[:2], w, mask[:2], seg_two, torch.float32, False)[1]
     assert torch.equal(dw_all, dw_two)
 
     # T < k, and rows of single-token segments.
@@ -302,8 +324,8 @@ def test_backward_degenerate_rows(packed):
 
 def test_backward_deterministic():
     x, w, mask, seg = _case(4, 300, 100, 7, True, seed=3)
-    dy = torch.randn_like(x)
-    dx1, dw1 = canon_backward(dy, x, w, mask, seg, True)
-    dx2, dw2 = canon_backward(dy, x, w, mask, seg, True)
+    dy = torch.randn(x.shape, generator=torch.Generator().manual_seed(4)).to(DEVICE)
+    dx1, dw1 = canon_backward(dy, x, w, mask, seg, torch.float32, True)
+    dx2, dw2 = canon_backward(dy, x, w, mask, seg, torch.float32, True)
     assert torch.equal(dw1, dw2)
     assert torch.equal(dx1, dx2)
