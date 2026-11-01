@@ -9,9 +9,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .canon_kernel import TRITON_AVAILABLE, canon_conv_kernel
 from .masking import zero_pad_positions
 
 __all__ = ["CanonConv", "canon_conv_reference", "resolve_canon_kernel_sizes"]
+
+_KERNEL_ENABLED = True  # tests only: False forces the reference path on CUDA
 
 
 _ACTIVATIONS = {
@@ -39,13 +42,14 @@ class CanonConv(nn.Module):
     time axis before the conv runs — this preserves the same-length output
     while keeping the bias of the receptive field consistent across layers.
 
-    The forward computes that convolution as `kernel_size` shifted multiply-adds in the
-    `(B, T, D)` layout instead of calling `self.conv`: the same cross-correlation, but
-    `torch.compile` fuses it into one memory-bound kernel, where `nn.Conv1d(groups=D)`
-    dispatches to PyTorch's slow native depthwise kernel and needs two transposes (it took
-    about 45 % of a 170M training step on B200s). `self.conv` still owns the weight, so
-    checkpoints and initialization are unchanged. Accumulation is in fp32; the output has
-    the dtype autocast would give a convolution (`x`'s dtype when autocast is off).
+    The forward never calls `self.conv` (`nn.Conv1d(groups=D)` dispatches to PyTorch's slow
+    native depthwise kernel and needs two transposes). On CUDA it runs the Triton op
+    `oplm::canon_conv` (`canon_kernel.py`): pad zeroing, segment masks, the conv and, without
+    an activation, the residual add in one opaque kernel with its own backward. Elsewhere (CPU)
+    it runs `canon_conv_reference`, the same cross-correlation as `kernel_size` shifted
+    multiply-adds. `self.conv` still owns the weight, so checkpoints and initialization are
+    unchanged. Accumulation is in fp32; the conv has the dtype autocast would give a
+    convolution (`x`'s dtype when autocast is off).
     """
 
     def __init__(
@@ -93,11 +97,12 @@ class CanonConv(nn.Module):
             out_dtype = torch.get_autocast_dtype(device_type)
         else:
             out_dtype = x.dtype
-        out = canon_conv_reference(
-            x, self.conv.weight.squeeze(1), attention_mask, segment_ids, out_dtype, False
-        )
-        if self._activation is not None:
-            out = self._activation(out)
+        use_kernel = _KERNEL_ENABLED and TRITON_AVAILABLE and x.is_cuda
+        conv = canon_conv_kernel if use_kernel else canon_conv_reference
+        weight = self.conv.weight.squeeze(1)  # (D, k) view: autograd gives dW back as (D, 1, k)
+        if self._activation is None:  # the residual folds into the conv call
+            return conv(x, weight, attention_mask, segment_ids, out_dtype, residual)
+        out = self._activation(conv(x, weight, attention_mask, segment_ids, out_dtype, False))
         return x + out if residual else out
 
 

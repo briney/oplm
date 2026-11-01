@@ -6,22 +6,27 @@ checked without a GPU: `TRITON_INTERPRET=1 pytest tests/model/test_canon_kernel.
 
 from __future__ import annotations
 
+import copy
 import os
 
 import pytest
 import torch
 
-from oplm.model.conv import canon_conv_reference
+from oplm.model import conv as conv_mod
+from oplm.model.conv import CanonConv, canon_conv_reference
 
-pytestmark = pytest.mark.skipif(
+# Kernel tests; the dispatch tests at the end set their own marks.
+kernel = pytest.mark.skipif(
     not (torch.cuda.is_available() or os.environ.get("TRITON_INTERPRET") == "1"),
     reason="needs CUDA or TRITON_INTERPRET=1",
 )
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 from oplm.model.canon_kernel import (  # noqa: E402
     BLOCK_T,
     BWD_TILES,
     canon_backward,
+    canon_conv_kernel,
     canon_forward,
 )
 
@@ -86,6 +91,7 @@ def _case(
     )
 
 
+@kernel
 @pytest.mark.parametrize("residual", [True, False])
 @pytest.mark.parametrize("packed", [True, False])
 @pytest.mark.parametrize("T", [1, 2, 37, 128])
@@ -99,6 +105,7 @@ def test_forward_matches_reference_fp32(k, D, T, packed, residual):
     torch.testing.assert_close(out, ref, **FP32_TOL)
 
 
+@kernel
 @pytest.mark.parametrize("residual", [True, False])
 @pytest.mark.parametrize("x_dtype", [torch.bfloat16, torch.float32])
 def test_forward_bf16_and_mixed_dtypes(x_dtype, residual):
@@ -112,6 +119,7 @@ def test_forward_bf16_and_mixed_dtypes(x_dtype, residual):
         assert torch.equal(out, x + canon_forward(x, w, mask, seg, torch.bfloat16, False))
 
 
+@kernel
 def test_forward_bool_mask():
     x, w, mask, seg = _case(2, 37, 64, 3, False, seed=3)
     out = canon_forward(x, w, mask.bool(), seg, torch.float32, False)
@@ -139,6 +147,7 @@ def _edge_layouts(T: int, edges: list[int], n: int = 20):
         yield x, w, mask, seg.unsqueeze(0).to(DEVICE)
 
 
+@kernel
 def test_forward_segment_boundaries_on_tile_edges():
     for x, w, mask, seg in _edge_layouts(2 * BLOCK_T + 3, [BLOCK_T - 1, BLOCK_T, BLOCK_T + 1]):
         for residual in (True, False):
@@ -147,6 +156,7 @@ def test_forward_segment_boundaries_on_tile_edges():
             torch.testing.assert_close(out, ref, **FP32_TOL)
 
 
+@kernel
 @pytest.mark.parametrize("packed", [True, False])
 def test_forward_degenerate_rows(packed):
     # All-pad row: conv is zero, residual returns the raw `x` (garbage pads included).
@@ -170,6 +180,7 @@ def test_forward_degenerate_rows(packed):
             torch.testing.assert_close(out, ref, **FP32_TOL)
 
 
+@kernel
 def test_forward_residual_keeps_raw_pads():
     # Packed: a pad's segment id (0) matches only other (zeroed) pads, so its conv is exactly 0.
     for dtype in (torch.float32, torch.bfloat16):
@@ -180,6 +191,7 @@ def test_forward_residual_keeps_raw_pads():
         assert torch.equal(out[pad], x[pad])
 
 
+@kernel
 @pytest.mark.parametrize("residual", [True, False])
 @pytest.mark.parametrize("k", [2, 7])
 def test_forward_interior_pads(k, residual):
@@ -191,6 +203,7 @@ def test_forward_interior_pads(k, residual):
     torch.testing.assert_close(out, ref, **FP32_TOL)
 
 
+@kernel
 def test_row_size_guard():
     # In-row offsets are int32; a row of 2**31 elements must be refused, not overflow.
     T, D = 2**16, 2**15
@@ -227,6 +240,7 @@ def _assert_pad_grads(dx, dy, mask, residual):
     assert torch.equal(dx[pad], expect)
 
 
+@kernel
 @pytest.mark.parametrize("residual", [True, False])
 @pytest.mark.parametrize("packed", [True, False])
 @pytest.mark.parametrize("T", [1, 2, 37, 128])
@@ -241,6 +255,7 @@ def test_backward_matches_reference_fp32(k, D, T, packed, residual):
     _assert_pad_grads(dx, dy, mask, residual)
 
 
+@kernel
 @pytest.mark.parametrize("residual", [True, False])
 @pytest.mark.parametrize("packed", [True, False])
 def test_backward_bf16(packed, residual):
@@ -253,6 +268,7 @@ def test_backward_bf16(packed, residual):
     _assert_pad_grads(dx, dy, mask, residual)
 
 
+@kernel
 @pytest.mark.parametrize("residual", [True, False])
 @pytest.mark.parametrize("packed", [True, False])
 def test_backward_mixed_dtypes(packed, residual):
@@ -266,6 +282,7 @@ def test_backward_mixed_dtypes(packed, residual):
     _assert_pad_grads(dx, dy, mask, residual)
 
 
+@kernel
 def test_backward_bool_mask():
     x, w, mask, seg = _case(2, 37, 64, 3, False, seed=3, interior_pads=True)
     dx, dw, ref_dx, ref_dw, _ = _grads(x, w, mask.bool(), seg, torch.float32, False)
@@ -273,6 +290,7 @@ def test_backward_bool_mask():
     torch.testing.assert_close(dw, ref_dw, **FP32_TOL)
 
 
+@kernel
 def test_backward_tile_edges():
     # Boundaries on token-tile edges and on the edges of a program's span of BWD_TILES tiles.
     span = BLOCK_T * BWD_TILES
@@ -285,6 +303,7 @@ def test_backward_tile_edges():
             _assert_pad_grads(dx, dy, mask, residual)
 
 
+@kernel
 @pytest.mark.parametrize("packed", [True, False])
 def test_backward_degenerate_rows(packed):
     # All-pad row: no gradient into the conv, so dx is 0 (or dy) and dw is exactly 0.
@@ -322,6 +341,7 @@ def test_backward_degenerate_rows(packed):
             _assert_pad_grads(dx, dy, mask, residual)
 
 
+@kernel
 def test_backward_deterministic():
     x, w, mask, seg = _case(4, 300, 100, 7, True, seed=3)
     dy = torch.randn(x.shape, generator=torch.Generator().manual_seed(4)).to(DEVICE)
@@ -329,3 +349,172 @@ def test_backward_deterministic():
     dx2, dw2 = canon_backward(dy, x, w, mask, seg, torch.float32, True)
     assert torch.equal(dw1, dw2)
     assert torch.equal(dx1, dx2)
+
+
+# --- the oplm::canon_conv op, its autograd, and CanonConv dispatch ---
+
+
+@kernel
+@pytest.mark.parametrize(
+    ("packed", "dtype", "residual"),
+    [(True, torch.bfloat16, True), (False, torch.float32, False)],
+    ids=["packed-bf16", "unpacked-fp32"],
+)
+def test_op_opcheck(packed, dtype, residual):
+    x, w, mask, seg = _case(2, 37, 100, 7, packed, seed=21, dtype=dtype, interior_pads=not packed)
+    args = (x.requires_grad_(), w.requires_grad_(), mask, seg, dtype, residual)
+    torch.library.opcheck(torch.ops.oplm.canon_conv, args)
+
+
+def _op_and_reference_grads(fn, x, w, mask, seg, out_dtype, residual, dy):
+    """Forward + backward of `fn` with the weight as a `(D, k)` view of a `(D, 1, k)` leaf (as
+    `CanonConv` passes `conv.weight.squeeze(1)`): `(out, dx, dw)`, `dw` shaped `(D, 1, k)`."""
+    xr = x.detach().requires_grad_()
+    param = w.detach().unsqueeze(1).clone().requires_grad_()
+    out = fn(xr, param.squeeze(1), mask, seg, out_dtype, residual)
+    out.backward(dy.to(out.dtype))
+    return out, xr.grad, param.grad
+
+
+@kernel
+@pytest.mark.parametrize("residual", [True, False])
+@pytest.mark.parametrize(
+    ("x_dtype", "out_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.float32, torch.bfloat16),  # fp32 LayerNorm output under bf16 autocast
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_op_autograd_matches_reference(x_dtype, out_dtype, residual):
+    x, w, mask, seg = _case(2, 37, 100, 7, True, seed=22, dtype=x_dtype)
+    dy = torch.randn(x.shape, generator=torch.Generator().manual_seed(0)).to(DEVICE)
+    got = _op_and_reference_grads(canon_conv_kernel, x, w, mask, seg, out_dtype, residual, dy)
+    ref = _op_and_reference_grads(canon_conv_reference, x, w, mask, seg, out_dtype, residual, dy)
+    out_tol = FP32_TOL if out_dtype == torch.float32 else BF16_TOL
+    dx_tol = FP32_TOL if x_dtype == torch.float32 else BF16_TOL
+    assert got[0].dtype == ref[0].dtype and got[1].dtype == x_dtype
+    assert got[2].shape == (100, 1, 7) and got[2].dtype == torch.float32
+    torch.testing.assert_close(got[0], ref[0], **out_tol)
+    torch.testing.assert_close(got[1], ref[1], **dx_tol)
+    torch.testing.assert_close(got[2], ref[2], **FP32_TOL)
+
+
+@kernel
+def test_op_compiles_without_graph_breaks():
+    # The op is opaque to Dynamo/AOTAutograd: fullgraph tracing (fake impls for the forward and
+    # the backward op) succeeds and runs the same kernels as eager.
+    x, w, mask, seg = _case(2, 37, 100, 7, True, seed=23)
+    dy = torch.randn(x.shape, generator=torch.Generator().manual_seed(0)).to(DEVICE)
+    compiled = torch.compile(canon_conv_kernel, backend="aot_eager", fullgraph=True)
+    got = _op_and_reference_grads(compiled, x, w, mask, seg, torch.float32, True, dy)
+    ref = _op_and_reference_grads(canon_conv_kernel, x, w, mask, seg, torch.float32, True, dy)
+    for g, r in zip(got, ref, strict=True):
+        assert torch.equal(g, r)
+
+
+@pytest.mark.parametrize("residual", [True, False])
+@pytest.mark.parametrize("activation", ["none", "silu"])
+def test_cpu_uses_reference(monkeypatch, activation, residual):
+    def no_kernel(*args):  # noqa: ANN002, ANN202
+        raise AssertionError("CPU tensors must not take the kernel path")
+
+    monkeypatch.setattr(conv_mod, "canon_conv_kernel", no_kernel)
+    torch.manual_seed(0)
+    module = CanonConv(100, 7, activation)
+    x, _, mask, seg = (t.cpu() for t in _case(2, 37, 100, 7, True, seed=24))
+    weight = module.conv.weight.squeeze(1)
+    with torch.no_grad():
+        out = module(x, mask, seg, residual=residual)
+        conv = canon_conv_reference(x, weight, mask, seg, torch.float32, False)
+        if activation == "silu":
+            conv = torch.nn.functional.silu(conv)
+    assert torch.equal(out, x + conv if residual else conv)
+
+
+@needs_cuda
+@pytest.mark.parametrize("autocast", [False, True], ids=["fp32", "bf16-autocast"])
+@pytest.mark.parametrize("residual", [True, False])
+@pytest.mark.parametrize("activation", ["none", "silu"])
+def test_module_kernel_matches_reference(monkeypatch, activation, residual, autocast):
+    calls = []
+    real = conv_mod.canon_conv_kernel
+
+    def spy(*args):  # noqa: ANN002, ANN202
+        calls.append(args[-1])  # the residual flag the module passed
+        return real(*args)
+
+    monkeypatch.setattr(conv_mod, "canon_conv_kernel", spy)
+    torch.manual_seed(0)
+    module = CanonConv(100, 7, activation).cuda()
+    x, _, mask, seg = _case(2, 37, 100, 7, True, seed=25)  # fp32, like a LayerNorm output
+    dy = torch.randn(x.shape, generator=torch.Generator().manual_seed(0)).to(DEVICE)
+    results = []
+    for enabled in (False, True):
+        monkeypatch.setattr(conv_mod, "_KERNEL_ENABLED", enabled)
+        module.zero_grad(set_to_none=True)
+        xr = x.clone().requires_grad_()
+        with torch.autocast("cuda", torch.bfloat16, enabled=autocast):
+            out = module(xr, mask, seg, residual=residual)
+        out.backward(dy.to(out.dtype))
+        results.append((out, xr.grad, module.conv.weight.grad))
+    # One kernel call, on the enabled pass; the residual is folded in only without activation.
+    assert calls == [residual and activation == "none"]
+    tol = BF16_TOL if autocast else FP32_TOL
+    for got, ref in zip(results[1], results[0], strict=True):
+        assert got.dtype == ref.dtype
+        torch.testing.assert_close(got, ref, **tol)
+
+
+@needs_cuda
+@pytest.mark.parametrize("autocast", [False, True], ids=["fp32", "bf16-autocast"])
+def test_compiled_block_no_graph_breaks(monkeypatch, autocast):
+    from oplm import OplmConfig
+    from oplm.model.masking import segment_block_mask
+    from oplm.model.transformer import OplmBlock
+
+    torch.manual_seed(0)
+    cfg = OplmConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        canon_enabled=True,
+        canon_positions=["A", "B", "C", "D"],
+        canon_kernel_sizes=[7],
+        packed_attention="flex",
+    )
+    eager = OplmBlock(cfg, layer_idx=0).cuda().train()
+    block = copy.deepcopy(eager)
+    _, _, mask, seg = _case(2, 256, 64, 7, True, seed=26, all_pad_row=False)
+    x = torch.randn(2, 256, 64, device=DEVICE)
+    dy = torch.randn_like(x)
+
+    def forward(module):  # noqa: ANN001, ANN202
+        # As OplmStack does: the flex block mask is built inside the (compiled) forward.
+        def fn(xr):  # noqa: ANN001, ANN202
+            return module(xr, mask, segment_ids=seg, block_mask=segment_block_mask(seg))[0]
+
+        return fn
+
+    def run(module, fn, enabled):  # noqa: ANN001, ANN202
+        monkeypatch.setattr(conv_mod, "_KERNEL_ENABLED", enabled)
+        xr = x.clone().requires_grad_()
+        with torch.autocast("cuda", torch.bfloat16, enabled=autocast):
+            y = fn(xr)
+        y.backward(dy.to(y.dtype))
+        return [y, xr.grad] + [p.grad for p in module.parameters()]
+
+    ref = run(eager, forward(eager), False)
+    got = run(block, torch.compile(forward(block), fullgraph=True), True)
+    assert all(g is not None for g in got)
+    # Compiled vs eager differ by more than the conv: fusion changes rounding everywhere. Under
+    # bf16 that noise is ~1% of a tensor's scale (CPU dry run, reference conv: max error / max
+    # magnitude up to 1.3e-2; elementwise BF16_TOL fails on near-zero elements), fp32 ~1e-6. So
+    # bound the max error relative to each tensor's max magnitude; a kernel bug is O(1) on it.
+    bound = 3e-2 if autocast else 1e-3
+    for g, r in zip(got, ref, strict=True):
+        assert g.dtype == r.dtype and g.shape == r.shape
+        assert (g - r).abs().max() <= bound * r.abs().max()

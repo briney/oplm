@@ -243,8 +243,18 @@ experiments, a centered bidirectional same-length depthwise convolution, and no 
 ### Convolution window
 
 The operator is a depthwise `nn.Conv1d(D, D, kernel_size=k, groups=D, bias=False)` over sequence
-positions, run on `(B,D,T)` internally. Pad-token rows are zeroed before each convolution, so pad
-content cannot leak into real tokens. That guard is the model's responsibility, not the caller's.
+positions; the module owns that weight but computes the cross-correlation itself in the `(B,T,D)`
+layout. Pad-token rows are zeroed before each convolution, so pad content cannot leak into real
+tokens. That guard is the model's responsibility, not the caller's.
+
+On CUDA the convolution runs as a Triton kernel registered as the custom op `oplm::canon_conv`
+(`src/oplm/model/canon_kernel.py`), with its own backward, so `torch.compile` treats each Canon call
+as one opaque op. The op does the pad zeroing, the per-sequence masks of packed rows, fp32
+accumulation and, when `canon_activation` is `none`, the residual add; the weight gradient is
+reduced deterministically. Everywhere else (CPU, or no Triton) the same function runs as
+`canon_conv_reference`, `k` shifted multiply-adds, which is also the kernel's test oracle. There is
+no config switch between the two. A training run that uses the kernel first checks it against the
+reference on its first real batch (output and both gradients, in fp32) and stops on a mismatch.
 
 The library default kernel size is 4 (the paper's choice) and the run default in `base.yaml` is 7.
 For even kernels, exact token-centered symmetry is impossible in a same-length convolution. OPLM pads

@@ -5,6 +5,9 @@ source is inside the row, not a pad, and (packed rows) in the output's segment; 
 cast to `out_dtype`, then optionally `x + conv` with the raw `x`. The backward is one pass giving
 `dx` (the transposed conv, plus `dy` for the residual) and per-program fp32 `dw` partials, summed
 after. Kernels run on CUDA tensors, or on CPU tensors under `TRITON_INTERPRET=1`.
+
+`torch.ops.oplm.canon_conv` wraps them as one custom op with its own autograd, opaque to
+`torch.compile` (no graph break, no tracing into Triton): `canon_conv_kernel` is its entry point.
 """
 
 from __future__ import annotations
@@ -21,7 +24,14 @@ try:
 except ImportError:  # pragma: no cover - triton ships with torch on Linux
     TRITON_AVAILABLE = False
 
-__all__ = ["BLOCK_T", "BWD_TILES", "TRITON_AVAILABLE", "canon_backward", "canon_forward"]
+__all__ = [
+    "BLOCK_T",
+    "BWD_TILES",
+    "TRITON_AVAILABLE",
+    "canon_backward",
+    "canon_conv_kernel",
+    "canon_forward",
+]
 
 BLOCK_T = 64  # tokens per program
 BLOCK_D = 64  # channels per program
@@ -321,3 +331,75 @@ def canon_backward(
         TILES=BWD_TILES,
     )
     return dx, partials.sum(0).to(weight.dtype)
+
+
+# `custom_op`, not `triton_op`: Inductor traces into a `triton_op` body and re-emits its kernels,
+# and the op must stay opaque. Registration needs no Triton (the kernels launch only when the op
+# runs), so `import oplm` works on CPU-only installs; `CanonConv` dispatches here only on CUDA.
+# The backward is an op of its own so AOTAutograd traces it through its fake impl.
+@torch.library.custom_op("oplm::canon_conv", mutates_args=())
+def _canon_conv_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    residual: bool,
+) -> torch.Tensor:
+    return canon_forward(x, weight, attention_mask, segment_ids, out_dtype, residual)
+
+
+@_canon_conv_op.register_fake
+def _(x, weight, attention_mask, segment_ids, out_dtype, residual):  # noqa: ANN001, ANN202
+    return x.new_empty(
+        x.shape, dtype=torch.promote_types(x.dtype, out_dtype) if residual else out_dtype
+    )
+
+
+@torch.library.custom_op("oplm::canon_conv_backward", mutates_args=())
+def _canon_conv_backward_op(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    residual: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return canon_backward(dy, x, weight, attention_mask, segment_ids, out_dtype, residual)
+
+
+@_canon_conv_backward_op.register_fake
+def _(dy, x, weight, attention_mask, segment_ids, out_dtype, residual):  # noqa: ANN001, ANN202
+    return x.new_empty(x.shape), weight.new_empty(weight.shape)
+
+
+def _setup_context(ctx, inputs, output):  # noqa: ANN001, ANN202
+    x, weight, attention_mask, segment_ids, out_dtype, residual = inputs
+    ctx.save_for_backward(x, weight, attention_mask, segment_ids)
+    ctx.out_dtype = out_dtype
+    ctx.residual = residual
+
+
+def _backward(ctx, dy):  # noqa: ANN001, ANN202
+    x, weight, attention_mask, segment_ids = ctx.saved_tensors
+    dx, dw = _canon_conv_backward_op(
+        dy, x, weight, attention_mask, segment_ids, ctx.out_dtype, ctx.residual
+    )
+    return dx, dw, None, None, None, None  # no gradient for the masks or the flags
+
+
+_canon_conv_op.register_autograd(_backward, setup_context=_setup_context)
+
+
+def canon_conv_kernel(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    residual: bool,
+) -> torch.Tensor:
+    """`torch.ops.oplm.canon_conv`: Triton Canon conv with autograd; same signature and function
+    as `conv.canon_conv_reference`."""
+    return torch.ops.oplm.canon_conv(x, weight, attention_mask, segment_ids, out_dtype, residual)
