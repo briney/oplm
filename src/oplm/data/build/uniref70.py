@@ -690,6 +690,7 @@ def build_uniref70(
     mmseqs: str = "mmseqs",
     mmseqs_extra: Sequence[str] = (),
     pool: int = 250_000,
+    min_survival: float = 0.05,
     n_eval: int = 5_000,
     n_test: int = 5_000,
     rows_per_shard: int = 100_000,
@@ -780,6 +781,7 @@ def build_uniref70(
     # screen
     sc_params = {
         "pool": pool,
+        "min_survival": min_survival,
         "n_eval": n_eval,
         "n_test": n_test,
         "per_stratum": True,
@@ -814,7 +816,12 @@ def build_uniref70(
             return deep_hits | u70_hits
 
         chosen, stats = select_eval(
-            iter_rows(parts), pool=pool, n_eval=n_eval, n_test=n_test, screen=screen
+            iter_rows(parts),
+            pool=pool,
+            n_eval=n_eval,
+            n_test=n_test,
+            screen=screen,
+            min_survival=min_survival,
         )
         sc = {
             "params": sc_params,
@@ -887,6 +894,7 @@ def build_uniref70(
             "mmseqs": mmseqs,
             "mmseqs_extra": list(mmseqs_extra),
             "pool": pool,
+            "min_survival": min_survival,
             "n_eval": n_eval,
             "n_test": n_test,
             "rows_per_shard": rows_per_shard,
