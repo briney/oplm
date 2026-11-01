@@ -75,7 +75,7 @@ def main() -> None:
 
     dev = torch.device("cuda")
     seg = packed_segments(a.batch, a.seq_len, seed=0).to(dev)
-    mask = seg > 0
+    mask = (seg > 0).long()  # int64, as training's collator builds it
     print(
         f"{torch.cuda.get_device_name()} | torch {torch.__version__} | "
         f"mean segment {a.seq_len * a.batch / int(seg.max(1).values.sum()):.0f} tokens"

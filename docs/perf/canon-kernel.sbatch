@@ -9,6 +9,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
+#SBATCH --mem=256G
 #SBATCH --time=01:00:00
 #SBATCH --output=/mnt/home/briney/logs/%x_%j.out
 #SBATCH --error=/mnt/home/briney/logs/%x_%j.err
@@ -17,7 +18,8 @@ set -euo pipefail
 
 : "${OPLM_REF:?set OPLM_REF to the pushed commit, e.g. OPLM_REF=abc1234 sbatch canon-kernel.sbatch}"
 export OPLM_REF
-export OUT="${OUT:-/mnt/home/briney/projects/oplm/mup_redo/canon-kernel}"
+# Per-job default, so a rerun does not overwrite an earlier run's results.
+export OUT="${OUT:-/mnt/home/briney/projects/oplm/mup_redo/canon-kernel/$SLURM_JOB_ID}"
 
 # Creates JOB_WORK_DIR and exports W&B / storage credentials, as the sweep jobs do.
 source /mnt/home/briney/.env
@@ -36,8 +38,11 @@ srun --export=ALL \
     git -C oplm-src checkout "$OPLM_REF"
     cd oplm-src
     pip install -e ".[train,dev]"
-    nvidia-smi -L
-    python -c "import torch, triton; print(torch.__version__, triton.__version__)"
+    # Provenance: the commit, GPU and torch/triton versions behind the results in $OUT.
+    { echo "commit $(git rev-parse HEAD)"
+      nvidia-smi -L
+      python -c "import torch, triton; print(\"torch\", torch.__version__, \"triton\", triton.__version__)"
+    } | tee "$OUT/versions.txt"
     python -m pytest tests/model/test_canon_kernel.py tests/model/test_conv.py \
       tests/model/test_canon_semantics.py -q -rs 2>&1 | tee "$OUT/pytest.log"
     python docs/perf/canon_kernel_bench.py --out "$OUT/bench.json" 2>&1 | tee "$OUT/bench.log"'
