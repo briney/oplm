@@ -25,6 +25,8 @@ needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 from oplm.model.canon_kernel import (  # noqa: E402
     BLOCK_T,
     BWD_TILES,
+    BwdConfig,
+    FwdConfig,
     canon_backward,
     canon_conv_kernel,
     canon_forward,
@@ -349,6 +351,60 @@ def test_backward_deterministic():
     dx2, dw2 = canon_backward(dy, x, w, mask, seg, torch.float32, True)
     assert torch.equal(dw1, dw2)
     assert torch.equal(dx1, dx2)
+
+
+# Non-default launch configs, as the benchmark sweep tries them: tiles smaller and larger than the
+# 77-token rows and 100 channels below (so partial tiles in T and D), backward spans of one tile
+# and of several, dw reduced per tile and deferred. num_warps only matters on a GPU.
+FWD_VARIANTS = [FwdConfig(16, 32, 2), FwdConfig(32, 128, 8, 1), FwdConfig(128, 32)]
+BWD_VARIANTS = [
+    BwdConfig(16, 32, 1, True, 2),
+    BwdConfig(8, 128, 3, False),
+    BwdConfig(32, 64, 2, True, 4, 1),
+    BwdConfig(64, 32, 4, False),
+]
+DTYPE_PAIRS = [  # (x dtype, conv dtype)
+    (torch.float32, torch.float32),
+    (torch.bfloat16, torch.bfloat16),
+    (torch.float32, torch.bfloat16),
+]
+_TOL = {torch.float32: FP32_TOL, torch.bfloat16: BF16_TOL}
+
+
+@kernel
+@pytest.mark.parametrize("dtypes", DTYPE_PAIRS, ids=["fp32", "bf16", "mixed"])
+@pytest.mark.parametrize("packed", [True, False])
+@pytest.mark.parametrize("k", [2, 7])
+@pytest.mark.parametrize("cfg", FWD_VARIANTS, ids=str)
+def test_forward_configs(cfg, k, packed, dtypes):
+    x_dtype, out_dtype = dtypes
+    x, w, mask, seg = _case(2, 77, 100, k, packed, seed=k, dtype=x_dtype, interior_pads=True)
+    for residual in (True, False):
+        out = canon_forward(x, w, mask, seg, out_dtype, residual, config=cfg)
+        ref = canon_conv_reference(x, w, mask, seg, out_dtype, residual)
+        assert out.dtype == ref.dtype
+        torch.testing.assert_close(out, ref, **_TOL[out_dtype])
+
+
+@kernel
+@pytest.mark.parametrize("dtypes", DTYPE_PAIRS, ids=["fp32", "bf16", "mixed"])
+@pytest.mark.parametrize("packed", [True, False])
+@pytest.mark.parametrize("k", [2, 7])
+@pytest.mark.parametrize("cfg", BWD_VARIANTS, ids=str)
+def test_backward_configs(cfg, k, packed, dtypes):
+    x_dtype, out_dtype = dtypes
+    x, w, mask, seg = _case(2, 77, 100, k, packed, seed=k, dtype=x_dtype, interior_pads=True)
+    for residual in (True, False):
+        y_dtype = torch.promote_types(x_dtype, out_dtype) if residual else out_dtype
+        dy = torch.randn(x.shape, generator=torch.Generator().manual_seed(k)).to(DEVICE, y_dtype)
+        xr, wr = x.detach().requires_grad_(), w.detach().requires_grad_()
+        canon_conv_reference(xr, wr, mask, seg, out_dtype, residual).backward(dy)
+        dx, dw = canon_backward(dy, x, w, mask, seg, out_dtype, residual, config=cfg)
+        torch.testing.assert_close(dx, xr.grad, **_TOL[x_dtype])
+        torch.testing.assert_close(dw, wr.grad, **FP32_TOL)
+        _assert_pad_grads(dx, dy, mask, residual)
+        again = canon_backward(dy, x, w, mask, seg, out_dtype, residual, config=cfg)
+        assert torch.equal(dw, again[1])  # deterministic per config
 
 
 # --- the oplm::canon_conv op, its autograd, and CanonConv dispatch ---
