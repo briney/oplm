@@ -325,6 +325,82 @@ W&B run names are `<phase>-<preset>-lr<lr>-om<output_mult>-a<depth_exponent>-s<s
 runs every cell of a phase sequentially on one node and ranks it, for checking a new sweep config
 before committing an allocation; it is mutually exclusive with `--submit`.
 
+## ESM-C funnel
+
+The ESM-C comparison model (`src/oplm/configs/train/esm-c.yaml`) gets its own run of the same
+funnel, in AdamW-only μP mode. Its `train.lr` and `model.mup_output_mult` are placeholders until
+this campaign fills them in. An OPLM result can't be reused: the optimizer, the norms, the residual
+scaling and the FFN all differ, and an AdamW base LR isn't on the same scale as a Muon one.
+
+Run every phase as in [Commands](#commands), with these differences.
+
+### ESM-C sweep config
+
+Build the sweep config exactly as in [Sweep config](#sweep-config), so data, context, batch,
+eval and `slurm:` match the OPLM funnel. Then merge `esm-c.yaml` over it, ESM-C winning, and give
+the result its own W&B project and sweep directory:
+
+```bash
+python -c "import sys; from omegaconf import OmegaConf as O; \
+  O.save(O.merge(O.load(sys.argv[1]), O.load(sys.argv[2])), sys.argv[3])" \
+  $HOME/oplm-sweep/sweep.yaml src/oplm/configs/train/esm-c.yaml $HOME/oplm-sweep/sweep-esmc.yaml
+```
+
+Set `train.wandb_project` in `sweep-esmc.yaml` to a new project (for example `oplm-mup-esmc-4M`).
+`esm-c.yaml` pins every architecture and optimizer knob, so nothing from the OPLM recipe leaks
+through the merge; data, batch, schedule and `slurm:` come from the sweep config. The sweep's
+`train.weight_decay=0.01` requirement holds (ESM-C pins 0.01), and the Muon-only
+`muon_adjust_lr_fn` check doesn't apply. Keep the same `oplm` version pin for every phase.
+
+```bash
+CONFIG=$HOME/oplm-sweep/sweep-esmc.yaml
+SWEEP=$HOME/oplm-sweep/sweeps-esmc
+```
+
+### ESM-C coordinate check
+
+`coord-check` takes the optimizer from `--optimizer` (default `muon`), not from the config, so pass
+`--optimizer adamw` to every run:
+
+```bash
+oplm sweep coord-check --config $CONFIG --optimizer adamw \
+  --scaling width --widths 384,768,1536 --depth 24 --base-width 768 --out $SWEEP/coord-width
+oplm sweep coord-check --config $CONFIG --optimizer adamw --no-mup \
+  --scaling width --widths 384,768,1536 --depth 24 --base-width 768 --out $SWEEP/coord-width-control
+oplm sweep coord-check --config $CONFIG --optimizer adamw \
+  --scaling preset_ray --widths 512,768,1024,1280 --base-width 768 --out $SWEEP/coord-ray
+```
+
+Read it as in [Coordinate check](#coordinate-check).
+
+### ESM-C LR grid
+
+Run `smoke` with its default LRs (0.0004, 0.0016, 0.0063), then pick the `coarse` grid from the
+result. The coarse winner must be interior, or `refine` gets nothing:
+
+- smoke best at 0.0016: the built-in default grid (0.0004 to 0.0063, 1.6× spacing) is fine, so
+  `--lrs` can be left off;
+- smoke best at 0.0004: shift the grid down, for example
+  `--lrs 0.0001,0.00016,0.00025,0.0004,0.00063,0.001,0.0016,0.0025`;
+- smoke best at 0.0063: use the OPLM refresh grid
+  `--lrs 0.00063,0.001,0.0016,0.0025,0.004,0.0063,0.01,0.016`.
+
+`refine`, the decays, `replicate` and `confirm` then run with the same commands and the same
+decayed-loss ranking. Pick the replicate and confirm candidates from the ESM-C results. In
+`confirm`, keep the depth exponent at 0.5. ESM-C's `esmc` residual scaling (`1/√(L/36)`) is a
+constant times `1/√L`, so the derivation in [Depth correction](#depth-correction) still gives
+`e = 0.5`.
+
+### Where the ESM-C result goes
+
+Write the winning `train.lr` and `model.mup_output_mult` into `src/oplm/configs/train/esm-c.yaml`
+and drop their `PLACEHOLDER` comments. Leave `base.yaml` and `configs/scaling.yaml` alone; they
+hold the OPLM recipe.
+
+Like the OPLM value, the ESM-C winner is a 24k-horizon LR. The OPLM LR-vs-length trend
+([LR vs training length](#lr-vs-training-length)) was measured with Muon, so it isn't known
+whether AdamW's best LR falls at the same rate.
+
 ## What to check
 
 ### Coordinate check
@@ -356,7 +432,7 @@ Final `eval/uniref70/loss` from the refresh. A re-run on the same data should la
   refine cell was 0.0063 at output multiplier 2 (2.0771). The recipe keeps 1.
 - **The optimum is bracketed.** 0.004 is clearly worse. At output multiplier 1, 0.01 finished 0.002
   behind 0.0063 on seed 42 (0.0009 behind the 3-seed mean), and within 0.0005 at 0.5 and 2. The
-  basin is flat between 0.0063 and 0.01 (vertex ≈0.007), consistent with ~0.008 at 24k in
+  basin is flat between 0.0063 and 0.01 (vertex ≈0.007), consistent with ~0.007 at 24k in
   [LR vs training length](#lr-vs-training-length).
 - **Replicate (3 seeds, decayed, output multiplier 1):** 0.0063 2.0786 against 0.004 2.0812, a gap
   of 0.0026 (about 4.5 standard errors). Undecayed, the order reverses.
@@ -377,27 +453,42 @@ the reason the residual gate was dropped (see [Why and what was ruled out](#why-
 
 ## LR vs training length
 
-The best LR falls as training gets longer. Estimated best LR, on decayed loss:
+The best LR falls as training gets longer. The long 170M campaign (W&B `thebrineylab/oplm-170M-long`,
+current recipe, seed 42) ran 0.0016, 0.004 and 0.0063 to 300k steps, decaying over the last 50k
+steps, plus 20% decay branches off the 50k and 100k checkpoints. The best LR is the vertex of a
+parabola in log LR through the three decayed losses (`eval/uniref70/loss`):
 
-| Training length (steps at 4,194,304 tokens) | Estimated best LR |
-| ---: | ---: |
-| 24k | ~0.008 |
-| 60k | ~0.0043 |
-| 120k | ~0.0033 |
+| Training length (steps at 4,194,304 tokens) | 0.0016 | 0.004 | 0.0063 | Estimated best LR |
+| ---: | ---: | ---: | ---: | ---: |
+| 24k (funnel) | — | — | — | ~0.007 |
+| 60k (50k → 60k decay) | 2.0355 | **2.0256** | 2.0265 | 0.0045 |
+| 120k (100k → 120k decay) | 1.9974 | **1.9910** | 1.9927 | 0.0040 |
+| 300k (250k → 300k decay) | 1.9537 | **1.9516** | 1.9549 | 0.0030 |
+
+A power law through these points falls as steps^−0.33 (steps^−0.26 without the 24k point), which
+puts the best LR at **~0.0017–0.002 for 1.5M steps** and **~0.0014–0.0017 for 3M steps**. That is a
+5–10× extrapolation from the last measured point; the step-to-step slope is noisy (−0.17 from 60k
+to 120k, −0.31 from 120k to 300k), and each long-horizon point is a single seed.
+
+The basin is flat: at 300k the whole 4× bracket spans 0.0033, and a 2× miss costs about
+0.002–0.003, roughly symmetric in log LR. As in the funnel, rank only after decay. Undecayed, 0.0016
+led at every horizon and by more the longer the run (2.0138 against 2.0289 for 0.004 at 250k), but
+its decay gain was only 75–80% of 0.004's, so it finished behind.
 
 The funnel ranks at 24k, so `train.lr` in `src/oplm/configs/train/base.yaml` (and in
 `configs/scaling.yaml`) is a 24k-horizon value, too high for a production run of millions of steps.
-The production LR comes from extrapolating this trend to the production length. Width transfer still
-holds: the extrapolated value is a base LR, used unchanged at every preset.
+Width transfer still holds: the extrapolated value is a base LR, used unchanged at every preset.
+The full analysis is on #55.
 
-> **Pending:** the long-run LR-vs-length results and the extrapolated production LR (waiting on #55).
+> **Pending:** the production LR, set from this trend once the production horizon is fixed
+> (waiting on #70).
 
 ## Decay recipe
 
 The 20% linear tail in the funnel is a ranking device: it makes each cell's loss comparable to the
 end of a real run. It is not the production decay.
 
-> **Pending:** the production decay shape, length fraction and LR floor (waiting on #55).
+> **Pending:** the production decay shape, length fraction and LR floor (waiting on #58).
 
 Whatever the decay recipe turns out to be, keep the optimizer state through the stable-to-decay
 transition, including the data-mix change there: no momentum reset and no second warmup. A branch
@@ -413,11 +504,8 @@ The mechanics of running a decay off a stable-phase checkpoint are in
   these. Re-run the funnel with the new values in the sweep config (`--global-tokens` for the
   batch).
 - **A different optimizer or architecture recipe.** Re-run the coordinate check and the funnel with
-  that recipe as `--config`. For the ESM-C comparison model (AdamW-only μP), merge
-  `src/oplm/configs/train/esm-c.yaml` over the sweep config as shown in
-  [training.md, *Optimizer and schedule*](training.md#optimizer-and-schedule), pass
-  `--optimizer adamw` to `coord-check`, and write the winning `train.lr` and `model.mup_output_mult`
-  back into `esm-c.yaml`. Its current values are placeholders until that campaign runs.
+  that recipe as `--config`. The ESM-C comparison model (AdamW-only μP) has its own funnel:
+  [ESM-C funnel](#esm-c-funnel).
 - **`model.mup_base_width`, `model.mup_output_mult`, `train.adamw_lr_mult`,
   `train.mup_depth_lr_exponent` or `train.weight_decay_to_init`.** These were tuned together.
   Changing the base width moves the anchor, so results tuned at one base width don't carry over to

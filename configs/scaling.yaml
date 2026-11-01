@@ -13,7 +13,7 @@ model:
   residual_gate: none
 
 train:
-  # Tuned at 4M tok/step for 24k steps. PENDING(#55): best LR falls with training length;
+  # Tuned at 4M tok/step for 24k steps. PENDING(#70): best LR falls with training length;
   # production value comes from the LR-vs-length extrapolation (docs/mup-lr.md).
   lr: 0.0063
   weight_decay_to_init: 0.1
@@ -24,7 +24,7 @@ train:
   # train.batch_tokens=<slurm.max_batch_tokens[preset]> on the generate command line.
   batch_tokens: 65536
   scheduler: wsd_linear
-  # 170M long-run horizon. PENDING(#55): production horizon.
+  # 170M long-run horizon. PENDING(#70): production horizon.
   # 2k warmup + 248k stable + 50k decay = 300k max_steps. Keep warmup_steps + stable_steps
   # strictly less than max_steps so the decay phase exists (the sweep-phase convention of
   # stable_steps = max_steps - warmup_steps is for short proxy runs and does not belong here).

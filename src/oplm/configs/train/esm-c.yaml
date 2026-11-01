@@ -20,7 +20,7 @@
 #     my-run.yaml src/oplm/configs/train/esm-c.yaml esmc-run.yaml
 #
 # μP is on (AdamW-only mode, see docs/mup-lr.md, "Recipe"). lr and mup_output_mult are
-# PLACEHOLDERS until the ESM-C μP campaign (docs/mup-lr.md, "How to change it") fills them in.
+# PLACEHOLDERS until the ESM-C μP campaign (docs/mup-lr.md, "ESM-C funnel") fills them in.
 model:
   num_loops: 1
   loop_strategy: stack

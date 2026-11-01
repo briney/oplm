@@ -145,10 +145,10 @@ def test_pending_markers_present() -> None:
     expect = {  # doc → issue numbers whose Pending markers must appear in it
         "docs/data.md": ["#61", "#58"],
         "docs/training.md": ["#62"],
-        "docs/mup-lr.md": ["#55"],
+        "docs/mup-lr.md": ["#70", "#58"],
         "docs/inference.md": ["#62"],
         "docs/evaluation.md": ["#57"],
-        "docs/reproduce.md": ["#55", "#58"],  # decay recipe, loss / P@L ranges; data mix
+        "docs/reproduce.md": ["#70", "#58"],  # LR, horizon, loss / P@L ranges; decay recipe, data mix
     }
     for doc, issues in expect.items():
         # each marker is its blockquote: the Pending line plus the consecutive ">" lines after it
