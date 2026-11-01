@@ -155,9 +155,10 @@ Every command takes one config. Make it from the production recipe:
 1. Copy [`configs/scaling.yaml`](../configs/scaling.yaml) to an absolute path on shared storage,
    for example `$HOME/oplm-sweep/sweep.yaml`. It already carries the production context, packing,
    flex attention, static compile, data mix and token mode.
-2. Keep only the `uniref70` entry under `data.eval`, evaluated every 500 steps. The harness infers
-   its ranking metric (`eval/uniref70/loss`) when there is exactly one eval task, and the structure
-   evals only cost time.
+2. Keep one sequence eval under `data.eval`, evaluated every 500 steps. The harness infers its
+   ranking metric (`eval/<name>/loss`) when there is exactly one eval task, and the structure
+   evals only cost time. The refresh below used the old `uniref70` eval (`eval/uniref70/loss`),
+   since dropped; `scaling.yaml` now has `uniref70_singletons` and `uniref70_gte2`.
 3. Set `train.wandb_project` so every cell lands in one W&B project. There is no flag for it.
 4. Size the `slurm:` block for the sweep. The refresh ran:
 

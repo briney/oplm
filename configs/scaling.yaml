@@ -47,7 +47,7 @@ data:
   pack_sequences: true
   train:
     # PENDING(#61): paths become the published training-set layout.
-    # Rows, not tokens (0.05 rows ≈ 11% tokens). PENDING(#58): production mix.
+    # Rows, not tokens (0.05 rows ≈ 12% tokens). PENDING(#58): production mix.
     uniref70:
       path: /path/to/oplm-training-data/uniref70/train
       fraction: 0.05
@@ -55,8 +55,13 @@ data:
       path: /path/to/oplm-training-data/deepclust70/train
       fraction: 0.95
   eval:
-    uniref70:
-      path: /path/to/oplm-training-data/uniref70/eval.parquet
+    # Held-out uniref70 clusters, 5,000 per stratum (docs/data.md, *Held-out sequences*).
+    uniref70_singletons:
+      path: /path/to/oplm-training-data/uniref70/eval_singletons.parquet
+      type: sequence
+      every: {steps: 500}
+    uniref70_gte2:
+      path: /path/to/oplm-training-data/uniref70/eval_gte2.parquet
       type: sequence
       every: {steps: 500}
     # Structure evals (contact precision@L), published as brineylab/oplm-structure-evals.
