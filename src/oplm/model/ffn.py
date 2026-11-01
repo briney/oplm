@@ -46,8 +46,7 @@ def _apply_canon_d(
         return branch
     if attention_mask is None:
         raise ValueError("Canon-D requires an attention_mask to zero pad positions.")
-    convolved = conv_d(branch, attention_mask, segment_ids)
-    return branch + convolved if canon_residual else convolved
+    return conv_d(branch, attention_mask, segment_ids, residual=canon_residual)
 
 
 class SwiGLU(nn.Module):

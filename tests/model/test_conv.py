@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from oplm.model.conv import CanonConv, resolve_canon_kernel_sizes
+from oplm.model.conv import CanonConv, canon_conv_reference, resolve_canon_kernel_sizes
 
 # ---------------------------------------------------------------------------
 # CanonConv shape / construction
@@ -263,3 +263,35 @@ def test_canon_conv_output_dtype_follows_autocast():
     assert conv(x, mask).dtype == torch.float32
     with torch.autocast("cpu", dtype=torch.bfloat16):
         assert conv(x, mask).dtype == torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# residual argument / functional reference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("activation", ["none", "silu"])
+def test_residual_matches_explicit_add(activation: str, packed: bool):
+    torch.manual_seed(0)
+    conv = CanonConv(channels=8, kernel_size=3, activation=activation)
+    x = torch.randn(2, 9, 8)
+    mask = torch.ones(2, 9, dtype=torch.long)
+    mask[:, -2:] = 0
+    seg = None
+    if packed:
+        seg = torch.tensor([[1, 1, 1, 2, 2, 2, 2, 0, 0]] * 2)
+    assert torch.equal(conv(x, mask, seg, residual=True), x + conv(x, mask, seg))
+
+
+@pytest.mark.parametrize("kernel_size", [2, 3, 4, 7])
+def test_reference_function_matches_module(kernel_size: int):
+    torch.manual_seed(0)
+    conv = CanonConv(channels=8, kernel_size=kernel_size)
+    x = torch.randn(2, 9, 8)
+    mask = torch.ones(2, 9, dtype=torch.long)
+    mask[:, -2:] = 0
+    seg = torch.tensor([[1, 1, 1, 2, 2, 2, 2, 0, 0]] * 2)
+    for s in (None, seg):
+        ref = canon_conv_reference(x, conv.conv.weight.squeeze(1), mask, s, x.dtype, residual=False)
+        assert torch.equal(ref, conv(x, mask, s))

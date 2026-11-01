@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 from .masking import zero_pad_positions
 
-__all__ = ["CanonConv", "resolve_canon_kernel_sizes"]
+__all__ = ["CanonConv", "canon_conv_reference", "resolve_canon_kernel_sizes"]
 
 
 _ACTIVATIONS = {
@@ -85,36 +85,57 @@ class CanonConv(nn.Module):
         x: torch.Tensor,
         attention_mask: torch.Tensor,
         segment_ids: torch.Tensor | None = None,
+        residual: bool = False,
     ) -> torch.Tensor:
-        # (B, T, D) -> (B, T, D). With `segment_ids` (packed rows: 1..n per sequence, 0 at pads), a
-        # tap that would read a token of a neighboring sequence contributes zero instead.
+        # (B, T, D) -> (B, T, D); returns `x + act(conv)` when `residual`, else `act(conv)`.
         device_type = x.device.type
         if torch.is_autocast_enabled(device_type):
             out_dtype = torch.get_autocast_dtype(device_type)
         else:
             out_dtype = x.dtype
-        x = zero_pad_positions(x, attention_mask)
-        k = self.kernel_size
-        left = k // 2  # odd k: k//2 on both sides; even k: (k//2, k//2 - 1), as above
-        padded = F.pad(x, (0, 0, left, k - 1 - left)).float()  # pad the time axis
-        weight = self.conv.weight.squeeze(1).float()  # (D, k) cross-correlation taps
-        length = x.shape[1]
-        keep = None  # packed rows: per tap, whether it stays inside the output's sequence
-        if segment_ids is not None:
-            seg = F.pad(segment_ids, (left, k - 1 - left), value=-1)
-            keep = [seg[:, i : i + length].eq(segment_ids).unsqueeze(-1) for i in range(k)]
-        out = padded[:, :length] * weight[:, 0]
-        if keep is not None:
-            out = out * keep[0]
-        for i in range(1, k):
-            tap = padded[:, i : i + length] * weight[:, i]
-            if keep is not None:
-                tap = tap * keep[i]
-            out = out + tap
-        out = out.to(out_dtype)
+        out = canon_conv_reference(
+            x, self.conv.weight.squeeze(1), attention_mask, segment_ids, out_dtype, False
+        )
         if self._activation is not None:
             out = self._activation(out)
-        return out
+        return x + out if residual else out
+
+
+def canon_conv_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    residual: bool,
+) -> torch.Tensor:
+    """Shift-add Canon conv (no activation): `(B, T, D)` -> `(B, T, D)`.
+
+    `weight` is `(D, k)`. With `segment_ids` (packed rows: 1..n per sequence, 0 at pads), a tap
+    that would read a token of a neighboring sequence contributes zero instead. Returns the conv
+    in `out_dtype`, or `x + conv` (promoted dtype, raw `x`) when `residual`.
+    """
+    x_in = x
+    x = zero_pad_positions(x, attention_mask)
+    k = weight.shape[1]
+    left = k // 2  # odd k: k//2 on both sides; even k: (k//2, k//2 - 1), as above
+    padded = F.pad(x, (0, 0, left, k - 1 - left)).float()  # pad the time axis
+    weight = weight.float()  # (D, k) cross-correlation taps
+    length = x.shape[1]
+    keep = None  # packed rows: per tap, whether it stays inside the output's sequence
+    if segment_ids is not None:
+        seg = F.pad(segment_ids, (left, k - 1 - left), value=-1)
+        keep = [seg[:, i : i + length].eq(segment_ids).unsqueeze(-1) for i in range(k)]
+    out = padded[:, :length] * weight[:, 0]
+    if keep is not None:
+        out = out * keep[0]
+    for i in range(1, k):
+        tap = padded[:, i : i + length] * weight[:, i]
+        if keep is not None:
+            tap = tap * keep[i]
+        out = out + tap
+    out = out.to(out_dtype)
+    return x_in + out if residual else out
 
 
 def resolve_canon_kernel_sizes(spec: Any, num_hidden_layers: int) -> list[int]:
