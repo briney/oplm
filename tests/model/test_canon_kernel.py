@@ -419,6 +419,21 @@ def _packed_rows(B: int, T: int, D: int, k: int, dtype: torch.dtype, seed: int =
     return x, torch.randn(D, k, generator=gen).to(DEVICE), mask.long(), seg
 
 
+def _assert_close_up_to_flip(got, ref, tol, residual_in):
+    """`assert_close`, plus (with `residual_in`) one bf16 ulp of the conv term `ref - residual_in`
+    per element. The GPU kernel accumulates with FMA, so about one fp32 conv value in 10^7 lands on
+    the other side of a bf16 rounding boundary than the shift-add reference's; `x + conv` keeps
+    that full ulp even where the sum cancels to near zero (first B200 run: 0.0156 on a 0.09 sum)."""
+    if residual_in is None:
+        torch.testing.assert_close(got, ref, **tol)
+        return
+    ref = ref.double()
+    conv = (ref - residual_in.double()).abs()
+    ulp = torch.ldexp(torch.ones_like(conv), torch.frexp(conv).exponent - 8)
+    excess = (got.double() - ref).abs() - (tol["atol"] + tol["rtol"] * ref.abs() + ulp)
+    assert excess.max() <= 0, f"max excess {excess.max().item():.3g} beyond one bf16 ulp of conv"
+
+
 def _assert_op_matches_reference(x, w, mask, seg, out_dtype, residual):
     """Output, `dx` and `dW` of the op vs autograd through the reference; `dW` (a sum over every
     token) gets a scale-relative atol, as in `canon_self_check`."""
@@ -427,8 +442,10 @@ def _assert_op_matches_reference(x, w, mask, seg, out_dtype, residual):
     got = _op_and_reference_grads(canon_conv_kernel, x, w, mask, seg, out_dtype, residual, dy)
     ref = _op_and_reference_grads(canon_conv_reference, x, w, mask, seg, out_dtype, residual, dy)
     tol = {torch.float32: FP32_TOL, torch.bfloat16: BF16_TOL}
-    torch.testing.assert_close(got[0], ref[0], **tol[out_dtype])
-    torch.testing.assert_close(got[1], ref[1], **tol[x.dtype])
+    bf16_res = residual and out_dtype == torch.bfloat16
+    _assert_close_up_to_flip(got[0], ref[0], tol[out_dtype], x if bf16_res else None)
+    bf16_res = residual and x.dtype == torch.bfloat16
+    _assert_close_up_to_flip(got[1], ref[1], tol[x.dtype], dy if bf16_res else None)
     atol = 1e-4 * ref[2].abs().max().clamp_min(1).item()
     torch.testing.assert_close(got[2], ref[2], rtol=1e-4, atol=atol)
 
