@@ -429,10 +429,11 @@ def canon_self_check(
     Each `CanonConv` call's `x`, `attention_mask` and `segment_ids` go through `kernel` and
     `canon_conv_reference` in fp32 with the residual flag `CanonConv.forward` gives the op (the
     conv before any activation); one random `dy` is backpropagated through both, and the output,
-    `dx` and `dW` must agree within `rtol = atol = 1e-4` or `CanonKernelMismatch` is raised. The
-    forward runs under `no_grad` on detached inputs (no parameter `.grad`), the RNG state (CPU and
-    the model's CUDA device) is restored after, and the hooks are always removed. Returns the
-    number of calls checked.
+    `dx` and `dW` must each agree within `rtol = 1e-4`, `atol = 1e-4 * max(1, max|ref|)` (finite
+    entries; matching NaNs pass), or `CanonKernelMismatch` is raised. The forward runs under
+    `no_grad` on detached inputs (no parameter `.grad`), the RNG state (CPU and the model's CUDA
+    device) is restored after, and the hooks are always removed. Returns the number of calls
+    checked.
     """
     from .conv import CanonConv, canon_conv_reference  # conv.py imports this module
 
@@ -456,15 +457,23 @@ def canon_self_check(
                 for fn in (kernel, canon_conv_reference):
                     out = fn(x, w, a["attention_mask"], a["segment_ids"], torch.float32, residual)
                     results.append((out.detach(), *torch.autograd.grad(out, (x, w), dy)))
-            pairs = list(zip(("out", "dx", "dW"), *results, strict=True))
+            # Scale-relative atol: dW sums over every token, so its fp32 error grows with |x|.
+            checks = [
+                (n, got, ref, 1e-4 * ref.abs().nan_to_num(0.0, 0.0).max().clamp_min(1).item())
+                for n, got, ref in zip(("out", "dx", "dW"), *results, strict=True)
+            ]
             if not all(
-                torch.allclose(got, ref, rtol=1e-4, atol=1e-4, equal_nan=True)
-                for _, got, ref in pairs
+                torch.allclose(got, ref, rtol=1e-4, atol=atol, equal_nan=True)
+                for _, got, ref, atol in checks
             ):
-                errors = ", ".join(f"{n} {(g - r).abs().max().item():.3g}" for n, g, r in pairs)
+                errors = ", ".join(
+                    f"{n} {(g - r).abs().max().item():.3g} (atol {atol:.3g})"
+                    for n, g, r, atol in checks
+                )
                 raise CanonKernelMismatch(
                     f"Canon kernel != reference at {name} (input {tuple(x.shape)}, "
-                    f"k={module.kernel_size}, residual={residual}); max abs error: {errors}"
+                    f"k={module.kernel_size}, residual={residual}); max abs error vs tol "
+                    f"(rtol 1e-4): {errors}"
                 )
             calls += 1
 

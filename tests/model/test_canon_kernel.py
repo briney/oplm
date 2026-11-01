@@ -650,3 +650,28 @@ def test_self_check_with_kernel():
 
     model, batch = _self_check_model_and_batch()
     assert canon_self_check(model, lambda: model(**batch)) == 2 * 6
+
+
+@pytest.mark.parametrize(("shift", "raises"), [(1e-5, False), (1e-2, True)])
+def test_self_check_tolerance_scales_with_tensor(shift, raises):
+    # x std 20: a kernel off by 1e-5 of the output's max is fp32 summation noise and must pass (an
+    # absolute 1e-4 would flag it); 1e-2 of the max is a bug and must raise.
+    from oplm.model.canon_kernel import CanonKernelMismatch, canon_self_check
+
+    torch.manual_seed(0)
+    module = CanonConv(64, 7)
+    x, _, mask, seg = (t.cpu() for t in _case(4, 512, 64, 7, True, seed=27))
+    x = x * 20
+
+    def shifted(*args):  # noqa: ANN002, ANN202
+        out = canon_conv_reference(*args)
+        return out + shift * out.detach().abs().max()
+
+    def run():  # noqa: ANN202
+        return canon_self_check(module, lambda: module(x, mask, seg, residual=True), kernel=shifted)
+
+    if raises:
+        with pytest.raises(CanonKernelMismatch, match="tol"):
+            run()
+    else:
+        assert run() == 1
