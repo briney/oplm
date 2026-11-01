@@ -97,6 +97,17 @@ Exactly today's semantics (see `CanonConv` and `tests/model/test_canon_semantics
   No config option (my call; see below).
 - **The reference implementation stays** in `conv.py` as the fallback and the oracle; it is not
   deleted.
+- **Startup self-check (Bryan, 2026-11-01).** At the start of every training run that will use
+  the kernel, before the first optimizer step, run one eager forward of the uncompiled model on
+  the first rows (up to 4) of the first real training batch with every `CanonConv` checked in place: for each call, run the
+  kernel and the reference on that call's actual `x`, `attention_mask` and `segment_ids` (cast to
+  fp32, so the comparison is not limited by bf16 rounding), backprop the same random `dy` through
+  both, and compare the output, `dx` and `dW`. Any mismatch beyond fp32 tolerance raises with the
+  module name, shapes and the max error, and the run stops before training. Checking inline, one
+  call at a time, keeps memory bounded (inputs are not held across layers). It runs on every rank,
+  costs well under a second, needs no config option, and covers model sizes, kernel sizes and
+  packing patterns the tests never saw. It is skipped when the kernel is not in use (CPU,
+  `canon_enabled: false`). On resume it runs again, which is intended.
 
 ## Acceptance
 
