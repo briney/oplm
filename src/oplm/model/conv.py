@@ -15,6 +15,19 @@ from .masking import zero_pad_positions
 __all__ = ["CanonConv", "canon_conv_reference", "resolve_canon_kernel_sizes"]
 
 _KERNEL_ENABLED = True  # tests only: False forces the reference path on CUDA
+_KERNEL_DTYPES = (torch.float32, torch.bfloat16)  # the dtypes the kernel tests cover
+
+
+def _use_kernel(x: torch.Tensor, out_dtype: torch.dtype) -> bool:
+    """Whether `CanonConv` runs the Triton op: CUDA, Triton, and a kernel-tested dtype (else the
+    reference, e.g. for `model.double()`)."""
+    return (
+        _KERNEL_ENABLED
+        and TRITON_AVAILABLE
+        and x.is_cuda
+        and x.dtype in _KERNEL_DTYPES
+        and out_dtype in _KERNEL_DTYPES
+    )
 
 
 _ACTIVATIONS = {
@@ -97,8 +110,7 @@ class CanonConv(nn.Module):
             out_dtype = torch.get_autocast_dtype(device_type)
         else:
             out_dtype = x.dtype
-        use_kernel = _KERNEL_ENABLED and TRITON_AVAILABLE and x.is_cuda
-        conv = canon_conv_kernel if use_kernel else canon_conv_reference
+        conv = canon_conv_kernel if _use_kernel(x, out_dtype) else canon_conv_reference
         weight = self.conv.weight.squeeze(1)  # (D, k) view: autograd gives dW back as (D, 1, k)
         if self._activation is None:  # the residual folds into the conv call
             return conv(x, weight, attention_mask, segment_ids, out_dtype, residual)

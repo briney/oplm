@@ -261,15 +261,15 @@ def canon_forward(
         attention_mask.stride(1),
         seg.stride(0),
         seg.stride(1),
-        K=k,
-        LEFT=k // 2,
-        HAS_SEG=segment_ids is not None,
-        RESIDUAL=residual,
-        CONV_DTYPE=_TL_DTYPES[out_dtype],
-        ROUND_CONV=interpret and out_dtype == torch.bfloat16,
-        ROUND_OUT=interpret and out.dtype == torch.bfloat16,
-        BLOCK_T=BLOCK_T,
-        BLOCK_D=BLOCK_D,
+        K=k,  # ty: ignore[invalid-argument-type]  # Triton boundary: plain values for tl.constexpr
+        LEFT=k // 2,  # ty: ignore[invalid-argument-type]
+        HAS_SEG=segment_ids is not None,  # ty: ignore[invalid-argument-type]
+        RESIDUAL=residual,  # ty: ignore[invalid-argument-type]
+        CONV_DTYPE=_TL_DTYPES[out_dtype],  # ty: ignore[invalid-argument-type]
+        ROUND_CONV=interpret and out_dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
+        ROUND_OUT=interpret and out.dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
+        BLOCK_T=BLOCK_T,  # ty: ignore[invalid-argument-type]
+        BLOCK_D=BLOCK_D,  # ty: ignore[invalid-argument-type]
     )
     return out
 
@@ -318,17 +318,17 @@ def canon_backward(
         attention_mask.stride(1),
         seg.stride(0),
         seg.stride(1),
-        K=k,
+        K=k,  # ty: ignore[invalid-argument-type]  # Triton boundary: plain values for tl.constexpr
         K_POW2=triton.next_power_of_2(k),
-        LEFT=k // 2,
-        HAS_SEG=segment_ids is not None,
-        RESIDUAL=residual,
-        CONV_DTYPE=_TL_DTYPES[out_dtype],
-        ROUND_G=interpret and out_dtype == torch.bfloat16,
-        ROUND_DX=interpret and x.dtype == torch.bfloat16,
-        BLOCK_T=BLOCK_T,
-        BLOCK_D=BLOCK_D,
-        TILES=BWD_TILES,
+        LEFT=k // 2,  # ty: ignore[invalid-argument-type]
+        HAS_SEG=segment_ids is not None,  # ty: ignore[invalid-argument-type]
+        RESIDUAL=residual,  # ty: ignore[invalid-argument-type]
+        CONV_DTYPE=_TL_DTYPES[out_dtype],  # ty: ignore[invalid-argument-type]
+        ROUND_G=interpret and out_dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
+        ROUND_DX=interpret and x.dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
+        BLOCK_T=BLOCK_T,  # ty: ignore[invalid-argument-type]
+        BLOCK_D=BLOCK_D,  # ty: ignore[invalid-argument-type]
+        TILES=BWD_TILES,  # ty: ignore[invalid-argument-type]
     )
     return dx, partials.sum(0).to(weight.dtype)
 

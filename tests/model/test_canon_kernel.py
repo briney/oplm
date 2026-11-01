@@ -466,9 +466,36 @@ def test_module_kernel_matches_reference(monkeypatch, activation, residual, auto
         torch.testing.assert_close(got, ref, **tol)
 
 
+def test_dispatch_predicate(monkeypatch):
+    # Kernel only for CUDA tensors with Triton and kernel-tested dtypes; fp64 (`model.double()`)
+    # and fp16 take the reference instead of a KeyError in the launch.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(conv_mod, "TRITON_AVAILABLE", True)
+    f32, bf16 = torch.float32, torch.bfloat16
+
+    def cuda(dtype):  # noqa: ANN001, ANN202 — a stand-in: CPU-only machines have no CUDA tensor
+        return SimpleNamespace(is_cuda=True, dtype=dtype)
+
+    assert conv_mod._use_kernel(cuda(f32), f32)
+    assert conv_mod._use_kernel(cuda(f32), bf16)
+    assert conv_mod._use_kernel(cuda(bf16), bf16)
+    assert not conv_mod._use_kernel(cuda(torch.float64), torch.float64)
+    assert not conv_mod._use_kernel(cuda(torch.float64), bf16)
+    assert not conv_mod._use_kernel(cuda(f32), torch.float16)
+    assert not conv_mod._use_kernel(torch.zeros(1), f32)  # CPU
+    monkeypatch.setattr(conv_mod, "_KERNEL_ENABLED", False)
+    assert not conv_mod._use_kernel(cuda(f32), f32)
+    monkeypatch.setattr(conv_mod, "_KERNEL_ENABLED", True)
+    monkeypatch.setattr(conv_mod, "TRITON_AVAILABLE", False)
+    assert not conv_mod._use_kernel(cuda(f32), f32)
+
+
 @needs_cuda
 @pytest.mark.parametrize("autocast", [False, True], ids=["fp32", "bf16-autocast"])
 def test_compiled_block_no_graph_breaks(monkeypatch, autocast):
+    from torch._inductor.compile_fx import compile_fx
+
     from oplm import OplmConfig
     from oplm.model.masking import segment_block_mask
     from oplm.model.transformer import OplmBlock
@@ -486,35 +513,49 @@ def test_compiled_block_no_graph_breaks(monkeypatch, autocast):
         canon_kernel_sizes=[7],
         packed_attention="flex",
     )
-    eager = OplmBlock(cfg, layer_idx=0).cuda().train()
-    block = copy.deepcopy(eager)
+    ref_block = OplmBlock(cfg, layer_idx=0).cuda().train()
+    kernel_block = copy.deepcopy(ref_block)
     _, _, mask, seg = _case(2, 256, 64, 7, True, seed=26, all_pad_row=False)
     x = torch.randn(2, 256, 64, device=DEVICE)
     dy = torch.randn_like(x)
 
-    def forward(module):  # noqa: ANN001, ANN202
-        # As OplmStack does: the flex block mask is built inside the (compiled) forward.
+    def run(module, enabled):  # noqa: ANN001, ANN202
+        """Inductor-compiled (fullgraph) forward + backward, and whether its graph has the op."""
+        monkeypatch.setattr(conv_mod, "_KERNEL_ENABLED", enabled)
+        torch._dynamo.reset()  # fresh compile per side: no cache entry shared across the flag
+        graphs = []
+
+        def inductor(gm, example_inputs):  # noqa: ANN001, ANN202 — what backend="inductor" runs
+            graphs.append(gm)
+            return compile_fx(gm, example_inputs)
+
+        # As OplmStack does: the flex block mask is built inside the compiled forward.
         def fn(xr):  # noqa: ANN001, ANN202
             return module(xr, mask, segment_ids=seg, block_mask=segment_block_mask(seg))[0]
 
-        return fn
-
-    def run(module, fn, enabled):  # noqa: ANN001, ANN202
-        monkeypatch.setattr(conv_mod, "_KERNEL_ENABLED", enabled)
         xr = x.clone().requires_grad_()
         with torch.autocast("cuda", torch.bfloat16, enabled=autocast):
-            y = fn(xr)
+            y = torch.compile(fn, backend=inductor, fullgraph=True)(xr)
         y.backward(dy.to(y.dtype))
-        return [y, xr.grad] + [p.grad for p in module.parameters()]
+        has_op = any("oplm.canon_conv" in str(n.target) for g in graphs for n in g.graph.nodes)
+        return has_op, [y, xr.grad] + [p.grad for p in module.parameters()]
 
-    ref = run(eager, forward(eager), False)
-    got = run(block, torch.compile(forward(block), fullgraph=True), True)
+    ref_has_op, ref = run(ref_block, False)
+    got_has_op, got = run(kernel_block, True)
+    assert got_has_op and not ref_has_op  # only the Canon conv differs between the two sides
     assert all(g is not None for g in got)
-    # Compiled vs eager differ by more than the conv: fusion changes rounding everywhere. Under
-    # bf16 that noise is ~1% of a tensor's scale (CPU dry run, reference conv: max error / max
-    # magnitude up to 1.3e-2; elementwise BF16_TOL fails on near-zero elements), fp32 ~1e-6. So
-    # bound the max error relative to each tensor's max magnitude; a kernel bug is O(1) on it.
-    bound = 3e-2 if autocast else 1e-3
     for g, r in zip(got, ref, strict=True):
         assert g.dtype == r.dtype and g.shape == r.shape
-        assert (g - r).abs().max() <= bound * r.abs().max()
+    if not autocast:
+        # Measured on CPU (Inductor both sides, kernel under the interpreter, SDPA): elementwise
+        # FP32_TOL holds, max error ~1e-6 of each tensor's scale. 10x headroom for the GPU.
+        for g, r in zip(got, ref, strict=True):
+            torch.testing.assert_close(g, r, rtol=1e-4, atol=1e-4)
+    else:
+        # bf16 autocast: the gradients are themselves bf16 matmul outputs, so a 1-ulp change in
+        # a conv output flips roundings downstream; the same CPU measurement gave max error up
+        # to 1.2e-2 of each tensor's scale (elementwise BF16_TOL fails on near-zero elements).
+        # This side checks the production dtype path end to end, for gross errors only; the fp32
+        # case above is the precision check.
+        for g, r in zip(got, ref, strict=True):
+            assert (g - r).abs().max() <= 3e-2 * r.abs().max()
