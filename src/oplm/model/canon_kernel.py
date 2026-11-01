@@ -13,6 +13,7 @@ after. Kernels run on CUDA tensors, or on CPU tensors under `TRITON_INTERPRET=1`
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import os
 from typing import TYPE_CHECKING
@@ -226,6 +227,11 @@ if TRITON_AVAILABLE:
         )
 
 
+def _on_device(x: torch.Tensor) -> contextlib.AbstractContextManager:
+    """Launch on `x`'s GPU (Triton uses the current device); a no-op for interpreter CPU tensors."""
+    return torch.cuda.device(x.device) if x.is_cuda else contextlib.nullcontext()
+
+
 def _check_row_size(T: int, D: int) -> None:
     if T * D >= 2**31:
         raise ValueError(f"Canon kernel needs T * D < 2**31 (int32 in-row offsets); got {T} * {D}")
@@ -257,30 +263,32 @@ def canon_forward(
         return out
     seg = segment_ids if segment_ids is not None else attention_mask  # unread when None
     grid = (B, triton.cdiv(T, BLOCK_T), triton.cdiv(D, BLOCK_D))
-    _canon_fwd_kernel[grid](
-        x,
-        weight,
-        attention_mask,
-        seg,
-        out,
-        T,
-        D,
-        weight.stride(0),
-        weight.stride(1),
-        attention_mask.stride(0),
-        attention_mask.stride(1),
-        seg.stride(0),
-        seg.stride(1),
-        K=k,  # ty: ignore[invalid-argument-type]  # Triton boundary: plain values for tl.constexpr
-        LEFT=k // 2,  # ty: ignore[invalid-argument-type]
-        HAS_SEG=segment_ids is not None,  # ty: ignore[invalid-argument-type]
-        RESIDUAL=residual,  # ty: ignore[invalid-argument-type]
-        CONV_DTYPE=_TL_DTYPES[out_dtype],  # ty: ignore[invalid-argument-type]
-        ROUND_CONV=interpret and out_dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
-        ROUND_OUT=interpret and out.dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
-        BLOCK_T=BLOCK_T,  # ty: ignore[invalid-argument-type]
-        BLOCK_D=BLOCK_D,  # ty: ignore[invalid-argument-type]
-    )
+    # ty ignores: Triton boundary, plain values for tl.constexpr parameters.
+    with _on_device(x):
+        _canon_fwd_kernel[grid](
+            x,
+            weight,
+            attention_mask,
+            seg,
+            out,
+            T,
+            D,
+            weight.stride(0),
+            weight.stride(1),
+            attention_mask.stride(0),
+            attention_mask.stride(1),
+            seg.stride(0),
+            seg.stride(1),
+            K=k,  # ty: ignore[invalid-argument-type]
+            LEFT=k // 2,  # ty: ignore[invalid-argument-type]
+            HAS_SEG=segment_ids is not None,  # ty: ignore[invalid-argument-type]
+            RESIDUAL=residual,  # ty: ignore[invalid-argument-type]
+            CONV_DTYPE=_TL_DTYPES[out_dtype],  # ty: ignore[invalid-argument-type]
+            ROUND_CONV=interpret and out_dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
+            ROUND_OUT=interpret and out.dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
+            BLOCK_T=BLOCK_T,  # ty: ignore[invalid-argument-type]
+            BLOCK_D=BLOCK_D,  # ty: ignore[invalid-argument-type]
+        )
     return out
 
 
@@ -312,34 +320,36 @@ def canon_backward(
     seg = segment_ids if segment_ids is not None else attention_mask  # unread when None
     grid = (B, triton.cdiv(T, BLOCK_T * BWD_TILES), triton.cdiv(D, BLOCK_D))
     partials = torch.empty(B * grid[1], D, k, device=x.device, dtype=torch.float32)
-    _canon_bwd_kernel[grid](
-        dy,
-        x,
-        weight,
-        attention_mask,
-        seg,
-        dx,
-        partials,
-        T,
-        D,
-        weight.stride(0),
-        weight.stride(1),
-        attention_mask.stride(0),
-        attention_mask.stride(1),
-        seg.stride(0),
-        seg.stride(1),
-        K=k,  # ty: ignore[invalid-argument-type]  # Triton boundary: plain values for tl.constexpr
-        K_POW2=triton.next_power_of_2(k),
-        LEFT=k // 2,  # ty: ignore[invalid-argument-type]
-        HAS_SEG=segment_ids is not None,  # ty: ignore[invalid-argument-type]
-        RESIDUAL=residual,  # ty: ignore[invalid-argument-type]
-        CONV_DTYPE=_TL_DTYPES[out_dtype],  # ty: ignore[invalid-argument-type]
-        ROUND_G=interpret and out_dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
-        ROUND_DX=interpret and x.dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
-        BLOCK_T=BLOCK_T,  # ty: ignore[invalid-argument-type]
-        BLOCK_D=BLOCK_D,  # ty: ignore[invalid-argument-type]
-        TILES=BWD_TILES,  # ty: ignore[invalid-argument-type]
-    )
+    # ty ignores: Triton boundary, plain values for tl.constexpr parameters.
+    with _on_device(x):
+        _canon_bwd_kernel[grid](
+            dy,
+            x,
+            weight,
+            attention_mask,
+            seg,
+            dx,
+            partials,
+            T,
+            D,
+            weight.stride(0),
+            weight.stride(1),
+            attention_mask.stride(0),
+            attention_mask.stride(1),
+            seg.stride(0),
+            seg.stride(1),
+            K=k,  # ty: ignore[invalid-argument-type]
+            K_POW2=triton.next_power_of_2(k),
+            LEFT=k // 2,  # ty: ignore[invalid-argument-type]
+            HAS_SEG=segment_ids is not None,  # ty: ignore[invalid-argument-type]
+            RESIDUAL=residual,  # ty: ignore[invalid-argument-type]
+            CONV_DTYPE=_TL_DTYPES[out_dtype],  # ty: ignore[invalid-argument-type]
+            ROUND_G=interpret and out_dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
+            ROUND_DX=interpret and x.dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
+            BLOCK_T=BLOCK_T,  # ty: ignore[invalid-argument-type]
+            BLOCK_D=BLOCK_D,  # ty: ignore[invalid-argument-type]
+            TILES=BWD_TILES,  # ty: ignore[invalid-argument-type]
+        )
     return dx, partials.sum(0).to(weight.dtype)
 
 
