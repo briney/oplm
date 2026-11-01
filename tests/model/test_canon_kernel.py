@@ -400,6 +400,56 @@ def test_op_autograd_matches_reference(x_dtype, out_dtype, residual):
     torch.testing.assert_close(got[2], ref[2], **FP32_TOL)
 
 
+def _packed_rows(B: int, T: int, D: int, k: int, dtype: torch.dtype, seed: int = 0):
+    """`(x, weight, attention_mask, segment_ids)` like a packed training batch: rows full of
+    protein-length segments (30 to 600 tokens), the last row ending in a quarter of pad (garbage
+    `x`, so a leak shows up). `x` is drawn on `DEVICE`."""
+    gen = torch.Generator().manual_seed(seed)
+    rows = []
+    for b in range(B):
+        fill, lengths = T if b < B - 1 else T * 3 // 4, []
+        while sum(lengths) < fill:
+            n = int(torch.randint(30, 601, (1,), generator=gen))
+            lengths.append(min(n, fill - sum(lengths)))
+        rows.append(_segments_from_lengths(lengths, T))
+    seg = torch.stack(rows).to(DEVICE)
+    mask = seg.ne(0)
+    x = torch.randn(B, T, D, device=DEVICE, generator=torch.Generator(DEVICE).manual_seed(seed))
+    x = torch.where(mask.unsqueeze(-1), x, 1e3).to(dtype)
+    return x, torch.randn(D, k, generator=gen).to(DEVICE), mask.long(), seg
+
+
+def _assert_op_matches_reference(x, w, mask, seg, out_dtype, residual):
+    """Output, `dx` and `dW` of the op vs autograd through the reference; `dW` (a sum over every
+    token) gets a scale-relative atol, as in `canon_self_check`."""
+    gen = torch.Generator(DEVICE).manual_seed(1)
+    dy = torch.randn(x.shape, device=DEVICE, generator=gen)
+    got = _op_and_reference_grads(canon_conv_kernel, x, w, mask, seg, out_dtype, residual, dy)
+    ref = _op_and_reference_grads(canon_conv_reference, x, w, mask, seg, out_dtype, residual, dy)
+    tol = {torch.float32: FP32_TOL, torch.bfloat16: BF16_TOL}
+    torch.testing.assert_close(got[0], ref[0], **tol[out_dtype])
+    torch.testing.assert_close(got[1], ref[1], **tol[x.dtype])
+    atol = 1e-4 * ref[2].abs().max().clamp_min(1).item()
+    torch.testing.assert_close(got[2], ref[2], rtol=1e-4, atol=atol)
+
+
+@needs_cuda
+@pytest.mark.parametrize("residual", [True, False])
+@pytest.mark.parametrize(
+    ("x_dtype", "out_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("D", [768, 2048, 5504])
+def test_op_matches_reference_at_training_shapes(D, x_dtype, out_dtype, residual):
+    # Spec acceptance #1: real widths at B=4, T=2048, k=7 on packed rows.
+    x, w, mask, seg = _packed_rows(4, 2048, D, 7, x_dtype, seed=D)
+    _assert_op_matches_reference(x, w, mask, seg, out_dtype, residual)
+
+
 @kernel
 def test_op_compiles_without_graph_breaks():
     # The op is opaque to Dynamo/AOTAutograd: fullgraph tracing (fake impls for the forward and
