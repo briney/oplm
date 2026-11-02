@@ -61,8 +61,8 @@ class CanonConv(nn.Module):
     an activation, the residual add in one opaque kernel with its own backward. Elsewhere (CPU)
     it runs `canon_conv_reference`, the same cross-correlation as `kernel_size` shifted
     multiply-adds. `self.conv` still owns the weight, so checkpoints and initialization are
-    unchanged. Accumulation is in fp32; the conv has the dtype autocast would give a
-    convolution (`x`'s dtype when autocast is off).
+    unchanged. Accumulation is in fp32; `x`, the conv and the residual have the dtype autocast
+    would give a convolution (`x`'s dtype when autocast is off).
     """
 
     def __init__(
@@ -110,6 +110,10 @@ class CanonConv(nn.Module):
             out_dtype = torch.get_autocast_dtype(device_type)
         else:
             out_dtype = x.dtype
+        # Canon A/C get fp32 LayerNorm output under autocast; their consumers (Q/K/V and FFN
+        # projections) cast to bf16 anyway, so cast here: half the conv's traffic, and Inductor
+        # fuses the cast into the norm's store.
+        x = x.to(out_dtype)
         conv = canon_conv_kernel if _use_kernel(x, out_dtype) else canon_conv_reference
         weight = self.conv.weight.squeeze(1)  # (D, k) view: autograd gives dW back as (D, 1, k)
         if self._activation is None:  # the residual folds into the conv call

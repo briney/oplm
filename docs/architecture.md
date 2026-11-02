@@ -251,7 +251,9 @@ On CUDA the convolution runs as a Triton kernel registered as the custom op `opl
 (`src/oplm/model/canon_kernel.py`), with its own backward, so `torch.compile` treats each Canon call
 as one opaque op. The op does the pad zeroing, the per-sequence masks of packed rows, fp32
 accumulation and, when `canon_activation` is `none`, the residual add; the weight gradient is
-reduced deterministically. Everywhere else (CPU, or no Triton) the same function runs as
+reduced deterministically. Under autocast the input is cast to the autocast dtype first, so
+Canon-A/C run on bf16 copies of their fp32 LayerNorm outputs and return bf16 (their consumers,
+the Q/K/V and FFN projections, cast to bf16 anyway). Everywhere else (CPU, or no Triton) the same function runs as
 `canon_conv_reference`, `k` shifted multiply-adds, which is also the kernel's test oracle. There is
 no config switch between the two. A training run that uses the kernel first checks it against the
 reference on the first rows (up to 4) of its first micro-batch: every Canon call's output and both

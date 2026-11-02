@@ -265,6 +265,21 @@ def test_canon_conv_output_dtype_follows_autocast():
         assert conv(x, mask).dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("activation", ["none", "silu"])
+def test_canon_conv_runs_in_autocast_dtype(activation: str):
+    # Canon A/C get fp32 LayerNorm output under autocast: the conv and the residual run on its
+    # bf16 cast (half the traffic), so the residual output is bf16, not promoted to fp32.
+    torch.manual_seed(0)
+    conv = CanonConv(channels=8, kernel_size=3, activation=activation)
+    x = torch.randn(2, 9, 8)
+    mask = torch.ones(2, 9, dtype=torch.long)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = conv(x, mask, residual=True)
+        expected = conv(x.bfloat16(), mask, residual=True)
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, expected)
+
+
 # ---------------------------------------------------------------------------
 # residual argument / functional reference
 # ---------------------------------------------------------------------------
