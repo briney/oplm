@@ -110,7 +110,7 @@ def test_scale_keeps_the_full_eval_suite(confirm_phase: Path, tmp_path: Path) ->
     out = tmp_path / "scale"
     _run_scale(confirm_phase, out, "170M")
     cfg = load_config(["--config", str(out / "170M" / "run.yaml")])
-    assert set(cfg.data.eval) >= {"uniref70", "pdb40", "cameo", "casp"}
+    assert set(cfg.data.eval) >= {"uniref70_singletons", "uniref70_gte2", "pdb40", "cameo", "casp"}
 
 
 def test_scale_has_no_submit_flag(confirm_phase: Path, tmp_path: Path) -> None:

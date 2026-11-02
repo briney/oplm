@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path  # noqa: TC003 (typer resolves annotations at runtime)
 from typing import Annotated
 
@@ -40,6 +41,10 @@ def uniref70(
     pool: Annotated[
         int, typer.Option(min=1, help="Eval/test candidate pool per stratum (rows)")
     ] = 250_000,
+    min_survival: Annotated[
+        float,
+        typer.Option(min=0, max=1, help="Stop if a stratum's screen survival is below this"),
+    ] = 0.05,
     n_eval: Annotated[int, typer.Option(min=1, help="Eval rows per stratum")] = 5_000,
     n_test: Annotated[
         int, typer.Option(min=0, help="Test rows per stratum; 0 disables the test split")
@@ -65,6 +70,7 @@ def uniref70(
         mmseqs=mmseqs,
         mmseqs_extra=mmseqs_extra or [],
         pool=pool,
+        min_survival=min_survival,
         n_eval=n_eval,
         n_test=n_test,
         rows_per_shard=rows_per_shard,
@@ -79,6 +85,39 @@ def uniref70(
         )
     else:
         typer.echo(f"wrote {out} ({s['stages']['write']['train']['rows']} train rows)")
+
+
+@app.command("deepclust70-heldout")
+def deepclust70_heldout(
+    src: Annotated[Path, typer.Argument(help="Directory of the copied eval_*/test_* files")],
+    out: Annotated[Path, typer.Argument(help="Output directory (not SRC)")],
+    deepclust70: Annotated[Path, typer.Option(help="deepclust70 train/ shard directory")],
+    uniref70: Annotated[Path, typer.Option(help="uniref70 train/ shard directory")],
+    workdir: Annotated[Path, typer.Option(help="Screen scratch directory (resumable)")],
+    threads: Annotated[int, typer.Option()] = 32,
+    mmseqs: Annotated[str, typer.Option(help="mmseqs executable")] = "mmseqs",
+    n_eval: Annotated[int, typer.Option(min=1, help="Eval rows per stratum")] = 5_000,
+    n_test: Annotated[int, typer.Option(min=0, help="Test rows per stratum")] = 5_000,
+    chunk_rows: Annotated[int, typer.Option(min=1, help="Reference rows per screen chunk")] = (
+        200_000_000
+    ),
+) -> None:
+    """Screen deepclust70's held-out reps against the training mix and keep survivors."""
+    from oplm.data.build.deepclust70 import screen_heldout
+
+    s = screen_heldout(
+        src,
+        out,
+        deepclust70=deepclust70,
+        uniref70=uniref70,
+        workdir=workdir,
+        mmseqs=mmseqs,
+        threads=threads,
+        n_eval=n_eval,
+        n_test=n_test,
+        chunk_rows=chunk_rows,
+    )
+    typer.echo(json.dumps(s["stats"]))
 
 
 @app.command()
