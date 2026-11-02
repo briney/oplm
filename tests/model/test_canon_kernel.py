@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import copy
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -23,8 +25,8 @@ kernel = pytest.mark.skipif(
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 from oplm.model.canon_kernel import (  # noqa: E402
-    BLOCK_T,
-    BWD_TILES,
+    BWD_CONFIGS,
+    FWD_CONFIGS,
     BwdConfig,
     FwdConfig,
     canon_backward,
@@ -150,8 +152,11 @@ def _edge_layouts(T: int, edges: list[int], n: int = 20):
 
 
 @kernel
-def test_forward_segment_boundaries_on_tile_edges():
-    for x, w, mask, seg in _edge_layouts(2 * BLOCK_T + 3, [BLOCK_T - 1, BLOCK_T, BLOCK_T + 1]):
+def test_forward_segment_boundaries_on_strip_edges():
+    # Boundaries on loop-step edges and on the edges of a program's strip.
+    step, strip = FwdConfig().unroll, FwdConfig().strip
+    edges = [step - 1, step, step + 1, strip - 1, strip, strip + 1]
+    for x, w, mask, seg in _edge_layouts(2 * strip + 3, edges):
         for residual in (True, False):
             out = canon_forward(x, w, mask, seg, torch.float32, residual)
             ref = canon_conv_reference(x, w, mask, seg, torch.float32, residual)
@@ -216,6 +221,16 @@ def test_row_size_guard():
         canon_forward(x, w, mask, None, torch.float32, False)
     with pytest.raises(ValueError, match="2\\*\\*31"):
         canon_backward(x, x, w, mask, None, torch.float32, False)
+
+
+@kernel
+def test_strip_guard():
+    # A loop step crossing the strip's end would redo the next strip (and its dw twice).
+    x, w, mask, seg = _case(1, 37, 64, 3, True, seed=0)
+    with pytest.raises(ValueError, match="unroll to divide strip"):
+        canon_forward(x, w, mask, seg, torch.float32, False, config=FwdConfig(strip=12, unroll=8))
+    with pytest.raises(ValueError, match="unroll to divide strip"):
+        canon_backward(x, x, w, mask, seg, torch.float32, False, config=BwdConfig(unroll=3))
 
 
 def _grads(x, w, mask, seg, out_dtype, residual, seed=0):
@@ -294,10 +309,10 @@ def test_backward_bool_mask():
 
 @kernel
 def test_backward_tile_edges():
-    # Boundaries on token-tile edges and on the edges of a program's span of BWD_TILES tiles.
-    span = BLOCK_T * BWD_TILES
-    edges = [BLOCK_T - 1, BLOCK_T, BLOCK_T + 1, span - 1, span, span + 1]
-    for x, w, mask, seg in _edge_layouts(span + BLOCK_T + 3, edges):
+    # Boundaries on loop-step edges and on the edges of a program's strip (one dw partial).
+    step, strip = BwdConfig().unroll, BwdConfig().strip
+    edges = [step - 1, step, step + 1, strip - 1, strip, strip + 1]
+    for x, w, mask, seg in _edge_layouts(strip + 2 * step + 3, edges):
         for residual in (True, False):
             dx, dw, ref_dx, ref_dw, dy = _grads(x, w, mask, seg, torch.float32, residual)
             torch.testing.assert_close(dx, ref_dx, **FP32_TOL)
@@ -353,15 +368,16 @@ def test_backward_deterministic():
     assert torch.equal(dx1, dx2)
 
 
-# Non-default launch configs, as the benchmark sweep tries them: tiles smaller and larger than the
-# 77-token rows and 100 channels below (so partial tiles in T and D), backward spans of one tile
-# and of several, dw reduced per tile and deferred. num_warps only matters on a GPU.
-FWD_VARIANTS = [FwdConfig(16, 32, 2), FwdConfig(32, 128, 8, 1), FwdConfig(128, 32)]
+# Non-default launch configs, as the benchmark sweep tries them: channel blocks and strips smaller
+# and larger than the 77-token rows and 100 channels below (so partial blocks in D, partial strips
+# and loop steps in T), one token per loop step and several. num_warps, num_stages only matter on
+# a GPU.
+FWD_VARIANTS = [FwdConfig(32, 16, 4, 2), FwdConfig(128, 128, 8), FwdConfig(64, 32, 1, 4, 2)]
 BWD_VARIANTS = [
-    BwdConfig(16, 32, 1, True, 2),
-    BwdConfig(8, 128, 3, False),
-    BwdConfig(32, 64, 2, True, 4, 1),
-    BwdConfig(64, 32, 4, False),
+    BwdConfig(32, 16, 4, 2),
+    BwdConfig(128, 256, 8),
+    BwdConfig(64, 32, 1, 4, 2),
+    BwdConfig(256, 8, 8),
 ]
 DTYPE_PAIRS = [  # (x dtype, conv dtype)
     (torch.float32, torch.float32),
@@ -405,6 +421,89 @@ def test_backward_configs(cfg, k, packed, dtypes):
         _assert_pad_grads(dx, dy, mask, residual)
         again = canon_backward(dy, x, w, mask, seg, out_dtype, residual, config=cfg)
         assert torch.equal(dw, again[1])  # deterministic per config
+
+
+def _sm100_stack_bytes(fn, dtypes: dict[str, str], constexprs: dict, cfg) -> int:
+    """Per-thread stack of `fn` compiled for sm_100 (no GPU needed): > 0 means register spills."""
+    import re
+    import subprocess
+
+    import triton
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    signature = {
+        name: dtypes.get(name, "i32")
+        for name in fn.arg_names
+        if name not in constexprs  # pointers get a dtype; the rest are int32 sizes and strides
+    }
+    options = {"num_warps": cfg.num_warps, "num_stages": cfg.num_stages}
+    compiled = triton.compile(
+        ASTSource(fn, signature, constexprs), target=GPUTarget("cuda", 100, 32), options=options
+    )
+    cuobjdump = Path(triton.__file__).parent / "backends/nvidia/bin/cuobjdump"
+    with tempfile.NamedTemporaryFile(suffix=".cubin") as f:
+        f.write(compiled.asm["cubin"])
+        f.flush()
+        usage = subprocess.run(
+            [str(cuobjdump), "--dump-resource-usage", f.name],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    return int(re.search(r"STACK:(\d+)", usage).group(1))
+
+
+def _shipped_configs(table: dict, default):
+    """(x dtype, conv dtype, config) for the default (bf16, as training runs) and every entry."""
+    return [(torch.bfloat16, torch.bfloat16, default)] + [
+        (x_dtype, conv_dtype, cfg) for (_, x_dtype, conv_dtype), cfg in table.items()
+    ]
+
+
+_TRITON_DTYPES = {torch.float32: "fp32", torch.bfloat16: "bf16"}
+
+
+@pytest.mark.skipif(
+    not conv_mod.TRITON_AVAILABLE or os.environ.get("TRITON_INTERPRET") == "1",
+    reason="needs Triton's compiler (not the interpreter)",
+)
+@pytest.mark.parametrize("phase", ["fwd", "bwd"])
+def test_shipped_configs_do_not_spill(phase):
+    # The first (tile) kernels spilled to local memory and ran at ~10% of DRAM bandwidth. Compile
+    # every shipped launch config for sm_100 at k=7, packed, residual (training's case).
+    from oplm.model import canon_kernel as ck
+
+    if not (Path(ck.triton.__file__).parent / "backends/nvidia/bin/ptxas").exists():
+        pytest.skip("Triton without the bundled NVIDIA ptxas")
+    fn, table, default = {
+        "fwd": (ck._canon_fwd_kernel, FWD_CONFIGS, FwdConfig()),
+        "bwd": (ck._canon_bwd_kernel, BWD_CONFIGS, BwdConfig()),
+    }[phase]
+    for x_dtype, conv_dtype, cfg in _shipped_configs(table, default):
+        x_t = _TRITON_DTYPES[x_dtype]
+        y_t = _TRITON_DTYPES[torch.promote_types(x_dtype, conv_dtype)]
+        dtypes = {"w_ptr": "*fp32", "mask_ptr": "*i64", "seg_ptr": "*i64", "dw_part_ptr": "*fp32"}
+        dtypes |= {
+            "x_ptr": f"*{x_t}",
+            "dx_ptr": f"*{x_t}",
+            "out_ptr": f"*{y_t}",
+            "dy_ptr": f"*{y_t}",
+        }
+        constexprs = {
+            "K": 7,
+            "LEFT": 3,
+            "HAS_SEG": True,
+            "RESIDUAL": True,
+            "CONV_DTYPE": ck._TL_DTYPES[conv_dtype],
+            "BLOCK_D": cfg.block_d,
+            "STRIP": cfg.strip,
+            "UNROLL": cfg.unroll,
+        }
+        rounding = ("ROUND_CONV", "ROUND_OUT") if phase == "fwd" else ("ROUND_G", "ROUND_DX")
+        constexprs |= dict.fromkeys(rounding, False)
+        stack = _sm100_stack_bytes(fn, dtypes, constexprs, cfg)
+        assert stack == 0, f"{phase} {cfg} ({x_dtype}, {conv_dtype}) spills: {stack} B stack"
 
 
 # --- the oplm::canon_conv op, its autograd, and CanonConv dispatch ---

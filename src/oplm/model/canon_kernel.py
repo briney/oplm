@@ -7,6 +7,10 @@ cast to `out_dtype`, then optionally `x + conv` with the raw `x`. The backward i
 after. Kernels run on CUDA tensors, or on CPU tensors under `TRITON_INTERPRET=1`. Launch shapes
 come from `FWD_CONFIGS` / `BWD_CONFIGS` (picked by `canon_kernel_bench.py --sweep`).
 
+Both kernels walk a strip of tokens in order, keeping the k rows the current position needs in
+registers, so each row is read from DRAM once per program. Tile kernels that issue the k shifted
+reads together miss L1 together (each read goes to L2), and their wide 2D/3D tiles spilled.
+
 `torch.ops.oplm.canon_conv` wraps them as one custom op with its own autograd, opaque to
 `torch.compile` (no graph break, no tracing into Triton): `canon_conv_kernel` is its entry point.
 `canon_self_check` compares it with the reference on a model's real Canon inputs (run start).
@@ -35,9 +39,7 @@ except ImportError:  # pragma: no cover - triton ships with torch on Linux
     TRITON_AVAILABLE = False
 
 __all__ = [
-    "BLOCK_T",
     "BWD_CONFIGS",
-    "BWD_TILES",
     "FWD_CONFIGS",
     "TRITON_AVAILABLE",
     "BwdConfig",
@@ -51,44 +53,33 @@ __all__ = [
 
 
 class FwdConfig(NamedTuple):
-    """Forward launch: one (block_t, block_d) output tile per program."""
+    """Forward launch: each program walks `strip` tokens of `block_d` channels, `unroll` tokens
+    per loop step (`unroll` divides `strip`)."""
 
-    block_t: int = 128
-    block_d: int = 64
-    num_warps: int = 4
-    num_stages: int = 3
+    block_d: int = 128
+    strip: int = 128
+    unroll: int = 8
+    num_warps: int = 1
+    num_stages: int = 1
 
 
 class BwdConfig(NamedTuple):
-    """Backward launch: `tiles` (block_t, block_d) tiles per program, so `block_t * tiles` tokens
-    per dw partial. `defer_dw` keeps the dw products elementwise across the tiles and reduces
-    over tokens once per program (more registers); otherwise once per tile."""
+    """Backward launch: as `FwdConfig`; `strip` is also the tokens per dw partial."""
 
-    block_t: int = 8
-    block_d: int = 32
-    tiles: int = 32
-    defer_dw: bool = True
-    num_warps: int = 2
-    num_stages: int = 3
+    block_d: int = 128
+    strip: int = 256
+    unroll: int = 4
+    num_warps: int = 1
+    num_stages: int = 1
 
 
-# The defaults are the B200 sweep's best (2026-11-01, job 33519, D 768 and 2048, packed B=32
-# T=2048 k=7): the forward default is within 4% of the best at every width and dtype, the backward
-# default is the best for bf16 x. fp32 x (Canon A/C, after LayerNorm) does 16-27% better with a
-# wider tile and per-tile dw, hence the entries below. Per `(D, x dtype, conv dtype)`; other
-# shapes take the defaults. A fixed table, not `triton.autotune`: autotune picks by timing at the
-# first call (in the self-check, on every rank), so ranks and reruns could pick different tilings,
-# and the tiling sets dw's summation order: training would stop being reproducible run to run.
+# Per `(D, x dtype, conv dtype)`; other shapes take the defaults, which compile without spills on
+# sm_100 at k=7 (tests/model/test_canon_kernel.py checks) and await the B200 sweep. A fixed table,
+# not `triton.autotune`: autotune picks by timing at the first call (in the self-check, on every
+# rank), so ranks and reruns could pick different strips, and the strip sets dw's summation
+# order: training would stop being reproducible run to run.
 FWD_CONFIGS: dict[tuple[int, torch.dtype, torch.dtype], FwdConfig] = {}
-BWD_CONFIGS: dict[tuple[int, torch.dtype, torch.dtype], BwdConfig] = {
-    (768, torch.float32, torch.bfloat16): BwdConfig(block_d=64, defer_dw=False),
-    (2048, torch.float32, torch.bfloat16): BwdConfig(block_d=128, defer_dw=False),
-}
-
-# Default tilings, as the tests see them: forward token tile, and a backward program's span of
-# `BLOCK_T * BWD_TILES` tokens (its token tiles divide BLOCK_T).
-BLOCK_T = FwdConfig().block_t
-BWD_TILES = BwdConfig().block_t * BwdConfig().tiles // BLOCK_T
+BWD_CONFIGS: dict[tuple[int, torch.dtype, torch.dtype], BwdConfig] = {}
 
 
 if TRITON_AVAILABLE:
@@ -101,6 +92,22 @@ if TRITON_AVAILABLE:
         bits = v.to(tl.uint32, bitcast=True)
         bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
         return bits.to(tl.float32, bitcast=True)
+
+    @triton.jit
+    def _load_row(
+        ptr, row, pos, T, D, d, d_ok, mask_row, stride_mt, seg_row, stride_st, HAS_SEG: tl.constexpr
+    ):
+        # Row `pos` of a row-major (T, D) slab at `row`: its raw values at `d` in fp32 (0 outside
+        # the row), whether it is inside the row, whether it is also not a pad, and its segment id
+        # (-1 outside the row; 0 when unpacked).
+        in_row = (pos >= 0) & (pos < T)
+        v = tl.load(ptr + row + pos * D + d, mask=in_row & d_ok, other=0.0).to(tl.float32)
+        real = in_row & (tl.load(mask_row + pos * stride_mt, mask=in_row, other=0) != 0)
+        if HAS_SEG:
+            seg = tl.load(seg_row + pos * stride_st, mask=in_row, other=-1).to(tl.int32)
+        else:
+            seg = in_row.to(tl.int32) - 1
+        return v, in_row, real, seg
 
     @triton.jit
     def _canon_fwd_kernel(
@@ -124,53 +131,63 @@ if TRITON_AVAILABLE:
         CONV_DTYPE: tl.constexpr,
         ROUND_CONV: tl.constexpr,
         ROUND_OUT: tl.constexpr,
-        BLOCK_T: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        STRIP: tl.constexpr,
+        UNROLL: tl.constexpr,
     ):
-        # One (BLOCK_T, BLOCK_D) output tile of row `b`. The k shifted reads of x cover the tile
-        # plus a (k - 1)-token halo; the overlap is served from L1/L2, so DRAM sees x about once.
-        # The mask and segment reads are masked by the row bounds only, so they do not wait on
-        # each other before x's read.
+        # Channels `d` of row `b`, outputs t0 <= t < t0 + STRIP in order. `xs` holds the k source
+        # rows t - LEFT .. t + RIGHT of output t (oldest first), with each row's real flag and
+        # segment id: one new row is read per output, the rest shift along.
         b = tl.program_id(0).to(tl.int64)
-        t = tl.program_id(1) * BLOCK_T + tl.arange(0, BLOCK_T)
+        t0 = tl.program_id(1) * STRIP
         d = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
-        t_ok = t < T
         d_ok = d < D
         row = b * T * D  # int64 row base; within-row offsets fit int32
         mask_row = mask_ptr + b * stride_mb
         seg_row = seg_ptr + b * stride_sb
-        if HAS_SEG:
-            seg_t = tl.load(seg_row + t * stride_st, mask=t_ok, other=-1)
+        RIGHT: tl.constexpr = K - 1 - LEFT
 
-        acc = tl.zeros((BLOCK_T, BLOCK_D), dtype=tl.float32)
+        w = ()
         for i in tl.static_range(K):
-            src = t + (i - LEFT)
-            in_row = (src >= 0) & (src < T)
-            ok = in_row & (tl.load(mask_row + src * stride_mt, mask=in_row, other=0) != 0)
-            if HAS_SEG:
-                ok = ok & (tl.load(seg_row + src * stride_st, mask=in_row, other=-1) == seg_t)
-            xv = tl.load(
-                x_ptr + row + src[:, None] * D + d[None, :],
-                mask=ok[:, None] & d_ok[None, :],
-                other=0.0,
-            )
             wv = tl.load(w_ptr + d * stride_wd + i * stride_wk, mask=d_ok, other=0.0)
-            acc += xv.to(tl.float32) * wv.to(tl.float32)[None, :]
+            w = w + (wv.to(tl.float32),)
+        xs, reals, segs = (), (), ()
+        for i in tl.static_range(K - 1):
+            v, _, real, seg = _load_row(
+                x_ptr, row, t0 - LEFT + i, T, D, d, d_ok, mask_row, stride_mt, seg_row, stride_st,
+                HAS_SEG,
+            )  # fmt: skip
+            xs, reals, segs = xs + (v,), reals + (real,), segs + (seg,)
 
-        if ROUND_CONV:
-            acc = _round_bf16(acc)
-        conv = acc.to(CONV_DTYPE)
-        io_ok = t_ok[:, None] & d_ok[None, :]
-        offs = row + t[:, None] * D + d[None, :]
-        if RESIDUAL:
-            # `x + conv` as torch computes it: conv rounded to out_dtype first, add in fp32.
-            xr = tl.load(x_ptr + offs, mask=io_ok, other=0.0)
-            res = xr.to(tl.float32) + conv.to(tl.float32)
-            if ROUND_OUT:
-                res = _round_bf16(res)
-            tl.store(out_ptr + offs, res.to(out_ptr.dtype.element_ty), mask=io_ok)
-        else:
-            tl.store(out_ptr + offs, conv, mask=io_ok)
+        for step in range(STRIP // UNROLL):  # positions past T are masked
+            for u in tl.static_range(UNROLL):
+                t = t0 + step * UNROLL + u
+                v, _, real, seg = _load_row(
+                    x_ptr, row, t + RIGHT, T, D, d, d_ok, mask_row, stride_mt, seg_row, stride_st,
+                    HAS_SEG,
+                )  # fmt: skip
+                xs, reals, segs = xs + (v,), reals + (real,), segs + (seg,)
+                acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+                for i in tl.static_range(K):
+                    keep = reals[i]
+                    if HAS_SEG:
+                        keep = keep & (segs[i] == segs[LEFT])
+                    acc += tl.where(keep, xs[i], 0.0) * w[i]
+
+                if ROUND_CONV:
+                    acc = _round_bf16(acc)
+                conv = acc.to(CONV_DTYPE)
+                io_ok = d_ok & (t < T)
+                offs = row + t * D + d
+                if RESIDUAL:
+                    # `x + conv` as torch computes it: conv rounded to out_dtype first, add in fp32.
+                    res = xs[LEFT] + conv.to(tl.float32)
+                    if ROUND_OUT:
+                        res = _round_bf16(res)
+                    tl.store(out_ptr + offs, res.to(out_ptr.dtype.element_ty), mask=io_ok)
+                else:
+                    tl.store(out_ptr + offs, conv, mask=io_ok)
+                xs, reals, segs = xs[1:], reals[1:], segs[1:]
 
     @triton.jit
     def _canon_bwd_kernel(
@@ -190,99 +207,94 @@ if TRITON_AVAILABLE:
         stride_sb,
         stride_st,
         K: tl.constexpr,
-        K_POW2: tl.constexpr,
         LEFT: tl.constexpr,
         HAS_SEG: tl.constexpr,
         RESIDUAL: tl.constexpr,
         CONV_DTYPE: tl.constexpr,
         ROUND_G: tl.constexpr,
         ROUND_DX: tl.constexpr,
-        BLOCK_T: tl.constexpr,
         BLOCK_D: tl.constexpr,
-        TILES: tl.constexpr,
-        DEFER_DW: tl.constexpr,
+        STRIP: tl.constexpr,
+        UNROLL: tl.constexpr,
     ):
-        # TILES consecutive (BLOCK_T, BLOCK_D) tiles of row `b`, indexed by the input position `s`.
-        # Tap i of output t = s - i + LEFT reads s, so per tap, with the forward's keep test on
-        # the pair (t inside the row, s not a pad, same segment):
-        #   dx[s] += w[i] * dy[t]   and   dw[i] += x[s] * dy[t]   (summed over the tiles' s).
-        # The taps are a tensor axis: one (K_POW2, BLOCK_T, BLOCK_D) read of dy per tile feeds
-        # both sums, so all k shifted reads are in flight at once and no cross-warp reduction
-        # (with its barrier) sits between taps. x and dx are touched once; dy's shifted reads
-        # are cached like the forward's x.
+        # Channels `d` of row `b`, input positions s0 <= s < s0 + STRIP in order. Tap i of output
+        # t = s - i + LEFT reads s, so per tap, with the forward's keep test on the pair (t inside
+        # the row, s real, same segment):
+        #   dx[s] = sum_i w[i] * dy[t]   and   dw[i] += x[s] * dy[t].
+        # `gs` holds dy's rows t = s - RIGHT .. s + LEFT (oldest first: tap i is gs[K - 1 - i])
+        # with each row's in-row flag and segment id; dw's k sums stay in registers.
         b = tl.program_id(0).to(tl.int64)
         pid_t = tl.program_id(1)
+        s0 = pid_t * STRIP
         d = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
         d_ok = d < D
         row = b * T * D  # int64 row base; within-row offsets fit int32
         mask_row = mask_ptr + b * stride_mb
         seg_row = seg_ptr + b * stride_sb
-        taps = tl.arange(0, K_POW2)
-        tap_ok = taps < K
-        wv = tl.load(
-            w_ptr + taps[:, None] * stride_wk + d[None, :] * stride_wd,
-            mask=tap_ok[:, None] & d_ok[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        if DEFER_DW:  # per-tap products, reduced over tokens after the last tile
-            dw_acc = tl.zeros((K_POW2, BLOCK_T, BLOCK_D), dtype=tl.float32)
-        else:
-            dw_acc = tl.zeros((K_POW2, BLOCK_D), dtype=tl.float32)
+        RIGHT: tl.constexpr = K - 1 - LEFT
 
-        for j in range(TILES):
-            s = (pid_t * TILES + j) * BLOCK_T + tl.arange(0, BLOCK_T)
-            s_ok = s < T
-            # A pad source gets no conv gradient (x is zeroed before the conv) and feeds no dw.
-            real = s_ok & (tl.load(mask_row + s * stride_mt, mask=s_ok, other=0) != 0)
-            offs = row + s[:, None] * D + d[None, :]
-            xv = tl.load(x_ptr + offs, mask=real[:, None] & d_ok[None, :], other=0.0)
-            xv = xv.to(tl.float32)
+        w, dw = (), ()
+        for i in tl.static_range(K):
+            wv = tl.load(w_ptr + d * stride_wd + i * stride_wk, mask=d_ok, other=0.0)
+            w, dw = w + (wv.to(tl.float32),), dw + (tl.zeros((BLOCK_D,), dtype=tl.float32),)
+        gs, in_rows, segs = (), (), ()
+        for j in tl.static_range(K - 1):
+            g, in_row, _, seg = _load_row(
+                dy_ptr, row, s0 - RIGHT + j, T, D, d, d_ok, mask_row, stride_mt, seg_row,
+                stride_st, HAS_SEG,
+            )  # fmt: skip
+            gs, in_rows, segs = gs + (g,), in_rows + (in_row,), segs + (seg,)
 
-            t = s[None, :] + (LEFT - taps[:, None])  # (K_POW2, BLOCK_T): tap i's output position
-            in_row = tap_ok[:, None] & (t >= 0) & (t < T)
-            ok = real[None, :] & in_row
-            if HAS_SEG:
-                seg_s = tl.load(seg_row + s * stride_st, mask=s_ok, other=-1)
-                seg_t = tl.load(seg_row + t * stride_st, mask=in_row, other=-1)
-                ok = ok & (seg_t == seg_s[None, :])
-            g = tl.load(
-                dy_ptr + row + t[:, :, None] * D + d[None, None, :],
-                mask=ok[:, :, None] & d_ok[None, None, :],
-                other=0.0,
-            ).to(tl.float32)
-            # The conv's gradient is dy in the conv's dtype (autograd casts it through the
-            # forward's `.to(out_dtype)`); the residual path below keeps the raw dy.
-            if ROUND_G:
-                g = _round_bf16(g)
-            g = g.to(CONV_DTYPE).to(tl.float32)
-            acc = tl.sum(g * wv[:, None, :], axis=0)
-            if DEFER_DW:
-                dw_acc += g * xv[None, :, :]
-            else:
-                dw_acc += tl.sum(g * xv[None, :, :], axis=1)
+        for step in range(STRIP // UNROLL):  # positions past T are masked
+            for u in tl.static_range(UNROLL):
+                s = s0 + step * UNROLL + u
+                g, in_row, _, seg = _load_row(
+                    dy_ptr, row, s + LEFT, T, D, d, d_ok, mask_row, stride_mt, seg_row,
+                    stride_st, HAS_SEG,
+                )  # fmt: skip
+                gs, in_rows, segs = gs + (g,), in_rows + (in_row,), segs + (seg,)
+                xv, _, real_s, seg_s = _load_row(
+                    x_ptr, row, s, T, D, d, d_ok, mask_row, stride_mt, seg_row, stride_st,
+                    HAS_SEG,
+                )  # fmt: skip
+                # A pad source gets no conv gradient (x is zeroed before the conv) and feeds no dw.
+                xv = tl.where(real_s, xv, 0.0)
+                acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+                new_dw = ()
+                for i in tl.static_range(K):
+                    ok = real_s & in_rows[K - 1 - i]
+                    if HAS_SEG:
+                        ok = ok & (segs[K - 1 - i] == seg_s)
+                    # The conv's gradient is dy in the conv's dtype (autograd casts it through the
+                    # forward's `.to(out_dtype)`); the residual path below keeps the raw dy.
+                    gi = gs[K - 1 - i]
+                    if ROUND_G:
+                        gi = _round_bf16(gi)
+                    gi = tl.where(ok, gi.to(CONV_DTYPE).to(tl.float32), 0.0)
+                    acc += gi * w[i]
+                    new_dw = new_dw + (dw[i] + gi * xv,)
+                dw = new_dw
 
-            io_ok = s_ok[:, None] & d_ok[None, :]
-            if ROUND_DX:
-                acc = _round_bf16(acc)
-            dx = acc.to(dx_ptr.dtype.element_ty)
-            if RESIDUAL:
-                # As autograd sums the two paths into x.grad: each rounded to x's dtype, then added.
-                r = tl.load(dy_ptr + offs, mask=io_ok, other=0.0).to(tl.float32)
+                io_ok = d_ok & (s < T)
                 if ROUND_DX:
-                    r = _round_bf16(r)
-                res = dx.to(tl.float32) + r.to(dx_ptr.dtype.element_ty).to(tl.float32)
-                if ROUND_DX:
-                    res = _round_bf16(res)
-                dx = res.to(dx_ptr.dtype.element_ty)
-            tl.store(dx_ptr + offs, dx, mask=io_ok)
+                    acc = _round_bf16(acc)
+                dx = acc.to(dx_ptr.dtype.element_ty)
+                if RESIDUAL:
+                    # As autograd sums the two paths into x.grad: each rounded to x's dtype, then
+                    # added. gs[RIGHT] is dy[s], raw.
+                    r = gs[RIGHT]
+                    if ROUND_DX:
+                        r = _round_bf16(r)
+                    res = dx.to(tl.float32) + r.to(dx_ptr.dtype.element_ty).to(tl.float32)
+                    if ROUND_DX:
+                        res = _round_bf16(res)
+                    dx = res.to(dx_ptr.dtype.element_ty)
+                tl.store(dx_ptr + row + s * D + d, dx, mask=io_ok)
+                gs, in_rows, segs = gs[1:], in_rows[1:], segs[1:]
 
-        dw = tl.sum(dw_acc, axis=1) if DEFER_DW else dw_acc
         part = (b * tl.num_programs(1) + pid_t) * D * K
-        tl.store(
-            dw_part_ptr + part + d[None, :] * K + taps[:, None],
-            dw,
-            mask=tap_ok[:, None] & d_ok[None, :],
-        )
+        for i in tl.static_range(K):
+            tl.store(dw_part_ptr + part + d * K + i, dw[i], mask=d_ok)
 
 
 def _on_device(x: torch.Tensor) -> contextlib.AbstractContextManager:
@@ -293,6 +305,12 @@ def _on_device(x: torch.Tensor) -> contextlib.AbstractContextManager:
 def _check_row_size(T: int, D: int) -> None:
     if T * D >= 2**31:
         raise ValueError(f"Canon kernel needs T * D < 2**31 (int32 in-row offsets); got {T} * {D}")
+
+
+def _check_strip(cfg: FwdConfig | BwdConfig) -> None:
+    # A loop step past the strip's end would redo the next strip's tokens (and their dw twice).
+    if cfg.strip % cfg.unroll:
+        raise ValueError(f"Canon kernel config needs unroll to divide strip; got {cfg}")
 
 
 def canon_forward(
@@ -317,6 +335,7 @@ def canon_forward(
     x = x.contiguous()
     k = weight.shape[1]
     cfg = config or FWD_CONFIGS.get((D, x.dtype, out_dtype), FwdConfig())
+    _check_strip(cfg)
     out = torch.empty_like(
         x, dtype=torch.promote_types(x.dtype, out_dtype) if residual else out_dtype
     )
@@ -324,7 +343,7 @@ def canon_forward(
     if out.numel() == 0:
         return out
     seg = segment_ids if segment_ids is not None else attention_mask  # unread when None
-    grid = (B, triton.cdiv(T, cfg.block_t), triton.cdiv(D, cfg.block_d))
+    grid = (B, triton.cdiv(T, cfg.strip), triton.cdiv(D, cfg.block_d))
     # ty ignores: Triton boundary, plain values for tl.constexpr parameters.
     with _on_device(x):
         _canon_fwd_kernel[grid](
@@ -348,8 +367,9 @@ def canon_forward(
             CONV_DTYPE=_TL_DTYPES[out_dtype],  # ty: ignore[invalid-argument-type]
             ROUND_CONV=interpret and out_dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
             ROUND_OUT=interpret and out.dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
-            BLOCK_T=cfg.block_t,  # ty: ignore[invalid-argument-type]
             BLOCK_D=cfg.block_d,  # ty: ignore[invalid-argument-type]
+            STRIP=cfg.strip,  # ty: ignore[invalid-argument-type]
+            UNROLL=cfg.unroll,  # ty: ignore[invalid-argument-type]
             num_warps=cfg.num_warps,  # ty: ignore[unknown-argument]
             num_stages=cfg.num_stages,  # ty: ignore[unknown-argument]
         )
@@ -380,12 +400,13 @@ def canon_backward(
     dy = dy.contiguous()
     k = weight.shape[1]
     cfg = config or BWD_CONFIGS.get((D, x.dtype, out_dtype), BwdConfig())
+    _check_strip(cfg)
     dx = torch.empty_like(x)
     interpret = os.environ.get("TRITON_INTERPRET") == "1"
     if x.numel() == 0:
         return dx, torch.zeros_like(weight)
     seg = segment_ids if segment_ids is not None else attention_mask  # unread when None
-    grid = (B, triton.cdiv(T, cfg.block_t * cfg.tiles), triton.cdiv(D, cfg.block_d))
+    grid = (B, triton.cdiv(T, cfg.strip), triton.cdiv(D, cfg.block_d))
     partials = torch.empty(B * grid[1], D, k, device=x.device, dtype=torch.float32)
     # ty ignores: Triton boundary, plain values for tl.constexpr parameters.
     with _on_device(x):
@@ -406,17 +427,15 @@ def canon_backward(
             seg.stride(0),
             seg.stride(1),
             K=k,  # ty: ignore[invalid-argument-type]
-            K_POW2=triton.next_power_of_2(k),
             LEFT=k // 2,  # ty: ignore[invalid-argument-type]
             HAS_SEG=segment_ids is not None,  # ty: ignore[invalid-argument-type]
             RESIDUAL=residual,  # ty: ignore[invalid-argument-type]
             CONV_DTYPE=_TL_DTYPES[out_dtype],  # ty: ignore[invalid-argument-type]
             ROUND_G=interpret and out_dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
             ROUND_DX=interpret and x.dtype == torch.bfloat16,  # ty: ignore[invalid-argument-type]
-            BLOCK_T=cfg.block_t,  # ty: ignore[invalid-argument-type]
             BLOCK_D=cfg.block_d,  # ty: ignore[invalid-argument-type]
-            TILES=cfg.tiles,  # ty: ignore[invalid-argument-type]
-            DEFER_DW=cfg.defer_dw,  # ty: ignore[invalid-argument-type]
+            STRIP=cfg.strip,  # ty: ignore[invalid-argument-type]
+            UNROLL=cfg.unroll,  # ty: ignore[invalid-argument-type]
             num_warps=cfg.num_warps,  # ty: ignore[unknown-argument]
             num_stages=cfg.num_stages,  # ty: ignore[unknown-argument]
         )

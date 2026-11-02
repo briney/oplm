@@ -7,9 +7,10 @@ Packed rows of 65,536 tokens (B=32, T=2048) with lognormal protein-like segment 
     python canon_kernel_bench.py --out canon-kernel-bench.json --sweep    # + launch configs
 
 `--sweep` also times `canon_forward` and `canon_backward` separately for every `FwdConfig` /
-`BwdConfig` in a grid. Each config is first checked against the reference at the timed shape; a
-config that fails to compile or disagrees is reported (`error`), not timed. The best config per
-(D, dtypes, phase) is printed as `FWD_CONFIGS` / `BWD_CONFIGS` entries for `canon_kernel.py`.
+`BwdConfig` in a grid, for bf16 `x` (what training feeds every Canon call). Each config is first
+checked against the reference at the timed shape; a config that fails to compile or disagrees is
+reported (`error`), not timed. The best config per (D, dtypes, phase) is printed as
+`FWD_CONFIGS` / `BWD_CONFIGS` entries for `canon_kernel.py`.
 `--tiny` runs everything on a toy shape (on CPU under `TRITON_INTERPRET=1` too), a smoke test.
 """
 
@@ -75,28 +76,15 @@ def time_ms(fn: Callable[[], object], iters: int, warmup: int, median: bool = Tr
     return batched, statistics.median(times)
 
 
-def fwd_grid():
-    """Forward configs; skips tiles over 64 fp32 accumulator elements per thread (spills)."""
-    from oplm.model.canon_kernel import FwdConfig
-
+def strip_grid(cls, per_thread=(2, 4, 8)):
+    """`FwdConfig` or `BwdConfig` launches: `per_thread` channels per thread (4-16 B bf16 vectors;
+    the backward spills at 8 for k=7), strips of 64-512 tokens, 2-8 tokens per loop step, with and
+    without Triton's loop pipelining."""
+    grid = itertools.product((64, 128, 256), (1, 2, 4), (64, 128, 256, 512), (2, 4, 8), (1, 2))
     return [
-        FwdConfig(bt, bd, w)
-        for bt, bd, w in itertools.product((16, 32, 64, 128), (32, 64, 128), (2, 4, 8))
-        if bt * bd / (32 * w) <= 64
-    ]
-
-
-def bwd_grid(k: int):
-    """Backward configs: tiles per program for a 256- or 512-token span, dw reduced per tile or
-    deferred. Skips 3D (taps x tile) tensors over 128 fp32 elements per thread (spills)."""
-    from oplm.model.canon_kernel import BwdConfig
-
-    k_pow2 = 1 << (k - 1).bit_length()
-    grid = itertools.product((8, 16, 32, 64), (32, 64, 128), (2, 4, 8), (True, False), (256, 512))
-    return [
-        BwdConfig(bt, bd, span // bt, defer, w)
-        for bt, bd, w, defer, span in grid
-        if k_pow2 * bt * bd / (32 * w) * (2 if defer else 1) <= 128
+        cls(block_d=bd, strip=strip, unroll=unroll, num_warps=w, num_stages=stages)
+        for bd, w, strip, unroll, stages in grid
+        if bd // (32 * w) in per_thread
     ]
 
 
@@ -107,7 +95,7 @@ def max_rel_err(got: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 # Correctness gate per config: out / dx within 1% of max |ref| (bf16 rounding flips), dW within
-# 0.1% (fp32 sums in another order). Miscompiles (missed tiles, garbage) are far beyond either.
+# 0.1% (fp32 sums in another order). Miscompiles (missed strips, garbage) are far beyond either.
 SWEEP_TOL = (1e-2, 1e-3)
 
 
@@ -126,8 +114,12 @@ def sweep(a, base: dict, x, w, dy, mask, seg, out_dtype) -> list[dict]:
     traffic["bwd"] = n * (dy.element_size() + 2 * x.element_size())
     args = (x, w, mask, seg, out_dtype, True)
     calls = {
-        "fwd": (FwdConfig(), fwd_grid(), lambda c: (canon_forward(*args, config=c),)),
-        "bwd": (BwdConfig(), bwd_grid(a.k), lambda c: canon_backward(dy, *args, config=c)),
+        "fwd": (FwdConfig(), strip_grid(FwdConfig), lambda c: (canon_forward(*args, config=c),)),
+        "bwd": (
+            BwdConfig(),
+            strip_grid(BwdConfig, (2, 4)),
+            lambda c: canon_backward(dy, *args, config=c),
+        ),
     }
     rows = []
     for phase, (default, configs, call) in calls.items():
@@ -268,7 +260,7 @@ def main() -> None:
                     )
             row["speedup"] = row["compiled_ref_ms"] / row["kernel_ms"]
             rows.append(row)
-            if a.sweep:
+            if a.sweep and x_dtype == torch.bfloat16:
                 x_in = x.detach()
                 sweep_rows += sweep(a, base, x_in, w.detach(), dy, mask, seg, out_dtype)
 
