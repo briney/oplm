@@ -99,14 +99,16 @@ was stale (`summary.json`, `oplm_version_note`). Design and rationale:
 | source | origin | obtained | version, size, checksum |
 |---|---|---|---|
 | UniRef90 | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` | 2026-10-30, 19:31:50–19:54:09 UTC | release 2026_03 (02-Sep-2026), 121,494,192 clusters; 32,107,879,019 bytes; sha256 `f6fa665e27d14fa3dadcff39df6db0052f125ffcf40ba7806f0863c1f262b8dc`; CC BY 4.0 (UniProt Consortium) |
+| DeepClust | `DeepClustParquet` from <https://objectstore.hpccloud.mpcdf.mpg.de/deepclust/index.html> ([file guide](https://github.com/bbuchfink/diamond/wiki/DeepClust-data-files)) | August 2026 (exact date not recorded) | archive dated 2024-04-12 on the server; no license stated (a compilation of public databases, each under its own terms) |
 | deepclust70 | the shuffled deepclust70 copy, 10,708 shards (`source_shards`) | 2026-10-20 (shuffled copy) | 5,353,586,520 rows |
 
 UniRef90 values are from `$OPLM_DATA/uniref90/SOURCES.txt`, `SHA256SUMS`,
 `download_started_utc.txt`, `download_finished_utc.txt` and `uniref90.release_note`.
 `summary.json` records the same input sha256 (`input_sha256`).
 
-> **Pending:** deepclust70's upstream sources, release versions and build procedure
-> (waiting on #61).
+deepclust70 was built by the maintainers from DeepClust (Buchfink et al., *Nature Methods*
+23, 724–727 (2026), doi:10.1038/s41592-026-03030-z), the sequence set behind DIAMOND
+DeepClust. The `DeepClustParquet` files on the server have not changed since then.
 
 ### Filtering
 
@@ -115,7 +117,12 @@ uniref70 cluster: 121,494,192 sequences in (`uniref90_sequences_in`), 121,494,19
 rows out (train 121,461,869 + eval 16,119 + test 16,204). No length, residue or
 taxonomy filter is applied.
 
-> **Pending:** filters applied to deepclust70's raw sequences (waiting on #61).
+deepclust70: DeepClust ships a deduplicated FASTA (about 19B sequences). Before
+clustering, every terminal stop codon (a trailing `*`) was removed; internal `*` were
+left as they are. No length, residue or taxonomy filter was applied. The result was
+converted to a DIAMOND database (`deepclust_dedup-19B.dmnd`).
+Internal `*` survive into the shards (18,283 of 1,000,000 rows in `shard-01234`) and
+tokenize to `<unk>`.
 
 ### Clustering
 
@@ -143,7 +150,17 @@ mean 1.604, max 2,370.
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | clusters | 60,298,749 | 11,193,570 | 3,011,528 | 842,621 | 262,141 | 80,833 | 22,036 | 5,458 | 1,128 | 153 | 17 | 2 |
 
-> **Pending:** deepclust70's clustering tool, parameters and cluster counts (waiting on #61).
+deepclust70: one round of DIAMOND v2.2.5.185 `linclust` over the deduplicated DeepClust
+sequences (`deepclust_dedup-19B.dmnd`), at about 70% identity with 90% member coverage:
+
+```
+diamond linclust -d deepclust_dedup-19B.dmnd -o deepclust70_memcov90.tsv \
+  --reps deepclust70_memcov90_reps.fasta --approx-id 70 --member-cover 90 \
+  -p 256 -M 800G -t <tmp> --log
+```
+
+The rows are the cluster representatives (`--reps`), one sequence per row. Members are
+not kept.
 
 ### Shuffling
 
@@ -162,7 +179,13 @@ shuffled one. See *Why the data is shuffled* below. The re-cut to 1,000,000-row 
 `dbf6da39210da1dbbe1f1e63794d91f0b94debbe30a556ccca56e612220a44a4` before and after
 (`sha256_in`, `sha256_out`), over 5,353,586,520 rows from 10,708 source shards.
 
-> **Pending:** deepclust70's shuffle procedure and seed (waiting on #61).
+The cluster representatives were randomly shuffled across shards (seed 0) before
+sharding. The shuffle script was not kept with the dataset, so treat the published shard
+order, not a replay, as the reference: it is the order the training runs read.
+
+deepclust70's held-out files are random draws of representatives from singleton clusters
+(`*_singletons`) and from clusters with 2+ members (`*_gte2`), made when deepclust70 was
+built.
 
 ### Final counts
 
