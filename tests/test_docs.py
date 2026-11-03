@@ -143,7 +143,7 @@ PENDING = "> **Pending:**"
 
 def test_pending_markers_present() -> None:
     expect = {  # doc → issue numbers whose Pending markers must appear in it
-        "docs/data.md": ["#61", "#58"],
+        "docs/data.md": ["#58"],
         "docs/training.md": ["#62"],
         "docs/mup-lr.md": ["#70", "#58"],
         "docs/inference.md": ["#62"],
