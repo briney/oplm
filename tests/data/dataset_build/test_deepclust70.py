@@ -52,6 +52,8 @@ def test_screen_heldout_keeps_survivors_in_pool_order(tmp_path, monkeypatch):
     ]
     assert ids("eval_gte2") == ["eval-gte2-0", "eval-gte2-2", "eval-gte2-3"]
     assert ids("test_gte2") == ["eval-gte2-4", "eval-gte2-5", "test-gte2-1", "test-gte2-2"]
+    assert ids("test_extra_singletons") == ["test-singletons-3", "test-singletons-4"]
+    assert ids("test_extra_gte2") == ["test-gte2-3", "test-gte2-4", "test-gte2-5"]
     assert pq.read_schema(out / "eval_gte2.parquet").field("sequence").type == pa.large_string()
     assert s["stats"]["singletons"]["survivors"] == 9 and s["stats"]["gte2"]["survivors"] == 10
     assert json.loads((out / "heldout.json").read_text()) == s
