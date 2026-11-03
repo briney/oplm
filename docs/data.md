@@ -71,10 +71,13 @@ oplm-sequence-data/
   deepclust70/
     train/summary.json           # re-cut record
     train/shard-00000.parquet    # 5,354 shards, 1,000,000 rows each (the last has 586,520)
-    eval_singletons.parquet      # 15,000
-    eval_gte2.parquet            # 15,000
-    test_singletons.parquet      # 150,000
-    test_gte2.parquet            # 150,000
+    heldout.json                 # held-out screen record
+    eval_singletons.parquet      # 5,000 held-out singleton-cluster reps
+    eval_gte2.parquet            # 5,000 held-out reps of 2+-member clusters
+    test_singletons.parquet      # 5,000
+    test_gte2.parquet            # 5,000
+    test_extra_singletons.parquet  # 105,279 (every other screen survivor)
+    test_extra_gte2.parquet        # 79,684
 ```
 
 uniref70 rows have `sequence_id`, `sequence` (the representative), `member_ids` and
@@ -197,12 +200,17 @@ built.
 | `uniref70/test_singletons.parquet` | 5,000 | 5,000 | 1,701,713 | 1,701,713 |
 | `uniref70/test_gte2.parquet` | 5,000 | 11,204 | 1,891,172 | 4,295,018 |
 | `deepclust70/train/` | 5,353,586,520 | | | |
-| `deepclust70/eval_singletons.parquet`, `eval_gte2.parquet` | 15,000 each | | | |
-| `deepclust70/test_singletons.parquet`, `test_gte2.parquet` | 150,000 each | | | |
+| `deepclust70/eval_singletons.parquet` | 5,000 | | 486,576 | |
+| `deepclust70/eval_gte2.parquet` | 5,000 | | 887,835 | |
+| `deepclust70/test_singletons.parquet` | 5,000 | | 488,725 | |
+| `deepclust70/test_gte2.parquet` | 5,000 | | 877,340 | |
+| `deepclust70/test_extra_singletons.parquet` | 105,279 | | 10,377,799 | |
+| `deepclust70/test_extra_gte2.parquet` | 79,684 | | 14,222,233 | |
 
 uniref70 train is 758 shards of 100,000 rows (`stages.write`: row groups of 10,000,
 zstd). deepclust70 train is 5,354 shards of 1,000,000 rows (zstd). deepclust70 row counts
-are read from the parquet metadata; its held-out files were copied as-is. Tokens per
+are read from the parquet metadata; its held-out files are screened (see *Held-out
+sequences*). Tokens per
 source are in *Training data* above.
 
 ## Evaluation data
@@ -257,6 +265,32 @@ candidates give more survivors at the same rate and of the same kind.
 
 The old `uniref70/eval.parquet` is dropped: its provenance is unknown and it is not
 published. Loss on the new evals is not comparable with earlier runs' curves.
+
+**deepclust70 held-out** (`oplm data deepclust70-heldout`; values from
+`deepclust70/heldout.json`). deepclust70's original held-out files (15,000 eval and
+150,000 test representatives per stratum) were never screened against uniref70. They
+are now screened the same way: every representative is searched with the arguments
+above against deepclust70 `train/` and against every uniref70 `train/` member. Per
+stratum the pool is the old eval file then the old test file, in file order. The first
+5,000 survivors are eval, the next 5,000 test, and every remaining survivor goes to
+`test_extra_*`. Candidates with a hit are dropped. They were never in deepclust70
+`train/`, and they are not added back, because that would change the published train
+order.
+
+| stratum | candidates | hits | survivors | survival |
+|---|--:|--:|--:|--:|
+| singletons | 165,000 | 49,721 | 115,279 | 69.9% |
+| gte2 | 165,000 | 75,316 | 89,684 | 54.4% |
+| total | 330,000 | 125,037 | 204,963 | 62.1% |
+
+Of the 330,000 candidates, 122,696 hit deepclust70 and 13,461 hit a uniref70 member (a
+candidate can hit both).
+
+```
+oplm data deepclust70-heldout <original held-out dir> <out>/deepclust70 \
+  --deepclust70 <out>/deepclust70/train --uniref70 <out>/uniref70/train \
+  --workdir <work> --threads 32
+```
 
 ### Structure evaluation sets
 

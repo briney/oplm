@@ -37,12 +37,13 @@ def screen_heldout(
     n_test: int,
     chunk_rows: int = 200_000_000,
 ) -> dict:
-    """Write ``out/{eval,test}_{singletons,gte2}.parquet`` and ``out/heldout.json``.
+    """Write ``out/{eval,test,test_extra}_{singletons,gte2}.parquet`` and ``out/heldout.json``.
 
     Per stratum the candidate pool is ``src/eval_<stratum>.parquet`` then
     ``src/test_<stratum>.parquet``, in file order. A candidate with any ``SCREEN_ARGS`` hit
     in ``deepclust70`` (train shards) or among the members of ``uniref70`` (train shards)
-    is dropped; the first ``n_eval`` survivors are eval and the next ``n_test`` are test.
+    is dropped; the first ``n_eval`` survivors are eval, the next ``n_test`` are test and
+    the rest are test_extra.
     Screen hits files stay in ``workdir``, so a rerun resumes.
 
     Raises:
@@ -82,7 +83,12 @@ def screen_heldout(
 
     out.mkdir(parents=True, exist_ok=True)
     for k, t in kept.items():
-        for name, part in (("eval", t.slice(0, n_eval)), ("test", t.slice(n_eval, n_test))):
+        parts = {
+            "eval": t.slice(0, n_eval),
+            "test": t.slice(n_eval, n_test),
+            "test_extra": t.slice(n_eval + n_test),
+        }
+        for name, part in parts.items():
             pq.write_table(part, out / f"{name}_{k}.parquet", compression=_COMPRESSION)
     summary = {
         "params": {
