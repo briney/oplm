@@ -49,9 +49,22 @@ about 181k steps at 4M tokens per step (`train.tokens_per_step`).
 
 ## Download the exact training set
 
-The dataset is built but not yet published.
+Published at [`brineylab/oplm-sequence-data`](https://huggingface.co/datasets/brineylab/oplm-sequence-data)
+under tag `2026-11-03` (commit `6619c797`), about 504 GB. The tag pins the exact files the
+production runs train on. Check downloads against `manifest.parquet`.
 
-> **Pending:** the Hugging Face location of the published training set (waiting on #61).
+```bash
+# everything
+hf download brineylab/oplm-sequence-data --repo-type dataset --revision 2026-11-03 \
+    --local-dir $OPLM_DATA/hf/oplm-sequence-data
+# held-out sets only
+hf download brineylab/oplm-sequence-data --repo-type dataset --revision 2026-11-03 \
+    --include "*/eval_*" --include "*/test_*" --local-dir $OPLM_DATA/hf/oplm-sequence-data
+```
+
+Publishing: `hf upload-large-folder brineylab/oplm-sequence-data <folder> --repo-type
+dataset --num-workers 4`. With the default worker count the upload hits the Hub's API
+limit (1,000 requests per 5 minutes) and exits; it resumes when re-run.
 
 The dataset folder (`$OPLM_DATA/hf/oplm-sequence-data/`) holds both sources. Its dataset
 card (`README.md`) has the rebuild commands; `manifest.parquet` (one row per file: path,
