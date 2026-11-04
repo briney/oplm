@@ -120,6 +120,25 @@ def deepclust70_heldout(
     typer.echo(json.dumps(s["stats"]))
 
 
+@app.command("deepclust70-return")
+def deepclust70_return(
+    src: Annotated[Path, typer.Argument(help="Directory of the copied eval_*/test_* files")],
+    out: Annotated[Path, typer.Argument(help="deepclust70 dir: deepclust70-heldout OUT")],
+    uniref70: Annotated[Path, typer.Option(help="uniref70 dir with eval_*/test_* files")],
+    workdir: Annotated[Path, typer.Option(help="Screen scratch directory (resumable)")],
+    threads: Annotated[int, typer.Option()] = 32,
+    mmseqs: Annotated[str, typer.Option(help="mmseqs executable")] = "mmseqs",
+    seed: Annotated[int, typer.Option(help="Shuffle seed for the last train shard")] = 0,
+) -> None:
+    """Return unused deepclust70 held-out reps to train/ (after an eval/test screen)."""
+    from oplm.data.build.deepclust70 import return_heldout
+
+    s = return_heldout(
+        src, out, uniref70=uniref70, workdir=workdir, mmseqs=mmseqs, threads=threads, seed=seed
+    )
+    typer.echo(json.dumps(s["stats"]))
+
+
 @app.command()
 def manifest(dataset: Annotated[Path, typer.Argument(help="Dataset directory")]) -> None:
     """Write DATASET/manifest.parquet (path, rows, bytes, sha256 per file)."""
