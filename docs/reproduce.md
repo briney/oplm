@@ -17,7 +17,7 @@ OPLMFold training will get its own path later. Its development notes are in [FOL
 Download the published training set, or rebuild it from the primary sources. The training set
 and the held-out sequence sets are
 [`brineylab/oplm-sequence-data`](https://huggingface.co/datasets/brineylab/oplm-sequence-data)
-at tag `2026-11-03`. The structure eval sets are published separately. Point `data.train` and
+at tag `2026-11-04`. The structure eval sets are published separately. Point `data.train` and
 `data.eval` in the config at the downloaded folders.
 
 - Download or rebuild the training set: [data.md, *Download the exact training set*](data.md#download-the-exact-training-set)

@@ -50,10 +50,8 @@ about 181k steps at 4M tokens per step (`train.tokens_per_step`).
 ## Download the exact training set
 
 Published at [`brineylab/oplm-sequence-data`](https://huggingface.co/datasets/brineylab/oplm-sequence-data)
-under tag `2026-11-04` (commit `TBD`), about 504 GB. The tag pins the exact files the
-production runs train on. Check downloads against `manifest.parquet`. The earlier tag
-`2026-11-03` kept the unused deepclust70 held-out reps as `test_extra_*` instead of in
-`train/`; runs started on it should stay pinned to it.
+under tag `2026-11-04` (commit `813d9eeb`), about 504 GB. The tag pins the exact files the
+production runs train on. Check downloads against `manifest.parquet`.
 
 ```bash
 # everything
