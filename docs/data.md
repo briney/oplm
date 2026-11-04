@@ -12,7 +12,7 @@ The training set is two UniRef-derived sequence sets, mixed by rows:
 - **uniref70**: UniRef90 release 2026_03 clustered at 70% identity, one row per cluster,
   75.7M train rows, about 27.5B tokens. Built by `oplm data uniref70` (see
   *How the training set was built*).
-- **deepclust70**: the deep-clustered 70% identity set, 5.35B rows, about 730B tokens.
+- **deepclust70**: the deep-clustered 70% identity set, 5.35B rows, about 721B tokens.
 
 The mix is set in `data.train` of [`configs/scaling.yaml`](../configs/scaling.yaml):
 uniref70 `fraction: 0.05` and deepclust70 `fraction: 0.95`. Fractions are **rows**,
@@ -26,7 +26,7 @@ Rows to tokens: `tokens = rows x mean tokens per row`, with the mean taken per s
 | source | rows | tokens | mean tokens per row |
 | --- | --: | --: | --: |
 | uniref70 | 75.7M | about 27.5B | about 363 |
-| deepclust70 | 5.35B | about 730B | about 136 |
+| deepclust70 | 5.35B | about 721B | about 135 |
 
 uniref70 tokens come from `uniref70/summary.json` (`stages.write.train`), before
 truncation. The tokenizer adds `<cls>` and `<eos>` to each sequence, so a row is its
@@ -42,15 +42,22 @@ residues plus 2 tokens:
   `45,532,832,579 member residues / 121,461,869 members` = 374.9 residues, is higher,
   but it weights each cluster by its size, and the loader draws per cluster.
 
-With 0.05 / 0.95 as row fractions, `0.05 x 363 / (0.05 x 363 + 0.95 x 136)` is about
+deepclust70: `710,712,957,639 residues / 5,353,896,515 rows` = 132.7 residues, so about
+134.7 tokens per row and `710,712,957,639 + 2 x 5,353,896,515` = 721,420,750,669 tokens
+per epoch. The residue count is not in a build record: it was summed over the
+pre-reshard shards (same row stream; the first 10M rows' `(sequence_id, sequence)`
+sha256 matches the published shards) plus the 46,856,178 residues of the returned
+held-out reps.
+
+With 0.05 / 0.95 as row fractions, `0.05 x 363 / (0.05 x 363 + 0.95 x 135)` is about
 12% of tokens from uniref70. One epoch of the natural mix (every row of both sources
-once) is about 758B tokens (27.5B + 730B), which is `758B / 4,194,304 tokens per step`,
-about 181k steps at 4M tokens per step (`train.tokens_per_step`).
+once) is about 749B tokens (27.5B + 721B), which is `749B / 4,194,304 tokens per step`,
+about 179k steps at 4M tokens per step (`train.tokens_per_step`).
 
 ## Download the exact training set
 
 Published at [`brineylab/oplm-sequence-data`](https://huggingface.co/datasets/brineylab/oplm-sequence-data)
-under tag `2026-11-04` (commit `813d9eeb`), about 504 GB. The tag pins the exact files the
+under tag `2026-11-04` (commit `f903cd98`), about 504 GB. The tag pins the exact files the
 production runs train on. Check downloads against `manifest.parquet`.
 
 ```bash
@@ -213,7 +220,7 @@ built.
 | `uniref70/eval_gte2.parquet` | 5,000 | 11,119 | 1,973,383 | 4,469,677 |
 | `uniref70/test_singletons.parquet` | 5,000 | 5,000 | 1,701,713 | 1,701,713 |
 | `uniref70/test_gte2.parquet` | 5,000 | 11,204 | 1,891,172 | 4,295,018 |
-| `deepclust70/train/` | 5,353,896,515 | | | |
+| `deepclust70/train/` | 5,353,896,515 | | 710,712,957,639 | |
 | `deepclust70/eval_singletons.parquet` | 5,000 | | 486,576 | |
 | `deepclust70/eval_gte2.parquet` | 5,000 | | 887,835 | |
 | `deepclust70/test_singletons.parquet` | 5,000 | | 488,725 | |
