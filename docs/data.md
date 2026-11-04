@@ -50,15 +50,15 @@ about 181k steps at 4M tokens per step (`train.tokens_per_step`).
 ## Download the exact training set
 
 Published at [`brineylab/oplm-sequence-data`](https://huggingface.co/datasets/brineylab/oplm-sequence-data)
-under tag `2026-11-03` (commit `6619c797`), about 504 GB. The tag pins the exact files the
+under tag `2026-11-04` (commit `813d9eeb`), about 504 GB. The tag pins the exact files the
 production runs train on. Check downloads against `manifest.parquet`.
 
 ```bash
 # everything
-hf download brineylab/oplm-sequence-data --repo-type dataset --revision 2026-11-03 \
+hf download brineylab/oplm-sequence-data --repo-type dataset --revision 2026-11-04 \
     --local-dir $OPLM_DATA/hf/oplm-sequence-data
 # held-out sets only
-hf download brineylab/oplm-sequence-data --repo-type dataset --revision 2026-11-03 \
+hf download brineylab/oplm-sequence-data --repo-type dataset --revision 2026-11-04 \
     --include "*/eval_*" --include "*/test_*" --local-dir $OPLM_DATA/hf/oplm-sequence-data
 ```
 
@@ -83,14 +83,13 @@ oplm-sequence-data/
     test_gte2.parquet            # 5,000
   deepclust70/
     train/summary.json           # re-cut record
-    train/shard-00000.parquet    # 5,354 shards, 1,000,000 rows each (the last has 586,520)
-    heldout.json                 # held-out screen record
+    train/shard-00000.parquet    # 5,354 shards, 1,000,000 rows each (the last has 896,515)
+    heldout.json                 # eval/test screen record
+    returned.json                # record of unused held-out reps returned to train/
     eval_singletons.parquet      # 5,000 held-out singleton-cluster reps
     eval_gte2.parquet            # 5,000 held-out reps of 2+-member clusters
     test_singletons.parquet      # 5,000
     test_gte2.parquet            # 5,000
-    test_extra_singletons.parquet  # 105,279 (every other screen survivor)
-    test_extra_gte2.parquet        # 79,684
 ```
 
 uniref70 rows have `sequence_id`, `sequence` (the representative), `member_ids` and
@@ -194,6 +193,8 @@ shuffled one. See *Why the data is shuffled* below. The re-cut to 1,000,000-row 
 `(sequence_id, sequence)` stream is
 `dbf6da39210da1dbbe1f1e63794d91f0b94debbe30a556ccca56e612220a44a4` before and after
 (`sha256_in`, `sha256_out`), over 5,353,586,520 rows from 10,708 source shards.
+The 309,995 unused held-out reps returned afterwards (see *Held-out sequences*) were
+shuffled into the last shard only, so every other shard is unchanged.
 
 The cluster representatives were randomly shuffled across shards (seed 0) before
 sharding. The shuffle script was not kept with the dataset, so treat the published shard
@@ -212,16 +213,14 @@ built.
 | `uniref70/eval_gte2.parquet` | 5,000 | 11,119 | 1,973,383 | 4,469,677 |
 | `uniref70/test_singletons.parquet` | 5,000 | 5,000 | 1,701,713 | 1,701,713 |
 | `uniref70/test_gte2.parquet` | 5,000 | 11,204 | 1,891,172 | 4,295,018 |
-| `deepclust70/train/` | 5,353,586,520 | | | |
+| `deepclust70/train/` | 5,353,896,515 | | | |
 | `deepclust70/eval_singletons.parquet` | 5,000 | | 486,576 | |
 | `deepclust70/eval_gte2.parquet` | 5,000 | | 887,835 | |
 | `deepclust70/test_singletons.parquet` | 5,000 | | 488,725 | |
 | `deepclust70/test_gte2.parquet` | 5,000 | | 877,340 | |
-| `deepclust70/test_extra_singletons.parquet` | 105,279 | | 10,377,799 | |
-| `deepclust70/test_extra_gte2.parquet` | 79,684 | | 14,222,233 | |
 
 uniref70 train is 758 shards of 100,000 rows (`stages.write`: row groups of 10,000,
-zstd). deepclust70 train is 5,354 shards of 1,000,000 rows (zstd). deepclust70 row counts
+zstd). deepclust70 train is 5,354 shards of 1,000,000 rows (zstd; the last has 896,515). deepclust70 row counts
 are read from the parquet metadata; its held-out files are screened (see *Held-out
 sequences*). Tokens per
 source are in *Training data* above.
@@ -285,10 +284,7 @@ published. Loss on the new evals is not comparable with earlier runs' curves.
 are now screened the same way: every representative is searched with the arguments
 above against deepclust70 `train/` and against every uniref70 `train/` member. Per
 stratum the pool is the old eval file then the old test file, in file order. The first
-5,000 survivors are eval, the next 5,000 test, and every remaining survivor goes to
-`test_extra_*`. Candidates with a hit are dropped. They were never in deepclust70
-`train/`, and they are not added back, because that would change the published train
-order.
+5,000 survivors are eval and the next 5,000 test.
 
 | stratum | candidates | hits | survivors | survival |
 |---|--:|--:|--:|--:|
@@ -303,6 +299,22 @@ candidate can hit both).
 oplm data deepclust70-heldout <original held-out dir> <out>/deepclust70 \
   --deepclust70 <out>/deepclust70/train --uniref70 <out>/uniref70/train \
   --workdir <work> --threads 32
+```
+
+**Returning unused deepclust70 held-out reps** (`oplm data deepclust70-return`; values
+from `deepclust70/returned.json`). The other 310,000 candidates (hits and unused
+survivors alike) go back to deepclust70 `train/`. They were never in it, so first each
+is searched with the same arguments against every eval/test sequence: deepclust70's 20,000
+and every member of uniref70's 20,000 eval/test clusters. The uniref70 eval/test screen
+ran against `train/` without them, so this closes that gap. 5 candidates hit a uniref70
+eval/test member (none hit deepclust70's) and are left out of the dataset. The other
+309,995 (154,998 singletons, 154,997 gte2) are concatenated with the last `train/`
+shard, `shard-05353.parquet` (586,520 rows → 896,515), and that shard is shuffled with
+`default_rng(0)`. Every other shard is unchanged. Run at commit `fa6d689` (2026-11-04).
+
+```
+oplm data deepclust70-return <original held-out dir> <out>/deepclust70 \
+  --uniref70 <out>/uniref70 --workdir <work> --threads 32 --seed 0
 ```
 
 ### Structure evaluation sets
