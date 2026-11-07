@@ -293,7 +293,7 @@ Backed by `oplm.config.TrainConfig`.
 | `train.embedding_weight_decay` | `float` | `0.01` | Decoupled weight decay on the token embedding, toward 0 (`0`: undecayed). Finite and `>= 0`. Run default `0.01`; dataclass fallback `0`. |
 | `train.weight_decay_to_init` | `float` | `0.1` | Decoupled weight decay toward each parameter's initial value: norm gains toward 1, residual gates toward `model.residual_gate_init`, biases toward 0 (`0`: undecayed). Value-residual lambdas and L2 QK scales are never decayed. Finite and `>= 0`. Turning this or `embedding_weight_decay` on or off changes the AdamW param groups, so a resume or branch must keep the setting (on or off) its checkpoint was saved with; changing a nonzero value is fine. Run default `0.1`, which bounds the sandwich post-norm gains on long runs; dataclass fallback `0`. |
 | `train.max_grad_norm` | `float` | `1.0` | Set `0` to disable clipping. |
-| `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, or `wsd_cosine`. |
+| `train.scheduler` | `str` | `warmup_linear` | `warmup_linear`, `warmup_cosine`, `wsd_linear`, `wsd_cosine`, or `wsd_sqrt`. |
 | `train.warmup_steps` | `int` | `5_000` | Must be `≥ 0`. |
 | `train.stable_steps` | `int` | `0` | WSD plateau length; must be `≥ 0`. |
 | `train.log_every` | `int` | `10` | Train-metric logging cadence (optimizer steps). |

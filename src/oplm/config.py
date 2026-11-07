@@ -17,7 +17,13 @@ from omegaconf import DictConfig, OmegaConf
 AVAILABLE_PRESETS = ("50M", "170M", "400M", "800M", "1B", "3B", "6B", "12B")
 
 
-_VALID_SCHEDULERS = ("warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine")
+_VALID_SCHEDULERS = (
+    "warmup_linear",
+    "warmup_cosine",
+    "wsd_linear",
+    "wsd_cosine",
+    "wsd_sqrt",
+)
 _VALID_OPTIMIZERS = ("adamw", "muon")
 _VALID_MIXED_PRECISION = ("bf16", "fp16", "no")
 _VALID_PARALLELISM = ("ddp", "hsdp")

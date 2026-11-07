@@ -8,13 +8,19 @@ any ``embed``-named weight go to AdamW-no-decay.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
 from oplm.config import TrainConfig
 from oplm.model import OplmConfig as OplmModelConfig
 from oplm.model import OplmForMaskedLM
-from oplm.training.optim import OptimizerParamGroups, partition_optimizer_params
+from oplm.training.optim import (
+    OptimizerParamGroups,
+    get_schedule_fn,
+    partition_optimizer_params,
+)
 
 
 def _model() -> OplmForMaskedLM:
@@ -322,3 +328,23 @@ def test_group_structure_depends_on_which_knobs_are_on_not_their_values() -> Non
         groups = partition_optimizer_params(model, cfg).adamw_groups
         shapes.append([(len(g.params), g.decay_target) for g in groups])
     assert shapes[0] == shapes[1]
+
+
+@pytest.mark.parametrize(
+    ("scheduler", "quarter"),
+    [
+        ("wsd_linear", 0.75),
+        ("wsd_cosine", 0.5 * (1 + math.cos(math.pi / 4))),
+        ("wsd_sqrt", 0.5),
+    ],
+)
+def test_wsd_decay_shapes(scheduler: str, quarter: float) -> None:
+    """Each WSD shape: plateau at 1, its own value a quarter into the decay, floor at the end."""
+    r = 0.1
+    fn = get_schedule_fn(scheduler, warmup_steps=0, total_steps=500, min_ratio=r, stable_steps=100)
+    assert fn(0) == fn(99) == 1.0
+    assert fn(200) == pytest.approx(r + (1 - r) * quarter)  # decay_steps=400, 100/400 = 0.25
+    assert fn(500) == pytest.approx(r)
+    assert fn(520) == pytest.approx(r)  # past the end: held at the floor
+    decay = [fn(s) for s in range(100, 521)]
+    assert all(a >= b for a, b in zip(decay, decay[1:], strict=False))

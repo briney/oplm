@@ -58,7 +58,7 @@ train:
   max_grad_norm: 1.0
 
   # Scheduler
-  scheduler: warmup_linear    # warmup_linear | warmup_cosine | wsd_linear | wsd_cosine
+  scheduler: warmup_linear    # warmup_linear | warmup_cosine | wsd_linear | wsd_cosine | wsd_sqrt
   warmup_steps: 5_000
   stable_steps: 0             # WSD plateau length (WSD schedules only)
 

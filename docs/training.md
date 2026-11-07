@@ -272,13 +272,13 @@ moves a parameter `lr * wd` of the way to its target, with `lr` its AdamW group'
 holds a parameter within about `sqrt(lr / (2 * wd))` of its target.
 
 **Schedule** (`train.scheduler`): `warmup_linear` (default), `warmup_cosine`,
-`wsd_linear`, or `wsd_cosine`. The multiplier on the peak LR has three phases:
+`wsd_linear`, `wsd_cosine`, or `wsd_sqrt`. The multiplier on the peak LR has three phases:
 
 1. **Warmup**: linear from 0 to 1 over steps `0 .. warmup_steps`.
 2. **Stable** (WSD only): held at 1 for the next `stable_steps` steps. `stable_steps` counts
    steps **after** warmup, so the plateau ends at step `warmup_steps + stable_steps`. It is ignored
    by the non-WSD schedulers.
-3. **Decay**: linear or cosine from 1 to `min_lr / lr` over the remaining
+3. **Decay**: linear, cosine or 1-sqrt (`1 - sqrt(progress)`) from 1 to `min_lr / lr` over the remaining
    `decay_steps = max_steps - warmup_steps - stable_steps` steps (at least 1), reaching the floor at
    the final step.
 
