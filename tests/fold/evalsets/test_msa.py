@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+import urllib.error
 
 import pytest
 import torch
@@ -52,13 +53,17 @@ def _fake(submits: list[dict], statuses: list[str]):
 def test_fetch_msa_polls_then_combines():
     sleeps: list[float] = []
     fake = _fake(
-        [{"id": "", "status": "RATELIMIT"}, {"id": "abc", "status": "PENDING"}],
+        [
+            {"status": "RATELIMIT"},
+            {"status": "RATELIMIT"},
+            {"id": "abc", "status": "PENDING"},
+        ],
         ["RUNNING", "COMPLETE"],
     )
     a3m = fetch_msa(SEQ, "http://x", fetch=fake, sleep=sleeps.append, poll_seconds=5.0)
     assert a3m.count(">") == 1 + 2 + 1  # env query not repeated
     assert "\x00" not in a3m
-    assert sleeps[0] == 5.0 and sleeps[1] > sleeps[0]  # backed off after RATELIMIT
+    assert sleeps == [5.0, 10.0, 5.0, 5.0]  # backs off on RATELIMIT, resets after
     assert parse_a3m(a3m)[-1] == "MK-LA"
 
 
@@ -93,3 +98,33 @@ def test_neff_identical_and_distinct():
     distinct = torch.tensor([[i] * 6 for i in range(4)], dtype=torch.int8)
     assert neff(distinct)[0] == pytest.approx(4.0)
     assert neff(same[:1])[0] == 1.0
+
+
+def test_fetch_msa_retries_transient_http_error():
+    inner = _fake([{"id": "abc", "status": "COMPLETE"}], [])
+    calls = {"n": 0}
+
+    def flaky(url: str, body: bytes | None) -> bytes:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.HTTPError(url, 503, "unavailable", {}, None)  # ty: ignore[invalid-argument-type]
+        if calls["n"] == 2:
+            raise TimeoutError
+        return inner(url, body)
+
+    sleeps: list[float] = []
+    assert fetch_msa(SEQ, "http://x", fetch=flaky, sleep=sleeps.append).startswith(">101")
+    assert sleeps == [5.0, 10.0]
+
+
+def test_fetch_msa_nontransient_http_error_raises():
+    def bad(url: str, body: bytes | None) -> bytes:
+        raise urllib.error.HTTPError(url, 404, "nope", {}, None)  # ty: ignore[invalid-argument-type]
+
+    with pytest.raises(urllib.error.HTTPError):
+        fetch_msa(SEQ, "http://x", fetch=bad, sleep=lambda s: None)
+
+
+def test_fetch_msa_resubmits_when_reply_has_no_id():
+    fake = _fake([{"status": "UNKNOWN"}, {"id": "abc", "status": "COMPLETE"}], [])
+    assert fetch_msa(SEQ, "http://x", fetch=fake, sleep=lambda s: None).count(">") == 4

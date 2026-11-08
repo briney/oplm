@@ -9,6 +9,7 @@ import io
 import json
 import tarfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -37,6 +38,8 @@ Fetch = Callable[[str, bytes | None], bytes]
 _GAP = len(CANONICAL_AMINO_ACIDS)
 _RETRY = {"RATELIMIT", "UNKNOWN", "PENDING", "RUNNING", "MAINTENANCE"}
 _MAX_WAIT = 600.0
+_MAX_ATTEMPTS = 8
+_TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 
 
 def _urllib_fetch(url: str, body: bytes | None) -> bytes:
@@ -59,23 +62,44 @@ def fetch_msa(
     Raises:
         RuntimeError: The server reports ``ERROR`` for this sequence.
     """
-    fetch = fetch or _urllib_fetch
+    raw_fetch = fetch or _urllib_fetch
     host = host.rstrip("/")
     body = urllib.parse.urlencode({"q": f">101\n{sequence}", "mode": mode}).encode()
+
+    def fetch(url: str, data: bytes | None) -> bytes:
+        """``raw_fetch`` retried with back-off on 429/5xx, URLError and timeouts."""
+        delay = poll_seconds
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                return raw_fetch(url, data)
+            except urllib.error.HTTPError as exc:
+                if exc.code not in _TRANSIENT_HTTP or attempt == _MAX_ATTEMPTS - 1:
+                    raise
+            except (urllib.error.URLError, TimeoutError):
+                if attempt == _MAX_ATTEMPTS - 1:
+                    raise
+            sleep(delay)
+            delay = min(delay * 2, _MAX_WAIT)
+        raise AssertionError("unreachable")
+
+    def submit() -> dict:
+        return json.loads(fetch(f"{host}/ticket/msa", body))
+
     wait = poll_seconds
-
-    def status_of(reply: dict) -> str:
-        status = reply["status"]
-        if status == "ERROR":
+    reply = submit()
+    while True:
+        if reply["status"] == "ERROR":
             raise RuntimeError(f"ColabFold MSA server returned ERROR for sequence {sequence}")
-        return status
-
-    reply = json.loads(fetch(f"{host}/ticket/msa", body))
-    while status_of(reply) in _RETRY:
+        if reply["status"] not in _RETRY:
+            break
+        ratelimited = reply["status"] == "RATELIMIT"
+        if not ratelimited:
+            wait = poll_seconds
         sleep(wait)
-        if reply["status"] == "RATELIMIT":
+        if ratelimited:
             wait = min(wait * 2, _MAX_WAIT)
-            reply = json.loads(fetch(f"{host}/ticket/msa", body))
+        if ratelimited or "id" not in reply:  # no ticket yet: resubmit, as ColabFold does
+            reply = submit()
         else:
             reply = json.loads(fetch(f"{host}/ticket/{reply['id']}", None))
     ticket = reply["id"]
