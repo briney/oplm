@@ -421,6 +421,7 @@ categorical Jacobian over PDB/CIF structures.
 | `categorical_jacobian_sample_seed` | `int` | `42` | Seed for subset sampling. |
 | `categorical_jacobian_mutation_batch_size` | `int` | `20` | Mutant sequences per Jacobian forward pass. |
 | `max_structures` | `int \| null` | `null` | Optional cap on structures loaded. |
+| `coevolution` | `str \| null` | `null` | Path to the coevolution folder (MSA Potts couplings); enables the [coevolution metrics](evaluation.md#coevolution-metrics). |
 
 ### proteingym
 

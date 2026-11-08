@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+from typing import TYPE_CHECKING
 
+import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -13,8 +17,12 @@ from oplm.eval.metrics.categorical_jacobian import (
 )
 from oplm.eval.metrics.coevolution import (
     COEVOLUTION_METRIC_DIVISORS,
+    CoevolutionReference,
     compute_coevolution_metrics,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _data(scores, potts, labels, seq_len, neff_bin="high"):
@@ -103,3 +111,32 @@ def test_structures_without_potts_are_ignored_and_only_requested_metrics_emitted
     without = _data([0.9, 0.1, 0.2], None, [1, 0, 0], 1)
     m = compute_coevolution_metrics([with_potts, without], ["p_at_L_beyond"])
     assert set(m) == {"p_at_L_beyond", "p_at_L_beyond_neff_high"}
+
+
+def _write_reference(root: Path, seq: str, shape: tuple[int, int], bin_: str = "mid") -> str:
+    sha = hashlib.sha256(seq.encode()).hexdigest()
+    (root / "couplings").mkdir(parents=True)
+    np.save(root / "couplings" / f"{sha}.npy", np.ones(shape, dtype=np.float16))
+    pd.DataFrame({"sha256": [sha], "length": [len(seq)], "neff_bin": [bin_]}).to_parquet(
+        root / "manifest.parquet"
+    )
+    return sha
+
+
+def test_reference_lookup_and_missing(tmp_path: Path) -> None:
+    seq = "ACDEFGHIK"
+    _write_reference(tmp_path, seq, (9, 9))
+    ref = CoevolutionReference.load(tmp_path)
+    found = ref.lookup(seq)
+    assert found is not None
+    potts, bin_ = found
+    assert bin_ == "mid" and potts.dtype == torch.float32 and potts.shape == (9, 9)
+    assert ref.lookup("ACD") is None
+
+
+def test_reference_shape_mismatch_raises(tmp_path: Path) -> None:
+    seq = "ACDEFGHIK"
+    sha = _write_reference(tmp_path, seq, (8, 8))
+    ref = CoevolutionReference.load(tmp_path)
+    with pytest.raises(ValueError, match=sha):
+        ref.lookup(seq)

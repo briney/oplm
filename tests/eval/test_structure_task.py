@@ -7,9 +7,13 @@ the ``(L, A, L, A)`` reduction, and precision@L scoring — over real structures
 
 from __future__ import annotations
 
+import hashlib
 import math
+import shutil
 from typing import TYPE_CHECKING
 
+import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -22,6 +26,7 @@ from oplm.config import (
 )
 from oplm.data import StructureData, get_tokenizer, load_structures
 from oplm.eval.metrics.categorical_jacobian import get_canonical_amino_acid_token_ids
+from oplm.eval.metrics.coevolution import DEFAULT_COEVOLUTION_METRICS
 from oplm.eval.tasks.structure import StructureEvalTask, StructureTaskConfig
 from oplm.model import OplmConfig as OplmModelConfig
 
@@ -164,3 +169,77 @@ def test_unmodeled_residues_are_unscored(
     gap = torch.arange(19, 24)
     assert not torch.isin(data.pair_indices[0], gap).any()
     assert not torch.isin(data.pair_indices[1], gap).any()
+
+
+def test_structure_config_parses_coevolution_path() -> None:
+    assert StructureTaskConfig.from_extra({"coevolution": "/x"}).coevolution == "/x"
+    assert StructureTaskConfig.from_extra({}).coevolution is None
+
+
+def test_coevolution_key_extends_default_metrics() -> None:
+    def metrics(**kw) -> list[str]:
+        entry = EvalDatasetEntry(
+            name="s", path=".", type="structure", schedule=ScheduleSpec("steps", 1), **kw
+        )
+        cfg = OplmConfig(model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN))
+        return StructureEvalTask(entry, cfg).metrics
+
+    assert metrics(extra={"coevolution": "/x"}) == ["precision_at_L", *DEFAULT_COEVOLUTION_METRICS]
+    assert metrics(extra={"coevolution": "/x"}, metrics=["precision_at_L"]) == ["precision_at_L"]
+    assert metrics() == ["precision_at_L"]
+
+
+@pytest.mark.slow
+def test_structure_metrics_identical_with_and_without_coevolution(
+    structure_fixtures_dir: Path,
+    tmp_path: Path,
+    make_model: Callable[..., OplmForMaskedLM],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Coevolution for 1CRN only: structure P@L unchanged, 1CRN decomposes, others excluded."""
+    from accelerate import Accelerator
+
+    cfg = OplmConfig(
+        model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
+        train=TrainConfig(wandb_enabled=False),
+        data=DataConfig(num_workers=0, pin_memory=False),
+    )
+    model = make_model(max_position_embeddings=_MAX_SEQ_LEN)
+    accelerator = Accelerator(cpu=True)
+
+    def run(path: Path, extra: dict) -> dict[str, float]:
+        entry = EvalDatasetEntry(
+            name="struct",
+            path=str(path),
+            type="structure",
+            schedule=ScheduleSpec("steps", 1),
+            extra=extra,
+        )
+        return StructureEvalTask(entry, cfg).evaluate(model, accelerator)
+
+    crn_dir = tmp_path / "crn"
+    crn_dir.mkdir()
+    shutil.copy(structure_fixtures_dir / "1CRN.pdb", crn_dir)
+    (crn,) = load_structures(crn_dir)
+    gen = torch.Generator().manual_seed(0)
+    potts = torch.randn(len(crn.sequence), len(crn.sequence), generator=gen)
+    potts = potts + potts.T
+    sha = hashlib.sha256(crn.sequence.encode()).hexdigest()
+    coevo = tmp_path / "coevolution"
+    (coevo / "couplings").mkdir(parents=True)
+    np.save(coevo / "couplings" / f"{sha}.npy", potts.numpy().astype(np.float16))
+    pd.DataFrame({"sha256": [sha], "length": [len(crn.sequence)], "neff_bin": ["high"]}).to_parquet(
+        coevo / "manifest.parquet"
+    )
+
+    without = run(structure_fixtures_dir, {})
+    with caplog.at_level("WARNING"):
+        with_coevo = run(structure_fixtures_dir, {"coevolution": str(coevo)})
+    crn_only = run(crn_dir, {})
+
+    assert with_coevo["precision_at_L"] == without["precision_at_L"]
+    assert "p_at_L_beyond" in with_coevo and "p_at_L_beyond" not in without
+    assert with_coevo["p_at_L_shared"] + with_coevo["p_at_L_beyond"] == pytest.approx(
+        crn_only["precision_at_L"]
+    )
+    assert "2 of 3 structures have no coevolution data" in caplog.text

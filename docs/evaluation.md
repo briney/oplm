@@ -70,6 +70,40 @@ the precision is `0.0` (finite, not an error). Structures are sharded across ran
 > `categorical_jacobian_sample_size` for a deterministic subset and `max_structures`
 > to cap how many load.
 
+#### Coevolution metrics
+
+Optional: set `coevolution: <path to the coevolution folder>` on a `structure` entry and the
+Jacobian's pair scores are also compared with MSA Potts couplings (GREMLIN contact maps,
+precomputed and keyed by sequence sha256: `manifest.parquet` plus `couplings/<sha256>.npy`).
+The metrics join the entry's default metrics; an explicit `metrics:` list still filters.
+Without the key the task is unchanged. A structure with no coevolution row is scored for
+`precision_at_L` as usual and left out of these metrics, with one warning per eval.
+
+Per sequence, over the same scorable pairs as `precision_at_L`, with `k = L // d`
+(`d` = 1, 2, 5 for the `_at_L`, `_at_L_2`, `_at_L_5` suffixes): **M** is the top-`k` pairs by
+Jacobian score, **P** the top-`k` by Potts score, **T** the true contacts.
+
+| Metric | Definition | Reads as |
+| --- | --- | --- |
+| `coevo_precision_at_L` | `\|M ∩ P\| / k` | agreement of the model's top pairs with Potts |
+| `p_at_L_shared` | `\|M ∩ T ∩ P\| / k` | correct contacts coevolution also finds |
+| `p_at_L_beyond` | `\|M ∩ T \ P\| / k` | correct contacts Potts misses |
+| `p_at_L_potts_only` | `\|P ∩ T \ M\| / k` | coevolution contacts the model has not picked up |
+| `potts_precision_at_L` | `\|P ∩ T\| / k` | the Potts reference's own P@L (constant over training) |
+| `coevo_spearman` | Spearman rho of Jacobian vs Potts scores over all scorable pairs | whole-matrix agreement (no `d`) |
+
+Identity: `p_at_L_shared + p_at_L_beyond == precision_at_L`, per sequence and so in the mean
+(over the structures that have coevolution data).
+
+Every metric is also reported per Neff bin as `<metric>_neff_<low|mid|high>` (bin edges are
+fixed in the published manifest); an empty bin is omitted. The unsuffixed
+`coevo_precision_*` and `coevo_spearman` average over `mid` and `high` only; the other
+metrics average over all sequences.
+
+> Agreement with Potts is **not** higher-is-better. A model can be right where coevolution
+> is silent (`p_at_L_beyond`), so read `coevo_*` next to `precision_at_L`: rising
+> agreement with flat or falling P@L means the model is learning coevolution, not contacts.
+
 ### proteingym and proteingym_clinical
 
 Both share one scoring core (`src/oplm/eval/tasks/variant_scoring.py`). A variant's

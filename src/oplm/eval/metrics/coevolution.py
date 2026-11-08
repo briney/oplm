@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
+import pandas as pd
 import torch
 from torch import Tensor
 
@@ -124,3 +128,36 @@ def compute_coevolution_metrics(
             if val is not None:
                 out[f"{name}_neff_{b}"] = val
     return out
+
+
+class CoevolutionReference:
+    """Precomputed Potts contact maps keyed by sequence sha256.
+
+    Layout: ``manifest.parquet`` (``sha256``, ``length``, ``neff_bin``) and
+    ``couplings/<sha256>.npy`` (float16 ``(L, L)``, over the full sequence).
+    """
+
+    def __init__(self, root: Path, bins: dict[str, str]) -> None:
+        self.root = root
+        self._bins = bins
+
+    @classmethod
+    def load(cls, path: str | Path) -> CoevolutionReference:
+        """Read the manifest under ``path``; maps load lazily in :meth:`lookup`."""
+        root = Path(path)
+        manifest = pd.read_parquet(root / "manifest.parquet", columns=["sha256", "neff_bin"])
+        manifest = manifest.drop_duplicates("sha256")
+        return cls(root, dict(zip(manifest["sha256"], manifest["neff_bin"], strict=True)))
+
+    def lookup(self, sequence: str) -> tuple[Tensor, str] | None:
+        """Return the float32 ``(L, L)`` map and its Neff bin, or None if not in the manifest."""
+        sha = hashlib.sha256(sequence.encode()).hexdigest()
+        if sha not in self._bins:
+            return None
+        potts = torch.from_numpy(np.load(self.root / "couplings" / f"{sha}.npy")).float()
+        n = len(sequence)
+        if potts.shape != (n, n):
+            raise ValueError(
+                f"coevolution map {sha} has shape {tuple(potts.shape)}, expected {(n, n)}"
+            )
+        return potts, self._bins[sha]
