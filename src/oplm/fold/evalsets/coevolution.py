@@ -82,6 +82,16 @@ def _sha(sequence: str) -> str:
     return hashlib.sha256(sequence.encode()).hexdigest()
 
 
+def _fit_settings(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
+    """The settings a stored fit depends on (``device`` is recorded but not compared)."""
+    return {
+        "max_seqs": cfg.max_seqs,
+        "max_gap_fraction": cfg.max_gap_fraction,
+        "identity": cfg.identity,
+        "gremlin": dataclasses.asdict(GremlinConfig()),
+    }
+
+
 def _fit_one(cfg: CoevolutionBuildConfig, sequence: str, sha: str) -> None:
     """Fit one sequence from its stored MSA; writes ``couplings/`` then ``stats/``."""
 
@@ -101,6 +111,8 @@ def _fit_one(cfg: CoevolutionBuildConfig, sequence: str, sha: str) -> None:
         "depth_filtered": int(msa.shape[0]),
         "kept_columns": int(kept.numel()),
         "neff": n_eff,
+        "settings": _fit_settings(cfg),
+        "device": cfg.device,
     }
     _write_atomic(cfg.out / "stats" / f"{sha}.json", json.dumps(stats).encode())
 
@@ -168,6 +180,7 @@ def build_coevolution(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
 
     Raises:
         FileNotFoundError: A set directory is missing.
+        ValueError: A stored fit used different settings than this run.
         RuntimeError: The server reports ERROR for a sequence (message carries its sha256), or
             the written files don't validate.
     """
@@ -196,7 +209,19 @@ def build_coevolution(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
         return {"sequences": len(order), "fetched": fetched}
 
     for i, sha in enumerate(order, 1):
-        if not (cfg.out / "stats" / f"{sha}.json").exists():
+        stats_path = cfg.out / "stats" / f"{sha}.json"
+        if stats_path.exists() and (cfg.out / "couplings" / f"{sha}.npy").exists():
+            stored = json.loads(stats_path.read_text()).get("settings", {})
+            current = _fit_settings(cfg)
+            differ = sorted(
+                k for k in current.keys() | stored.keys() if stored.get(k) != current.get(k)
+            )
+            if differ:
+                raise ValueError(
+                    f"sequence {sha}: stored fit used different settings ({', '.join(differ)}); "
+                    f"delete {cfg.out}/couplings and {cfg.out}/stats to refit"
+                )
+        else:
             _fit_one(cfg, sequences[sha], sha)
         if i % _LOG_EVERY == 0 or i == len(order):
             logger.info("fits %d/%d", i, len(order))

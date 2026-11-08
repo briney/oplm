@@ -119,3 +119,19 @@ def test_server_error_names_the_sha256(tmp_path: Path, sets_root: Path) -> None:
     cfg = _cfg(tmp_path, sets_root, FakeServer(error_on=CRAMBIN))
     with pytest.raises(RuntimeError, match=hashlib.sha256(CRAMBIN.encode()).hexdigest()):
         build_coevolution(cfg)
+
+
+def test_resume_with_changed_settings_raises(tmp_path: Path, sets_root: Path) -> None:
+    build_coevolution(_cfg(tmp_path, sets_root, FakeServer()))
+    with pytest.raises(ValueError, match=r"sequence [0-9a-f]{64}") as exc:
+        build_coevolution(_cfg(tmp_path, sets_root, FakeServer(), max_seqs=10))
+    assert "max_seqs" in str(exc.value)
+
+
+def test_missing_couplings_are_refit(tmp_path: Path, sets_root: Path) -> None:
+    cfg = _cfg(tmp_path, sets_root, FakeServer())
+    build_coevolution(cfg)
+    victim = next((cfg.out / "couplings").iterdir())
+    victim.unlink()
+    build_coevolution(_cfg(tmp_path, sets_root, FakeServer()))
+    assert victim.is_file()
