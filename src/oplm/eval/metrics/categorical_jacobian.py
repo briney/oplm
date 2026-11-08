@@ -50,12 +50,17 @@ class StructurePairScoreData:
         seq_len: L for precision@L: the number of residues with coordinates.
         pair_indices: ``(i_indices, j_indices)`` for reconstructing ``(L, L)``
             matrices from the flat arrays.
+        potts_scores: Optional MSA Potts coupling score for the same pairs, shape
+            ``(n_pairs,)``; NaN where the coupling could not be fit.
+        neff_bin: Optional MSA depth bin (``"low"``, ``"mid"`` or ``"high"``).
     """
 
     scores: Tensor
     labels: Tensor
     seq_len: int
     pair_indices: tuple[Tensor, Tensor]
+    potts_scores: Tensor | None = None
+    neff_bin: str | None = None
 
 
 def get_canonical_amino_acid_token_ids(tokenizer: OplmTokenizerFast) -> Tensor:
