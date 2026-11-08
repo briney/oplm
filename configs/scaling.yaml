@@ -68,18 +68,22 @@ data:
     pdb40:
       path: /path/to/oplm-structure-evals/pdb40_256
       type: structure
+      coevolution: /path/to/oplm-structure-evals/coevolution
       every: {steps: 5000}
     pdb40_2048:
       path: /path/to/oplm-structure-evals/pdb40_2048
       type: structure
+      coevolution: /path/to/oplm-structure-evals/coevolution
       every: {steps: 50000}
     cameo:
       path: /path/to/oplm-structure-evals/cameo_256
       type: structure
+      coevolution: /path/to/oplm-structure-evals/coevolution
       every: {steps: 5000}
     casp:
       path: /path/to/oplm-structure-evals/casp15_16
       type: structure
+      coevolution: /path/to/oplm-structure-evals/coevolution
       every: {steps: 5000}
 
 slurm:

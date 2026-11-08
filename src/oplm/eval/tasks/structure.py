@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import numpy as np
@@ -17,6 +18,13 @@ from oplm.eval.metrics.categorical_jacobian import (
     compute_categorical_jacobian,
     compute_mean_pair_score_precision_at_l,
     get_canonical_amino_acid_token_ids,
+)
+from oplm.eval.metrics.coevolution import (
+    COEVOLUTION_METRIC_DIVISORS,
+    DEFAULT_COEVOLUTION_METRICS,
+    CoevolutionReference,
+    compute_coevolution_metrics,
+    has_coevolution,
 )
 from oplm.eval.metrics.contact import compute_contact_map, contact_positions_valid
 from oplm.eval.registry import register_eval_task
@@ -50,6 +58,7 @@ class StructureTaskConfig:
     categorical_jacobian_sample_seed: int = 42
     categorical_jacobian_mutation_batch_size: int = 20
     max_structures: int | None = None
+    coevolution: str | None = None
 
     @classmethod
     def from_extra(cls, extra: dict[str, Any]) -> StructureTaskConfig:
@@ -79,6 +88,7 @@ class StructureTaskConfig:
                 extra.get("categorical_jacobian_mutation_batch_size", 20)
             ),
             max_structures=_opt_int("max_structures"),
+            coevolution=str(extra["coevolution"]) if extra.get("coevolution") else None,
         )
         if cfg.categorical_jacobian_sample_size is not None and (
             cfg.categorical_jacobian_sample_size < 1
@@ -114,6 +124,8 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
         categorical_jacobian_mutation_batch_size (int): Mutants per forward
             pass for Jacobian extraction. Default 20.
         max_structures (int | None): Max structures to load. Default None.
+        coevolution (str | None): Path to a coevolution folder (MSA Potts couplings). Adds
+            the coevolution metrics to the default metrics. Default None (off).
     """
 
     default_metrics: ClassVar[list[str]] = ["precision_at_L"]
@@ -121,11 +133,22 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
     def __init__(self, entry: EvalDatasetEntry, cfg: OplmConfig) -> None:
         super().__init__(entry, cfg)
         self.tcfg = StructureTaskConfig.from_extra(entry.extra)
+        if self.tcfg.coevolution:
+            if not (Path(self.tcfg.coevolution) / "manifest.parquet").is_file():
+                raise ValueError(
+                    f"{entry.name}: coevolution folder {self.tcfg.coevolution!r} has no "
+                    "manifest.parquet"
+                )
+            if not entry.metrics:
+                self.metrics = [*self.default_metrics, *DEFAULT_COEVOLUTION_METRICS]
+        elif any(m in COEVOLUTION_METRIC_DIVISORS for m in entry.metrics or []):
+            raise ValueError(f"{entry.name}: coevolution metrics requested but no coevolution: set")
 
         # Cached data (lazily loaded)
         self._structures: list[StructureData] | None = None
         self._tokenizer: OplmTokenizerFast | None = None
         self._canonical_aa_token_ids: torch.Tensor | None = None
+        self._coevolution: CoevolutionReference | None = None
 
     def evaluate(
         self,
@@ -152,13 +175,16 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
             self._tokenizer = get_tokenizer()
         if self._canonical_aa_token_ids is None:
             self._canonical_aa_token_ids = get_canonical_amino_acid_token_ids(self._tokenizer)
+        if self.tcfg.coevolution and self._coevolution is None:
+            self._coevolution = CoevolutionReference.load(self.tcfg.coevolution)
 
         if not self._structures:
             logger.warning("No structures loaded from %s", self.path)
-            return {m: 0.0 for m in self.metrics}
+            return {m: 0.0 for m in self.metrics if m not in COEVOLUTION_METRIC_DIVISORS}
 
         requested_metrics = self._requested_metric_divisors(_METRIC_DIVISORS)
-        if not requested_metrics:
+        coevolution_names = [m for m in self.metrics if m in COEVOLUTION_METRIC_DIVISORS]
+        if not requested_metrics and not (self._coevolution and coevolution_names):
             return {}
 
         # Shard structures across ranks
@@ -182,7 +208,7 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
 
         if not all_pair_score_data:
             logger.warning("No valid structures after processing")
-            return {m: 0.0 for m in self.metrics}
+            return {m: 0.0 for m in self.metrics if m not in COEVOLUTION_METRIC_DIVISORS}
 
         results: dict[str, float] = {}
         for metric_name, divisor in requested_metrics.items():
@@ -190,8 +216,21 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
                 all_pair_score_data,
                 l_divisor=divisor,
             )
+        results = {k: v for k, v in results.items() if k in self.metrics}
 
-        return {k: v for k, v in results.items() if k in self.metrics}
+        if self._coevolution is not None and coevolution_names:
+            missing = sum(not has_coevolution(d) for d in all_pair_score_data)
+            if missing and accelerator.is_main_process:
+                logger.warning(
+                    "%s: %d of %d structures have no coevolution data; "
+                    "left out of coevolution metrics",
+                    self.path,
+                    missing,
+                    len(all_pair_score_data),
+                )
+            results.update(compute_coevolution_metrics(all_pair_score_data, coevolution_names))
+
+        return results
 
     def _process_single_structure(
         self,
@@ -282,6 +321,10 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
             self.tcfg.min_seq_sep,
             valid=valid,
         )
+        if self._coevolution is not None and (hit := self._coevolution.lookup(struct.sequence)):
+            potts_map, pair_score_data.neff_bin = hit
+            i_idx, j_idx = pair_score_data.pair_indices
+            pair_score_data.potts_scores = potts_map[i_idx, j_idx]
 
         del (
             wildtype_logits,

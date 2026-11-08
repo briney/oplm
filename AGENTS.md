@@ -48,7 +48,7 @@ src/oplm/                      # main package (src layout)
 │   ├── configuration_oplm.py  # OplmConfig (PretrainedConfig)
 │   ├── tokenization_oplm.py   # OplmTokenizerFast (33-token ESM-C-compatible)
 │   └── modeling_oplm.py       # all public Oplm* model classes
-├── fold/                       # structure prediction head: kernels, model, data, training, predict, eval/ (held-out metrics, `fold_monomer` task), evalsets/ (`oplm fold eval-sets`: CASP/CAMEO/PDB40 contact-eval sets); parity tests need OPLM_FOLD_FIXTURES (docs/FOLD.md, Milestone 1 through Milestone 2b)
+├── fold/                       # structure prediction head: kernels, model, data, training, predict, eval/ (held-out metrics, `fold_monomer` task), evalsets/ (`oplm fold eval-sets`: CASP/CAMEO/PDB40 contact-eval sets; `oplm fold eval-coevolution`: their MSA Potts maps); parity tests need OPLM_FOLD_FIXTURES (docs/FOLD.md, Milestone 1 through Milestone 2b)
 ├── slurm/                      # general Slurm job generation/submission (docs/slurm.md)
 │   ├── config.py               # `slurm:` block schema, PhaseTable, resolve_batch_plan
 │   ├── render.py                # JobSpec -> sbatch script text, submit.sh, job arrays
