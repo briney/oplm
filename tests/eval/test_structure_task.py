@@ -208,7 +208,11 @@ def test_structure_metrics_identical_with_and_without_coevolution(
     accelerator = Accelerator(cpu=True)
 
     def run(path: Path, extra: dict) -> dict[str, float]:
+        return run_entry(path, extra, None)
+
+    def run_entry(path: Path, extra: dict, metrics: list[str] | None) -> dict[str, float]:
         entry = EvalDatasetEntry(
+            metrics=metrics,
             name="struct",
             path=str(path),
             type="structure",
@@ -243,3 +247,6 @@ def test_structure_metrics_identical_with_and_without_coevolution(
         crn_only["precision_at_L"]
     )
     assert "2 of 3 structures have no coevolution data" in caplog.text
+
+    only = run_entry(structure_fixtures_dir, {"coevolution": str(coevo)}, ["p_at_L_beyond"])
+    assert "p_at_L_beyond" in only and "precision_at_L" not in only

@@ -173,7 +173,8 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
             return {m: 0.0 for m in self.metrics}
 
         requested_metrics = self._requested_metric_divisors(_METRIC_DIVISORS)
-        if not requested_metrics:
+        coevolution_names = [m for m in self.metrics if m in COEVOLUTION_METRIC_DIVISORS]
+        if not requested_metrics and not (self._coevolution and coevolution_names):
             return {}
 
         # Shard structures across ranks
@@ -207,7 +208,6 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
             )
         results = {k: v for k, v in results.items() if k in self.metrics}
 
-        coevolution_names = [m for m in self.metrics if m in COEVOLUTION_METRIC_DIVISORS]
         if self._coevolution is not None and coevolution_names:
             missing = sum(d.potts_scores is None for d in all_pair_score_data)
             if missing and accelerator.is_main_process:
