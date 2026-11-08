@@ -79,8 +79,10 @@ The metrics join the entry's default metrics; an explicit `metrics:` list still 
 Without the key the task is unchanged. A structure with no coevolution row is scored for
 `precision_at_L` as usual and left out of these metrics, with one warning per eval.
 
-Per sequence, over the same scorable pairs as `precision_at_L`, with `k = L // d`
-(`d` = 1, 2, 5 for the `_at_L`, `_at_L_2`, `_at_L_5` suffixes): **M** is the top-`k` pairs by
+Per sequence, over the same scorable pairs as `precision_at_L`, with `k` as for `precision_at_L`:
+`k = min(max(1, L // d), n_pairs)`, L = modeled residues, `d` = 1, 2, 5 for the `_at_L`,
+`_at_L_2`, `_at_L_5` suffixes. Pairs without a finite Potts value never enter **P** (a structure
+with fewer than `k` such pairs keeps `k` as the denominator; one with none is left out): **M** is the top-`k` pairs by
 Jacobian score, **P** the top-`k` by Potts score, **T** the true contacts.
 
 | Metric | Definition | Reads as |

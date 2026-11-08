@@ -28,7 +28,7 @@ src/oplm/fold/
 ├── train.py                # python -m oplm.fold.train entry point
 ├── predict.py              # fold(), mmCIF writer
 ├── fixtures.py             # ESMFold2 golden-fixture generator (runs in the esm venv)
-├── cli.py                  # oplm fold bench-kernels | compare | eval | eval-sets | make-fixtures | measure | predict | preprocess | train
+├── cli.py                  # oplm fold bench-kernels | compare | eval | eval-coevolution | eval-sets | make-fixtures | measure | predict | preprocess | train
 ├── data/
 │   ├── ccd.py              # residue vocabulary, reference conformers, ChemCompTable (CCD parents)
 │   ├── complex.py          # MolecularComplex (flat atoms/tokens/bonds) + Parquet row
@@ -46,7 +46,10 @@ src/oplm/fold/
     ├── chain.py            # EvalChain, eval PDB writer (SEQRES + sequence numbering), curation rules
     ├── casp.py             # CASP15/16 domain tarballs on the full target sequence (pinned sha256)
     ├── pdb.py              # CAMEO list and PDB40 (MMseqs2 40% clusters) from the fold dataset
-    └── build.py            # oplm fold eval-sets: subsets, validation, manifest, README
+    ├── build.py            # oplm fold eval-sets: subsets, validation, manifest, README
+    ├── msa.py              # ColabFold MSA server client, a3m parsing, gap filtering, Neff weights
+    ├── gremlin.py          # GREMLIN pseudolikelihood fit in PyTorch, APC-corrected Potts contact map
+    └── coevolution.py      # oplm fold eval-coevolution: MSAs, Potts maps, Neff bins, manifest, README
 tests/fold/                 # mirrors the above; tests/fixtures/fold/ holds real entries
 tests/fold/oracles/         # frozen Boltz-2 loss functions the losses are checked against (§9)
 ```
@@ -618,3 +621,23 @@ hf download brineylab/oplm-structure-evals --repo-type dataset --revision 2026-1
 at tag `2026-10-12` (commit `08f188a3`), folder `2026-10-12/`; built at `c0b5f08`. The full
 `pdb40/` ships as `pdb40.tar.gz` (extract it in place); every other set is a plain folder.
 Provenance for the methods section: [`docs/data.md`](data.md), *Structure evaluation sets*.
+
+### Coevolution reference (`oplm fold eval-coevolution`)
+
+Adds the Potts contact maps the `structure` eval's coevolution metrics read (design:
+`docs/superpowers/specs/2026-11-07-coevolution-eval-design.md`; metrics in `docs/evaluation.md`).
+Two phases, so the GPU node needs no network:
+
+```bash
+SETS=$OPLM_DATA/hf/structure-evals/2026-10-12
+# 1. networked host: fetch one ColabFold MSA per distinct sequence (rate-limited; can take hours)
+oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --no-fit
+# 2. GPU node: fit GREMLIN, bin by Neff, validate, write manifest.parquet, summary.json, README.md
+oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --device cuda \
+    --colabfold-db "<versions from the server docs>"
+```
+
+Reruns resume: MSAs and fits already on disk are reused (files are renamed into place, so an
+interrupted run leaves no partial file). A stored fit made with different settings (`--max-seqs`,
+the gap and identity thresholds, GREMLIN settings) raises instead of mixing fits; delete
+`couplings/` and `stats/` to refit. `--device` defaults to `auto`.
