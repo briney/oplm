@@ -1,5 +1,6 @@
-"""``oplm fold`` command group: ``bench-kernels``, ``compare``, ``eval``, ``eval-sets``,
-``make-fixtures``, ``measure``, ``predict`` (design §5.2), ``preprocess``, and ``train``.
+"""``oplm fold`` command group: ``bench-kernels``, ``compare``, ``eval``, ``eval-coevolution``,
+``eval-sets``, ``make-fixtures``, ``measure``, ``predict`` (design §5.2), ``preprocess``, and
+``train``.
 
 Keep torch out of module scope: ``oplm.cli`` imports this module eagerly.
 """
@@ -731,6 +732,63 @@ def eval_sets_cmd(
     table.add_column("structures", justify="right")
     for name, count in summary["exported"].items():
         table.add_row(name, str(count))
+    console.print(table)
+
+
+@app.command("eval-coevolution")
+def eval_coevolution_cmd(
+    sets_root: Annotated[
+        Path, typer.Option("--sets-root", help="Directory of eval sets (oplm fold eval-sets)")
+    ],
+    out: Annotated[Path, typer.Option("--out", help="coevolution/ folder; reruns resume in it")],
+    host: Annotated[str, typer.Option(help="ColabFold MSA server")] = "",
+    sets: Annotated[
+        str, typer.Option(help="Comma-separated set names")
+    ] = "casp15_16,cameo_256,pdb40_256,pdb40_2048",
+    device: Annotated[str, typer.Option(help="Device for the GREMLIN fit")] = "cpu",
+    max_seqs: Annotated[int, typer.Option(help="MSA rows kept per sequence")] = 20_000,
+    bin_edges: Annotated[
+        str | None,
+        typer.Option(help="Fixed Neff/sqrt(L) bin edges, e.g. 2.5,8 (default: terciles)"),
+    ] = None,
+    no_fit: Annotated[bool, typer.Option("--no-fit", help="Stop after fetching MSAs")] = False,
+    colabfold_db: Annotated[
+        str, typer.Option(help="ColabFold DB versions, from the server's docs, for the README")
+    ] = "unrecorded",
+) -> None:
+    """Fetch ColabFold MSAs and fit GREMLIN Potts maps for the structure eval sets."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    from oplm.fold.evalsets.coevolution import CoevolutionBuildConfig, build_coevolution
+    from oplm.fold.evalsets.msa import PUBLIC_COLABFOLD_HOST
+
+    edges = None
+    if bin_edges is not None:
+        parts = [float(x) for x in bin_edges.split(",")]
+        if len(parts) != 2:
+            raise typer.BadParameter("--bin-edges takes two comma-separated numbers")
+        edges = (parts[0], parts[1])
+    summary = build_coevolution(
+        CoevolutionBuildConfig(
+            sets_root=sets_root,
+            out=out,
+            sets=tuple(s for s in sets.split(",") if s),
+            host=host or PUBLIC_COLABFOLD_HOST,
+            device=device,
+            max_seqs=max_seqs,
+            bin_edges=edges,
+            fit=not no_fit,
+            colabfold_db=colabfold_db,
+        )
+    )
+    if no_fit:
+        console.print(f"{summary['sequences']} MSAs in {out}/msas")
+        return
+    table = Table(title=f"eval-coevolution -> {out}")
+    table.add_column("set")
+    for b in ("low", "mid", "high"):
+        table.add_column(b, justify="right")
+    for name, counts in summary["bins"].items():
+        table.add_row(name, *(str(counts[b]) for b in ("low", "mid", "high")))
     console.print(table)
 
 

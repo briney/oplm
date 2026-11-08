@@ -389,3 +389,9 @@ def test_compare_cli_prints_the_paired_difference(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     out = json.loads(result.output)
     assert out["n"] == 3.0 and out["mean_diff"] == pytest.approx(0.1)
+
+
+def test_eval_coevolution_cli_help() -> None:
+    result = runner.invoke(app, ["fold", "eval-coevolution", "--help"])
+    assert result.exit_code == 0
+    assert "--sets-root" in plain(result.output)
