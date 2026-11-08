@@ -150,7 +150,7 @@ def neff(msa: Tensor, identity: float = 0.8, chunk: int = 4096) -> tuple[float, 
     """Effective sequence count and per-sequence weights (1 / number of rows at >= ``identity``)."""
     n, length = msa.shape
     onehot = torch.nn.functional.one_hot(msa.long(), _GAP + 1).reshape(n, -1).float()
-    weights = torch.empty(n)
+    weights = torch.empty(n, device=msa.device)
     for start in range(0, n, chunk):
         similar = onehot[start : start + chunk] @ onehot.T / length >= identity
         weights[start : start + chunk] = 1.0 / similar.sum(dim=1)

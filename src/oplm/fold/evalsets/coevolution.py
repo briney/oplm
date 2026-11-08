@@ -15,10 +15,12 @@ import json
 import logging
 import math
 import os
+import subprocess
 import textwrap
 from dataclasses import dataclass
 from importlib import metadata
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -41,9 +43,6 @@ from oplm.fold.evalsets.msa import (
     neff,
     parse_a3m,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 __all__ = ["CoevolutionBuildConfig", "build_coevolution", "render_readme"]
 
@@ -96,8 +95,10 @@ def _fit_one(cfg: CoevolutionBuildConfig, sequence: str, sha: str) -> None:
     """Fit one sequence from its stored MSA; writes ``couplings/`` then ``stats/``."""
 
     rows = parse_a3m(gzip.decompress((cfg.out / "msas" / f"{sha}.a3m.gz").read_bytes()).decode())
+    if rows[0] != sequence:
+        raise RuntimeError(f"sequence {sha}: MSA query differs from the sequence")
     msa, kept = filter_gap_columns(encode_msa(rows, cfg.max_seqs), cfg.max_gap_fraction)
-    n_eff, weights = neff(msa, cfg.identity)
+    n_eff, weights = neff(msa.to(cfg.device), cfg.identity)
     contacts = potts_contact_map(fit_gremlin(msa, weights, GremlinConfig(), cfg.device))
     full = full_length_map(contacts, kept, len(sequence)).numpy().astype(np.float16)
     path = cfg.out / "couplings" / f"{sha}.npy"
@@ -115,6 +116,21 @@ def _fit_one(cfg: CoevolutionBuildConfig, sequence: str, sha: str) -> None:
         "device": cfg.device,
     }
     _write_atomic(cfg.out / "stats" / f"{sha}.json", json.dumps(stats).encode())
+
+
+def _git_commit() -> str | None:
+    """HEAD of the repository holding this package, or None outside a git checkout."""
+    try:
+        done = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return done.stdout.strip() or None
 
 
 def _bin(value: float, edges: tuple[float, float]) -> str:
@@ -151,7 +167,8 @@ def render_readme(summary: dict[str, Any]) -> str:
     edges = ", ".join(f"{e:.4g}" for e in summary["neff_bin_edges"])
     return (
         "# OPLM coevolution reference\n\n"
-        f"Built {summary['built']} by `oplm fold eval-coevolution` (oplm {summary['oplm']}). "
+        f"Built {summary['built']} by `oplm fold eval-coevolution` (oplm {summary['oplm']}, "
+        f"commit {summary['commit']}). "
         "Design: `docs/superpowers/specs/2026-11-07-coevolution-eval-design.md` in the oplm "
         "repository.\n\n"
         f"MSAs come from the ColabFold server at `{summary['host']}` (mode `{summary['mode']}`; "
@@ -198,8 +215,8 @@ def build_coevolution(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
         if not path.exists():
             try:
                 text = fetch_msa(sequences[sha], cfg.host, fetch=cfg.fetch, mode=_MSA_MODE)
-            except RuntimeError as exc:
-                raise RuntimeError(f"sequence {sha}: {exc}") from exc
+            except Exception as exc:
+                raise RuntimeError(f"sequence {sha}: {exc!r}") from exc
             _write_atomic(path, gzip.compress(text.encode(), mtime=0))
             fetched += 1
         if i % _LOG_EVERY == 0 or i == len(order):
@@ -267,6 +284,7 @@ def build_coevolution(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "built": datetime.date.today().isoformat(),
         "oplm": metadata.version("oplm"),
+        "commit": _git_commit(),
         "host": cfg.host,
         "mode": _MSA_MODE,
         "colabfold_db": cfg.colabfold_db,

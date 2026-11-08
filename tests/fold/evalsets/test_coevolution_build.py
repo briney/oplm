@@ -23,9 +23,16 @@ FIXTURES = Path(__file__).parents[2] / "fixtures" / "eval" / "structures"
 class FakeServer:
     """The ColabFold ticket protocol, answering each sequence with mutated copies of it."""
 
-    def __init__(self, error_on: str | None = None) -> None:
+    def __init__(
+        self,
+        error_on: str | None = None,
+        wrong_query: bool = False,
+        raises: Exception | None = None,
+    ) -> None:
         self.calls = 0
         self.error_on = error_on
+        self.wrong_query = wrong_query
+        self.raises = raises
         self.queries: dict[str, str] = {}
 
     def __call__(self, url: str, body: bytes | None) -> bytes:
@@ -34,13 +41,16 @@ class FakeServer:
             query = urllib.parse.parse_qs(body.decode())["q"][0].split("\n")[1]
             if query == self.error_on:
                 return json.dumps({"status": "ERROR", "id": "x"}).encode()
+            if self.raises is not None:
+                raise self.raises
             self.calls += 1
             ticket = f"t{self.calls}"
             self.queries[ticket] = query
             return json.dumps({"status": "COMPLETE", "id": ticket}).encode()
         query = self.queries[url.rsplit("/", 1)[1]]
+        served = "A" + query[1:] if self.wrong_query else query
         rng = random.Random(query)
-        lines = [">101", query]
+        lines = [">101", served]
         for i in range(30):
             row = [rng.choice("ACDEFGHIKLMNPQRSTVWY") if rng.random() < 0.2 else c for c in query]
             lines += [f">hit{i}", "".join(row)]
@@ -135,3 +145,21 @@ def test_missing_couplings_are_refit(tmp_path: Path, sets_root: Path) -> None:
     victim.unlink()
     build_coevolution(_cfg(tmp_path, sets_root, FakeServer()))
     assert victim.is_file()
+
+
+def test_msa_query_mismatch_raises(tmp_path: Path, sets_root: Path) -> None:
+    cfg = _cfg(tmp_path, sets_root, FakeServer(wrong_query=True))
+    with pytest.raises(RuntimeError, match=r"sequence [0-9a-f]{64}: MSA query differs"):
+        build_coevolution(cfg)
+
+
+def test_any_fetch_exception_names_the_sha256(tmp_path: Path, sets_root: Path) -> None:
+    cfg = _cfg(tmp_path, sets_root, FakeServer(raises=KeyError("id")))
+    with pytest.raises(RuntimeError, match=r"sequence [0-9a-f]{64}: KeyError"):
+        build_coevolution(cfg)
+
+
+def test_summary_and_readme_record_the_commit(tmp_path: Path, sets_root: Path) -> None:
+    summary = build_coevolution(_cfg(tmp_path, sets_root, FakeServer()))
+    assert "commit" in summary  # None outside a git checkout
+    assert f"commit {summary['commit']}" in (tmp_path / "coevolution" / "README.md").read_text()

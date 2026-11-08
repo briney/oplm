@@ -745,7 +745,7 @@ def eval_coevolution_cmd(
     sets: Annotated[
         str, typer.Option(help="Comma-separated set names")
     ] = "casp15_16,cameo_256,pdb40_256,pdb40_2048",
-    device: Annotated[str, typer.Option(help="Device for the GREMLIN fit")] = "cpu",
+    device: Annotated[str, typer.Option(help="cuda, cpu or auto (GREMLIN fit)")] = "auto",
     max_seqs: Annotated[int, typer.Option(help="MSA rows kept per sequence")] = 20_000,
     bin_edges: Annotated[
         str | None,
@@ -761,6 +761,10 @@ def eval_coevolution_cmd(
     from oplm.fold.evalsets.coevolution import CoevolutionBuildConfig, build_coevolution
     from oplm.fold.evalsets.msa import PUBLIC_COLABFOLD_HOST
 
+    if device == "auto":
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     edges = None
     if bin_edges is not None:
         parts = [float(x) for x in bin_edges.split(",")]
