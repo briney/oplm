@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch import Tensor
+
+from oplm.eval.metrics.ranking import spearman_corr
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Sequence
@@ -47,16 +49,16 @@ DEFAULT_COEVOLUTION_METRICS: list[str] = [
 _HEADLINE_BINS = ("mid", "high")
 
 
-def _ranks(x: Tensor) -> Tensor:
-    # ponytail: ordinal ranks, ties not averaged; fp16 ties are rare
-    return x.argsort().argsort().float()
-
-
 def _spearman(a: Tensor, b: Tensor) -> float | None:
-    if a.numel() < 2:
+    try:
+        return spearman_corr(a.double().numpy(), b.double().numpy())
+    except ValueError:  # fewer than two points or a constant input
         return None
-    ra, rb = _ranks(a) - (a.numel() - 1) / 2, _ranks(b) - (a.numel() - 1) / 2
-    return float((ra * rb).sum() / (ra.norm() * rb.norm()))
+
+
+def has_coevolution(structure: StructurePairScoreData) -> bool:
+    """True when the structure has at least one scorable pair with a finite Potts value."""
+    return structure.potts_scores is not None and bool((~torch.isnan(structure.potts_scores)).any())
 
 
 def _structure_values(
@@ -82,6 +84,7 @@ def _structure_values(
         p = torch.zeros(n_pairs, dtype=torch.bool)
         m[torch.topk(structure.scores, k).indices] = True
         p[torch.topk(potts.nan_to_num(nan=float("-inf")), k).indices] = True
+        p &= finite  # fewer than k finite pairs: P holds only real Potts calls, k stays the divisor
         hits = _METRIC_HITS[name](m, p, structure.labels.bool())
         values[name] = hits.sum().item() / k
     return values
@@ -101,22 +104,20 @@ def compute_coevolution_metrics(
 ) -> dict[str, float]:
     """Compare Jacobian pair scores with MSA Potts couplings.
 
-    Only structures with ``potts_scores`` are used. For each requested metric the headline
-    key is averaged over the ``mid`` and ``high`` Neff bins for ``coevo_*`` names (agreement
-    needs a well-fit Potts model) and over all structures otherwise; ``{name}_neff_{bin}``
-    is emitted per populated bin. Empty groups are omitted.
+    Only structures with a finite Potts value on at least one scorable pair are used. For each
+    requested metric the headline key is averaged over the ``mid`` and ``high`` Neff bins for
+    ``coevo_*`` names (agreement needs a well-fit Potts model) and over all structures otherwise;
+    ``{name}_neff_{bin}`` is emitted per populated bin. Empty groups are omitted.
 
     Args:
-        structures: Per-structure pair scores; those without ``potts_scores`` are skipped.
+        structures: Per-structure pair scores; those without a finite Potts value are skipped.
         metrics: Base names from ``COEVOLUTION_METRIC_DIVISORS``.
 
     Returns:
         Mapping from metric key to mean value.
     """
     per_structure = [
-        (s.neff_bin, _structure_values(s, metrics))
-        for s in structures
-        if s.potts_scores is not None
+        (s.neff_bin, _structure_values(s, metrics)) for s in structures if has_coevolution(s)
     ]
     out: dict[str, float] = {}
     for name in metrics:
@@ -145,9 +146,10 @@ class CoevolutionReference:
     def load(cls, path: str | Path) -> CoevolutionReference:
         """Read the manifest under ``path``; maps load lazily in :meth:`lookup`."""
         root = Path(path)
-        manifest = pd.read_parquet(root / "manifest.parquet", columns=["sha256", "neff_bin"])
-        manifest = manifest.drop_duplicates("sha256")
-        return cls(root, dict(zip(manifest["sha256"], manifest["neff_bin"], strict=True)))
+        manifest = pq.read_table(root / "manifest.parquet", columns=["sha256", "neff_bin"])
+        columns = manifest.to_pydict()
+        # dict() keeps the last duplicate; rows sharing a sha256 share a bin
+        return cls(root, dict(zip(columns["sha256"], columns["neff_bin"], strict=True)))
 
     def lookup(self, sequence: str) -> tuple[Tensor, str] | None:
         """Return the float32 ``(L, L)`` map and its Neff bin, or None if not in the manifest."""

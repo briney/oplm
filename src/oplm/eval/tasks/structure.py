@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import numpy as np
@@ -23,6 +24,7 @@ from oplm.eval.metrics.coevolution import (
     DEFAULT_COEVOLUTION_METRICS,
     CoevolutionReference,
     compute_coevolution_metrics,
+    has_coevolution,
 )
 from oplm.eval.metrics.contact import compute_contact_map, contact_positions_valid
 from oplm.eval.registry import register_eval_task
@@ -131,8 +133,16 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
     def __init__(self, entry: EvalDatasetEntry, cfg: OplmConfig) -> None:
         super().__init__(entry, cfg)
         self.tcfg = StructureTaskConfig.from_extra(entry.extra)
-        if self.tcfg.coevolution and not entry.metrics:
-            self.metrics = [*self.default_metrics, *DEFAULT_COEVOLUTION_METRICS]
+        if self.tcfg.coevolution:
+            if not (Path(self.tcfg.coevolution) / "manifest.parquet").is_file():
+                raise ValueError(
+                    f"{entry.name}: coevolution folder {self.tcfg.coevolution!r} has no "
+                    "manifest.parquet"
+                )
+            if not entry.metrics:
+                self.metrics = [*self.default_metrics, *DEFAULT_COEVOLUTION_METRICS]
+        elif any(m in COEVOLUTION_METRIC_DIVISORS for m in entry.metrics or []):
+            raise ValueError(f"{entry.name}: coevolution metrics requested but no coevolution: set")
 
         # Cached data (lazily loaded)
         self._structures: list[StructureData] | None = None
@@ -170,7 +180,7 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
 
         if not self._structures:
             logger.warning("No structures loaded from %s", self.path)
-            return {m: 0.0 for m in self.metrics}
+            return {m: 0.0 for m in self.metrics if m not in COEVOLUTION_METRIC_DIVISORS}
 
         requested_metrics = self._requested_metric_divisors(_METRIC_DIVISORS)
         coevolution_names = [m for m in self.metrics if m in COEVOLUTION_METRIC_DIVISORS]
@@ -198,7 +208,7 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
 
         if not all_pair_score_data:
             logger.warning("No valid structures after processing")
-            return {m: 0.0 for m in self.metrics}
+            return {m: 0.0 for m in self.metrics if m not in COEVOLUTION_METRIC_DIVISORS}
 
         results: dict[str, float] = {}
         for metric_name, divisor in requested_metrics.items():
@@ -209,7 +219,7 @@ class StructureEvalTask(EvalTask["OplmForMaskedLM"]):
         results = {k: v for k, v in results.items() if k in self.metrics}
 
         if self._coevolution is not None and coevolution_names:
-            missing = sum(d.potts_scores is None for d in all_pair_score_data)
+            missing = sum(not has_coevolution(d) for d in all_pair_score_data)
             if missing and accelerator.is_main_process:
                 logger.warning(
                     "%s: %d of %d structures have no coevolution data; "

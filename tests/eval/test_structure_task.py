@@ -176,7 +176,10 @@ def test_structure_config_parses_coevolution_path() -> None:
     assert StructureTaskConfig.from_extra({}).coevolution is None
 
 
-def test_coevolution_key_extends_default_metrics() -> None:
+def test_coevolution_key_extends_default_metrics(tmp_path: Path) -> None:
+    (tmp_path / "manifest.parquet").touch()  # only its existence is checked at construction
+    folder = str(tmp_path)
+
     def metrics(**kw) -> list[str]:
         entry = EvalDatasetEntry(
             name="s", path=".", type="structure", schedule=ScheduleSpec("steps", 1), **kw
@@ -184,8 +187,11 @@ def test_coevolution_key_extends_default_metrics() -> None:
         cfg = OplmConfig(model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN))
         return StructureEvalTask(entry, cfg).metrics
 
-    assert metrics(extra={"coevolution": "/x"}) == ["precision_at_L", *DEFAULT_COEVOLUTION_METRICS]
-    assert metrics(extra={"coevolution": "/x"}, metrics=["precision_at_L"]) == ["precision_at_L"]
+    assert metrics(extra={"coevolution": folder}) == [
+        "precision_at_L",
+        *DEFAULT_COEVOLUTION_METRICS,
+    ]
+    assert metrics(extra={"coevolution": folder}, metrics=["precision_at_L"]) == ["precision_at_L"]
     assert metrics() == ["precision_at_L"]
 
 
@@ -250,3 +256,16 @@ def test_structure_metrics_identical_with_and_without_coevolution(
 
     only = run_entry(structure_fixtures_dir, {"coevolution": str(coevo)}, ["p_at_L_beyond"])
     assert "p_at_L_beyond" in only and "precision_at_L" not in only
+
+
+def test_coevolution_misconfiguration_fails_at_construction(tmp_path: Path) -> None:
+    def build(**kw) -> StructureEvalTask:
+        entry = EvalDatasetEntry(
+            name="struct", path=".", type="structure", schedule=ScheduleSpec("steps", 1), **kw
+        )
+        return StructureEvalTask(entry, OplmConfig(model=OplmModelConfig()))
+
+    with pytest.raises(ValueError, match="struct.*manifest.parquet"):
+        build(extra={"coevolution": str(tmp_path)})
+    with pytest.raises(ValueError, match="struct.*no coevolution"):
+        build(metrics=["p_at_L_beyond"])

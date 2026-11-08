@@ -19,6 +19,7 @@ from oplm.eval.metrics.coevolution import (
     COEVOLUTION_METRIC_DIVISORS,
     CoevolutionReference,
     compute_coevolution_metrics,
+    has_coevolution,
 )
 
 if TYPE_CHECKING:
@@ -92,6 +93,31 @@ def test_nan_potts_pairs_rank_last_and_skip_spearman():
     assert all(math.isfinite(v) for v in m.values())
     # P = {4, 2}: avoids the NaN pairs 0 and 1, so M (= {0, 1}) and P are disjoint.
     assert m["coevo_precision_at_L"] == 0.0
+
+
+def test_all_nan_potts_structure_is_left_out():
+    nan = float("nan")
+    d = _data([0.9, 0.8, 0.1, 0.1], [nan] * 4, [1, 1, 0, 0], 2)
+    good = _data([0.9, 0.8, 0.1, 0.1], [0.9, 0.8, 0.1, 0.1], [1, 1, 0, 0], 2)
+    assert not has_coevolution(d) and has_coevolution(good)
+    assert compute_coevolution_metrics([d], COEVOLUTION_METRIC_DIVISORS) == {}
+    m = compute_coevolution_metrics([d, good], ["potts_precision_at_L"])
+    assert m["potts_precision_at_L"] == 1.0  # only `good` counts
+
+
+def test_fewer_finite_pairs_than_k_keeps_only_real_potts_calls():
+    nan = float("nan")
+    # k = 2 but one finite Potts pair (index 3, a true contact); every pair is a contact.
+    d = _data([0.9, 0.8, 0.7, 0.1], [nan, nan, nan, 0.5], [1, 1, 1, 1], 2)
+    m = compute_coevolution_metrics([d], COEVOLUTION_METRIC_DIVISORS)
+    assert m["potts_precision_at_L"] == 0.5  # one real call over k = 2
+    assert m["coevo_precision_at_L"] == 0.0  # M = {0, 1} never meets P = {3}
+    assert m["p_at_L_potts_only"] == 0.5
+
+
+def test_constant_input_omits_spearman():
+    d = _data([0.1, 0.5, 0.3], [0.2, 0.2, 0.2], [0, 0, 0], 2)
+    assert "coevo_spearman" not in compute_coevolution_metrics([d], ["coevo_spearman"])
 
 
 def test_spearman_perfect_and_inverse():
