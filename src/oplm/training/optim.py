@@ -304,7 +304,7 @@ def get_schedule_fn(
 
     Args:
         scheduler_name: One of ``warmup_linear``, ``warmup_cosine``,
-            ``wsd_linear``, ``wsd_cosine``.
+            ``wsd_linear``, ``wsd_cosine``, ``wsd_sqrt``.
         warmup_steps: Number of linear warmup steps.
         total_steps: Total training steps.
         min_ratio: Minimum LR as a fraction of peak LR (min_lr / lr).
@@ -316,6 +316,7 @@ def get_schedule_fn(
     """
     is_wsd = scheduler_name.startswith("wsd_")
     is_cosine = scheduler_name.endswith("_cosine")
+    is_sqrt = scheduler_name.endswith("_sqrt")
 
     stable_steps = stable_steps if is_wsd else 0
     decay_steps = max(1, total_steps - warmup_steps - stable_steps)
@@ -333,7 +334,12 @@ def get_schedule_fn(
         progress = (current_step - warmup_steps - stable_steps) / decay_steps
         progress = min(progress, 1.0)
 
-        decay = 0.5 * (1.0 + math.cos(math.pi * progress)) if is_cosine else 1.0 - progress
+        if is_cosine:
+            decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        elif is_sqrt:
+            decay = 1.0 - math.sqrt(progress)
+        else:
+            decay = 1.0 - progress
 
         return min_ratio + (1.0 - min_ratio) * decay
 

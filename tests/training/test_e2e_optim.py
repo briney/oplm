@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.slow
 
-_SCHEDULERS = ["warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine"]
+_SCHEDULERS = ["warmup_linear", "warmup_cosine", "wsd_linear", "wsd_cosine", "wsd_sqrt"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Muon requires CUDA")
