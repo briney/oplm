@@ -742,6 +742,7 @@ def eval_coevolution_cmd(
     ],
     out: Annotated[Path, typer.Option("--out", help="coevolution/ folder; reruns resume in it")],
     host: Annotated[str, typer.Option(help="ColabFold MSA server")] = "",
+    msa_batch_size: Annotated[int, typer.Option(help="Sequences per MSA server query")] = 100,
     sets: Annotated[
         str, typer.Option(help="Comma-separated set names")
     ] = "casp15_16,cameo_256,pdb40_256,pdb40_2048",
@@ -777,6 +778,7 @@ def eval_coevolution_cmd(
             out=out,
             sets=tuple(s for s in sets.split(",") if s),
             host=host or PUBLIC_COLABFOLD_HOST,
+            msa_batch_size=msa_batch_size,
             device=device,
             max_seqs=max_seqs,
             bin_edges=edges,

@@ -38,7 +38,7 @@ from oplm.fold.evalsets.msa import (
     PUBLIC_COLABFOLD_HOST,
     Fetch,
     encode_msa,
-    fetch_msa,
+    fetch_msas,
     filter_gap_columns,
     neff,
     parse_a3m,
@@ -60,6 +60,7 @@ class CoevolutionBuildConfig:
     out: Path
     sets: tuple[str, ...] = ("casp15_16", "cameo_256", "pdb40_256", "pdb40_2048")
     host: str = PUBLIC_COLABFOLD_HOST
+    msa_batch_size: int = 100
     device: str = "cpu"
     max_seqs: int = 20_000
     max_gap_fraction: float = 0.25
@@ -198,7 +199,7 @@ def build_coevolution(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
     Raises:
         FileNotFoundError: A set directory is missing.
         ValueError: A stored fit used different settings than this run.
-        RuntimeError: The server reports ERROR for a sequence (message carries its sha256), or
+        RuntimeError: The server reports ERROR for a batch (message carries its sha256s), or
             the written files don't validate.
     """
     from oplm.data import load_structures
@@ -209,18 +210,19 @@ def build_coevolution(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
     sequences = {_sha(seq): seq for items in structures.values() for _, seq in items}
     order = sorted(sequences)
 
-    fetched = 0
-    for i, sha in enumerate(order, 1):
-        path = cfg.out / "msas" / f"{sha}.a3m.gz"
-        if not path.exists():
-            try:
-                text = fetch_msa(sequences[sha], cfg.host, fetch=cfg.fetch, mode=_MSA_MODE)
-            except Exception as exc:
-                raise RuntimeError(f"sequence {sha}: {exc!r}") from exc
-            _write_atomic(path, gzip.compress(text.encode(), mtime=0))
-            fetched += 1
-        if i % _LOG_EVERY == 0 or i == len(order):
-            logger.info("msas %d/%d (%d fetched)", i, len(order), fetched)
+    missing = [sha for sha in order if not (cfg.out / "msas" / f"{sha}.a3m.gz").exists()]
+    for start in range(0, len(missing), cfg.msa_batch_size):
+        batch = missing[start : start + cfg.msa_batch_size]
+        try:
+            texts = fetch_msas(
+                [sequences[sha] for sha in batch], cfg.host, fetch=cfg.fetch, mode=_MSA_MODE
+            )
+        except Exception as exc:
+            raise RuntimeError(f"sequences {', '.join(batch)}: {exc!r}") from exc
+        for sha, text in zip(batch, texts, strict=True):
+            _write_atomic(cfg.out / "msas" / f"{sha}.a3m.gz", gzip.compress(text.encode(), mtime=0))
+        logger.info("msas %d/%d fetched", start + len(batch), len(missing))
+    fetched = len(missing)
     if not cfg.fit:
         logger.info("%d MSAs in %s; stopping before the fit (--no-fit)", len(order), cfg.out)
         return {"sequences": len(order), "fetched": fetched}

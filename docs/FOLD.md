@@ -630,8 +630,10 @@ Two phases, so the GPU node needs no network:
 
 ```bash
 SETS=$OPLM_DATA/hf/structure-evals/2026-10-12
-# 1. networked host: fetch one ColabFold MSA per distinct sequence (rate-limited; can take hours)
-oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --no-fit
+# 1. networked host: fetch one ColabFold MSA per distinct sequence, 100 sequences per query
+#    (--msa-batch-size). --host defaults to the rate-limited public server; the published data
+#    used the lab's server, http://randy.scripps.edu:8765.
+oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --no-fit --host <server>
 # 2. GPU node: fit GREMLIN, bin by Neff, validate, write manifest.parquet, summary.json, README.md
 oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --device cuda \
     --colabfold-db "<versions from the server docs>"

@@ -24,7 +24,7 @@ __all__ = [
     "PUBLIC_COLABFOLD_HOST",
     "Fetch",
     "encode_msa",
-    "fetch_msa",
+    "fetch_msas",
     "filter_gap_columns",
     "neff",
     "parse_a3m",
@@ -48,23 +48,33 @@ def _urllib_fetch(url: str, body: bytes | None) -> bytes:
         return response.read()
 
 
-def fetch_msa(
-    sequence: str,
+def _by_query(text: str) -> dict[str, str]:
+    """A multi-query a3m split at its NUL separators, keyed by each query's header name."""
+    chunks = (c.strip() for c in text.split("\x00"))
+    return {c.split("\n", 1)[0][1:].strip(): c + "\n" for c in chunks if c}
+
+
+def fetch_msas(
+    sequences: list[str],
     host: str,
     *,
     fetch: Fetch | None = None,
     mode: str = "env",
     poll_seconds: float = 5.0,
     sleep: Callable[[float], None] = time.sleep,
-) -> str:
-    """The combined a3m (UniRef then environmental hits, query once) for ``sequence``.
+) -> list[str]:
+    """One combined a3m (UniRef then environmental hits, query once) per sequence, in order.
+
+    All sequences go to the server as one query. As in ColabFold's client, query ``i`` is named
+    ``101 + i`` and its MSA is found by that name in each NUL-separated result file.
 
     Raises:
-        RuntimeError: The server reports ``ERROR`` for this sequence.
+        RuntimeError: The server reports ``ERROR``, or its reply lacks a query's MSA.
     """
     raw_fetch = fetch or _urllib_fetch
     host = host.rstrip("/")
-    body = urllib.parse.urlencode({"q": f">101\n{sequence}", "mode": mode}).encode()
+    fasta = "\n".join(f">{101 + i}\n{seq}" for i, seq in enumerate(sequences))
+    body = urllib.parse.urlencode({"q": fasta, "mode": mode}).encode()
 
     def fetch(url: str, data: bytes | None) -> bytes:
         """``raw_fetch`` retried with back-off on 429/5xx, URLError and timeouts."""
@@ -90,7 +100,7 @@ def fetch_msa(
     ticket = reply.get("id")  # poll replies may omit it, so keep the submit's
     while True:
         if reply["status"] == "ERROR":
-            raise RuntimeError(f"ColabFold MSA server returned ERROR for sequence {sequence}")
+            raise RuntimeError(f"ColabFold MSA server returned ERROR ({len(sequences)} sequences)")
         if reply["status"] not in _RETRY:
             break
         ratelimited = reply["status"] == "RATELIMIT"
@@ -105,16 +115,22 @@ def fetch_msa(
         else:
             reply = json.loads(fetch(f"{host}/ticket/{ticket}", None))
     tar_bytes = fetch(f"{host}/result/download/{ticket}", None)
-    texts: list[str] = []
+    members: list[dict[str, str]] = []
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
         for name in ("uniref.a3m", "bfd.mgnify30.metaeuk30.smag30.a3m"):
             member = tf.extractfile(name)
             if member is not None:
-                texts.append(member.read().decode().replace("\x00", ""))
-    combined = texts[0]
-    for text in texts[1:]:
-        combined += text.split("\n", 2)[2]  # drop the repeated query record
-    return combined
+                members.append(_by_query(member.read().decode()))
+    msas: list[str] = []
+    for i in range(len(sequences)):
+        key = str(101 + i)
+        if key not in members[0]:
+            raise RuntimeError(f"ColabFold MSA server reply has no MSA for query {i}")
+        combined = members[0][key]
+        for extra in members[1:]:
+            combined += "".join(extra.get(key, "").split("\n", 2)[2:])  # drop the query record
+        msas.append(combined)
+    return msas
 
 
 def parse_a3m(text: str) -> list[str]:

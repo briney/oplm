@@ -60,10 +60,11 @@ It is a complement to structure P@L, never a replacement.
   environmental DB). Primary source is the lab's local ColabFold MSA server (address to be
   supplied); the public ColabFold MSA server is a rate-limited fallback. Both speak the same API,
   so the builder takes the server URL as a parameter.
-- This build uses the public ColabFold server (decided 2026-11-07), accepting its rate limit. Record
-  the DB versions it reports in the README. If #80 later uses the local server with different DB
-  versions, #80 rebuilds these subsets too, so all published coevolution data shares one DB
-  version.
+- This build uses the lab's ColabFold-compatible server, randy (`http://randy.scripps.edu:8765`,
+  UniRef30 2302 + ColabFoldDB 2023; decided 2026-11-09, replacing the 2026-11-07 choice of the
+  public server). Queries are batched (100 sequences per query) to keep the build to hours. Record
+  the DB versions in the README; #80 uses the same server so all published coevolution data shares
+  one DB version.
 - Potts fitter: GREMLIN-style pseudolikelihood fit, implemented in PyTorch in this repo.
 - The contact decomposition and Neff breakdown are built now, logged during training on the
   three sets, not deferred.
