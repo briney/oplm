@@ -114,13 +114,22 @@ def fetch_msas(
             ticket = reply.get("id")
         else:
             reply = json.loads(fetch(f"{host}/ticket/{ticket}", None))
-    tar_bytes = fetch(f"{host}/result/download/{ticket}", None)
-    members: list[dict[str, str]] = []
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
-        for name in ("uniref.a3m", "bfd.mgnify30.metaeuk30.smag30.a3m"):
-            member = tf.extractfile(name)
-            if member is not None:
-                members.append(_by_query(member.read().decode()))
+    # A server may report COMPLETE while the result is still being written: re-download a
+    # truncated one.
+    for attempt in range(_MAX_ATTEMPTS):
+        tar_bytes = fetch(f"{host}/result/download/{ticket}", None)
+        members: list[dict[str, str]] = []
+        try:
+            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+                for name in ("uniref.a3m", "bfd.mgnify30.metaeuk30.smag30.a3m"):
+                    member = tf.extractfile(name)
+                    if member is not None:
+                        members.append(_by_query(member.read().decode()))
+            break
+        except (EOFError, tarfile.ReadError):
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            sleep(poll_seconds)
     msas: list[str] = []
     for i in range(len(sequences)):
         key = str(101 + i)

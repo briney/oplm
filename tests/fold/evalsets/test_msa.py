@@ -161,3 +161,17 @@ def test_fetch_msas_missing_query_raises():
     fake = _fake([{"id": "abc", "status": "COMPLETE"}], [])  # serves query 101 only
     with pytest.raises(RuntimeError, match="no MSA for query 1"):
         fetch_msas([SEQ, "GHIKL"], "http://x", fetch=fake, sleep=lambda s: None)
+
+
+def test_fetch_msas_redownloads_a_truncated_result():
+    # randy reports COMPLETE once result.tar.gz exists, while it may still be being written.
+    downloads = [_tar()[:40], _tar()]
+    sleeps: list[float] = []
+
+    def fetch(url: str, body: bytes | None) -> bytes:
+        if url.endswith("/ticket/msa"):
+            return json.dumps({"id": "abc", "status": "COMPLETE"}).encode()
+        return downloads.pop(0)
+
+    [a3m] = fetch_msas([SEQ], "http://x", fetch=fetch, sleep=sleeps.append)
+    assert a3m.count(">") == 4 and not downloads and sleeps == [5.0]
