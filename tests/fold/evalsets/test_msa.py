@@ -42,7 +42,8 @@ def _fake(submits: list[dict], statuses: list[str]):
             assert body is not None and b"q=%3E" in body and b"mode=env" in body
             return json.dumps(submits.pop(0)).encode()
         if "/ticket/" in url:
-            return json.dumps({"id": "abc", "status": statuses.pop(0)}).encode()
+            # No "id" in poll replies, as on the lab's MSA server: the client keeps the ticket.
+            return json.dumps({"status": statuses.pop(0)}).encode()
         if url.endswith("/result/download/abc"):
             return _tar()
         raise AssertionError(url)

@@ -87,6 +87,7 @@ def fetch_msa(
 
     wait = poll_seconds
     reply = submit()
+    ticket = reply.get("id")  # poll replies may omit it, so keep the submit's
     while True:
         if reply["status"] == "ERROR":
             raise RuntimeError(f"ColabFold MSA server returned ERROR for sequence {sequence}")
@@ -98,11 +99,11 @@ def fetch_msa(
         sleep(wait)
         if ratelimited:
             wait = min(wait * 2, _MAX_WAIT)
-        if ratelimited or "id" not in reply:  # no ticket yet: resubmit, as ColabFold does
+        if ratelimited or ticket is None:  # no ticket yet: resubmit, as ColabFold does
             reply = submit()
+            ticket = reply.get("id")
         else:
-            reply = json.loads(fetch(f"{host}/ticket/{reply['id']}", None))
-    ticket = reply["id"]
+            reply = json.loads(fetch(f"{host}/ticket/{ticket}", None))
     tar_bytes = fetch(f"{host}/result/download/{ticket}", None)
     texts: list[str] = []
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
