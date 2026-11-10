@@ -423,6 +423,53 @@ def test_backward_configs(cfg, k, packed, dtypes):
         assert torch.equal(dw, again[1])  # deterministic per config
 
 
+# --- the mask-free branch (`fast`) ---
+
+
+@kernel
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("packed", [True, False])
+@pytest.mark.parametrize("k", [2, 7])
+def test_fast_path_is_bit_identical_to_masked_path(k, packed, dtype):
+    # Long and short segments, trailing pads, an all-pad row: loop steps of both kinds, and the
+    # mask-free ones must give exactly what the masked code gives (same sums in the same order),
+    # whether they read their rows one at a time or all first (`hoist`).
+    x, w, mask, seg = _case(2, 120, 40, k, packed, seed=k, dtype=dtype)
+    dy = torch.randn(x.shape, generator=torch.Generator().manual_seed(1)).to(DEVICE, dtype)
+    args = (x, w, mask, seg, dtype, True)
+    for fwd, bwd in ((FwdConfig(), BwdConfig()), (FwdConfig(32, 16, 4, 2), BwdConfig(64, 32, 1))):
+        masked = canon_forward(*args, config=fwd._replace(fast=False))
+        dx_m, dw_m = canon_backward(dy, *args, config=bwd._replace(fast=False))
+        for hoist in (False, True):
+            assert torch.equal(canon_forward(*args, config=fwd._replace(hoist=hoist)), masked)
+            dx, dw = canon_backward(dy, *args, config=bwd._replace(hoist=hoist))
+            assert torch.equal(dx, dx_m)
+            assert torch.equal(dw, dw_m)
+
+
+@kernel
+@pytest.mark.parametrize("residual", [True, False])
+@pytest.mark.parametrize("packed", [True, False])
+@pytest.mark.parametrize("k", [2, 3, 4, 7])
+def test_fast_path_matches_reference(k, packed, residual):
+    # Rows that are one segment end to end: every interior loop step is mask-free. Row 1 has a
+    # single pad mid-row, which must put the steps around it back on the masked path.
+    T = FwdConfig().strip + 37
+    x = torch.randn(2, T, 100, generator=torch.Generator().manual_seed(k)).to(DEVICE)
+    w = torch.randn(100, k, generator=torch.Generator().manual_seed(k + 1)).to(DEVICE)
+    seg_ids = torch.ones(2, T, dtype=torch.long, device=DEVICE)
+    seg_ids[1, T // 2] = 0
+    seg_ids[1, T // 2 + 1 :] = 2
+    mask = seg_ids.ne(0).long()
+    seg = seg_ids if packed else None
+    out = canon_forward(x, w, mask, seg, torch.float32, residual)
+    ref = canon_conv_reference(x, w, mask, seg, torch.float32, residual)
+    torch.testing.assert_close(out, ref, **FP32_TOL)
+    dx, dw, ref_dx, ref_dw, _ = _grads(x, w, mask, seg, torch.float32, residual)
+    torch.testing.assert_close(dx, ref_dx, **FP32_TOL)
+    torch.testing.assert_close(dw, ref_dw, rtol=1e-4, atol=1e-3)
+
+
 def _sm100_stack_bytes(fn, dtypes: dict[str, str], constexprs: dict, cfg) -> int:
     """Per-thread stack of `fn` compiled for sm_100 (no GPU needed): > 0 means register spills."""
     import re
@@ -455,8 +502,10 @@ def _sm100_stack_bytes(fn, dtypes: dict[str, str], constexprs: dict, cfg) -> int
 
 
 def _shipped_configs(table: dict, default):
-    """(x dtype, conv dtype, config) for the default (bf16, as training runs) and every entry."""
-    return [(torch.bfloat16, torch.bfloat16, default)] + [
+    """(x dtype, conv dtype, config) for the default (bf16, as training runs), the default with
+    `hoist` (the benchmark sweeps it) and every entry."""
+    defaults = (default, default._replace(hoist=True))
+    return [(torch.bfloat16, torch.bfloat16, cfg) for cfg in defaults] + [
         (x_dtype, conv_dtype, cfg) for (_, x_dtype, conv_dtype), cfg in table.items()
     ]
 
@@ -500,6 +549,8 @@ def test_shipped_configs_do_not_spill(phase):
             "STRIP": cfg.strip,
             "UNROLL": cfg.unroll,
         }
+        constexprs["FAST_RUN"] = 7 + cfg.unroll - 1 if cfg.fast else 2**30
+        constexprs["HOIST"] = cfg.hoist
         rounding = ("ROUND_CONV", "ROUND_OUT") if phase == "fwd" else ("ROUND_G", "ROUND_DX")
         constexprs |= dict.fromkeys(rounding, False)
         stack = _sm100_stack_bytes(fn, dtypes, constexprs, cfg)

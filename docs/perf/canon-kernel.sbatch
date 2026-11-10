@@ -1,7 +1,8 @@
 #!/bin/bash
 # Canon kernel GPU validation: GPU tests, then the kernel-vs-compiled-reference benchmark and the
 # launch-config sweep (fwd and bwd timed separately per config; 144 fwd + 120 bwd configs for bf16 x,
-# each compiled once, checked against the reference, then timed at D=768 and 2048: ~20 min).
+# each compiled once, checked against the reference, then timed at D=768 and 2048: ~20 min), then
+# the default launch per kernel size with the mask-free branch on and off.
 # Tests failing stops the job (the benchmark is meaningless on a broken kernel). Submit from the
 # login node with the pushed commit of branch perf/fused-canon:
 #   OPLM_REF=<commit> sbatch canon-kernel.sbatch      (sbatch exports the environment)
@@ -12,7 +13,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=/mnt/home/briney/logs/%x_%j.out
 #SBATCH --error=/mnt/home/briney/logs/%x_%j.err
 

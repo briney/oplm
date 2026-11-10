@@ -10,7 +10,10 @@ Packed rows of 65,536 tokens (B=32, T=2048) with lognormal protein-like segment 
 `BwdConfig` in a grid, for bf16 `x` (what training feeds every Canon call). Each config is first
 checked against the reference at the timed shape; a config that fails to compile or disagrees is
 reported (`error`), not timed. The best config per (D, dtypes, phase) is printed as
-`FWD_CONFIGS` / `BWD_CONFIGS` entries for `canon_kernel.py`.
+`FWD_CONFIGS` / `BWD_CONFIGS` entries for `canon_kernel.py`. It then times the default launch for
+each kernel size in `--ks`, on the packed rows and on rows that are one segment each, with the
+mask-free branch on and off: time growing with k means the kernel is bound by its instructions,
+flat time means it is waiting on memory.
 `--tiny` runs everything on a toy shape (on CPU under `TRITON_INTERPRET=1` too), a smoke test.
 """
 
@@ -78,12 +81,14 @@ def time_ms(fn: Callable[[], object], iters: int, warmup: int, median: bool = Tr
 
 def strip_grid(cls, per_thread=(2, 4, 8)):
     """`FwdConfig` or `BwdConfig` launches: `per_thread` channels per thread (4-16 B bf16 vectors;
-    the backward spills at 8 for k=7), strips of 64-512 tokens, 2-8 tokens per loop step, with and
-    without Triton's loop pipelining."""
-    grid = itertools.product((64, 128, 256), (1, 2, 4), (64, 128, 256, 512), (2, 4, 8), (1, 2))
+    the backward spills at 8 for k=7), strips of 64-512 tokens, 2-8 tokens per loop step, rows
+    read one at a time or a loop step's rows first (`hoist`)."""
+    grid = itertools.product(
+        (64, 128, 256), (1, 2, 4), (64, 128, 256, 512), (2, 4, 8), (False, True)
+    )
     return [
-        cls(block_d=bd, strip=strip, unroll=unroll, num_warps=w, num_stages=stages)
-        for bd, w, strip, unroll, stages in grid
+        cls(block_d=bd, strip=strip, unroll=unroll, num_warps=w, hoist=hoist)
+        for bd, w, strip, unroll, hoist in grid
         if bd // (32 * w) in per_thread
     ]
 
@@ -143,6 +148,54 @@ def sweep(a, base: dict, x, w, dy, mask, seg, out_dtype) -> list[dict]:
     return rows
 
 
+def clean_share(seg: torch.Tensor, k: int, unroll: int) -> float:
+    """Share of forward loop steps (`unroll` outputs) that are mask-free: the step's
+    `unroll + k - 1` source rows are real tokens of one segment (the kernel's `run` test)."""
+    t = seg.shape[1]
+    idx = torch.arange(t, device=seg.device).expand_as(seg)
+    starts = torch.ones_like(seg, dtype=torch.bool)
+    starts[:, 1:] = seg[:, 1:] != seg[:, :-1]
+    run = idx - torch.where(starts, idx, -1).cummax(1).values + 1
+    run = torch.where(seg > 0, run, 0)
+    last = torch.arange(unroll - 1, t, unroll, device=seg.device) + (k - 1 - k // 2)
+    last = last[last < t]
+    return (run[:, last] >= unroll + k - 1).sum().item() * unroll / seg.numel()
+
+
+def paths(a, d: int, mask, seg, dev) -> list[dict]:
+    """Default launch, fwd and bwd, per kernel size x segment layout x mask-free branch on/off
+    (bf16 `x`, residual). `clean` is the share of tokens in mask-free forward loop steps."""
+    from oplm.model.canon_kernel import BwdConfig, FwdConfig, canon_backward, canon_forward
+
+    x = torch.randn(a.batch, a.seq_len, d, device=dev, dtype=torch.bfloat16)
+    dy = torch.randn_like(x)
+    one = torch.ones_like(seg)
+    rows = []
+    for k in (int(v) for v in a.ks.split(",")):
+        w = torch.randn(d, k, device=dev)
+        for layout, m, s in (("packed", mask, seg), ("one segment", one.long(), one)):
+            clean = clean_share(s, k, FwdConfig().unroll)
+            for fast in (True, False):
+                args = (x, w, m, s, torch.bfloat16, True)
+                fwd, bwd = FwdConfig(fast=fast), BwdConfig(fast=fast)
+                row = {"D": d, "k": k, "layout": layout, "fast": fast, "clean": clean}
+                row["fwd_ms"] = time_ms(
+                    lambda args=args, fwd=fwd: canon_forward(*args, config=fwd),
+                    a.iters, a.warmup, median=False,
+                )[0]  # fmt: skip
+                row["bwd_ms"] = time_ms(
+                    lambda args=args, bwd=bwd: canon_backward(dy, *args, config=bwd),
+                    a.iters, a.warmup, median=False,
+                )[0]  # fmt: skip
+                rows.append(row)
+                print(
+                    f"  paths D={d} k={k} {layout:>11} fast={fast!s:>5} clean={clean:.2f}: "
+                    f"fwd {row['fwd_ms']:.3f} ms, bwd {row['bwd_ms']:.3f} ms",
+                    flush=True,
+                )
+    return rows
+
+
 def best_configs(rows: list[dict]) -> list[dict]:
     """Fastest correct config per (D, x dtype, conv dtype, phase), with the default's time."""
     best = {}
@@ -193,6 +246,7 @@ def main() -> None:
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--k", type=int, default=7)
+    p.add_argument("--ks", default="3,5,7", help="kernel sizes of the --sweep fast/masked table")
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--sweep", action="store_true", help="time every launch config, fwd and bwd")
@@ -213,7 +267,7 @@ def main() -> None:
         f"mean segment {a.seq_len * a.batch / int(seg.max(1).values.sum()):.0f} tokens"
     )
 
-    rows, sweep_rows = [], []
+    rows, sweep_rows, path_rows = [], [], []
     for d in (int(w) for w in a.widths.split(",")):
         w = torch.randn(d, a.k, device=dev, requires_grad=True)
         for x_dtype in (torch.bfloat16, torch.float32):
@@ -263,6 +317,8 @@ def main() -> None:
             if a.sweep and x_dtype == torch.bfloat16:
                 x_in = x.detach()
                 sweep_rows += sweep(a, base, x_in, w.detach(), dy, mask, seg, out_dtype)
+        if a.sweep:
+            path_rows += paths(a, d, mask, seg, dev)
 
     print(
         f"\n{'D':>5} {'x':>9} {'out':>9} {'ref fwd':>8} {'ref bwd':>8} {'kern fwd':>8} "
@@ -286,7 +342,7 @@ def main() -> None:
     if a.sweep:
         best = best_configs(sweep_rows)
         print_sweep(sweep_rows, best)
-        result.update(sweep=sweep_rows, best=best)
+        result.update(sweep=sweep_rows, best=best, paths=path_rows)
     with open(a.out, "w") as f:
         json.dump(result, f, indent=2)
 

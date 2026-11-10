@@ -11,6 +11,12 @@ Both kernels walk a strip of tokens in order, keeping the k rows the current pos
 registers, so each row is read from DRAM once per program. Tile kernels that issue the k shifted
 reads together miss L1 together (each read goes to L2), and their wide 2D/3D tiles spilled.
 
+Most positions need no masking: a loop step whose rows are all real tokens of one segment keeps
+every tap, so it takes a branch with plain multiply-adds (the same result in fewer instructions).
+`fast=False` in a config times the masked path alone. With `hoist`, a mask-free step reads all its
+rows before its first multiply-add, so a warp has `unroll` row loads in flight instead of one (at
+the cost of `unroll` more rows in registers).
+
 `torch.ops.oplm.canon_conv` wraps them as one custom op with its own autograd, opaque to
 `torch.compile` (no graph break, no tracing into Triton): `canon_conv_kernel` is its entry point.
 `canon_self_check` compares it with the reference on a model's real Canon inputs (run start).
@@ -61,6 +67,8 @@ class FwdConfig(NamedTuple):
     unroll: int = 8
     num_warps: int = 1
     num_stages: int = 1
+    fast: bool = True  # mask-free branch for clean windows (False: benchmark the masked path)
+    hoist: bool = False  # mask-free steps read their `unroll` rows before computing
 
 
 class BwdConfig(NamedTuple):
@@ -71,6 +79,8 @@ class BwdConfig(NamedTuple):
     unroll: int = 4
     num_warps: int = 1
     num_stages: int = 1
+    fast: bool = True  # as `FwdConfig.fast`
+    hoist: bool = False  # as `FwdConfig.hoist` (dy and x rows)
 
 
 # Per `(D, x dtype, conv dtype)`; other shapes take the defaults, which compile without spills on
@@ -94,20 +104,62 @@ if TRITON_AVAILABLE:
         return bits.to(tl.float32, bitcast=True)
 
     @triton.jit
-    def _load_row(
-        ptr, row, pos, T, D, d, d_ok, mask_row, stride_mt, seg_row, stride_st, HAS_SEG: tl.constexpr
-    ):
-        # Row `pos` of a row-major (T, D) slab at `row`: its raw values at `d` in fp32 (0 outside
-        # the row), whether it is inside the row, whether it is also not a pad, and its segment id
-        # (-1 outside the row; 0 when unpacked).
+    def _load_flags(pos, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG: tl.constexpr):
+        # Row `pos`: whether it is inside the row, whether it is also not a pad, and its segment
+        # id (-1 outside the row; 0 when unpacked).
         in_row = (pos >= 0) & (pos < T)
-        v = tl.load(ptr + row + pos * D + d, mask=in_row & d_ok, other=0.0).to(tl.float32)
         real = in_row & (tl.load(mask_row + pos * stride_mt, mask=in_row, other=0) != 0)
         if HAS_SEG:
             seg = tl.load(seg_row + pos * stride_st, mask=in_row, other=-1).to(tl.int32)
         else:
             seg = in_row.to(tl.int32) - 1
-        return v, in_row, real, seg
+        return in_row, real, seg
+
+    @triton.jit
+    def _load_values(ptr, row, pos, T, D, d, d_ok):
+        # Row `pos` of a row-major (T, D) slab at `row`: raw values at `d` in fp32, 0 outside it.
+        in_row = (pos >= 0) & (pos < T)
+        return tl.load(ptr + row + pos * D + d, mask=in_row & d_ok, other=0.0).to(tl.float32)
+
+    @triton.jit
+    def _clean_run(run, prev_seg, real, seg):
+        # Length of the run of consecutive real tokens of one segment that ends at this row (0 at
+        # a pad or outside the row).
+        return tl.where(real, tl.where(seg == prev_seg, run + 1, 1), 0)
+
+    @triton.jit
+    def _store_out(
+        acc, x_raw, out_ptr, offs, io_ok,
+        RESIDUAL: tl.constexpr, CONV_DTYPE: tl.constexpr, ROUND_CONV: tl.constexpr,
+        ROUND_OUT: tl.constexpr,
+    ):  # fmt: skip
+        if ROUND_CONV:
+            acc = _round_bf16(acc)
+        conv = acc.to(CONV_DTYPE)
+        if RESIDUAL:
+            # `x + conv` as torch computes it: conv rounded to out_dtype first, add in fp32.
+            res = x_raw + conv.to(tl.float32)
+            if ROUND_OUT:
+                res = _round_bf16(res)
+            tl.store(out_ptr + offs, res.to(out_ptr.dtype.element_ty), mask=io_ok)
+        else:
+            tl.store(out_ptr + offs, conv, mask=io_ok)
+
+    @triton.jit
+    def _store_dx(acc, dy_raw, dx_ptr, offs, io_ok, RESIDUAL: tl.constexpr, ROUND_DX: tl.constexpr):
+        if ROUND_DX:
+            acc = _round_bf16(acc)
+        dx = acc.to(dx_ptr.dtype.element_ty)
+        if RESIDUAL:
+            # As autograd sums the two paths into x.grad: each rounded to x's dtype, then added.
+            r = dy_raw
+            if ROUND_DX:
+                r = _round_bf16(r)
+            res = dx.to(tl.float32) + r.to(dx_ptr.dtype.element_ty).to(tl.float32)
+            if ROUND_DX:
+                res = _round_bf16(res)
+            dx = res.to(dx_ptr.dtype.element_ty)
+        tl.store(dx_ptr + offs, dx, mask=io_ok)
 
     @triton.jit
     def _canon_fwd_kernel(
@@ -134,10 +186,14 @@ if TRITON_AVAILABLE:
         BLOCK_D: tl.constexpr,
         STRIP: tl.constexpr,
         UNROLL: tl.constexpr,
+        FAST_RUN: tl.constexpr,
+        HOIST: tl.constexpr,
     ):
-        # Channels `d` of row `b`, outputs t0 <= t < t0 + STRIP in order. `xs` holds the k source
-        # rows t - LEFT .. t + RIGHT of output t (oldest first), with each row's real flag and
-        # segment id: one new row is read per output, the rest shift along.
+        # Channels `d` of row `b`, outputs t0 <= t < t0 + STRIP in order. `xs` holds the source
+        # rows t - LEFT .. t + RIGHT of output t (oldest first): one new row is read per output,
+        # the rest shift along. `run` is `_clean_run` of the newest row whose flags were read: a
+        # loop step whose last new row has run >= FAST_RUN = K + UNROLL - 1 reads only real tokens
+        # of one segment, so every tap of its outputs is kept and it needs no masks.
         b = tl.program_id(0).to(tl.int64)
         t0 = tl.program_id(1) * STRIP
         d = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -151,43 +207,67 @@ if TRITON_AVAILABLE:
         for i in tl.static_range(K):
             wv = tl.load(w_ptr + d * stride_wd + i * stride_wk, mask=d_ok, other=0.0)
             w = w + (wv.to(tl.float32),)
-        xs, reals, segs = (), (), ()
+        xs = ()
+        run = t0 * 0  # the first row read starts a run whatever `prev_seg` is
+        prev_seg = run
         for i in tl.static_range(K - 1):
-            v, _, real, seg = _load_row(
-                x_ptr, row, t0 - LEFT + i, T, D, d, d_ok, mask_row, stride_mt, seg_row, stride_st,
-                HAS_SEG,
-            )  # fmt: skip
-            xs, reals, segs = xs + (v,), reals + (real,), segs + (seg,)
+            pos = t0 - LEFT + i
+            xs = xs + (_load_values(x_ptr, row, pos, T, D, d, d_ok),)
+            _, real, seg = _load_flags(pos, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG)
+            run = _clean_run(run, prev_seg, real, seg)
+            prev_seg = seg
 
         for step in range(STRIP // UNROLL):  # positions past T are masked
+            tg = t0 + step * UNROLL
             for u in tl.static_range(UNROLL):
-                t = t0 + step * UNROLL + u
-                v, _, real, seg = _load_row(
-                    x_ptr, row, t + RIGHT, T, D, d, d_ok, mask_row, stride_mt, seg_row, stride_st,
-                    HAS_SEG,
-                )  # fmt: skip
-                xs, reals, segs = xs + (v,), reals + (real,), segs + (seg,)
-                acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-                for i in tl.static_range(K):
-                    keep = reals[i]
-                    if HAS_SEG:
-                        keep = keep & (segs[i] == segs[LEFT])
-                    acc += tl.where(keep, xs[i], 0.0) * w[i]
+                _, real, seg = _load_flags(
+                    tg + u + RIGHT, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG
+                )
+                run = _clean_run(run, prev_seg, real, seg)
+                prev_seg = seg
 
-                if ROUND_CONV:
-                    acc = _round_bf16(acc)
-                conv = acc.to(CONV_DTYPE)
-                io_ok = d_ok & (t < T)
-                offs = row + t * D + d
-                if RESIDUAL:
-                    # `x + conv` as torch computes it: conv rounded to out_dtype first, add in fp32.
-                    res = xs[LEFT] + conv.to(tl.float32)
-                    if ROUND_OUT:
-                        res = _round_bf16(res)
-                    tl.store(out_ptr + offs, res.to(out_ptr.dtype.element_ty), mask=io_ok)
-                else:
-                    tl.store(out_ptr + offs, conv, mask=io_ok)
-                xs, reals, segs = xs[1:], reals[1:], segs[1:]
+            if run >= FAST_RUN:
+                if HOIST:
+                    for u in tl.static_range(UNROLL):
+                        xs = xs + (_load_values(x_ptr, row, tg + u + RIGHT, T, D, d, d_ok),)
+                for u in tl.static_range(UNROLL):
+                    t = tg + u
+                    if not HOIST:
+                        xs = xs + (_load_values(x_ptr, row, t + RIGHT, T, D, d, d_ok),)
+                    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+                    for i in tl.static_range(K):
+                        acc += xs[i] * w[i]
+                    _store_out(
+                        acc, xs[LEFT], out_ptr, row + t * D + d, d_ok,
+                        RESIDUAL, CONV_DTYPE, ROUND_CONV, ROUND_OUT,
+                    )  # fmt: skip
+                    xs = xs[1:]
+            else:
+                # `reals`, `segs`: the flags of `xs`'s rows, kept only on this path.
+                reals, segs = (), ()
+                for i in tl.static_range(K - 1):
+                    _, real, seg = _load_flags(
+                        tg - LEFT + i, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG
+                    )
+                    reals, segs = reals + (real,), segs + (seg,)
+                for u in tl.static_range(UNROLL):
+                    t = tg + u
+                    xs = xs + (_load_values(x_ptr, row, t + RIGHT, T, D, d, d_ok),)
+                    _, real, seg = _load_flags(
+                        t + RIGHT, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG
+                    )
+                    reals, segs = reals + (real,), segs + (seg,)
+                    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+                    for i in tl.static_range(K):
+                        keep = reals[i]
+                        if HAS_SEG:
+                            keep = keep & (segs[i] == segs[LEFT])
+                        acc += tl.where(keep, xs[i], 0.0) * w[i]
+                    _store_out(
+                        acc, xs[LEFT], out_ptr, row + t * D + d, d_ok & (t < T),
+                        RESIDUAL, CONV_DTYPE, ROUND_CONV, ROUND_OUT,
+                    )  # fmt: skip
+                    xs, reals, segs = xs[1:], reals[1:], segs[1:]
 
     @triton.jit
     def _canon_bwd_kernel(
@@ -216,13 +296,16 @@ if TRITON_AVAILABLE:
         BLOCK_D: tl.constexpr,
         STRIP: tl.constexpr,
         UNROLL: tl.constexpr,
+        FAST_RUN: tl.constexpr,
+        HOIST: tl.constexpr,
     ):
         # Channels `d` of row `b`, input positions s0 <= s < s0 + STRIP in order. Tap i of output
         # t = s - i + LEFT reads s, so per tap, with the forward's keep test on the pair (t inside
         # the row, s real, same segment):
         #   dx[s] = sum_i w[i] * dy[t]   and   dw[i] += x[s] * dy[t].
-        # `gs` holds dy's rows t = s - RIGHT .. s + LEFT (oldest first: tap i is gs[K - 1 - i])
-        # with each row's in-row flag and segment id; dw's k sums stay in registers.
+        # `gs` holds dy's rows t = s - RIGHT .. s + LEFT (oldest first: tap i is gs[K - 1 - i]);
+        # dw's k sums stay in registers. `run` and the mask-free loop steps are as in the forward
+        # (s is one of its own k outputs, so a clean window makes every pair kept).
         b = tl.program_id(0).to(tl.int64)
         pid_t = tl.program_id(1)
         s0 = pid_t * STRIP
@@ -237,64 +320,97 @@ if TRITON_AVAILABLE:
         for i in tl.static_range(K):
             wv = tl.load(w_ptr + d * stride_wd + i * stride_wk, mask=d_ok, other=0.0)
             w, dw = w + (wv.to(tl.float32),), dw + (tl.zeros((BLOCK_D,), dtype=tl.float32),)
-        gs, in_rows, segs = (), (), ()
+        gs = ()
+        run = s0 * 0  # the first row read starts a run whatever `prev_seg` is
+        prev_seg = run
         for j in tl.static_range(K - 1):
-            g, in_row, _, seg = _load_row(
-                dy_ptr, row, s0 - RIGHT + j, T, D, d, d_ok, mask_row, stride_mt, seg_row,
-                stride_st, HAS_SEG,
-            )  # fmt: skip
-            gs, in_rows, segs = gs + (g,), in_rows + (in_row,), segs + (seg,)
+            pos = s0 - RIGHT + j
+            gs = gs + (_load_values(dy_ptr, row, pos, T, D, d, d_ok),)
+            _, real, seg = _load_flags(pos, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG)
+            run = _clean_run(run, prev_seg, real, seg)
+            prev_seg = seg
 
         for step in range(STRIP // UNROLL):  # positions past T are masked
+            sg = s0 + step * UNROLL
             for u in tl.static_range(UNROLL):
-                s = s0 + step * UNROLL + u
-                g, in_row, _, seg = _load_row(
-                    dy_ptr, row, s + LEFT, T, D, d, d_ok, mask_row, stride_mt, seg_row,
-                    stride_st, HAS_SEG,
-                )  # fmt: skip
-                gs, in_rows, segs = gs + (g,), in_rows + (in_row,), segs + (seg,)
-                xv, _, real_s, seg_s = _load_row(
-                    x_ptr, row, s, T, D, d, d_ok, mask_row, stride_mt, seg_row, stride_st,
-                    HAS_SEG,
-                )  # fmt: skip
-                # A pad source gets no conv gradient (x is zeroed before the conv) and feeds no dw.
-                xv = tl.where(real_s, xv, 0.0)
-                acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-                new_dw = ()
-                for i in tl.static_range(K):
-                    ok = real_s & in_rows[K - 1 - i]
-                    if HAS_SEG:
-                        ok = ok & (segs[K - 1 - i] == seg_s)
-                    # The conv's gradient is dy in the conv's dtype (autograd casts it through the
-                    # forward's `.to(out_dtype)`); the residual path below keeps the raw dy.
-                    gi = gs[K - 1 - i]
-                    if ROUND_G:
-                        gi = _round_bf16(gi)
-                    gi = tl.where(ok, gi.to(CONV_DTYPE).to(tl.float32), 0.0)
-                    acc += gi * w[i]
-                    new_dw = new_dw + (dw[i] + gi * xv,)
-                dw = new_dw
+                _, real, seg = _load_flags(
+                    sg + u + LEFT, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG
+                )
+                run = _clean_run(run, prev_seg, real, seg)
+                prev_seg = seg
 
-                io_ok = d_ok & (s < T)
-                if ROUND_DX:
-                    acc = _round_bf16(acc)
-                dx = acc.to(dx_ptr.dtype.element_ty)
-                if RESIDUAL:
-                    # As autograd sums the two paths into x.grad: each rounded to x's dtype, then
-                    # added. gs[RIGHT] is dy[s], raw.
-                    r = gs[RIGHT]
-                    if ROUND_DX:
-                        r = _round_bf16(r)
-                    res = dx.to(tl.float32) + r.to(dx_ptr.dtype.element_ty).to(tl.float32)
-                    if ROUND_DX:
-                        res = _round_bf16(res)
-                    dx = res.to(dx_ptr.dtype.element_ty)
-                tl.store(dx_ptr + row + s * D + d, dx, mask=io_ok)
-                gs, in_rows, segs = gs[1:], in_rows[1:], segs[1:]
+            # The conv's gradient is dy in the conv's dtype (autograd casts it through the
+            # forward's `.to(out_dtype)`); the residual path (`_store_dx`) keeps the raw dy.
+            if run >= FAST_RUN:
+                xvs = ()
+                if HOIST:
+                    for u in tl.static_range(UNROLL):
+                        gs = gs + (_load_values(dy_ptr, row, sg + u + LEFT, T, D, d, d_ok),)
+                        xvs = xvs + (_load_values(x_ptr, row, sg + u, T, D, d, d_ok),)
+                for u in tl.static_range(UNROLL):
+                    s = sg + u
+                    if HOIST:
+                        xv = xvs[u]
+                    else:
+                        gs = gs + (_load_values(dy_ptr, row, s + LEFT, T, D, d, d_ok),)
+                        xv = _load_values(x_ptr, row, s, T, D, d, d_ok)
+                    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+                    new_dw = ()
+                    for i in tl.static_range(K):
+                        gi = gs[K - 1 - i]
+                        if ROUND_G:
+                            gi = _round_bf16(gi)
+                        gi = gi.to(CONV_DTYPE).to(tl.float32)
+                        acc += gi * w[i]
+                        new_dw = new_dw + (dw[i] + gi * xv,)
+                    dw = new_dw
+                    _store_dx(acc, gs[RIGHT], dx_ptr, row + s * D + d, d_ok, RESIDUAL, ROUND_DX)
+                    gs = gs[1:]
+            else:
+                # `in_rows`, `segs`: the flags of `gs`'s rows, kept only on this path.
+                in_rows, segs = (), ()
+                for j in tl.static_range(K - 1):
+                    in_row, _, seg = _load_flags(
+                        sg - RIGHT + j, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG
+                    )
+                    in_rows, segs = in_rows + (in_row,), segs + (seg,)
+                for u in tl.static_range(UNROLL):
+                    s = sg + u
+                    gs = gs + (_load_values(dy_ptr, row, s + LEFT, T, D, d, d_ok),)
+                    in_row, _, seg = _load_flags(
+                        s + LEFT, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG
+                    )
+                    in_rows, segs = in_rows + (in_row,), segs + (seg,)
+                    _, real_s, seg_s = _load_flags(
+                        s, T, mask_row, stride_mt, seg_row, stride_st, HAS_SEG
+                    )
+                    # A pad source gets no conv gradient (x is zeroed before the conv), feeds no dw.
+                    xv = _load_values(x_ptr, row, s, T, D, d, d_ok)
+                    xv = tl.where(real_s, xv, 0.0)
+                    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+                    new_dw = ()
+                    for i in tl.static_range(K):
+                        ok = real_s & in_rows[K - 1 - i]
+                        if HAS_SEG:
+                            ok = ok & (segs[K - 1 - i] == seg_s)
+                        gi = gs[K - 1 - i]
+                        if ROUND_G:
+                            gi = _round_bf16(gi)
+                        gi = tl.where(ok, gi.to(CONV_DTYPE).to(tl.float32), 0.0)
+                        acc += gi * w[i]
+                        new_dw = new_dw + (dw[i] + gi * xv,)
+                    dw = new_dw
+                    _store_dx(
+                        acc, gs[RIGHT], dx_ptr, row + s * D + d, d_ok & (s < T), RESIDUAL, ROUND_DX
+                    )
+                    gs, in_rows, segs = gs[1:], in_rows[1:], segs[1:]
 
         part = (b * tl.num_programs(1) + pid_t) * D * K
         for i in tl.static_range(K):
             tl.store(dw_part_ptr + part + d * K + i, dw[i], mask=d_ok)
+
+
+_NEVER = 2**30  # a run length no row reaches (T * D < 2**31): `fast=False`
 
 
 def _on_device(x: torch.Tensor) -> contextlib.AbstractContextManager:
@@ -370,6 +486,8 @@ def canon_forward(
             BLOCK_D=cfg.block_d,  # ty: ignore[invalid-argument-type]
             STRIP=cfg.strip,  # ty: ignore[invalid-argument-type]
             UNROLL=cfg.unroll,  # ty: ignore[invalid-argument-type]
+            FAST_RUN=k + cfg.unroll - 1 if cfg.fast else _NEVER,  # ty: ignore[invalid-argument-type]
+            HOIST=cfg.hoist,  # ty: ignore[invalid-argument-type]
             num_warps=cfg.num_warps,  # ty: ignore[unknown-argument]
             num_stages=cfg.num_stages,  # ty: ignore[unknown-argument]
         )
@@ -436,6 +554,8 @@ def canon_backward(
             BLOCK_D=cfg.block_d,  # ty: ignore[invalid-argument-type]
             STRIP=cfg.strip,  # ty: ignore[invalid-argument-type]
             UNROLL=cfg.unroll,  # ty: ignore[invalid-argument-type]
+            FAST_RUN=k + cfg.unroll - 1 if cfg.fast else _NEVER,  # ty: ignore[invalid-argument-type]
+            HOIST=cfg.hoist,  # ty: ignore[invalid-argument-type]
             num_warps=cfg.num_warps,  # ty: ignore[unknown-argument]
             num_stages=cfg.num_stages,  # ty: ignore[unknown-argument]
         )
