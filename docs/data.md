@@ -430,6 +430,88 @@ the other sets are plain folders, byte-identical to the build output. Licenses: 
 `pdb40` derive from the wwPDB archive (CC0 1.0); `casp15_16` and the CASP files in `sources/`
 fall under the Protein Structure Prediction Center's terms.
 
+### Coevolution data
+
+MSA-derived Potts contact maps for `casp15_16`, `cameo_256`, `pdb40_256` and `pdb40_2048`. They
+back the `coevo_*` and `p_at_L_*` structure-eval metrics (see `docs/FOLD.md`). They are built by
+`oplm fold eval-coevolution` into a `coevolution/` folder beside the sets. Design and rationale:
+`docs/superpowers/specs/2026-11-07-coevolution-eval-design.md`.
+
+Built 2026-11-10 at commit `6b7c06c` (oplm 0.4.1.dev290+g6b7c06cdb). The build's `README.md`
+and `summary.json` carry this commit.
+
+1. **Sequences.** The 2,372 distinct full sequences across the four sets, keyed by sha256.
+   `pdb40_256` is inside `pdb40_2048`, and CAMEO and CASP overlap PDB40, so files are shared.
+   CASP domains use the full target sequence.
+2. **MSAs.** MSAs were fetched from the lab's ColabFold-API server
+   ([mmseqs2-server-randy](https://github.com/brineylab/mmseqs2-server-randy),
+   `http://randy.scripps.edu:8765`) on 2026-11-09/10 (23:00–02:43 UTC), in batches of 100
+   sequences.
+   - Mode `env`: the UniRef30 2302 hits, then the ColabFoldDB 2023 environmental hits. The query
+     appears once.
+   - The server runs ColabFold's own search and filtering, which caps and diversifies hits
+     (about 3,000 per identity band, at most 95% identity to each other).
+   - Stored as returned in `msas/<sha256>.a3m.gz`.
+   - Median depth is 6,092 rows. 16 sequences got no hits; their maps come from the query
+     alone and fall in the `low` bin.
+3. **Preprocessing.**
+   - Insertions (lowercase) are removed, and the first 20,000 rows are kept.
+   - Non-standard residues are treated as gaps.
+   - Rows covering less than 75% of the query are dropped (as hhfilter `-cov 75`). This keeps a
+     median 51% of rows.
+   - Columns with 50% or more gaps are dropped (GREMLIN_TF's cutoff).
+   - ColabFold MSAs are full of local hits. An earlier fit that only dropped columns more than
+     25% gapped kept no columns for 205 sequences, and lowered long-range Potts P@L from 0.32
+     to 0.20 on 100 `pdb40_256` chains.
+4. **Neff.** Each row is weighted by 1 / (number of rows at ≥ 80% identity over the kept
+   columns, gaps included). Neff is the sum of the weights.
+5. **Potts fit.** A GREMLIN pseudolikelihood fit, a PyTorch port of GREMLIN_TF v2.1 with its
+   defaults: λ_v = 0.01, λ_w = 0.01 · ½(L−1)(A−1), its modified Adam at lr 1.0, 100 full-batch
+   iterations. One A100.
+   - The map is the Frobenius norm over the 20 amino-acid states, symmetrized and
+     APC-corrected.
+   - It is stored as float16 `couplings/<sha256>.npy` over the full sequence, NaN on dropped
+     columns.
+   - There is no explicit zero-sum gauge; the L2 penalty fixes the gauge, as in the reference.
+     Settings are in `src/oplm/fold/evalsets/gremlin.py`.
+6. **Neff bins.** Neff / √L, with L the full sequence length. The edges are the terciles over
+   all 2,372 sequences: 24.40 and 185.32 (`low` < 24.40 ≤ `mid` < 185.32 ≤ `high`).
+
+| set | low | mid | high |
+|---|---|---|---|
+| `casp15_16` | 68 | 23 | 10 |
+| `cameo_256` | 81 | 87 | 88 |
+| `pdb40_256` | 85 | 86 | 85 |
+| `pdb40_2048` | 663 | 690 | 695 |
+
+**Sanity check.** Mean long-range Potts P@L (top-L Potts pairs at sequence separation ≥ 24
+against virtual Cβ contacts < 8 Å) rises with Neff in every set:
+
+| set | low | mid | high |
+|---|---|---|---|
+| `casp15_16` | 0.061 | 0.232 | 0.437 |
+| `cameo_256` | 0.093 | 0.362 | 0.530 |
+| `pdb40_256` | 0.097 | 0.317 | 0.523 |
+| `pdb40_2048` | 0.092 | 0.326 | 0.504 |
+
+Every structure has at least L finite long-range Potts pairs.
+
+**Rebuild check.** 10 `pdb40_256` sequences (3 low, 4 mid, 3 high; L ≤ 300) were refit on CPU
+from the published MSAs. Their top-L long-range Potts pairs and P@L match the GPU build exactly.
+The largest map difference was 1.2e-4, at float16 precision.
+
+**Licenses.** The MSAs and the maps derived from them come from UniRef30 and ColabFoldDB. The
+ColabFold databases page (`colabfold.mmseqs.com`) gives them under CC BY 4.0.
+
+**Distribution.** Published 2026-11-10 in
+[`brineylab/oplm-structure-evals`](https://huggingface.co/datasets/brineylab/oplm-structure-evals),
+folder `2026-10-12/coevolution/`, tag `2026-11-10` (commit `843a08c6`). The folder has 7,119
+files: `msas/`, `couplings/` and `stats/` (2,372 each), `manifest.parquet`, `summary.json` and
+`README.md`. They are byte-identical to the build output, except that `README.md` and
+`summary.json` record the commit and `README.md` adds the checks and license above. The tag
+`2026-10-12` still points at the sets alone (commit `08f188a3`). The evals read only
+`manifest.parquet` and `couplings/` (about 330 MB).
+
 ## Dataset formats
 
 The pretraining substrate is **parquet**: a single `.parquet` / `.parq` / `.pq`

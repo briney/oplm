@@ -14,14 +14,19 @@ import pyarrow.parquet as pq
 import pytest
 
 from oplm.eval.metrics.coevolution import NEFF_BINS, CoevolutionReference
-from oplm.fold.evalsets.coevolution import CoevolutionBuildConfig, build_coevolution
+from oplm.fold.evalsets.coevolution import (
+    CoevolutionBuildConfig,
+    _version_commit,
+    build_coevolution,
+)
 from tests.fold.evalsets.conftest import CRAMBIN
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "eval" / "structures"
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 
 
 class FakeServer:
-    """The ColabFold ticket protocol, answering each sequence with mutated copies of it."""
+    """The ColabFold ticket protocol, answering each query sequence with mutated copies of it."""
 
     def __init__(
         self,
@@ -30,31 +35,35 @@ class FakeServer:
         raises: Exception | None = None,
     ) -> None:
         self.calls = 0
+        self.fetched = 0
         self.error_on = error_on
         self.wrong_query = wrong_query
         self.raises = raises
-        self.queries: dict[str, str] = {}
+        self.queries: dict[str, list[str]] = {}
 
     def __call__(self, url: str, body: bytes | None) -> bytes:
         if url.endswith("/ticket/msa"):
             assert body is not None
-            query = urllib.parse.parse_qs(body.decode())["q"][0].split("\n")[1]
-            if query == self.error_on:
+            queries = urllib.parse.parse_qs(body.decode())["q"][0].split("\n")[1::2]
+            if self.error_on in queries:
                 return json.dumps({"status": "ERROR", "id": "x"}).encode()
             if self.raises is not None:
                 raise self.raises
             self.calls += 1
+            self.fetched += len(queries)
             ticket = f"t{self.calls}"
-            self.queries[ticket] = query
+            self.queries[ticket] = queries
             return json.dumps({"status": "COMPLETE", "id": ticket}).encode()
-        query = self.queries[url.rsplit("/", 1)[1]]
-        served = "A" + query[1:] if self.wrong_query else query
-        rng = random.Random(query)
-        lines = [">101", served]
-        for i in range(30):
-            row = [rng.choice("ACDEFGHIKLMNPQRSTVWY") if rng.random() < 0.2 else c for c in query]
-            lines += [f">hit{i}", "".join(row)]
-        data = ("\n".join(lines) + "\n").encode()
+        chunks = []
+        for i, query in enumerate(self.queries[url.rsplit("/", 1)[1]]):
+            served = "A" + query[1:] if self.wrong_query else query
+            rng = random.Random(query)
+            lines = [f">{101 + i}", served]
+            for j in range(30):
+                row = [rng.choice(AMINO_ACIDS) if rng.random() < 0.2 else c for c in query]
+                lines += [f">hit{j}", "".join(row)]
+            chunks.append("\n".join(lines) + "\n")
+        data = "\x00".join(chunks).encode()
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
             for member in ("uniref.a3m", "bfd.mgnify30.metaeuk30.smag30.a3m"):
@@ -88,7 +97,7 @@ def test_build_end_to_end(tmp_path: Path, sets_root: Path) -> None:
     server = FakeServer()
     cfg = _cfg(tmp_path, sets_root, server)
     summary = build_coevolution(cfg)
-    assert server.calls == 2  # deduped by sequence
+    assert (server.calls, server.fetched) == (1, 2)  # one batch, deduped by sequence
     potts, bin_ = CoevolutionReference.load(cfg.out).lookup(CRAMBIN)  # type: ignore[misc]
     assert potts.shape == (46, 46) and bin_ in NEFF_BINS
     assert summary["neff_bin_edges"]
@@ -107,6 +116,12 @@ def test_build_resumes_without_refetch_or_refit(tmp_path: Path, sets_root: Path)
     build_coevolution(_cfg(tmp_path, sets_root, again))
     assert again.calls == 0
     assert [f.stat().st_mtime_ns for f in files] == before
+
+
+def test_msa_batch_size_splits_queries(tmp_path: Path, sets_root: Path) -> None:
+    server = FakeServer()
+    build_coevolution(_cfg(tmp_path, sets_root, server, msa_batch_size=1, fit=False))
+    assert (server.calls, server.fetched) == (2, 2)
 
 
 def test_no_fit_stops_after_msas(tmp_path: Path, sets_root: Path) -> None:
@@ -155,7 +170,7 @@ def test_msa_query_mismatch_raises(tmp_path: Path, sets_root: Path) -> None:
 
 def test_any_fetch_exception_names_the_sha256(tmp_path: Path, sets_root: Path) -> None:
     cfg = _cfg(tmp_path, sets_root, FakeServer(raises=KeyError("id")))
-    with pytest.raises(RuntimeError, match=r"sequence [0-9a-f]{64}: KeyError"):
+    with pytest.raises(RuntimeError, match=r"sequences [0-9a-f]{64}.*: KeyError"):
         build_coevolution(cfg)
 
 
@@ -163,3 +178,10 @@ def test_summary_and_readme_record_the_commit(tmp_path: Path, sets_root: Path) -
     summary = build_coevolution(_cfg(tmp_path, sets_root, FakeServer()))
     assert "commit" in summary  # None outside a git checkout
     assert f"commit {summary['commit']}" in (tmp_path / "coevolution" / "README.md").read_text()
+
+
+def test_commit_falls_back_to_the_installed_version() -> None:
+    # A pip install from git has no checkout; setuptools-scm put the commit in the version.
+    assert _version_commit("0.4.1.dev290+g6b7c06cdb") == "6b7c06cdb"
+    assert _version_commit("0.4.1.dev290+g6b7c06cdb.d20261110") == "6b7c06cdb"
+    assert _version_commit("0.4.1") is None

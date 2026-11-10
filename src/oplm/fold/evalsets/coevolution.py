@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import textwrap
 from dataclasses import dataclass
@@ -38,7 +39,8 @@ from oplm.fold.evalsets.msa import (
     PUBLIC_COLABFOLD_HOST,
     Fetch,
     encode_msa,
-    fetch_msa,
+    fetch_msas,
+    filter_coverage,
     filter_gap_columns,
     neff,
     parse_a3m,
@@ -60,9 +62,11 @@ class CoevolutionBuildConfig:
     out: Path
     sets: tuple[str, ...] = ("casp15_16", "cameo_256", "pdb40_256", "pdb40_2048")
     host: str = PUBLIC_COLABFOLD_HOST
+    msa_batch_size: int = 100
     device: str = "cpu"
     max_seqs: int = 20_000
-    max_gap_fraction: float = 0.25
+    min_coverage: float = 0.75
+    max_gap_fraction: float = 0.5
     identity: float = 0.8
     bin_edges: tuple[float, float] | None = None
     fit: bool = True
@@ -85,6 +89,7 @@ def _fit_settings(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
     """The settings a stored fit depends on (``device`` is recorded but not compared)."""
     return {
         "max_seqs": cfg.max_seqs,
+        "min_coverage": cfg.min_coverage,
         "max_gap_fraction": cfg.max_gap_fraction,
         "identity": cfg.identity,
         "gremlin": dataclasses.asdict(GremlinConfig()),
@@ -97,7 +102,10 @@ def _fit_one(cfg: CoevolutionBuildConfig, sequence: str, sha: str) -> None:
     rows = parse_a3m(gzip.decompress((cfg.out / "msas" / f"{sha}.a3m.gz").read_bytes()).decode())
     if rows[0] != sequence:
         raise RuntimeError(f"sequence {sha}: MSA query differs from the sequence")
-    msa, kept = filter_gap_columns(encode_msa(rows, cfg.max_seqs), cfg.max_gap_fraction)
+    covered = filter_coverage(encode_msa(rows, cfg.max_seqs), cfg.min_coverage)
+    msa, kept = filter_gap_columns(covered, cfg.max_gap_fraction)
+    if kept.numel() == 0:  # can't happen while max_gap_fraction > 1 - min_coverage
+        raise RuntimeError(f"sequence {sha}: no MSA column passes the gap filter")
     n_eff, weights = neff(msa.to(cfg.device), cfg.identity)
     contacts = potts_contact_map(fit_gremlin(msa, weights, GremlinConfig(), cfg.device))
     full = full_length_map(contacts, kept, len(sequence)).numpy().astype(np.float16)
@@ -119,7 +127,7 @@ def _fit_one(cfg: CoevolutionBuildConfig, sequence: str, sha: str) -> None:
 
 
 def _git_commit() -> str | None:
-    """HEAD of the repository holding this package, or None outside a git checkout."""
+    """HEAD of the repository holding this package, else the commit in its version, else None."""
     try:
         done = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -129,8 +137,14 @@ def _git_commit() -> str | None:
             check=True,
         )
     except (OSError, subprocess.CalledProcessError):
-        return None
+        return _version_commit(metadata.version("oplm"))
     return done.stdout.strip() or None
+
+
+def _version_commit(version: str) -> str | None:
+    """The short commit in a setuptools-scm version (``0.4.1.dev290+g6b7c06cdb``), if any."""
+    found = re.search(r"\+g([0-9a-f]+)", version)
+    return found.group(1) if found else None
 
 
 def _bin(value: float, edges: tuple[float, float]) -> str:
@@ -198,7 +212,7 @@ def build_coevolution(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
     Raises:
         FileNotFoundError: A set directory is missing.
         ValueError: A stored fit used different settings than this run.
-        RuntimeError: The server reports ERROR for a sequence (message carries its sha256), or
+        RuntimeError: The server reports ERROR for a batch (message carries its sha256s), or
             the written files don't validate.
     """
     from oplm.data import load_structures
@@ -209,18 +223,19 @@ def build_coevolution(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
     sequences = {_sha(seq): seq for items in structures.values() for _, seq in items}
     order = sorted(sequences)
 
-    fetched = 0
-    for i, sha in enumerate(order, 1):
-        path = cfg.out / "msas" / f"{sha}.a3m.gz"
-        if not path.exists():
-            try:
-                text = fetch_msa(sequences[sha], cfg.host, fetch=cfg.fetch, mode=_MSA_MODE)
-            except Exception as exc:
-                raise RuntimeError(f"sequence {sha}: {exc!r}") from exc
-            _write_atomic(path, gzip.compress(text.encode(), mtime=0))
-            fetched += 1
-        if i % _LOG_EVERY == 0 or i == len(order):
-            logger.info("msas %d/%d (%d fetched)", i, len(order), fetched)
+    missing = [sha for sha in order if not (cfg.out / "msas" / f"{sha}.a3m.gz").exists()]
+    for start in range(0, len(missing), cfg.msa_batch_size):
+        batch = missing[start : start + cfg.msa_batch_size]
+        try:
+            texts = fetch_msas(
+                [sequences[sha] for sha in batch], cfg.host, fetch=cfg.fetch, mode=_MSA_MODE
+            )
+        except Exception as exc:
+            raise RuntimeError(f"sequences {', '.join(batch)}: {exc!r}") from exc
+        for sha, text in zip(batch, texts, strict=True):
+            _write_atomic(cfg.out / "msas" / f"{sha}.a3m.gz", gzip.compress(text.encode(), mtime=0))
+        logger.info("msas %d/%d fetched", start + len(batch), len(missing))
+    fetched = len(missing)
     if not cfg.fit:
         logger.info("%d MSAs in %s; stopping before the fit (--no-fit)", len(order), cfg.out)
         return {"sequences": len(order), "fetched": fetched}

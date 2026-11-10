@@ -47,7 +47,7 @@ src/oplm/fold/
     ├── casp.py             # CASP15/16 domain tarballs on the full target sequence (pinned sha256)
     ├── pdb.py              # CAMEO list and PDB40 (MMseqs2 40% clusters) from the fold dataset
     ├── build.py            # oplm fold eval-sets: subsets, validation, manifest, README
-    ├── msa.py              # ColabFold MSA server client, a3m parsing, gap filtering, Neff weights
+    ├── msa.py              # ColabFold MSA server client, a3m parsing, coverage and gap filters, Neff weights
     ├── gremlin.py          # GREMLIN pseudolikelihood fit in PyTorch, APC-corrected Potts contact map
     └── coevolution.py      # oplm fold eval-coevolution: MSAs, Potts maps, Neff bins, manifest, README
 tests/fold/                 # mirrors the above; tests/fixtures/fold/ holds real entries
@@ -630,8 +630,10 @@ Two phases, so the GPU node needs no network:
 
 ```bash
 SETS=$OPLM_DATA/hf/structure-evals/2026-10-12
-# 1. networked host: fetch one ColabFold MSA per distinct sequence (rate-limited; can take hours)
-oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --no-fit
+# 1. networked host: fetch one ColabFold MSA per distinct sequence, 100 sequences per query
+#    (--msa-batch-size). --host defaults to the rate-limited public server; the published data
+#    used the lab's server, http://randy.scripps.edu:8765.
+oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --no-fit --host <server>
 # 2. GPU node: fit GREMLIN, bin by Neff, validate, write manifest.parquet, summary.json, README.md
 oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --device cuda \
     --colabfold-db "<versions from the server docs>"
@@ -639,5 +641,5 @@ oplm fold eval-coevolution --sets-root $SETS --out $SETS/../coevolution --device
 
 Reruns resume: MSAs and fits already on disk are reused (files are renamed into place, so an
 interrupted run leaves no partial file). A stored fit made with different settings (`--max-seqs`,
-the gap and identity thresholds, GREMLIN settings) raises instead of mixing fits; delete
+the coverage, gap and identity thresholds, GREMLIN settings) raises instead of mixing fits; delete
 `couplings/` and `stats/` to refit. `--device` defaults to `auto`.

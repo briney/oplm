@@ -24,7 +24,8 @@ __all__ = [
     "PUBLIC_COLABFOLD_HOST",
     "Fetch",
     "encode_msa",
-    "fetch_msa",
+    "fetch_msas",
+    "filter_coverage",
     "filter_gap_columns",
     "neff",
     "parse_a3m",
@@ -48,23 +49,33 @@ def _urllib_fetch(url: str, body: bytes | None) -> bytes:
         return response.read()
 
 
-def fetch_msa(
-    sequence: str,
+def _by_query(text: str) -> dict[str, str]:
+    """A multi-query a3m split at its NUL separators, keyed by each query's header name."""
+    chunks = (c.strip() for c in text.split("\x00"))
+    return {c.split("\n", 1)[0][1:].strip(): c + "\n" for c in chunks if c}
+
+
+def fetch_msas(
+    sequences: list[str],
     host: str,
     *,
     fetch: Fetch | None = None,
     mode: str = "env",
     poll_seconds: float = 5.0,
     sleep: Callable[[float], None] = time.sleep,
-) -> str:
-    """The combined a3m (UniRef then environmental hits, query once) for ``sequence``.
+) -> list[str]:
+    """One combined a3m (UniRef then environmental hits, query once) per sequence, in order.
+
+    All sequences go to the server as one query. As in ColabFold's client, query ``i`` is named
+    ``101 + i`` and its MSA is found by that name in each NUL-separated result file.
 
     Raises:
-        RuntimeError: The server reports ``ERROR`` for this sequence.
+        RuntimeError: The server reports ``ERROR``, or its reply lacks a query's MSA.
     """
     raw_fetch = fetch or _urllib_fetch
     host = host.rstrip("/")
-    body = urllib.parse.urlencode({"q": f">101\n{sequence}", "mode": mode}).encode()
+    fasta = "\n".join(f">{101 + i}\n{seq}" for i, seq in enumerate(sequences))
+    body = urllib.parse.urlencode({"q": fasta, "mode": mode}).encode()
 
     def fetch(url: str, data: bytes | None) -> bytes:
         """``raw_fetch`` retried with back-off on 429/5xx, URLError and timeouts."""
@@ -87,9 +98,10 @@ def fetch_msa(
 
     wait = poll_seconds
     reply = submit()
+    ticket = reply.get("id")  # poll replies may omit it, so keep the submit's
     while True:
         if reply["status"] == "ERROR":
-            raise RuntimeError(f"ColabFold MSA server returned ERROR for sequence {sequence}")
+            raise RuntimeError(f"ColabFold MSA server returned ERROR ({len(sequences)} sequences)")
         if reply["status"] not in _RETRY:
             break
         ratelimited = reply["status"] == "RATELIMIT"
@@ -98,22 +110,37 @@ def fetch_msa(
         sleep(wait)
         if ratelimited:
             wait = min(wait * 2, _MAX_WAIT)
-        if ratelimited or "id" not in reply:  # no ticket yet: resubmit, as ColabFold does
+        if ratelimited or ticket is None:  # no ticket yet: resubmit, as ColabFold does
             reply = submit()
+            ticket = reply.get("id")
         else:
-            reply = json.loads(fetch(f"{host}/ticket/{reply['id']}", None))
-    ticket = reply["id"]
-    tar_bytes = fetch(f"{host}/result/download/{ticket}", None)
-    texts: list[str] = []
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
-        for name in ("uniref.a3m", "bfd.mgnify30.metaeuk30.smag30.a3m"):
-            member = tf.extractfile(name)
-            if member is not None:
-                texts.append(member.read().decode().replace("\x00", ""))
-    combined = texts[0]
-    for text in texts[1:]:
-        combined += text.split("\n", 2)[2]  # drop the repeated query record
-    return combined
+            reply = json.loads(fetch(f"{host}/ticket/{ticket}", None))
+    # A server may report COMPLETE while the result is still being written: re-download a
+    # truncated one.
+    for attempt in range(_MAX_ATTEMPTS):
+        tar_bytes = fetch(f"{host}/result/download/{ticket}", None)
+        members: list[dict[str, str]] = []
+        try:
+            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+                for name in ("uniref.a3m", "bfd.mgnify30.metaeuk30.smag30.a3m"):
+                    member = tf.extractfile(name)
+                    if member is not None:
+                        members.append(_by_query(member.read().decode()))
+            break
+        except (EOFError, tarfile.ReadError):
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            sleep(poll_seconds)
+    msas: list[str] = []
+    for i in range(len(sequences)):
+        key = str(101 + i)
+        if key not in members[0]:
+            raise RuntimeError(f"ColabFold MSA server reply has no MSA for query {i}")
+        combined = members[0][key]
+        for extra in members[1:]:
+            combined += "".join(extra.get(key, "").split("\n", 2)[2:])  # drop the query record
+        msas.append(combined)
+    return msas
 
 
 def parse_a3m(text: str) -> list[str]:
@@ -140,7 +167,12 @@ def encode_msa(rows: list[str], max_seqs: int = 20_000) -> Tensor:
     return _LOOKUP[torch.stack(codes).long()]
 
 
-def filter_gap_columns(msa: Tensor, max_gap_fraction: float = 0.25) -> tuple[Tensor, Tensor]:
+def filter_coverage(msa: Tensor, min_coverage: float = 0.75) -> Tensor:
+    """Rows of ``msa`` with residues in at least ``min_coverage`` of its columns (hhfilter -cov)."""
+    return msa[(msa != _GAP).float().mean(dim=1) >= min_coverage]
+
+
+def filter_gap_columns(msa: Tensor, max_gap_fraction: float = 0.5) -> tuple[Tensor, Tensor]:
     """The MSA kept to columns gapped in <= ``max_gap_fraction`` of rows, and their indices."""
     keep = ((msa == _GAP).float().mean(dim=0) <= max_gap_fraction).nonzero().squeeze(1)
     return msa[:, keep], keep
