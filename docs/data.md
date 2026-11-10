@@ -503,6 +503,15 @@ The largest map difference was 1.2e-4, at float16 precision.
 **Licenses.** The MSAs and the maps derived from them come from UniRef30 and ColabFoldDB. The
 ColabFold databases page (`colabfold.mmseqs.com`) gives them under CC BY 4.0.
 
+**Distribution.** Published 2026-11-10 in
+[`brineylab/oplm-structure-evals`](https://huggingface.co/datasets/brineylab/oplm-structure-evals),
+folder `2026-10-12/coevolution/`, tag `2026-11-10` (commit `843a08c6`). The folder has 7,119
+files: `msas/`, `couplings/` and `stats/` (2,372 each), `manifest.parquet`, `summary.json` and
+`README.md`. They are byte-identical to the build output, except that `README.md` and
+`summary.json` record the commit and `README.md` adds the checks and license above. The tag
+`2026-10-12` still points at the sets alone (commit `08f188a3`). The evals read only
+`manifest.parquet` and `couplings/` (about 330 MB).
+
 ## Dataset formats
 
 The pretraining substrate is **parquet**: a single `.parquet` / `.parq` / `.pq`
