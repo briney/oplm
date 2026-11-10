@@ -488,7 +488,22 @@ The full analysis is on #55.
 The 20% linear tail in the funnel is a ranking device: it makes each cell's loss comparable to the
 end of a real run. It is not the production decay.
 
-> **Pending:** the production decay shape, length fraction and LR floor (waiting on #58).
+The production decay shape is `wsd_linear`. In the 1/35 overfit proxy (#58), three branches off
+the 140k stable checkpoint, each decaying 35k steps to `min_lr: 0.0`, tied their linear twins (#81):
+
+| Branch | u70 held-out (s/g) | dc70 held-out | P@L pdb40 / cameo / casp / pdb40_2048 |
+|---|---|---|---|
+| linear, uniref70 0.11 rows | 2.048 / 2.036 | 2.141 | .375 / .401 / .327 / .373 |
+| `wsd_sqrt`, uniref70 0.11 rows | 2.049 / 2.037 | 2.138 | .378 / .400 / .325 / .373 |
+| `wsd_cosine`, uniref70 0.11 rows | 2.050 / 2.037 | 2.141 | .379 / .401 / .318 / .374 |
+| linear, uniref70 0.05 rows | 2.069 / 2.063 | 2.135 | .379 / .398 / .321 / .372 |
+| `wsd_sqrt`, uniref70 0.05 rows | 2.069 / 2.061 | 2.133 | .378 / .399 / .322 / .373 |
+
+Mid-decay, `wsd_sqrt` led linear by about 0.01 held-out CE at equal step, but the lead tracked its
+lower LR and was gone by the end. The published 1-sqrt advantage (Hägele et al. 2024, AdamW) doesn't
+show up under this Muon recipe.
+
+> **Pending:** the production decay length fraction and LR floor (waiting on #58).
 
 Whatever the decay recipe turns out to be, keep the optimizer state through the stable-to-decay
 transition, including the data-mix change there: no momentum reset and no second warmup. A branch
