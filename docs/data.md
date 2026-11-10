@@ -496,6 +496,10 @@ against virtual Cβ contacts < 8 Å) rises with Neff in every set:
 
 Every structure has at least L finite long-range Potts pairs.
 
+**Rebuild check.** 10 `pdb40_256` sequences (3 low, 4 mid, 3 high; L ≤ 300) were refit on CPU
+from the published MSAs. Their top-L long-range Potts pairs and P@L match the GPU build exactly.
+The largest map difference was 1.2e-4, at float16 precision.
+
 **Licenses.** The MSAs and the maps derived from them come from UniRef30 and ColabFoldDB. The
 ColabFold databases page (`colabfold.mmseqs.com`) gives them under CC BY 4.0.
 
