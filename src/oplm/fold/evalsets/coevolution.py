@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import textwrap
 from dataclasses import dataclass
@@ -126,7 +127,7 @@ def _fit_one(cfg: CoevolutionBuildConfig, sequence: str, sha: str) -> None:
 
 
 def _git_commit() -> str | None:
-    """HEAD of the repository holding this package, or None outside a git checkout."""
+    """HEAD of the repository holding this package, else the commit in its version, else None."""
     try:
         done = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -136,8 +137,14 @@ def _git_commit() -> str | None:
             check=True,
         )
     except (OSError, subprocess.CalledProcessError):
-        return None
+        return _version_commit(metadata.version("oplm"))
     return done.stdout.strip() or None
+
+
+def _version_commit(version: str) -> str | None:
+    """The short commit in a setuptools-scm version (``0.4.1.dev290+g6b7c06cdb``), if any."""
+    found = re.search(r"\+g([0-9a-f]+)", version)
+    return found.group(1) if found else None
 
 
 def _bin(value: float, edges: tuple[float, float]) -> str:

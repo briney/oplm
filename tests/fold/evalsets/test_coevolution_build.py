@@ -14,7 +14,11 @@ import pyarrow.parquet as pq
 import pytest
 
 from oplm.eval.metrics.coevolution import NEFF_BINS, CoevolutionReference
-from oplm.fold.evalsets.coevolution import CoevolutionBuildConfig, build_coevolution
+from oplm.fold.evalsets.coevolution import (
+    CoevolutionBuildConfig,
+    _version_commit,
+    build_coevolution,
+)
 from tests.fold.evalsets.conftest import CRAMBIN
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "eval" / "structures"
@@ -174,3 +178,10 @@ def test_summary_and_readme_record_the_commit(tmp_path: Path, sets_root: Path) -
     summary = build_coevolution(_cfg(tmp_path, sets_root, FakeServer()))
     assert "commit" in summary  # None outside a git checkout
     assert f"commit {summary['commit']}" in (tmp_path / "coevolution" / "README.md").read_text()
+
+
+def test_commit_falls_back_to_the_installed_version() -> None:
+    # A pip install from git has no checkout; setuptools-scm put the commit in the version.
+    assert _version_commit("0.4.1.dev290+g6b7c06cdb") == "6b7c06cdb"
+    assert _version_commit("0.4.1.dev290+g6b7c06cdb.d20261110") == "6b7c06cdb"
+    assert _version_commit("0.4.1") is None
