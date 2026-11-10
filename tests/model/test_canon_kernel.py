@@ -316,7 +316,9 @@ def test_backward_tile_edges():
         for residual in (True, False):
             dx, dw, ref_dx, ref_dw, dy = _grads(x, w, mask, seg, torch.float32, residual)
             torch.testing.assert_close(dx, ref_dx, **FP32_TOL)
-            torch.testing.assert_close(dw, ref_dw, **FP32_TOL)
+            # dw sums ~270 O(1) products that mostly cancel, in another order than the reference:
+            # 1.2e-5 on a 0.08 entry on a B200 (job 35468). A wrong tap would be off by ~0.1.
+            torch.testing.assert_close(dw, ref_dw, rtol=1e-4, atol=1e-4)
             _assert_pad_grads(dx, dy, mask, residual)
 
 
