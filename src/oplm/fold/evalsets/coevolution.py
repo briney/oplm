@@ -39,6 +39,7 @@ from oplm.fold.evalsets.msa import (
     Fetch,
     encode_msa,
     fetch_msas,
+    filter_coverage,
     filter_gap_columns,
     neff,
     parse_a3m,
@@ -63,7 +64,8 @@ class CoevolutionBuildConfig:
     msa_batch_size: int = 100
     device: str = "cpu"
     max_seqs: int = 20_000
-    max_gap_fraction: float = 0.25
+    min_coverage: float = 0.75
+    max_gap_fraction: float = 0.5
     identity: float = 0.8
     bin_edges: tuple[float, float] | None = None
     fit: bool = True
@@ -86,6 +88,7 @@ def _fit_settings(cfg: CoevolutionBuildConfig) -> dict[str, Any]:
     """The settings a stored fit depends on (``device`` is recorded but not compared)."""
     return {
         "max_seqs": cfg.max_seqs,
+        "min_coverage": cfg.min_coverage,
         "max_gap_fraction": cfg.max_gap_fraction,
         "identity": cfg.identity,
         "gremlin": dataclasses.asdict(GremlinConfig()),
@@ -98,7 +101,10 @@ def _fit_one(cfg: CoevolutionBuildConfig, sequence: str, sha: str) -> None:
     rows = parse_a3m(gzip.decompress((cfg.out / "msas" / f"{sha}.a3m.gz").read_bytes()).decode())
     if rows[0] != sequence:
         raise RuntimeError(f"sequence {sha}: MSA query differs from the sequence")
-    msa, kept = filter_gap_columns(encode_msa(rows, cfg.max_seqs), cfg.max_gap_fraction)
+    covered = filter_coverage(encode_msa(rows, cfg.max_seqs), cfg.min_coverage)
+    msa, kept = filter_gap_columns(covered, cfg.max_gap_fraction)
+    if kept.numel() == 0:  # can't happen while max_gap_fraction > 1 - min_coverage
+        raise RuntimeError(f"sequence {sha}: no MSA column passes the gap filter")
     n_eff, weights = neff(msa.to(cfg.device), cfg.identity)
     contacts = potts_contact_map(fit_gremlin(msa, weights, GremlinConfig(), cfg.device))
     full = full_length_map(contacts, kept, len(sequence)).numpy().astype(np.float16)

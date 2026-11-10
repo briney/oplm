@@ -13,6 +13,7 @@ import torch
 from oplm.fold.evalsets.msa import (
     encode_msa,
     fetch_msas,
+    filter_coverage,
     filter_gap_columns,
     neff,
     parse_a3m,
@@ -90,6 +91,11 @@ def test_filter_gap_columns():
     kept, cols = filter_gap_columns(msa)
     assert cols.tolist() == [0, 2]
     assert kept.shape == (4, 2)
+
+
+def test_filter_coverage_drops_fragments():
+    msa = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 20], [0, 20, 20, 3]], dtype=torch.int8)
+    assert filter_coverage(msa).tolist() == msa[:2].tolist()  # 4/4 and 3/4 covered; 2/4 dropped
 
 
 def test_neff_identical_and_distinct():

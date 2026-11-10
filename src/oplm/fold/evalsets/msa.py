@@ -25,6 +25,7 @@ __all__ = [
     "Fetch",
     "encode_msa",
     "fetch_msas",
+    "filter_coverage",
     "filter_gap_columns",
     "neff",
     "parse_a3m",
@@ -166,7 +167,12 @@ def encode_msa(rows: list[str], max_seqs: int = 20_000) -> Tensor:
     return _LOOKUP[torch.stack(codes).long()]
 
 
-def filter_gap_columns(msa: Tensor, max_gap_fraction: float = 0.25) -> tuple[Tensor, Tensor]:
+def filter_coverage(msa: Tensor, min_coverage: float = 0.75) -> Tensor:
+    """Rows of ``msa`` with residues in at least ``min_coverage`` of its columns (hhfilter -cov)."""
+    return msa[(msa != _GAP).float().mean(dim=1) >= min_coverage]
+
+
+def filter_gap_columns(msa: Tensor, max_gap_fraction: float = 0.5) -> tuple[Tensor, Tensor]:
     """The MSA kept to columns gapped in <= ``max_gap_fraction`` of rows, and their indices."""
     keep = ((msa == _GAP).float().mean(dim=0) <= max_gap_fraction).nonzero().squeeze(1)
     return msa[:, keep], keep
