@@ -15,7 +15,8 @@ Most positions need no masking: a loop step whose rows are all real tokens of on
 every tap, so it takes a branch with plain multiply-adds (the same result in fewer instructions).
 `fast=False` in a config times the masked path alone. With `hoist`, a mask-free step reads all its
 rows before its first multiply-add, so a warp has `unroll` row loads in flight instead of one (at
-the cost of `unroll` more rows in registers).
+the cost of `unroll` more rows in registers): about 2x on a B200, where the kernels wait on
+memory, not on arithmetic.
 
 `torch.ops.oplm.canon_conv` wraps them as one custom op with its own autograd, opaque to
 `torch.compile` (no graph break, no tracing into Triton): `canon_conv_kernel` is its entry point.
@@ -62,32 +63,34 @@ class FwdConfig(NamedTuple):
     """Forward launch: each program walks `strip` tokens of `block_d` channels, `unroll` tokens
     per loop step (`unroll` divides `strip`)."""
 
-    block_d: int = 128
-    strip: int = 128
+    block_d: int = 256
+    strip: int = 64
     unroll: int = 8
-    num_warps: int = 1
+    num_warps: int = 2
     num_stages: int = 1
     fast: bool = True  # mask-free branch for clean windows (False: benchmark the masked path)
-    hoist: bool = False  # mask-free steps read their `unroll` rows before computing
+    hoist: bool = True  # mask-free steps read their `unroll` rows before computing
 
 
 class BwdConfig(NamedTuple):
     """Backward launch: as `FwdConfig`; `strip` is also the tokens per dw partial."""
 
     block_d: int = 128
-    strip: int = 256
-    unroll: int = 4
-    num_warps: int = 1
+    strip: int = 64
+    unroll: int = 8
+    num_warps: int = 2
     num_stages: int = 1
     fast: bool = True  # as `FwdConfig.fast`
-    hoist: bool = False  # as `FwdConfig.hoist` (dy and x rows)
+    hoist: bool = True  # as `FwdConfig.hoist` (dy and x rows)
 
 
-# Per `(D, x dtype, conv dtype)`; other shapes take the defaults, which compile without spills on
-# sm_100 at k=7 (tests/model/test_canon_kernel.py checks) and await the B200 sweep. A fixed table,
-# not `triton.autotune`: autotune picks by timing at the first call (in the self-check, on every
-# rank), so ranks and reruns could pick different strips, and the strip sets dw's summation
-# order: training would stop being reproducible run to run.
+# Per `(D, x dtype, conv dtype)`; other shapes take the defaults. B200 sweep, job 35469 (6840a29,
+# bf16, k=7): the defaults are the best forward config at D 768 and 2048 (0.077 / 0.174 ms per
+# 65,536 tokens) and within 2% of the best backward at both (0.139 / 0.323 ms), so the tables are
+# empty; every shipped config must compile without spills on sm_100 (test_canon_kernel.py). A
+# fixed table, not `triton.autotune`: autotune picks by timing at the first call (in the
+# self-check, on every rank), so ranks and reruns could pick different strips, and the strip sets
+# dw's summation order: training would stop being reproducible run to run.
 FWD_CONFIGS: dict[tuple[int, torch.dtype, torch.dtype], FwdConfig] = {}
 BWD_CONFIGS: dict[tuple[int, torch.dtype, torch.dtype], BwdConfig] = {}
 

@@ -504,9 +504,9 @@ def _sm100_stack_bytes(fn, dtypes: dict[str, str], constexprs: dict, cfg) -> int
 
 
 def _shipped_configs(table: dict, default):
-    """(x dtype, conv dtype, config) for the default (bf16, as training runs), the default with
-    `hoist` (the benchmark sweeps it) and every entry."""
-    defaults = (default, default._replace(hoist=True))
+    """(x dtype, conv dtype, config) for the default (bf16, as training runs), the default with the
+    other `hoist` setting (the benchmark sweeps both) and every entry."""
+    defaults = (default, default._replace(hoist=not default.hoist))
     return [(torch.bfloat16, torch.bfloat16, cfg) for cfg in defaults] + [
         (x_dtype, conv_dtype, cfg) for (_, x_dtype, conv_dtype), cfg in table.items()
     ]
