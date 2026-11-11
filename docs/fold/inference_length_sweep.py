@@ -5,9 +5,9 @@ states are random, so the LM itself is excluded. Otherwise the run follows
 ``oplm.fold.predict.fold``: fp32 parameters under the model's own bf16 autocast, eval mode,
 ``no_grad``, tokens padded to a multiple of 128. Loops and steps are cut to 2: under ``no_grad``
 only one loop or step is live at a time, so the peak does not depend on them (each width first
-checks this at 1024 tokens against the config's defaults). Every case runs twice, the first
-compiling FlexAttention; the second is recorded. A configuration stops at its first OOM, which
-records the phase it was in.
+checks this at 1024 tokens against the config's defaults). Every case starts from a reset
+dynamo cache and runs twice, the first compiling FlexAttention; the second is recorded. A
+configuration stops at its first OOM, which records the phase it was in.
 
     python docs/fold/inference_length_sweep.py --out sweep.json
 """
@@ -97,6 +97,9 @@ def run_case(
         "steps": steps,
         "pair_unit_gib": pad * pad * cfg.pair_width * 2 / GIB,
     }
+    # Each case compiles new FlexAttention shapes; past dynamo's recompile limit flex silently
+    # runs eagerly with full score matrices, so start every case like a fresh process.
+    torch._dynamo.reset()
     try:
         seq = "".join(AMINO[i] for i in torch.randint(0, len(AMINO), (length,)).tolist())
         feats = featurize([ChainSpec(seq, "A")], pad_tokens_to=pad)
