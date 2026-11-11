@@ -324,6 +324,17 @@ oplm data deepclust70-return <original held-out dir> <out>/deepclust70 \
   --uniref70 <out>/uniref70 --workdir <work> --threads 32 --seed 0
 ```
 
+### Antibody sequences
+
+The antibody train sources and held-out sets are the Hugging Face dataset
+[`brineylab/oplm-antibody-sequences`](https://huggingface.co/datasets/brineylab/oplm-antibody-sequences),
+tag `v1.0.0`, built from AntiRef v2022.12.14. Its README is the home for the files, columns,
+recipe and caveats. `eval_singletons.parquet` and `eval_gte2.parquet` are the
+`antibody_singletons` and `antibody_gte2` evals (`type: antibody_cdr3`, see
+[evaluation.md](evaluation.md), *antibody_cdr3*) in [`configs/scaling.yaml`](../configs/scaling.yaml).
+About 60 per million train rows hold a literal lowercase `nan` inside the sequence, which
+tokenizes to `<unk>`. The held-out files have none.
+
 ### Structure evaluation sets
 
 Provenance for the methods section: every value is copied from the build artifact

@@ -64,6 +64,17 @@ data:
       path: /path/to/oplm-training-data/uniref70/eval_gte2.parquet
       type: sequence
       every: {steps: 500}
+    # Antibody CDR3 evals (docs/evaluation.md, *antibody_cdr3*), held-out AntiRef90 clusters
+    # from brineylab/oplm-antibody-sequences tag v1.0.0. Cheap (~61k short forwards per file),
+    # so one cadence serves the stable phase and the antibody anneal (#78).
+    antibody_singletons:
+      path: /path/to/oplm-antibody-sequences/eval_singletons.parquet
+      type: antibody_cdr3
+      every: {steps: 5000}
+    antibody_gte2:
+      path: /path/to/oplm-antibody-sequences/eval_gte2.parquet
+      type: antibody_cdr3
+      every: {steps: 5000}
     # Structure evals (contact precision@L), published as brineylab/oplm-structure-evals.
     pdb40:
       path: /path/to/oplm-structure-evals/pdb40_256

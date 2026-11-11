@@ -390,8 +390,8 @@ data:
 Shared keys on every entry:
 
 - `path` — file or directory consumed by the task.
-- `type` — one of `sequence`, `structure`, `proteingym`, `proteingym_clinical`,
-  `tape`, `proteinglue`, `everest`.
+- `type` — one of `sequence`, `structure`, `antibody_cdr3`, `proteingym`,
+  `proteingym_clinical`, `tape`, `proteinglue`, `everest`.
 - `every` — optional per-dataset cadence: exactly one of `{steps: N}` /
   `{tokens: N}`, plus optional `at_start` (default `false`) and `at_end`
   (default `true`). Datasets that omit `every` inherit `train.eval_every`.
@@ -422,6 +422,16 @@ categorical Jacobian over PDB/CIF structures.
 | `categorical_jacobian_mutation_batch_size` | `int` | `20` | Mutant sequences per Jacobian forward pass. |
 | `max_structures` | `int \| null` | `null` | Optional cap on structures loaded. |
 | `coevolution` | `str \| null` | `null` | Path to the coevolution folder (MSA Potts couplings); enables the [coevolution metrics](evaluation.md#coevolution-metrics). |
+
+### antibody_cdr3
+
+Per-position masked-LM metrics over antibody CDR3 residues, by chain type (see
+[evaluation.md](evaluation.md), *antibody_cdr3*). Reads one parquet file with `sequence`,
+`locus` and `cdr_mask_aa`.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `mask_batch_size` | `int` | `256` | Masked sequences per forward pass; must be in `[1, 4096]`. |
 
 ### proteingym
 
