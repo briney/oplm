@@ -670,7 +670,8 @@ constant number of units, so the maximum length on a device of `M` GiB is about
 `sqrt(M · 2³⁰ / (units · pair_width · 2))`. Compare phases by `start_gib` (pair state held when the
 phase begins) and `peak_gib` (its transient high-water mark).
 
-**Current** (job 35784, `788fece`, one B200 with 178 GiB, cuEquivariance 0.13.0,
+**Current** (job 35784, measured at `788fece`, code identical to `6468578`; one B200 with 178 GiB,
+cuEquivariance 0.13.0,
 `expandable_segments`; [`fold/inference-memory/788fece.json`](fold/inference-memory/788fece.json)):
 
 | Width | Samples | Largest that ran | First OOM | OOM phase | Peak (units) |
