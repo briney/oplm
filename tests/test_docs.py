@@ -147,7 +147,6 @@ def test_pending_markers_present() -> None:
         "docs/training.md": ["#62"],
         "docs/mup-lr.md": ["#70", "#58"],
         "docs/inference.md": ["#62"],
-        "docs/evaluation.md": ["#57"],
         "docs/reproduce.md": ["#70", "#58"],  # LR, horizon, loss / P@L ranges; decay recipe, data mix
     }
     for doc, issues in expect.items():

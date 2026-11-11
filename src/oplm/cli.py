@@ -143,6 +143,86 @@ def encode(
     console.print(f"[green]Saved embeddings[/green] {tuple(embeddings.shape)} → {out_path}")
 
 
+@app.command(name="eval")
+def eval_cmd(
+    ckpts: Annotated[
+        list[str],
+        typer.Argument(metavar="CKPT...", help="Checkpoint directories (each with an hf/ export)"),
+    ],
+    config: ConfigOpt = None,
+    only: Annotated[
+        str | None,
+        typer.Option("--only", help="Comma-separated data.eval task names to run (default: all)"),
+    ] = None,
+    output: Annotated[
+        str | None, typer.Option("--output", "-o", help="Append the JSON lines to this file")
+    ] = None,
+    precision: Annotated[
+        str | None,
+        typer.Option(
+            "--precision", help="Mixed precision: no, bf16 or fp16 (default: train.mixed_precision)"
+        ),
+    ] = None,
+    overrides: OverridesOpt = None,
+) -> None:
+    """Score checkpoints on the config's data.eval tasks, outside training.
+
+    Runs every task once per checkpoint (a task's cadence is ignored) and prints one JSON line per
+    (checkpoint, task). Without --config, each checkpoint's own config.yaml is used.
+
+    For multi-GPU: accelerate launch -m oplm eval <ckpt> --config <path>
+    """
+    import json
+    import time
+
+    from accelerate import Accelerator
+
+    import oplm.eval.tasks  # noqa: F401  -- triggers task registration
+    from oplm.config import ScheduleSpec
+    from oplm.data.config import parse_eval_configs
+    from oplm.eval.registry import get_eval_task_class
+
+    wanted = set(only.split(",")) if only else None
+    # Resolve and validate everything before the first (slow) model load.
+    plans = []
+    for ck in ckpts:
+        try:
+            cfg = resolve_inference_config(ck, config_path=config, overrides=overrides)
+            entries = parse_eval_configs(cfg.data.eval, ScheduleSpec("steps", 1))
+            if wanted is not None:
+                unknown = wanted - {e.name for e in entries}
+                if unknown:
+                    raise ValueError(f"--only names tasks not in data.eval: {sorted(unknown)}")
+                entries = [e for e in entries if e.name in wanted]
+            if not entries:
+                raise ValueError(f"no eval tasks to run: data.eval is empty in the config for {ck}")
+            task_classes = [get_eval_task_class(e.type) for e in entries]
+        except (FileNotFoundError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        plans.append((ck, cfg, list(zip(entries, task_classes, strict=True))))
+
+    acc = Accelerator(mixed_precision=precision or plans[0][1].train.mixed_precision)
+    for ck, cfg, tasks in plans:
+        model = load_model_for_inference(ck, cfg, device=acc.device)
+        cfg.model = model.config  # the export's config wins over the YAML's model block
+        # Same mixed-precision wrapper the trainer's model carries into in-loop eval: autocast
+        # inside forward only, outputs cast back to fp32. Wrapping evaluate() in autocast
+        # instead runs the tasks' own post-forward math in bf16 and shifts the metrics.
+        model = acc.prepare_model(model, evaluation_mode=True)
+        for entry, task_cls in tasks:
+            task = task_cls(entry, cfg)
+            start = time.time()
+            metrics = task.evaluate(model, acc)
+            if not acc.is_main_process:
+                continue
+            record = {"ckpt": ck, "task": entry.name, "seconds": round(time.time() - start, 1)}
+            line = json.dumps({**record, **metrics})
+            print(line, flush=True)  # plain print: rich would wrap and highlight the JSON
+            if output:
+                with Path(output).open("a") as f:
+                    f.write(line + "\n")
+
+
 def _safetensors_tensors(files: list[Path]):  # noqa: ANN202 — generator of (name, tensor)
     from safetensors import safe_open
 
