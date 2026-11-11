@@ -1,0 +1,1558 @@
+{
+  "env": {
+    "host": "slurm-b200-193-181",
+    "gpu": "NVIDIA B200",
+    "total_gib": 178.34405517578125,
+    "torch": "2.11.0+cu130"
+  },
+  "cases": [
+    {
+      "width": 128,
+      "length": 1024,
+      "padded": 1024,
+      "samples": 1,
+      "loops": 10,
+      "steps": 14,
+      "pair_unit_gib": 0.25,
+      "status": "ok",
+      "seconds": 2.606868783943355,
+      "peak_allocated_gib": 9.4280424118042,
+      "peak_reserved_gib": 10.931640625,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.6455612182617188,
+          "peak_gib": 1.921402931213379,
+          "peak_over_start_gib": 1.2758417129516602,
+          "end_gib": 1.4123954772949219,
+          "seconds": 0.006220559007488191
+        },
+        "language_model.forward": {
+          "start_gib": 1.4123954772949219,
+          "peak_gib": 2.6709418296813965,
+          "peak_over_start_gib": 1.2585463523864746,
+          "end_gib": 1.9127936363220215,
+          "seconds": 0.003228456014767289
+        },
+        "parcae.run": {
+          "start_gib": 2.1627936363220215,
+          "peak_gib": 8.173078536987305,
+          "peak_over_start_gib": 6.010284900665283,
+          "end_gib": 2.4230475425720215,
+          "seconds": 2.1084955210098997
+        },
+        "parcae.readout": {
+          "start_gib": 2.4230475425720215,
+          "peak_gib": 7.6736884117126465,
+          "peak_over_start_gib": 5.250640869140625,
+          "end_gib": 2.6738104820251465,
+          "seconds": 0.016179530997760594
+        },
+        "structure_head.prepare": {
+          "start_gib": 2.910405158996582,
+          "peak_gib": 5.910710334777832,
+          "peak_over_start_gib": 3.00030517578125,
+          "end_gib": 3.4146175384521484,
+          "seconds": 0.012721688952296972
+        },
+        "structure_head.sample": {
+          "start_gib": 3.4146175384521484,
+          "peak_gib": 3.994662284851074,
+          "peak_over_start_gib": 0.5800447463989258,
+          "end_gib": 3.4147133827209473,
+          "seconds": 0.40049396897666156
+        },
+        "confidence_head.forward": {
+          "start_gib": 3.4147133827209473,
+          "peak_gib": 9.4280424118042,
+          "peak_over_start_gib": 6.013329029083252,
+          "end_gib": 3.9245810508728027,
+          "seconds": 0.046434027957729995
+        }
+      },
+      "tag": "loops-check"
+    },
+    {
+      "width": 128,
+      "length": 1024,
+      "padded": 1024,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.25,
+      "status": "ok",
+      "seconds": 0.5984172510216013,
+      "peak_allocated_gib": 9.4280424118042,
+      "peak_reserved_gib": 11.013671875,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.6455612182617188,
+          "peak_gib": 1.921402931213379,
+          "peak_over_start_gib": 1.2758417129516602,
+          "end_gib": 1.4123954772949219,
+          "seconds": 0.005958375986665487
+        },
+        "language_model.forward": {
+          "start_gib": 1.4123954772949219,
+          "peak_gib": 2.6709418296813965,
+          "peak_over_start_gib": 1.2585463523864746,
+          "end_gib": 1.9127936363220215,
+          "seconds": 0.0032016889890655875
+        },
+        "parcae.run": {
+          "start_gib": 2.1627936363220215,
+          "peak_gib": 8.173078536987305,
+          "peak_over_start_gib": 6.010284900665283,
+          "end_gib": 2.4230475425720215,
+          "seconds": 0.4222518680617213
+        },
+        "parcae.readout": {
+          "start_gib": 2.4230475425720215,
+          "peak_gib": 7.6736884117126465,
+          "peak_over_start_gib": 5.250640869140625,
+          "end_gib": 2.6738104820251465,
+          "seconds": 0.015690509928390384
+        },
+        "structure_head.prepare": {
+          "start_gib": 2.910405158996582,
+          "peak_gib": 5.910710334777832,
+          "peak_over_start_gib": 3.00030517578125,
+          "end_gib": 3.4146175384521484,
+          "seconds": 0.012343029025942087
+        },
+        "structure_head.sample": {
+          "start_gib": 3.4146175384521484,
+          "peak_gib": 3.994662284851074,
+          "peak_over_start_gib": 0.5800447463989258,
+          "end_gib": 3.4147133827209473,
+          "seconds": 0.08075036993250251
+        },
+        "confidence_head.forward": {
+          "start_gib": 3.4147133827209473,
+          "peak_gib": 9.4280424118042,
+          "peak_over_start_gib": 6.013329029083252,
+          "end_gib": 3.9245810508728027,
+          "seconds": 0.04641248797997832
+        }
+      },
+      "tag": "loops-check"
+    },
+    {
+      "width": 128,
+      "length": 512,
+      "padded": 512,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.0625,
+      "status": "ok",
+      "seconds": 0.185611522058025,
+      "peak_allocated_gib": 2.800100803375244,
+      "peak_reserved_gib": 3.486328125,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.5979022979736328,
+          "peak_gib": 0.9242420196533203,
+          "peak_over_start_gib": 0.3263397216796875,
+          "end_gib": 0.7947225570678711,
+          "seconds": 0.004131127963773906
+        },
+        "language_model.forward": {
+          "start_gib": 0.7947225570678711,
+          "peak_gib": 1.1095738410949707,
+          "peak_over_start_gib": 0.3148512840270996,
+          "end_gib": 0.9201207160949707,
+          "seconds": 0.0010753809474408627
+        },
+        "parcae.run": {
+          "start_gib": 0.9826207160949707,
+          "peak_gib": 2.492905616760254,
+          "peak_over_start_gib": 1.5102849006652832,
+          "end_gib": 1.0553746223449707,
+          "seconds": 0.1095624880399555
+        },
+        "parcae.readout": {
+          "start_gib": 1.0553746223449707,
+          "peak_gib": 2.3685154914855957,
+          "peak_over_start_gib": 1.313140869140625,
+          "end_gib": 1.1186375617980957,
+          "seconds": 0.004883284913375974
+        },
+        "structure_head.prepare": {
+          "start_gib": 1.1677322387695312,
+          "peak_gib": 1.9180374145507812,
+          "peak_over_start_gib": 0.75030517578125,
+          "end_gib": 1.2957301139831543,
+          "seconds": 0.009374679066240788
+        },
+        "structure_head.sample": {
+          "start_gib": 1.2957301139831543,
+          "peak_gib": 1.4466094970703125,
+          "peak_over_start_gib": 0.1508793830871582,
+          "end_gib": 1.2957782745361328,
+          "seconds": 0.03454585000872612
+        },
+        "confidence_head.forward": {
+          "start_gib": 1.2957782745361328,
+          "peak_gib": 2.800100803375244,
+          "peak_over_start_gib": 1.5043225288391113,
+          "end_gib": 1.4235825538635254,
+          "seconds": 0.012513010995462537
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 1024,
+      "padded": 1024,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.25,
+      "status": "ok",
+      "seconds": 0.5984328300692141,
+      "peak_allocated_gib": 9.428145408630371,
+      "peak_reserved_gib": 11.060546875,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.6455726623535156,
+          "peak_gib": 1.921729564666748,
+          "peak_over_start_gib": 1.2761569023132324,
+          "end_gib": 1.412600040435791,
+          "seconds": 0.0058097869623452425
+        },
+        "language_model.forward": {
+          "start_gib": 1.412600040435791,
+          "peak_gib": 2.6708106994628906,
+          "peak_over_start_gib": 1.2582106590270996,
+          "end_gib": 1.9129981994628906,
+          "seconds": 0.003202660009264946
+        },
+        "parcae.run": {
+          "start_gib": 2.1629981994628906,
+          "peak_gib": 8.173283100128174,
+          "peak_over_start_gib": 6.010284900665283,
+          "end_gib": 2.4232521057128906,
+          "seconds": 0.42218958504963666
+        },
+        "parcae.readout": {
+          "start_gib": 2.4232521057128906,
+          "peak_gib": 7.673892974853516,
+          "peak_over_start_gib": 5.250640869140625,
+          "end_gib": 2.6740150451660156,
+          "seconds": 0.01552347291726619
+        },
+        "structure_head.prepare": {
+          "start_gib": 2.910609722137451,
+          "peak_gib": 5.910914897918701,
+          "peak_over_start_gib": 3.00030517578125,
+          "end_gib": 3.414885997772217,
+          "seconds": 0.012402371037751436
+        },
+        "structure_head.sample": {
+          "start_gib": 3.414885997772217,
+          "peak_gib": 3.9950618743896484,
+          "peak_over_start_gib": 0.5801758766174316,
+          "end_gib": 3.4149832725524902,
+          "seconds": 0.08094723895192146
+        },
+        "confidence_head.forward": {
+          "start_gib": 3.4149832725524902,
+          "peak_gib": 9.428145408630371,
+          "peak_over_start_gib": 6.013162136077881,
+          "end_gib": 3.925081253051758,
+          "seconds": 0.04640528897289187
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 1536,
+      "padded": 1536,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.5625,
+      "status": "ok",
+      "seconds": 1.3121130910003558,
+      "peak_allocated_gib": 20.43924570083618,
+      "peak_reserved_gib": 23.888671875,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.695685863494873,
+          "peak_gib": 3.5461816787719727,
+          "peak_over_start_gib": 2.8504958152770996,
+          "end_gib": 2.406924247741699,
+          "seconds": 0.008904426940716803
+        },
+        "language_model.forward": {
+          "start_gib": 2.406924247741699,
+          "peak_gib": 5.237771511077881,
+          "peak_over_start_gib": 2.8308472633361816,
+          "end_gib": 3.532322406768799,
+          "seconds": 0.006720438017509878
+        },
+        "parcae.run": {
+          "start_gib": 4.094822406768799,
+          "peak_gib": 17.605107307434082,
+          "peak_over_start_gib": 13.510284900665283,
+          "end_gib": 4.667576313018799,
+          "seconds": 0.9635248930426314
+        },
+        "parcae.readout": {
+          "start_gib": 4.667576313018799,
+          "peak_gib": 16.480717182159424,
+          "peak_over_start_gib": 11.813140869140625,
+          "end_gib": 5.230839252471924,
+          "seconds": 0.03475076099857688
+        },
+        "structure_head.prepare": {
+          "start_gib": 5.779933929443359,
+          "peak_gib": 12.53023910522461,
+          "peak_over_start_gib": 6.75030517578125,
+          "end_gib": 6.911244869232178,
+          "seconds": 0.026868811924941838
+        },
+        "structure_head.sample": {
+          "start_gib": 6.911244869232178,
+          "peak_gib": 8.203070640563965,
+          "peak_over_start_gib": 1.291825771331787,
+          "end_gib": 6.911386966705322,
+          "seconds": 0.15035137499216944
+        },
+        "confidence_head.forward": {
+          "start_gib": 6.911386966705322,
+          "peak_gib": 20.43924570083618,
+          "peak_over_start_gib": 13.52785873413086,
+          "end_gib": 8.056482315063477,
+          "seconds": 0.10424546501599252
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 2048,
+      "padded": 2048,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 1.0,
+      "status": "ok",
+      "seconds": 2.3431499570142478,
+      "peak_allocated_gib": 35.837162494659424,
+      "peak_reserved_gib": 41.80859375,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.7505168914794922,
+          "peak_gib": 5.800302028656006,
+          "peak_over_start_gib": 5.049785137176514,
+          "end_gib": 3.7819228172302246,
+          "seconds": 0.012880043010227382
+        },
+        "language_model.forward": {
+          "start_gib": 3.7819228172302246,
+          "peak_gib": 8.813570976257324,
+          "peak_over_start_gib": 5.0316481590271,
+          "end_gib": 5.782320976257324,
+          "seconds": 0.011608217027969658
+        },
+        "parcae.run": {
+          "start_gib": 6.782320976257324,
+          "peak_gib": 30.792605876922607,
+          "peak_over_start_gib": 24.010284900665283,
+          "end_gib": 7.792574882507324,
+          "seconds": 1.7427135499892756
+        },
+        "parcae.readout": {
+          "start_gib": 7.792574882507324,
+          "peak_gib": 28.79321575164795,
+          "peak_over_start_gib": 21.000640869140625,
+          "end_gib": 8.79333782196045,
+          "seconds": 0.06237790500745177
+        },
+        "structure_head.prepare": {
+          "start_gib": 9.779932498931885,
+          "peak_gib": 21.780237674713135,
+          "peak_over_start_gib": 12.00030517578125,
+          "end_gib": 11.788552284240723,
+          "seconds": 0.04734706494491547
+        },
+        "structure_head.sample": {
+          "start_gib": 11.788552284240723,
+          "peak_gib": 14.073769569396973,
+          "peak_over_start_gib": 2.28521728515625,
+          "end_gib": 11.788744926452637,
+          "seconds": 0.2568710669875145
+        },
+        "confidence_head.forward": {
+          "start_gib": 11.788744926452637,
+          "peak_gib": 35.837162494659424,
+          "peak_over_start_gib": 24.048417568206787,
+          "end_gib": 13.823404312133789,
+          "seconds": 0.18658210197463632
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 3072,
+      "padded": 3072,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 2.25,
+      "status": "ok",
+      "seconds": 5.484027029015124,
+      "peak_allocated_gib": 79.78629684448242,
+      "peak_reserved_gib": 92.87890625,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.8721699714660645,
+          "peak_gib": 12.194856643676758,
+          "peak_over_start_gib": 11.322686672210693,
+          "end_gib": 7.6678972244262695,
+          "seconds": 0.024867099011316895
+        },
+        "language_model.forward": {
+          "start_gib": 7.6678972244262695,
+          "peak_gib": 18.98860788345337,
+          "peak_over_start_gib": 11.3207106590271,
+          "end_gib": 12.16829538345337,
+          "seconds": 0.028980545001104474
+        },
+        "parcae.run": {
+          "start_gib": 14.41829538345337,
+          "peak_gib": 68.42858028411865,
+          "peak_over_start_gib": 54.01028490066528,
+          "end_gib": 16.67854928970337,
+          "seconds": 4.161190891987644
+        },
+        "parcae.readout": {
+          "start_gib": 16.67854928970337,
+          "peak_gib": 63.929190158843994,
+          "peak_over_start_gib": 47.250640869140625,
+          "end_gib": 18.929312229156494,
+          "seconds": 0.14970425597857684
+        },
+        "structure_head.prepare": {
+          "start_gib": 21.16590690612793,
+          "peak_gib": 48.16621208190918,
+          "peak_over_start_gib": 27.00030517578125,
+          "end_gib": 25.67890167236328,
+          "seconds": 0.1083493089536205
+        },
+        "structure_head.sample": {
+          "start_gib": 25.67890167236328,
+          "peak_gib": 30.793964862823486,
+          "peak_over_start_gib": 5.115063190460205,
+          "end_gib": 25.679187774658203,
+          "seconds": 0.5391644958872348
+        },
+        "confidence_head.forward": {
+          "start_gib": 25.679187774658203,
+          "peak_gib": 79.78629684448242,
+          "peak_over_start_gib": 54.10710906982422,
+          "end_gib": 30.254562854766846,
+          "seconds": 0.4297076449729502
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 4096,
+      "padded": 4096,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 4.0,
+      "status": "ok",
+      "seconds": 10.301096420967951,
+      "peak_allocated_gib": 141.27902269363403,
+      "peak_reserved_gib": 164.044921875,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 1.0110578536987305,
+          "peak_gib": 21.110682487487793,
+          "peak_over_start_gib": 20.099624633789062,
+          "end_gib": 13.0736403465271,
+          "seconds": 0.04108407208696008
+        },
+        "language_model.forward": {
+          "start_gib": 13.0736403465271,
+          "peak_gib": 33.1990385055542,
+          "peak_over_start_gib": 20.1253981590271,
+          "end_gib": 21.0740385055542,
+          "seconds": 0.05083240999374539
+        },
+        "parcae.run": {
+          "start_gib": 25.0740385055542,
+          "peak_gib": 121.08432340621948,
+          "peak_over_start_gib": 96.01028490066528,
+          "end_gib": 29.0842924118042,
+          "seconds": 7.923792554996908
+        },
+        "parcae.readout": {
+          "start_gib": 29.0842924118042,
+          "peak_gib": 113.08493328094482,
+          "peak_over_start_gib": 84.00064086914062,
+          "end_gib": 33.085055351257324,
+          "seconds": 0.2844662700081244
+        },
+        "structure_head.prepare": {
+          "start_gib": 37.07165002822876,
+          "peak_gib": 85.07195520401001,
+          "peak_over_start_gib": 48.00030517578125,
+          "end_gib": 45.089396476745605,
+          "seconds": 0.19223371508996934
+        },
+        "structure_head.sample": {
+          "start_gib": 45.089396476745605,
+          "peak_gib": 54.15976333618164,
+          "peak_over_start_gib": 9.070366859436035,
+          "end_gib": 45.08978080749512,
+          "seconds": 0.9287745389156044
+        },
+        "confidence_head.forward": {
+          "start_gib": 45.08978080749512,
+          "peak_gib": 141.27902269363403,
+          "peak_over_start_gib": 96.18924188613892,
+          "end_gib": 53.22158432006836,
+          "seconds": 0.8089580530067906
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 5120,
+      "padded": 5120,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 6.25,
+      "status": "oom",
+      "phase": "parcae.run",
+      "error": "CUDA out of memory. Tried to allocate 25.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 11.02 GiB is free. Including non-PyTorch memory, this process has 167.31 GiB memory in use. Of the allocated memory 144.99 GiB is allocated by PyTorch, and 21.45 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 1.162534236907959,
+          "peak_gib": 32.5344352722168,
+          "peak_over_start_gib": 31.371901035308838,
+          "end_gib": 19.989218711853027,
+          "seconds": 1.3240067969309166
+        },
+        "language_model.forward": {
+          "start_gib": 19.989218711853027,
+          "peak_gib": 51.43492937088013,
+          "peak_over_start_gib": 31.4457106590271,
+          "end_gib": 32.48961687088013,
+          "seconds": 0.07956242305226624
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 512,
+      "padded": 512,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.0625,
+      "status": "ok",
+      "seconds": 0.27756334003061056,
+      "peak_allocated_gib": 8.825019359588623,
+      "peak_reserved_gib": 11.48828125,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.5978941917419434,
+          "peak_gib": 0.9239974021911621,
+          "peak_over_start_gib": 0.32610321044921875,
+          "end_gib": 0.7945694923400879,
+          "seconds": 0.004402360995300114
+        },
+        "language_model.forward": {
+          "start_gib": 0.7945694923400879,
+          "peak_gib": 1.1094207763671875,
+          "peak_over_start_gib": 0.3148512840270996,
+          "end_gib": 0.9199676513671875,
+          "seconds": 0.0011311490088701248
+        },
+        "parcae.run": {
+          "start_gib": 0.9824676513671875,
+          "peak_gib": 2.4927525520324707,
+          "peak_over_start_gib": 1.5102849006652832,
+          "end_gib": 1.0552215576171875,
+          "seconds": 0.10955264093354344
+        },
+        "parcae.readout": {
+          "start_gib": 1.0552215576171875,
+          "peak_gib": 2.3683624267578125,
+          "peak_over_start_gib": 1.313140869140625,
+          "end_gib": 1.1184844970703125,
+          "seconds": 0.004887907998636365
+        },
+        "structure_head.prepare": {
+          "start_gib": 1.167579174041748,
+          "peak_gib": 2.6198601722717285,
+          "peak_over_start_gib": 1.4522809982299805,
+          "end_gib": 1.3085484504699707,
+          "seconds": 0.02126769593451172
+        },
+        "structure_head.sample": {
+          "start_gib": 1.3085484504699707,
+          "peak_gib": 1.5180120468139648,
+          "peak_over_start_gib": 0.20946359634399414,
+          "end_gib": 1.3087830543518066,
+          "seconds": 0.07269155303947628
+        },
+        "confidence_head.forward": {
+          "start_gib": 1.3087830543518066,
+          "peak_gib": 8.825019359588623,
+          "peak_over_start_gib": 7.516236305236816,
+          "end_gib": 1.9476995468139648,
+          "seconds": 0.05348544707521796
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 1024,
+      "padded": 1024,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.25,
+      "status": "ok",
+      "seconds": 0.8725889680208638,
+      "peak_allocated_gib": 33.50401306152344,
+      "peak_reserved_gib": 44.947265625,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.6448297500610352,
+          "peak_gib": 1.9207501411437988,
+          "peak_over_start_gib": 1.2759203910827637,
+          "end_gib": 1.4117121696472168,
+          "seconds": 0.006091468036174774
+        },
+        "language_model.forward": {
+          "start_gib": 1.4117121696472168,
+          "peak_gib": 2.6699228286743164,
+          "peak_over_start_gib": 1.2582106590270996,
+          "end_gib": 1.9121103286743164,
+          "seconds": 0.003225018037483096
+        },
+        "parcae.run": {
+          "start_gib": 2.1621103286743164,
+          "peak_gib": 8.1723952293396,
+          "peak_over_start_gib": 6.010284900665283,
+          "end_gib": 2.4223642349243164,
+          "seconds": 0.4226988150039688
+        },
+        "parcae.readout": {
+          "start_gib": 2.4223642349243164,
+          "peak_gib": 7.673005104064941,
+          "peak_over_start_gib": 5.250640869140625,
+          "end_gib": 2.6731271743774414,
+          "seconds": 0.015733454027213156
+        },
+        "structure_head.prepare": {
+          "start_gib": 2.909721851348877,
+          "peak_gib": 8.92758321762085,
+          "peak_over_start_gib": 6.017861366271973,
+          "end_gib": 3.4430994987487793,
+          "seconds": 0.02216599602252245
+        },
+        "structure_head.sample": {
+          "start_gib": 3.4430994987487793,
+          "peak_gib": 4.093474388122559,
+          "peak_over_start_gib": 0.6503748893737793,
+          "end_gib": 3.4435787200927734,
+          "seconds": 0.1785355560714379
+        },
+        "confidence_head.forward": {
+          "start_gib": 3.4435787200927734,
+          "peak_gib": 33.50401306152344,
+          "peak_over_start_gib": 30.060434341430664,
+          "end_gib": 5.991747856140137,
+          "seconds": 0.21132688398938626
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 1536,
+      "padded": 1536,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.5625,
+      "status": "ok",
+      "seconds": 1.915745550999418,
+      "peak_allocated_gib": 74.58870649337769,
+      "peak_reserved_gib": 99.056640625,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.6956906318664551,
+          "peak_gib": 3.5463438034057617,
+          "peak_over_start_gib": 2.8506531715393066,
+          "end_gib": 2.4070253372192383,
+          "seconds": 0.009097098023630679
+        },
+        "language_model.forward": {
+          "start_gib": 2.4070253372192383,
+          "peak_gib": 5.23787260055542,
+          "peak_over_start_gib": 2.8308472633361816,
+          "end_gib": 3.532423496246338,
+          "seconds": 0.0067357749212533236
+        },
+        "parcae.run": {
+          "start_gib": 4.094923496246338,
+          "peak_gib": 17.60520839691162,
+          "peak_over_start_gib": 13.510284900665283,
+          "end_gib": 4.667677402496338,
+          "seconds": 0.9639929310651496
+        },
+        "parcae.readout": {
+          "start_gib": 4.667677402496338,
+          "peak_gib": 16.480818271636963,
+          "peak_over_start_gib": 11.813140869140625,
+          "end_gib": 5.230940341949463,
+          "seconds": 0.0354103350546211
+        },
+        "structure_head.prepare": {
+          "start_gib": 5.780035018920898,
+          "peak_gib": 19.105923652648926,
+          "peak_over_start_gib": 13.325888633728027,
+          "end_gib": 6.954071044921875,
+          "seconds": 0.04203052097000182
+        },
+        "structure_head.sample": {
+          "start_gib": 6.954071044921875,
+          "peak_gib": 8.35191535949707,
+          "peak_over_start_gib": 1.3978443145751953,
+          "end_gib": 6.954784870147705,
+          "seconds": 0.36373373004607856
+        },
+        "confidence_head.forward": {
+          "start_gib": 6.954784870147705,
+          "peak_gib": 74.58870649337769,
+          "peak_over_start_gib": 67.63392162322998,
+          "end_gib": 12.680311679840088,
+          "seconds": 0.4767412309302017
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 2048,
+      "padded": 2048,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 1.0,
+      "status": "ok",
+      "seconds": 3.3801180940354243,
+      "peak_allocated_gib": 132.08361434936523,
+      "peak_reserved_gib": 175.87890625,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.7505154609680176,
+          "peak_gib": 5.800221920013428,
+          "peak_over_start_gib": 5.04970645904541,
+          "end_gib": 3.7818732261657715,
+          "seconds": 0.013107834965921938
+        },
+        "language_model.forward": {
+          "start_gib": 3.7818732261657715,
+          "peak_gib": 8.813521385192871,
+          "peak_over_start_gib": 5.0316481590271,
+          "end_gib": 5.782271385192871,
+          "seconds": 0.011603199993260205
+        },
+        "parcae.run": {
+          "start_gib": 6.782271385192871,
+          "peak_gib": 30.792556285858154,
+          "peak_over_start_gib": 24.010284900665283,
+          "end_gib": 7.792525291442871,
+          "seconds": 1.7430698539828882
+        },
+        "parcae.readout": {
+          "start_gib": 7.792525291442871,
+          "peak_gib": 28.793166160583496,
+          "peak_over_start_gib": 21.000640869140625,
+          "end_gib": 8.793288230895996,
+          "seconds": 0.06283267599064857
+        },
+        "structure_head.prepare": {
+          "start_gib": 9.779882907867432,
+          "peak_gib": 33.85424041748047,
+          "peak_over_start_gib": 24.074357509613037,
+          "end_gib": 11.84593915939331,
+          "seconds": 0.07449194299988449
+        },
+        "structure_head.sample": {
+          "start_gib": 11.84593915939331,
+          "peak_gib": 14.271885395050049,
+          "peak_over_start_gib": 2.4259462356567383,
+          "end_gib": 11.846899509429932,
+          "seconds": 0.5864915830316022
+        },
+        "confidence_head.forward": {
+          "start_gib": 11.846899509429932,
+          "peak_gib": 132.08361434936523,
+          "peak_over_start_gib": 120.2367148399353,
+          "end_gib": 22.02015495300293,
+          "seconds": 0.8658910979283974
+        }
+      }
+    },
+    {
+      "width": 128,
+      "length": 3072,
+      "padded": 3072,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 2.25,
+      "status": "oom",
+      "phase": "confidence_head.forward",
+      "error": "CUDA out of memory. Tried to allocate 90.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 67.49 GiB is free. Including non-PyTorch memory, this process has 110.84 GiB memory in use. Of the allocated memory 105.05 GiB is allocated by PyTorch, and 4.93 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.8721857070922852,
+          "peak_gib": 12.19518756866455,
+          "peak_over_start_gib": 11.323001861572266,
+          "end_gib": 7.6681060791015625,
+          "seconds": 1.3278902031015605
+        },
+        "language_model.forward": {
+          "start_gib": 7.6681060791015625,
+          "peak_gib": 18.988816738128662,
+          "peak_over_start_gib": 11.3207106590271,
+          "end_gib": 12.168504238128662,
+          "seconds": 0.02901005302555859
+        },
+        "parcae.run": {
+          "start_gib": 14.418504238128662,
+          "peak_gib": 68.42878913879395,
+          "peak_over_start_gib": 54.01028490066528,
+          "end_gib": 16.678758144378662,
+          "seconds": 4.173742058919743
+        },
+        "parcae.readout": {
+          "start_gib": 16.678758144378662,
+          "peak_gib": 63.92939901351929,
+          "peak_over_start_gib": 47.250640869140625,
+          "end_gib": 18.929521083831787,
+          "seconds": 0.15099441702477634
+        },
+        "structure_head.prepare": {
+          "start_gib": 21.166115760803223,
+          "peak_gib": 74.97169828414917,
+          "peak_over_start_gib": 53.80558252334595,
+          "end_gib": 25.765965938568115,
+          "seconds": 0.16882341995369643
+        },
+        "structure_head.sample": {
+          "start_gib": 25.765965938568115,
+          "peak_gib": 31.093994140625,
+          "peak_over_start_gib": 5.328028202056885,
+          "end_gib": 25.767919063568115,
+          "seconds": 5.070995994959958
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 1024,
+      "padded": 1024,
+      "samples": 1,
+      "loops": 10,
+      "steps": 14,
+      "pair_unit_gib": 0.5,
+      "status": "ok",
+      "seconds": 5.859135317965411,
+      "peak_allocated_gib": 18.089592933654785,
+      "peak_reserved_gib": 22.580078125,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.8033161163330078,
+          "peak_gib": 3.329326629638672,
+          "peak_over_start_gib": 2.526010513305664,
+          "end_gib": 2.32034969329834,
+          "seconds": 0.00713261601049453
+        },
+        "language_model.forward": {
+          "start_gib": 2.32034969329834,
+          "peak_gib": 4.8292012214660645,
+          "peak_over_start_gib": 2.5088515281677246,
+          "end_gib": 3.3213887214660645,
+          "seconds": 0.004841008107177913
+        },
+        "parcae.run": {
+          "start_gib": 3.8213887214660645,
+          "peak_gib": 15.862526893615723,
+          "peak_over_start_gib": 12.041138172149658,
+          "end_gib": 4.3624043464660645,
+          "seconds": 5.227166411001235
+        },
+        "parcae.readout": {
+          "start_gib": 4.3624043464660645,
+          "peak_gib": 14.864967823028564,
+          "peak_over_start_gib": 10.5025634765625,
+          "end_gib": 4.8654561042785645,
+          "seconds": 0.03827045392245054
+        },
+        "structure_head.prepare": {
+          "start_gib": 5.068111896514893,
+          "peak_gib": 11.069332599639893,
+          "peak_over_start_gib": 6.001220703125,
+          "end_gib": 6.072308540344238,
+          "seconds": 0.022841752041131258
+        },
+        "structure_head.sample": {
+          "start_gib": 6.072308540344238,
+          "peak_gib": 7.152322769165039,
+          "peak_over_start_gib": 1.0800142288208008,
+          "end_gib": 6.072403907775879,
+          "seconds": 0.44414830999448895
+        },
+        "confidence_head.forward": {
+          "start_gib": 6.072403907775879,
+          "peak_gib": 18.089592933654785,
+          "peak_over_start_gib": 12.017189025878906,
+          "end_gib": 6.582271099090576,
+          "seconds": 0.10081632295623422
+        }
+      },
+      "tag": "loops-check"
+    },
+    {
+      "width": 256,
+      "length": 1024,
+      "padded": 1024,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.5,
+      "status": "ok",
+      "seconds": 1.3176887889858335,
+      "peak_allocated_gib": 18.08979845046997,
+      "peak_reserved_gib": 22.580078125,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.8033261299133301,
+          "peak_gib": 3.329573154449463,
+          "peak_over_start_gib": 2.526247024536133,
+          "end_gib": 2.320504665374756,
+          "seconds": 0.006845762021839619
+        },
+        "language_model.forward": {
+          "start_gib": 2.320504665374756,
+          "peak_gib": 4.8293561935424805,
+          "peak_over_start_gib": 2.5088515281677246,
+          "end_gib": 3.3215436935424805,
+          "seconds": 0.004818910034373403
+        },
+        "parcae.run": {
+          "start_gib": 3.8215436935424805,
+          "peak_gib": 15.862681865692139,
+          "peak_over_start_gib": 12.041138172149658,
+          "end_gib": 4.3625593185424805,
+          "seconds": 1.040651960996911
+        },
+        "parcae.readout": {
+          "start_gib": 4.3625593185424805,
+          "peak_gib": 14.86512279510498,
+          "peak_over_start_gib": 10.5025634765625,
+          "end_gib": 4.8656110763549805,
+          "seconds": 0.03791848791297525
+        },
+        "structure_head.prepare": {
+          "start_gib": 5.068266868591309,
+          "peak_gib": 11.069487571716309,
+          "peak_over_start_gib": 6.001220703125,
+          "end_gib": 6.072512149810791,
+          "seconds": 0.02299921994563192
+        },
+        "structure_head.sample": {
+          "start_gib": 6.072512149810791,
+          "peak_gib": 7.152624607086182,
+          "peak_over_start_gib": 1.0801124572753906,
+          "end_gib": 6.072608470916748,
+          "seconds": 0.09050054696854204
+        },
+        "confidence_head.forward": {
+          "start_gib": 6.072608470916748,
+          "peak_gib": 18.08979845046997,
+          "peak_over_start_gib": 12.017189979553223,
+          "end_gib": 6.58247709274292,
+          "seconds": 0.09974482608959079
+        }
+      },
+      "tag": "loops-check"
+    },
+    {
+      "width": 256,
+      "length": 512,
+      "padded": 512,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.125,
+      "status": "ok",
+      "seconds": 0.3522750969277695,
+      "peak_allocated_gib": 5.086787700653076,
+      "peak_reserved_gib": 6.64453125,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.7561569213867188,
+          "peak_gib": 1.39558744430542,
+          "peak_over_start_gib": 0.6394305229187012,
+          "end_gib": 1.1408696174621582,
+          "seconds": 0.004349824041128159
+        },
+        "language_model.forward": {
+          "start_gib": 1.1408696174621582,
+          "peak_gib": 1.7688617706298828,
+          "peak_over_start_gib": 0.6279921531677246,
+          "end_gib": 1.3919086456298828,
+          "seconds": 0.0014762419741600752
+        },
+        "parcae.run": {
+          "start_gib": 1.5169086456298828,
+          "peak_gib": 4.558046817779541,
+          "peak_over_start_gib": 3.041138172149658,
+          "end_gib": 1.6829242706298828,
+          "seconds": 0.25433232192881405
+        },
+        "parcae.readout": {
+          "start_gib": 1.6829242706298828,
+          "peak_gib": 4.310487747192383,
+          "peak_over_start_gib": 2.6275634765625,
+          "end_gib": 1.8109760284423828,
+          "seconds": 0.0096830939874053
+        },
+        "structure_head.prepare": {
+          "start_gib": 1.826131820678711,
+          "peak_gib": 3.327352523803711,
+          "peak_over_start_gib": 1.501220703125,
+          "end_gib": 2.0783867835998535,
+          "seconds": 0.009485041024163365
+        },
+        "structure_head.sample": {
+          "start_gib": 2.0783867835998535,
+          "peak_gib": 2.3543643951416016,
+          "peak_over_start_gib": 0.27597761154174805,
+          "end_gib": 2.0784358978271484,
+          "seconds": 0.0370024120202288
+        },
+        "confidence_head.forward": {
+          "start_gib": 2.0784358978271484,
+          "peak_gib": 5.086787700653076,
+          "peak_over_start_gib": 3.0083518028259277,
+          "end_gib": 2.2062597274780273,
+          "seconds": 0.0255572940222919
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 1024,
+      "padded": 1024,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.5,
+      "status": "ok",
+      "seconds": 1.3182700760662556,
+      "peak_allocated_gib": 18.08952760696411,
+      "peak_reserved_gib": 22.533203125,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.8033146858215332,
+          "peak_gib": 3.3292465209960938,
+          "peak_over_start_gib": 2.5259318351745605,
+          "end_gib": 2.3203001022338867,
+          "seconds": 0.006915682926774025
+        },
+        "language_model.forward": {
+          "start_gib": 2.3203001022338867,
+          "peak_gib": 4.829151630401611,
+          "peak_over_start_gib": 2.5088515281677246,
+          "end_gib": 3.3213391304016113,
+          "seconds": 0.004813043982721865
+        },
+        "parcae.run": {
+          "start_gib": 3.8213391304016113,
+          "peak_gib": 15.86247730255127,
+          "peak_over_start_gib": 12.041138172149658,
+          "end_gib": 4.362354755401611,
+          "seconds": 1.040922002051957
+        },
+        "parcae.readout": {
+          "start_gib": 4.362354755401611,
+          "peak_gib": 14.864918231964111,
+          "peak_over_start_gib": 10.5025634765625,
+          "end_gib": 4.865406513214111,
+          "seconds": 0.03791733703110367
+        },
+        "structure_head.prepare": {
+          "start_gib": 5.0680623054504395,
+          "peak_gib": 11.06928300857544,
+          "peak_over_start_gib": 6.001220703125,
+          "end_gib": 6.072243690490723,
+          "seconds": 0.022724444046616554
+        },
+        "structure_head.sample": {
+          "start_gib": 6.072243690490723,
+          "peak_gib": 7.152225017547607,
+          "peak_over_start_gib": 1.0799813270568848,
+          "end_gib": 6.072338581085205,
+          "seconds": 0.09065351402387023
+        },
+        "confidence_head.forward": {
+          "start_gib": 6.072338581085205,
+          "peak_gib": 18.08952760696411,
+          "peak_over_start_gib": 12.017189025878906,
+          "end_gib": 6.582205772399902,
+          "seconds": 0.10000163596123457
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 1536,
+      "padded": 1536,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 1.125,
+      "status": "ok",
+      "seconds": 3.0009486590279266,
+      "peak_allocated_gib": 39.72612476348877,
+      "peak_reserved_gib": 49.1640625,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.8532133102416992,
+          "peak_gib": 6.516850471496582,
+          "peak_over_start_gib": 5.663637161254883,
+          "end_gib": 4.252440452575684,
+          "seconds": 0.01117984892334789
+        },
+        "language_model.forward": {
+          "start_gib": 4.252440452575684,
+          "peak_gib": 9.896057605743408,
+          "peak_over_start_gib": 5.643617153167725,
+          "end_gib": 6.503479480743408,
+          "seconds": 0.01041351689491421
+        },
+        "parcae.run": {
+          "start_gib": 7.628479480743408,
+          "peak_gib": 34.669617652893066,
+          "peak_over_start_gib": 27.041138172149658,
+          "end_gib": 8.794495105743408,
+          "seconds": 2.421764482045546
+        },
+        "parcae.readout": {
+          "start_gib": 8.794495105743408,
+          "peak_gib": 32.42205858230591,
+          "peak_over_start_gib": 23.6275634765625,
+          "end_gib": 9.922546863555908,
+          "seconds": 0.08766303700394928
+        },
+        "structure_head.prepare": {
+          "start_gib": 10.437702655792236,
+          "peak_gib": 23.938923358917236,
+          "peak_over_start_gib": 13.501220703125,
+          "end_gib": 12.694092750549316,
+          "seconds": 0.04892518708948046
+        },
+        "structure_head.sample": {
+          "start_gib": 12.694092750549316,
+          "peak_gib": 15.111997604370117,
+          "peak_over_start_gib": 2.417904853820801,
+          "end_gib": 12.694236755371094,
+          "seconds": 0.16997082100715488
+        },
+        "confidence_head.forward": {
+          "start_gib": 12.694236755371094,
+          "peak_gib": 39.72612476348877,
+          "peak_over_start_gib": 27.031888008117676,
+          "end_gib": 13.839363098144531,
+          "seconds": 0.22972783097065985
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 2048,
+      "padded": 2048,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 2.0,
+      "status": "ok",
+      "seconds": 5.499135763035156,
+      "peak_allocated_gib": 69.99863958358765,
+      "peak_reserved_gib": 86.326171875,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.9080295562744141,
+          "peak_gib": 10.958227634429932,
+          "peak_over_start_gib": 10.050198078155518,
+          "end_gib": 6.939634799957275,
+          "seconds": 0.017094237031415105
+        },
+        "language_model.forward": {
+          "start_gib": 6.939634799957275,
+          "peak_gib": 16.971923828125,
+          "peak_over_start_gib": 10.032289028167725,
+          "end_gib": 10.940673828125,
+          "seconds": 0.021252686041407287
+        },
+        "parcae.run": {
+          "start_gib": 12.940673828125,
+          "peak_gib": 60.98181200027466,
+          "peak_over_start_gib": 48.04113817214966,
+          "end_gib": 14.981689453125,
+          "seconds": 4.46997580002062
+        },
+        "parcae.readout": {
+          "start_gib": 14.981689453125,
+          "peak_gib": 56.9842529296875,
+          "peak_over_start_gib": 42.0025634765625,
+          "end_gib": 16.9847412109375,
+          "seconds": 0.1594110489822924
+        },
+        "structure_head.prepare": {
+          "start_gib": 17.937397003173828,
+          "peak_gib": 41.93861770629883,
+          "peak_over_start_gib": 24.001220703125,
+          "end_gib": 21.946001529693604,
+          "seconds": 0.08930986002087593
+        },
+        "structure_head.sample": {
+          "start_gib": 21.946001529693604,
+          "peak_gib": 26.23126983642578,
+          "peak_over_start_gib": 4.285268306732178,
+          "end_gib": 21.94619369506836,
+          "seconds": 0.2913780399831012
+        },
+        "confidence_head.forward": {
+          "start_gib": 21.94619369506836,
+          "peak_gib": 69.99863958358765,
+          "peak_over_start_gib": 48.05244588851929,
+          "end_gib": 23.980847358703613,
+          "seconds": 0.4198452029377222
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 3072,
+      "padded": 3072,
+      "samples": 1,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 4.5,
+      "status": "oom",
+      "phase": "confidence_head.forward",
+      "error": "CUDA out of memory. Tried to allocate 18.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 8.00 GiB is free. Including non-PyTorch memory, this process has 170.33 GiB memory in use. Of the allocated memory 138.45 GiB is allocated by PyTorch, and 31.01 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 1.0296807289123535,
+          "peak_gib": 23.602776527404785,
+          "peak_over_start_gib": 22.57309579849243,
+          "end_gib": 14.575847625732422,
+          "seconds": 1.4287823749473318
+        },
+        "language_model.forward": {
+          "start_gib": 14.575847625732422,
+          "peak_gib": 37.14719915390015,
+          "peak_over_start_gib": 22.571351528167725,
+          "end_gib": 23.576886653900146,
+          "seconds": 0.04824180295690894
+        },
+        "parcae.run": {
+          "start_gib": 28.076886653900146,
+          "peak_gib": 136.1180248260498,
+          "peak_over_start_gib": 108.04113817214966,
+          "end_gib": 32.61790227890015,
+          "seconds": 11.18581633490976
+        },
+        "parcae.readout": {
+          "start_gib": 32.61790227890015,
+          "peak_gib": 127.12046575546265,
+          "peak_over_start_gib": 94.5025634765625,
+          "end_gib": 37.12095403671265,
+          "seconds": 0.37985140504315495
+        },
+        "structure_head.prepare": {
+          "start_gib": 39.323609828948975,
+          "peak_gib": 93.32483053207397,
+          "peak_over_start_gib": 54.001220703125,
+          "end_gib": 48.336588859558105,
+          "seconds": 0.1965180989354849
+        },
+        "structure_head.sample": {
+          "start_gib": 48.336588859558105,
+          "peak_gib": 57.951618671417236,
+          "peak_over_start_gib": 9.61502981185913,
+          "end_gib": 48.33687448501587,
+          "seconds": 0.8054081239970401
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 512,
+      "padded": 512,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.125,
+      "status": "ok",
+      "seconds": 0.4939520850311965,
+      "peak_allocated_gib": 17.112138748168945,
+      "peak_reserved_gib": 23.078125,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.7554197311401367,
+          "peak_gib": 1.3947229385375977,
+          "peak_over_start_gib": 0.6393032073974609,
+          "end_gib": 1.140035629272461,
+          "seconds": 0.004683544975705445
+        },
+        "language_model.forward": {
+          "start_gib": 1.140035629272461,
+          "peak_gib": 1.7680277824401855,
+          "peak_over_start_gib": 0.6279921531677246,
+          "end_gib": 1.3910746574401855,
+          "seconds": 0.0015709480503574014
+        },
+        "parcae.run": {
+          "start_gib": 1.5160746574401855,
+          "peak_gib": 4.557212829589844,
+          "peak_over_start_gib": 3.041138172149658,
+          "end_gib": 1.6820902824401855,
+          "seconds": 0.25486855604685843
+        },
+        "parcae.readout": {
+          "start_gib": 1.6820902824401855,
+          "peak_gib": 4.3096537590026855,
+          "peak_over_start_gib": 2.6275634765625,
+          "end_gib": 1.8101420402526855,
+          "seconds": 0.010208188905380666
+        },
+        "structure_head.prepare": {
+          "start_gib": 1.8252978324890137,
+          "peak_gib": 3.484396457672119,
+          "peak_over_start_gib": 1.6590986251831055,
+          "end_gib": 2.0916266441345215,
+          "seconds": 0.021661194041371346
+        },
+        "structure_head.sample": {
+          "start_gib": 2.0916266441345215,
+          "peak_gib": 2.401355266571045,
+          "peak_over_start_gib": 0.30972862243652344,
+          "end_gib": 2.0918684005737305,
+          "seconds": 0.07518444303423166
+        },
+        "confidence_head.forward": {
+          "start_gib": 2.0918684005737305,
+          "peak_gib": 17.112138748168945,
+          "peak_over_start_gib": 15.020270347595215,
+          "end_gib": 2.7310380935668945,
+          "seconds": 0.11543965502642095
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 1024,
+      "padded": 1024,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 0.5,
+      "status": "ok",
+      "seconds": 1.8004413029411808,
+      "peak_allocated_gib": 66.16752243041992,
+      "peak_reserved_gib": 86.421875,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.8025937080383301,
+          "peak_gib": 3.328840732574463,
+          "peak_over_start_gib": 2.526247024536133,
+          "end_gib": 2.319772243499756,
+          "seconds": 0.007211224990896881
+        },
+        "language_model.forward": {
+          "start_gib": 2.319772243499756,
+          "peak_gib": 4.8286237716674805,
+          "peak_over_start_gib": 2.5088515281677246,
+          "end_gib": 3.3208112716674805,
+          "seconds": 0.004858287982642651
+        },
+        "parcae.run": {
+          "start_gib": 3.8208112716674805,
+          "peak_gib": 15.861949443817139,
+          "peak_over_start_gib": 12.041138172149658,
+          "end_gib": 4.3618268966674805,
+          "seconds": 1.038925975910388
+        },
+        "parcae.readout": {
+          "start_gib": 4.3618268966674805,
+          "peak_gib": 14.86439037322998,
+          "peak_over_start_gib": 10.5025634765625,
+          "end_gib": 4.8648786544799805,
+          "seconds": 0.03884077398106456
+        },
+        "structure_head.prepare": {
+          "start_gib": 5.067534446716309,
+          "peak_gib": 11.627306938171387,
+          "peak_over_start_gib": 6.559772491455078,
+          "end_gib": 6.102576732635498,
+          "seconds": 0.030413678963668644
+        },
+        "structure_head.sample": {
+          "start_gib": 6.102576732635498,
+          "peak_gib": 7.253116607666016,
+          "peak_over_start_gib": 1.1505398750305176,
+          "end_gib": 6.103057861328125,
+          "seconds": 0.1884501720778644
+        },
+        "confidence_head.forward": {
+          "start_gib": 6.103057861328125,
+          "peak_gib": 66.16752243041992,
+          "peak_over_start_gib": 60.0644645690918,
+          "end_gib": 8.651082992553711,
+          "seconds": 0.4770487359492108
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 1536,
+      "padded": 1536,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 1.125,
+      "status": "ok",
+      "seconds": 4.088609640020877,
+      "peak_allocated_gib": 147.87687492370605,
+      "peak_reserved_gib": 162.689453125,
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.8534808158874512,
+          "peak_gib": 6.517669677734375,
+          "peak_over_start_gib": 5.664188861846924,
+          "end_gib": 4.253046035766602,
+          "seconds": 0.011264591943472624
+        },
+        "language_model.forward": {
+          "start_gib": 4.253046035766602,
+          "peak_gib": 9.896663188934326,
+          "peak_over_start_gib": 5.643617153167725,
+          "end_gib": 6.504085063934326,
+          "seconds": 0.010404021013528109
+        },
+        "parcae.run": {
+          "start_gib": 7.629085063934326,
+          "peak_gib": 34.670223236083984,
+          "peak_over_start_gib": 27.041138172149658,
+          "end_gib": 8.795100688934326,
+          "seconds": 2.4136688068974763
+        },
+        "parcae.readout": {
+          "start_gib": 8.795100688934326,
+          "peak_gib": 32.422664165496826,
+          "peak_over_start_gib": 23.6275634765625,
+          "end_gib": 9.923152446746826,
+          "seconds": 0.08556253206916153
+        },
+        "structure_head.prepare": {
+          "start_gib": 10.438308238983154,
+          "peak_gib": 25.50660753250122,
+          "peak_over_start_gib": 15.068299293518066,
+          "end_gib": 12.738180160522461,
+          "seconds": 0.06517363106831908
+        },
+        "structure_head.sample": {
+          "start_gib": 12.738180160522461,
+          "peak_gib": 15.261872291564941,
+          "peak_over_start_gib": 2.5236921310424805,
+          "end_gib": 12.738911628723145,
+          "seconds": 0.38386272406205535
+        },
+        "confidence_head.forward": {
+          "start_gib": 12.738911628723145,
+          "peak_gib": 147.87687492370605,
+          "peak_over_start_gib": 135.1379632949829,
+          "end_gib": 18.464754581451416,
+          "seconds": 1.0974813139764592
+        }
+      }
+    },
+    {
+      "width": 256,
+      "length": 2048,
+      "padded": 2048,
+      "samples": 5,
+      "loops": 2,
+      "steps": 2,
+      "pair_unit_gib": 2.0,
+      "status": "oom",
+      "phase": "confidence_head.forward",
+      "error": "CUDA out of memory. Tried to allocate 80.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 79.52 GiB is free. Including non-PyTorch memory, this process has 98.81 GiB memory in use. Of the allocated memory 92.24 GiB is allocated by PyTorch, and 5.70 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+      "phases": {
+        "input_embedder.forward": {
+          "start_gib": 0.9080085754394531,
+          "peak_gib": 10.957812309265137,
+          "peak_over_start_gib": 10.049803733825684,
+          "end_gib": 6.9393720626831055,
+          "seconds": 1.2196774340700358
+        },
+        "language_model.forward": {
+          "start_gib": 6.9393720626831055,
+          "peak_gib": 16.97166109085083,
+          "peak_over_start_gib": 10.032289028167725,
+          "end_gib": 10.94041109085083,
+          "seconds": 0.021202355972491205
+        },
+        "parcae.run": {
+          "start_gib": 12.94041109085083,
+          "peak_gib": 60.98154926300049,
+          "peak_over_start_gib": 48.04113817214966,
+          "end_gib": 14.98142671585083,
+          "seconds": 4.454646094935015
+        },
+        "parcae.readout": {
+          "start_gib": 14.98142671585083,
+          "peak_gib": 56.98399019241333,
+          "peak_over_start_gib": 42.0025634765625,
+          "end_gib": 16.98447847366333,
+          "seconds": 0.1603900600457564
+        },
+        "structure_head.prepare": {
+          "start_gib": 17.937134265899658,
+          "peak_gib": 43.60391044616699,
+          "peak_over_start_gib": 25.666776180267334,
+          "end_gib": 22.003082275390625,
+          "seconds": 0.1123144670855254
+        },
+        "structure_head.sample": {
+          "start_gib": 22.003082275390625,
+          "peak_gib": 26.428225994110107,
+          "peak_over_start_gib": 4.425143718719482,
+          "end_gib": 22.00403356552124,
+          "seconds": 1.859695685096085
+        }
+      }
+    }
+  ],
+  "params_gib": {
+    "128": 0.5459961891174316,
+    "256": 1.2172374725341797
+  }
+}

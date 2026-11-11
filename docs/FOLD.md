@@ -643,3 +643,46 @@ Reruns resume: MSAs and fits already on disk are reused (files are renamed into 
 interrupted run leaves no partial file). A stored fit made with different settings (`--max-seqs`,
 the coverage, gap and identity thresholds, GREMLIN settings) raises instead of mixing fits; delete
 `couplings/` and `stats/` to refit. `--device` defaults to `auto`.
+
+## 12. Inference memory and maximum length
+
+**Recipe.** [`docs/fold/inference_length_sweep.py`](fold/inference_length_sweep.py) measures peak
+allocated GPU memory per prediction phase against token length, for pair widths 128 and 256 and
+1 and 5 diffusion samples. It doubles up to 8192 tokens until a configuration runs out of memory.
+The head is randomly initialized and the frozen-LM states are random (memory does not depend on
+the weights; the LM is excluded); otherwise the run is `oplm.fold.predict.fold`'s path. Loops and
+steps are cut to 2, which the script checks leaves the peak unchanged.
+
+**Commands.**
+
+```bash
+# on the cluster login node, with the commit pushed:
+OPLM_REF=<commit> sbatch docs/fold/inference-length-sweep.sbatch
+```
+
+Results land in `/mnt/home/briney/fold-lensweep/<jobid>/` (`sweep.json`, `versions.txt`).
+
+**What to check.** Report peaks in *pair units*, one bf16 pair tensor (`L² × pair_width × 2`
+bytes, `L` padded to 128), recorded per case as `pair_unit_gib`. From 1536 tokens up the peak is a
+constant number of units, so the maximum length on a device of `M` GiB is about
+`sqrt(M · 2³⁰ / (units · pair_width · 2))`. Compare phases by `start_gib` (pair state held when the
+phase begins) and `peak_gib` (its transient high-water mark).
+
+**Baseline** (job 35762, `28c97ac`, one B200 with 178 GiB, cuEquivariance 0.13.0;
+[`fold/inference-memory/28c97ac-baseline.json`](fold/inference-memory/28c97ac-baseline.json)):
+
+| Width | Samples | Largest that ran | First OOM | OOM phase | Peak (units) |
+| --- | --- | --- | --- | --- | --- |
+| 128 | 1 | 4096 (141 GiB) | 5120 | trunk loop | 35 |
+| 128 | 5 | 2048 (132 GiB) | 3072 | confidence head | 132 |
+| 256 | 1 | 2048 (70 GiB) | 3072 | confidence head | 35 |
+| 256 | 5 | 1536 (148 GiB) | 2048 | confidence head | 131 |
+
+At width 256, 2048 tokens, 1 sample, the pair state held entering the trunk is 6.5 units and rises
+to 11 by the confidence head. Each pair-update block adds a transient of about 24 units (the trunk,
+the coda and the confidence head alike), the diffusion conditioning adds 12, and the confidence
+head repeats its 24 once per sample. Reserved memory runs 15–25 % above allocated.
+
+**How to change it.** Execution-only memory work is tracked on the board (#101–#104); multi-GPU
+inference beyond one device's capacity is milestone 6, Fold-CP (#105). Rerun the sweep after each
+change and replace the baseline here.
