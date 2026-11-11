@@ -167,7 +167,7 @@ def eval_cmd(
 ) -> None:
     """Score checkpoints on the config's data.eval tasks, outside training.
 
-    Runs every task once per checkpoint (``every:`` is ignored) and prints one JSON line per
+    Runs every task once per checkpoint (a task's cadence is ignored) and prints one JSON line per
     (checkpoint, task). Without --config, each checkpoint's own config.yaml is used.
 
     For multi-GPU: accelerate launch -m oplm eval <ckpt> --config <path>
