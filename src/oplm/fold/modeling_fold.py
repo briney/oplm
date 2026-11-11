@@ -387,10 +387,21 @@ class OplmForFolding(OplmFoldPreTrainedModel):
             if z0 is None:
                 z0 = self.parcae.init_state(emb.z_init, generator=generator)
             drop = cfg.pair_dropout if self.training else 0.0
+            kept_lm_z = lm_z if return_intermediates else None
+            if drop == 0 and not torch.is_grad_enabled():
+                # Loop-invariant without dropout or gradients: encode once and free the LM pair
+                # (docs/FOLD.md §12).
+                injected = emb.z_init + self.lm_encoder(lm_z.to(emb.z_init.dtype), pair_mask)
+                del lm_z
 
-            def inject(_t: int) -> Tensor:
-                lm_t = F.dropout(lm_z, drop, training=True) if drop > 0 else lm_z
-                return emb.z_init + self.lm_encoder(lm_t.to(emb.z_init.dtype), pair_mask)
+                def inject(_t: int) -> Tensor:
+                    return injected
+
+            else:
+
+                def inject(_t: int) -> Tensor:
+                    lm_t = F.dropout(lm_z, drop, training=True) if drop > 0 else lm_z
+                    return emb.z_init + self.lm_encoder(lm_t.to(emb.z_init.dtype), pair_mask)
 
             z, states = self.parcae.run(
                 self.folding_trunk,
@@ -442,7 +453,7 @@ class OplmForFolding(OplmFoldPreTrainedModel):
                 "z_init": emb.z_init,
                 "relpos": emb.relpos,
                 "bonds": emb.bonds,
-                "lm_z": lm_z,
+                "lm_z": kept_lm_z,
                 "z0": z0,
                 "states": states,
                 "pair": z,
