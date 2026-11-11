@@ -297,3 +297,38 @@ def test_input_embedder_row_chunks_match_the_whole_call_without_grad() -> None:
     z, relpos, bonds = (torch.randn(2, 7, 7, cfg.pair_width) for _ in range(3))
     with torch.no_grad():
         torch.testing.assert_close(chunked(s, z, relpos, bonds), whole(s, z, relpos, bonds))
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("grad", [False, True])
+def test_confidence_pair_stack_runs_bf16_on_cuda_for_training_and_inference(grad: bool) -> None:
+    cfg = _cfg()
+    head = ConfidenceHead(cfg).cuda().train(grad)
+    seen: list[torch.dtype] = []
+    head.folding_trunk.register_forward_pre_hook(lambda _m, args: seen.append(args[0].dtype))
+    f = featurize([ChainSpec("MKVL", "A")])
+    L, A = f.num_tokens, f.num_atoms
+    with torch.set_grad_enabled(grad):
+        out = head(
+            s_inputs=torch.randn(1, L, cfg.single_inputs_width, device="cuda"),
+            z=torch.randn(1, L, L, cfg.pair_width, device="cuda"),
+            relpos=torch.randn(1, L, L, cfg.pair_width, device="cuda"),
+            bonds=torch.randn(1, L, L, cfg.pair_width, device="cuda"),
+            coords=torch.randn(2, A, 3, device="cuda") * 5,
+            **{
+                k: getattr(f, k).cuda()
+                for k in (
+                    "distogram_atom_idx",
+                    "token_mask",
+                    "atom_to_token",
+                    "atom_mask",
+                    "asym_id",
+                )
+            },
+        )
+    assert seen == [torch.bfloat16, torch.bfloat16]
+    assert out.pae_logits.dtype == torch.float32 and out.plddt_logits.dtype == torch.float32
+    if grad:
+        out.plddt_logits.sum().backward()
+        assert head.folding_trunk.layers[0].tri_mul_out.proj_bundle.weight.grad is not None

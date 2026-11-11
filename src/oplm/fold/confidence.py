@@ -260,7 +260,11 @@ class ConfidenceHead(nn.Module):
         pair = pair + self.dist_bin_pairwise_embed(bins)
         pair_mask = token_mask[:, :, None].float() * token_mask[:, None, :].float()
         with cuda_bf16_autocast(pair.is_cuda):
-            delta = self.folding_trunk(pair, pair_mask)
+            # bf16 pair stream on CUDA, as the main trunk (spec §5.4); an fp32 input would run the
+            # fused trimul in fp32 at twice the memory (docs/FOLD.md §12). Training and
+            # inference both come through here.
+            trunk_in = pair.to(torch.bfloat16) if pair.is_cuda else pair
+            delta = self.folding_trunk(trunk_in, pair_mask)
         pair = pair + delta.float()  # upstream quirk: ``delta`` already includes the residual
         single = self.row_attention_pooling(pair, token_mask)
         pae_logits = self.pae_head(self.pae_layernorm(pair))
