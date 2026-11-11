@@ -259,4 +259,23 @@ all-gathers. The group hangs until `dist_timeout_minutes`. `load_config` refuses
 combination up front (`validate_parallelism_compat` in `src/oplm/config.py`), so an
 HSDP run must have an empty `data.eval`.
 
-> **Pending:** standalone eval of a saved checkpoint, to score HSDP runs offline (waiting on #57).
+`oplm eval` scores a saved checkpoint's `hf/` export on a `data.eval` block outside training. It
+runs every listed task once per checkpoint (`every:` is ignored) and prints one JSON line per
+checkpoint and task: `ckpt`, `task`, `seconds`, then the task's metrics under their bare names.
+
+```bash
+oplm eval outputs/run/checkpoint-10000 outputs/run/checkpoint-20000 \
+  --config eval.yaml --only casp15_16,uniref70_gte2 --output results.jsonl
+```
+
+- `--config` is a training config or a YAML holding only `data:`. Without it, each checkpoint's
+  own `config.yaml` is used, which reproduces that run's in-loop evals. An HSDP run's config has
+  no `data.eval`, so pass one.
+- The model architecture always comes from the `hf/` export, so one config can score checkpoints
+  of different architectures.
+- `--only` limits the run to the named tasks, `--output` appends the lines to a file, and
+  `--override KEY=VALUE` changes a config value, such as a dataset `path`.
+- Precision follows `train.mixed_precision` unless `--precision` is given.
+
+`fold_monomer` is not supported here: it scores an `OplmForFolding` model, which this command
+does not load.
