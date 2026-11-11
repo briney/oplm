@@ -14,7 +14,7 @@ milestone 2. pLDDT is on the 0–1 scale, PAE/PDE in Å (64 bins over 0–32 Å 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING
 
 import torch
@@ -193,6 +193,10 @@ class ConfidenceHead(nn.Module):
     ) -> ConfidenceOutput:
         """Score ``coords (B·S, A, 3)`` against the base-batch trunk tensors, per sample.
 
+        Row ``b · S + j`` of every output is sample ``j`` of example ``b``. The pair embedding
+        that does not depend on coordinates is computed once; each sample then runs the pair
+        trunk on its own, so memory does not grow with the sample count (docs/FOLD.md §12).
+
         Raises:
             ValueError: ``coords.shape[0]`` is not a multiple of the trunk batch ``z.shape[0]``.
         """
@@ -200,58 +204,82 @@ class ConfidenceHead(nn.Module):
             raise ValueError(
                 f"coords batch {coords.shape[0]} is not a multiple of the trunk batch {z.shape[0]}"
             )
+        num_samples = coords.shape[0] // z.shape[0]
         with fp32_autocast_off(z.device):  # logits and scores stay fp32 (spec §5.4)
-            num_samples = coords.shape[0] // z.shape[0]
+            base = self.input_embedder(s_inputs, z.float(), relpos.float(), bonds.float())
+            per_sample = [
+                self._score(
+                    base,
+                    coords[j::num_samples],
+                    distogram_atom_idx,
+                    token_mask,
+                    atom_to_token,
+                    atom_mask,
+                    asym_id,
+                )
+                for j in range(num_samples)
+            ]
+        return ConfidenceOutput(
+            **{
+                f.name: torch.stack([getattr(o, f.name) for o in per_sample], 1).flatten(0, 1)
+                for f in fields(ConfidenceOutput)
+            }
+        )
 
-            def rep(t: Tensor) -> Tensor:
-                return t.repeat_interleave(num_samples, dim=0)
-
-            pair = rep(self.input_embedder(s_inputs, z.float(), relpos.float(), bonds.float()))
-            token_mask, atom_to_token, atom_mask, asym_id = map(
-                rep, (token_mask, atom_to_token, atom_mask, asym_id)
-            )
-            rep_idx = rep(distogram_atom_idx)
-            rep_coords = torch.gather(coords.float(), 1, rep_idx[..., None].expand(-1, -1, 3))
-            bins = distance_bins(
-                rep_coords,
-                self.boundaries,  # ty: ignore[invalid-argument-type]  # registered buffer typed Tensor | Module
-            )
-            pair = pair + self.dist_bin_pairwise_embed(bins)
-            pair_mask = token_mask[:, :, None].float() * token_mask[:, None, :].float()
-            with cuda_bf16_autocast(pair.is_cuda):
-                delta = self.folding_trunk(pair, pair_mask)
-            pair = pair + delta.float()  # upstream quirk: ``delta`` already includes the residual
-            single = self.row_attention_pooling(pair, token_mask)
-            pae_logits = self.pae_head(self.pae_layernorm(pair))
-            pde_logits = self.pde_head(self.pde_layernorm(pair))
-            s_atoms = gather_token_to_atom(single, atom_to_token)
-            slot = intra_token_index(atom_to_token).clamp(max=self.plddt_weight.shape[0] - 1)
-            plddt_logits = torch.einsum(
-                "...c,...cb->...b", self.plddt_layernorm(s_atoms), self.plddt_weight[slot]
-            )
-            resolved_logits = torch.einsum(
-                "...c,...cb->...b", self.resolved_layernorm(s_atoms), self.resolved_weight[slot]
-            )
-            plddt_per_atom = categorical_mean(plddt_logits, 0.0, 1.0)
-            plddt = scatter_atom_to_token_mean(
-                plddt_per_atom[..., None], atom_to_token, token_mask.shape[1], atom_mask
-            )[..., 0]
-            atom_f = atom_mask.float()
-            complex_plddt = (plddt_per_atom * atom_f).sum(-1) / atom_f.sum(-1).clamp(min=1.0)
-            ptm, iptm, pair_chains_iptm = tm_scores(
-                pae_logits, token_mask, asym_id, max_dist=self.config.pae_max_dist
-            )
-            return ConfidenceOutput(
-                plddt_logits=plddt_logits,
-                plddt_per_atom=plddt_per_atom,
-                plddt=plddt,
-                pae_logits=pae_logits,
-                pae=categorical_mean(pae_logits, 0.0, self.config.pae_max_dist),
-                pde_logits=pde_logits,
-                pde=categorical_mean(pde_logits, 0.0, self.config.pae_max_dist),
-                resolved_logits=resolved_logits,
-                ptm=ptm,
-                iptm=iptm,
-                pair_chains_iptm=pair_chains_iptm,
-                complex_plddt=complex_plddt,
-            )
+    def _score(
+        self,
+        pair: Tensor,
+        coords: Tensor,
+        distogram_atom_idx: Tensor,
+        token_mask: Tensor,
+        atom_to_token: Tensor,
+        atom_mask: Tensor,
+        asym_id: Tensor,
+    ) -> ConfidenceOutput:
+        """One sample per example: ``pair`` and ``coords`` share the batch dimension."""
+        rep_coords = torch.gather(
+            coords.float(), 1, distogram_atom_idx[..., None].expand(-1, -1, 3)
+        )
+        bins = distance_bins(
+            rep_coords,
+            self.boundaries,  # ty: ignore[invalid-argument-type]  # registered buffer typed Tensor | Module
+        )
+        pair = pair + self.dist_bin_pairwise_embed(bins)
+        pair_mask = token_mask[:, :, None].float() * token_mask[:, None, :].float()
+        with cuda_bf16_autocast(pair.is_cuda):
+            delta = self.folding_trunk(pair, pair_mask)
+        pair = pair + delta.float()  # upstream quirk: ``delta`` already includes the residual
+        single = self.row_attention_pooling(pair, token_mask)
+        pae_logits = self.pae_head(self.pae_layernorm(pair))
+        pde_logits = self.pde_head(self.pde_layernorm(pair))
+        s_atoms = gather_token_to_atom(single, atom_to_token)
+        slot = intra_token_index(atom_to_token).clamp(max=self.plddt_weight.shape[0] - 1)
+        plddt_logits = torch.einsum(
+            "...c,...cb->...b", self.plddt_layernorm(s_atoms), self.plddt_weight[slot]
+        )
+        resolved_logits = torch.einsum(
+            "...c,...cb->...b", self.resolved_layernorm(s_atoms), self.resolved_weight[slot]
+        )
+        plddt_per_atom = categorical_mean(plddt_logits, 0.0, 1.0)
+        plddt = scatter_atom_to_token_mean(
+            plddt_per_atom[..., None], atom_to_token, token_mask.shape[1], atom_mask
+        )[..., 0]
+        atom_f = atom_mask.float()
+        complex_plddt = (plddt_per_atom * atom_f).sum(-1) / atom_f.sum(-1).clamp(min=1.0)
+        ptm, iptm, pair_chains_iptm = tm_scores(
+            pae_logits, token_mask, asym_id, max_dist=self.config.pae_max_dist
+        )
+        return ConfidenceOutput(
+            plddt_logits=plddt_logits,
+            plddt_per_atom=plddt_per_atom,
+            plddt=plddt,
+            pae_logits=pae_logits,
+            pae=categorical_mean(pae_logits, 0.0, self.config.pae_max_dist),
+            pde_logits=pde_logits,
+            pde=categorical_mean(pde_logits, 0.0, self.config.pae_max_dist),
+            resolved_logits=resolved_logits,
+            ptm=ptm,
+            iptm=iptm,
+            pair_chains_iptm=pair_chains_iptm,
+            complex_plddt=complex_plddt,
+        )
