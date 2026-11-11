@@ -76,3 +76,82 @@ def test_compiled_packed_training_counts_sequences(training_parquet: Path, tmp_p
     losses = [m["train/loss"] for m in logged if "train/loss" in m]
     assert len(losses) == 4 and all(loss == loss for loss in losses)  # finite, not NaN
     assert trainer._samples_seen == 4 * 8
+
+
+def _gate_kernel_on(monkeypatch: pytest.MonkeyPatch, gate_dtypes: list) -> None:
+    """Dispatch predicate says "kernel" and the kernel is the reference; the trainer's gate call
+    (an empty probe tensor) records the dtype it asks about."""
+    from oplm.model import conv
+
+    def use_kernel(x, out_dtype):  # noqa: ANN001, ANN202
+        if x.numel() == 0:
+            gate_dtypes.append(out_dtype)
+        return True
+
+    monkeypatch.setattr(conv, "_use_kernel", use_kernel)
+    monkeypatch.setattr(conv, "canon_conv_kernel", conv.canon_conv_reference)
+
+
+def _canon_cfg(tmp_path: Path, training_parquet: Path, **kwargs):  # noqa: ANN003, ANN202
+    cfg = tiny_train_cfg(tmp_path, training_parquet, batch_size=16, **kwargs)
+    cfg.data.pack_sequences = True
+    cfg.model.canon_enabled, cfg.model.canon_positions = True, ["A", "B", "C", "D"]
+    cfg.model.canon_kernel_sizes = [3, 4]
+    return cfg
+
+
+@pytest.mark.slow
+def test_canon_self_check_runs_once_on_first_rows(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trainer checks the Canon kernel once, on the first micro-batch's first 4 rows.
+
+    CPU stand-in for a bf16 CUDA run: the dispatch predicate says "kernel" and the kernel is the
+    reference, so the check runs and training is unchanged. The gate asks about the autocast
+    dtype, as the model's Canon calls will.
+    """
+    import torch
+
+    from oplm.model import canon_kernel, conv
+    from oplm.training.trainer import Trainer
+
+    cfg = _canon_cfg(tmp_path, training_parquet, max_steps=3, mixed_precision="bf16")
+    gate_dtypes: list = []
+    _gate_kernel_on(monkeypatch, gate_dtypes)
+    checked: list[int] = []
+    real_check = canon_kernel.canon_self_check
+
+    def check(model, run_forward):  # noqa: ANN001, ANN202
+        checked.append(real_check(model, run_forward, kernel=conv.canon_conv_reference))
+        return checked[-1]
+
+    monkeypatch.setattr(canon_kernel, "canon_self_check", check)
+    trainer = Trainer(cfg)
+    rows: list[tuple[int, ...]] = []
+    step = trainer.task.step
+
+    def spy(model, batch):  # noqa: ANN001, ANN202
+        rows.append(tuple(v.shape[0] for v in batch.values() if hasattr(v, "shape")))
+        return step(model, batch)
+
+    trainer.task.step = spy  # ty: ignore[invalid-assignment]
+    trainer.train()
+    assert gate_dtypes == [torch.bfloat16]
+    assert checked == [2 * 6]  # 2 layers x (A, B-q, B-k, B-v, C, D), once
+    assert rows[0] == (4, 4, 4, 4) and rows[1][0] > 4  # the check's slice, then the full batch
+    assert len(rows) == 1 + 3
+
+
+@pytest.mark.slow
+def test_canon_self_check_raises_when_no_call_checked(
+    training_parquet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kernel is in use but the check saw no Canon call: refuse to train unchecked."""
+    from oplm.model import canon_kernel
+    from oplm.training.trainer import Trainer
+
+    _gate_kernel_on(monkeypatch, [])
+    monkeypatch.setattr(canon_kernel, "canon_self_check", lambda model, run_forward: 0)
+    trainer = Trainer(_canon_cfg(tmp_path, training_parquet, max_steps=1))
+    with pytest.raises(RuntimeError, match="no Canon calls"):
+        trainer.train()

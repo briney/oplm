@@ -9,9 +9,25 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .canon_kernel import TRITON_AVAILABLE, canon_conv_kernel
 from .masking import zero_pad_positions
 
-__all__ = ["CanonConv", "resolve_canon_kernel_sizes"]
+__all__ = ["CanonConv", "canon_conv_reference", "resolve_canon_kernel_sizes"]
+
+_KERNEL_ENABLED = True  # tests only: False forces the reference path on CUDA
+_KERNEL_DTYPES = (torch.float32, torch.bfloat16)  # the dtypes the kernel tests cover
+
+
+def _use_kernel(x: torch.Tensor, out_dtype: torch.dtype) -> bool:
+    """Whether `CanonConv` runs the Triton op: CUDA, Triton, and a kernel-tested dtype (else the
+    reference, e.g. for `model.double()`)."""
+    return (
+        _KERNEL_ENABLED
+        and TRITON_AVAILABLE
+        and x.is_cuda
+        and x.dtype in _KERNEL_DTYPES
+        and out_dtype in _KERNEL_DTYPES
+    )
 
 
 _ACTIVATIONS = {
@@ -39,13 +55,14 @@ class CanonConv(nn.Module):
     time axis before the conv runs — this preserves the same-length output
     while keeping the bias of the receptive field consistent across layers.
 
-    The forward computes that convolution as `kernel_size` shifted multiply-adds in the
-    `(B, T, D)` layout instead of calling `self.conv`: the same cross-correlation, but
-    `torch.compile` fuses it into one memory-bound kernel, where `nn.Conv1d(groups=D)`
-    dispatches to PyTorch's slow native depthwise kernel and needs two transposes (it took
-    about 45 % of a 170M training step on B200s). `self.conv` still owns the weight, so
-    checkpoints and initialization are unchanged. Accumulation is in fp32; the output has
-    the dtype autocast would give a convolution (`x`'s dtype when autocast is off).
+    The forward never calls `self.conv` (`nn.Conv1d(groups=D)` dispatches to PyTorch's slow
+    native depthwise kernel and needs two transposes). On CUDA it runs the Triton op
+    `oplm::canon_conv` (`canon_kernel.py`): pad zeroing, segment masks, the conv and, without
+    an activation, the residual add in one opaque kernel with its own backward. Elsewhere (CPU)
+    it runs `canon_conv_reference`, the same cross-correlation as `kernel_size` shifted
+    multiply-adds. `self.conv` still owns the weight, so checkpoints and initialization are
+    unchanged. Accumulation is in fp32; `x`, the conv and the residual have the dtype autocast
+    would give a convolution (`x`'s dtype when autocast is off).
     """
 
     def __init__(
@@ -85,36 +102,61 @@ class CanonConv(nn.Module):
         x: torch.Tensor,
         attention_mask: torch.Tensor,
         segment_ids: torch.Tensor | None = None,
+        residual: bool = False,
     ) -> torch.Tensor:
-        # (B, T, D) -> (B, T, D). With `segment_ids` (packed rows: 1..n per sequence, 0 at pads), a
-        # tap that would read a token of a neighboring sequence contributes zero instead.
+        # (B, T, D) -> (B, T, D); returns `x + act(conv)` when `residual`, else `act(conv)`.
         device_type = x.device.type
         if torch.is_autocast_enabled(device_type):
             out_dtype = torch.get_autocast_dtype(device_type)
         else:
             out_dtype = x.dtype
-        x = zero_pad_positions(x, attention_mask)
-        k = self.kernel_size
-        left = k // 2  # odd k: k//2 on both sides; even k: (k//2, k//2 - 1), as above
-        padded = F.pad(x, (0, 0, left, k - 1 - left)).float()  # pad the time axis
-        weight = self.conv.weight.squeeze(1).float()  # (D, k) cross-correlation taps
-        length = x.shape[1]
-        keep = None  # packed rows: per tap, whether it stays inside the output's sequence
-        if segment_ids is not None:
-            seg = F.pad(segment_ids, (left, k - 1 - left), value=-1)
-            keep = [seg[:, i : i + length].eq(segment_ids).unsqueeze(-1) for i in range(k)]
-        out = padded[:, :length] * weight[:, 0]
+        # Canon A/C get fp32 LayerNorm output under autocast; their consumers (Q/K/V and FFN
+        # projections) cast to bf16 anyway, so cast here: half the conv's traffic, and Inductor
+        # fuses the cast into the norm's store.
+        x = x.to(out_dtype)
+        conv = canon_conv_kernel if _use_kernel(x, out_dtype) else canon_conv_reference
+        weight = self.conv.weight.squeeze(1)  # (D, k) view: autograd gives dW back as (D, 1, k)
+        if self._activation is None:  # the residual folds into the conv call
+            return conv(x, weight, attention_mask, segment_ids, out_dtype, residual)
+        out = self._activation(conv(x, weight, attention_mask, segment_ids, out_dtype, False))
+        return x + out if residual else out
+
+
+def canon_conv_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    residual: bool,
+) -> torch.Tensor:
+    """Shift-add Canon conv (no activation): `(B, T, D)` -> `(B, T, D)`.
+
+    `weight` is `(D, k)`. With `segment_ids` (packed rows: 1..n per sequence, 0 at pads), a tap
+    that would read a token of a neighboring sequence contributes zero instead. Returns the conv
+    in `out_dtype`, or `x + conv` (promoted dtype, raw `x`) when `residual`.
+    """
+    x_in = x
+    x = zero_pad_positions(x, attention_mask)
+    k = weight.shape[1]
+    left = k // 2  # odd k: k//2 on both sides; even k: (k//2, k//2 - 1), as above
+    padded = F.pad(x, (0, 0, left, k - 1 - left)).float()  # pad the time axis
+    weight = weight.float()  # (D, k) cross-correlation taps
+    length = x.shape[1]
+    keep = None  # packed rows: per tap, whether it stays inside the output's sequence
+    if segment_ids is not None:
+        seg = F.pad(segment_ids, (left, k - 1 - left), value=-1)
+        keep = [seg[:, i : i + length].eq(segment_ids).unsqueeze(-1) for i in range(k)]
+    out = padded[:, :length] * weight[:, 0]
+    if keep is not None:
+        out = out * keep[0]
+    for i in range(1, k):
+        tap = padded[:, i : i + length] * weight[:, i]
         if keep is not None:
-            out = out * keep[0]
-        for i in range(1, k):
-            tap = padded[:, i : i + length] * weight[:, i]
-            if keep is not None:
-                tap = tap * keep[i]
-            out = out + tap
-        out = out.to(out_dtype)
-        if self._activation is not None:
-            out = self._activation(out)
-        return out
+            tap = tap * keep[i]
+        out = out + tap
+    out = out.to(out_dtype)
+    return x_in + out if residual else out
 
 
 def resolve_canon_kernel_sizes(spec: Any, num_hidden_layers: int) -> list[int]:

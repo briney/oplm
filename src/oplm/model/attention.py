@@ -297,8 +297,7 @@ class OplmAttention(nn.Module):
         def conv(t: torch.Tensor, layer: CanonConv) -> torch.Tensor:
             # (B, H, T, d) -> (B, T, D) -> conv -> (B, H, T, d)
             merged = t.transpose(1, 2).reshape(batch, seq_len, self.hidden_size)
-            convolved = layer(merged, attention_mask, segment_ids)
-            merged = merged + convolved if self.canon_residual else convolved
+            merged = layer(merged, attention_mask, segment_ids, residual=self.canon_residual)
             return merged.view(batch, seq_len, heads, head_dim).transpose(1, 2)
 
         return conv(q, self.conv_b_q), conv(k, self.conv_b_k), conv(v, self.conv_b_v)

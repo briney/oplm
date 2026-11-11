@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from oplm.model.conv import CanonConv, resolve_canon_kernel_sizes
+from oplm.model.conv import CanonConv, canon_conv_reference, resolve_canon_kernel_sizes
 
 # ---------------------------------------------------------------------------
 # CanonConv shape / construction
@@ -263,3 +263,65 @@ def test_canon_conv_output_dtype_follows_autocast():
     assert conv(x, mask).dtype == torch.float32
     with torch.autocast("cpu", dtype=torch.bfloat16):
         assert conv(x, mask).dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("activation", ["none", "silu"])
+def test_canon_conv_runs_in_autocast_dtype(activation: str):
+    # Canon A/C get fp32 LayerNorm output under autocast: the conv and the residual run on its
+    # bf16 cast (half the traffic), so the residual output is bf16, not promoted to fp32.
+    torch.manual_seed(0)
+    conv = CanonConv(channels=8, kernel_size=3, activation=activation)
+    x = torch.randn(2, 9, 8)
+    mask = torch.ones(2, 9, dtype=torch.long)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = conv(x, mask, residual=True)
+        expected = conv(x.bfloat16(), mask, residual=True)
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, expected)
+
+
+# ---------------------------------------------------------------------------
+# residual argument / functional reference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("activation", ["none", "silu"])
+def test_residual_matches_explicit_add(activation: str, packed: bool):
+    torch.manual_seed(0)
+    conv = CanonConv(channels=8, kernel_size=3, activation=activation)
+    x = torch.randn(2, 9, 8)
+    mask = torch.ones(2, 9, dtype=torch.long)
+    mask[:, -2:] = 0
+    seg = None
+    if packed:
+        seg = torch.tensor([[1, 1, 1, 2, 2, 2, 2, 0, 0]] * 2)
+    assert torch.equal(conv(x, mask, seg, residual=True), x + conv(x, mask, seg))
+
+
+@pytest.mark.parametrize("kernel_size", [2, 3, 4, 7])
+def test_reference_function_matches_module(kernel_size: int):
+    torch.manual_seed(0)
+    conv = CanonConv(channels=8, kernel_size=kernel_size)
+    x = torch.randn(2, 9, 8)
+    mask = torch.ones(2, 9, dtype=torch.long)
+    mask[:, -2:] = 0
+    seg = torch.tensor([[1, 1, 1, 2, 2, 2, 2, 0, 0]] * 2)
+    for s in (None, seg):
+        ref = canon_conv_reference(x, conv.conv.weight.squeeze(1), mask, s, x.dtype, residual=False)
+        assert torch.equal(ref, conv(x, mask, s))
+
+
+def test_reference_residual_is_raw_x_plus_conv():
+    # fp32 `x`, bf16 conv: the residual is `x + conv` with normal promotion (fp32), raw pads kept.
+    torch.manual_seed(0)
+    x = torch.randn(2, 9, 8)
+    w = torch.randn(8, 3)
+    mask = torch.ones(2, 9, dtype=torch.long)
+    mask[:, -2:] = 0
+    seg = torch.tensor([[1, 1, 1, 2, 2, 2, 2, 0, 0]] * 2)
+    for s in (None, seg):
+        out = canon_conv_reference(x, w, mask, s, torch.bfloat16, residual=True)
+        conv = canon_conv_reference(x, w, mask, s, torch.bfloat16, residual=False)
+        assert conv.dtype == torch.bfloat16 and out.dtype == torch.float32
+        assert torch.equal(out, x + conv)

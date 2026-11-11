@@ -257,8 +257,9 @@ class OplmBlock(nn.Module):
         # Canon-B (the conv on Q/K/V) is applied inside the attention module.
         attn_in = attn_base
         if hasattr(self, "conv_a"):
-            conv_a = self.conv_a(attn_base, attention_mask, segment_ids)
-            attn_in = attn_base + conv_a if self.canon_residual else conv_a
+            attn_in = self.conv_a(
+                attn_base, attention_mask, segment_ids, residual=self.canon_residual
+            )
 
         attn_result = self.attention(
             attn_in,
@@ -285,8 +286,7 @@ class OplmBlock(nn.Module):
         # width and is applied by the FFN module itself.
         mlp_in = h_norm
         if hasattr(self, "conv_c"):
-            conv_c = self.conv_c(h_norm, attention_mask, segment_ids)
-            mlp_in = h_norm + conv_c if self.canon_residual else conv_c
+            mlp_in = self.conv_c(h_norm, attention_mask, segment_ids, residual=self.canon_residual)
         ffn_out = self.ffn(mlp_in, attention_mask, segment_ids)
 
         if self.norm_strategy == "sandwich":

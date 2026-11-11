@@ -932,6 +932,16 @@ class Trainer:
         current_loss = float("nan")
         step_loss_sum = 0.0
         last_step_did_save = False
+        # Canon kernel self-check: once per run (a resume included), on the first micro-batch,
+        # when the model's Canon calls will take the Triton kernel (autocast sets their dtype).
+        from oplm.model.conv import CanonConv, _use_kernel
+
+        autocast_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(
+            self.accelerator.mixed_precision, torch.float32
+        )
+        canon_check = _use_kernel(
+            torch.empty(0, device=self.accelerator.device), autocast_dtype
+        ) and any(isinstance(m, CanonConv) for m in self._unwrapped_model.modules())
 
         try:
             while self.global_step < self.total_steps:
@@ -974,6 +984,10 @@ class Trainer:
                     self._worker_sources[worker] = (
                         [[int(pass_), int(offset)] for pass_, offset in tag[1]] if tag else None
                     )
+
+                if canon_check:
+                    canon_check = False
+                    self._canon_self_check(batch)
 
                 # Forward + backward inside accumulation context
                 with self.accelerator.accumulate(self.model):
@@ -2250,6 +2264,40 @@ class Trainer:
 
         for callback in self.callbacks:
             callback.on_log(self, dict(metrics), self.global_step)
+
+    def _canon_self_check(self, batch: dict[str, Any]) -> None:
+        """Run `canon_self_check` on the first `min(4, B)` rows of `batch`; a mismatch, or no
+        Canon call checked, raises.
+
+        Every `(B, ...)` tensor (`input_ids`, `attention_mask`, `labels`, `segment_ids`) keeps its
+        first rows, so packed rows stay whole and the model builds its masks from the slice;
+        other entries pass through (`num_sequences` still counts the full batch, but only feeds
+        `StepResult.samples`, which is discarded). The uncompiled, unwrapped model runs eagerly
+        (no DDP collectives; eager flex attention is why the rows are capped).
+        """
+        from rich.console import Console
+
+        from oplm.model.canon_kernel import canon_self_check
+
+        rows = batch["input_ids"].shape[0]
+        small = {
+            k: v[:4] if isinstance(v, torch.Tensor) and v.ndim and v.shape[0] == rows else v
+            for k, v in batch.items()
+        }
+
+        def run_forward() -> None:
+            with self.accelerator.autocast():
+                self.task.step(self._unwrapped_model, small)
+
+        calls = canon_self_check(self._unwrapped_model, run_forward)
+        if calls == 0:
+            raise RuntimeError(
+                "Canon self-check ran no Canon calls: the model has CanonConv modules and the "
+                "kernel is in use, but the first micro-batch's forward never reached them"
+            )
+        if self.accelerator.is_main_process:
+            # Console, like the other startup status lines: INFO logging is not shown by default.
+            Console().print(f"[dim]Canon self-check passed: {calls} calls[/dim]")
 
     def _emit_train_start(self) -> None:
         """Notify callbacks that training is starting."""

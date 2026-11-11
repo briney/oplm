@@ -8,18 +8,19 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
-from .conv import resolve_canon_kernel_sizes
-from .ffn import round_up_to
-from .looping import resolve_layer_execution_order
-
 # When loading custom code from a local directory with trust_remote_code=True,
 # HuggingFace copies only a module's *direct* relative imports (depth-1; see
 # transformers.dynamic_module_utils.get_cached_module_file). `conv` imports
-# `masking` transitively, so import it directly here to guarantee it is bundled
-# alongside this file. Referenced in `_REMOTE_CODE_DEPS` to mark it used.
+# `canon_kernel` and `masking` transitively, so import them directly here to
+# guarantee they are bundled alongside this file. Referenced in
+# `_REMOTE_CODE_DEPS` to mark them used.
+from .canon_kernel import TRITON_AVAILABLE
+from .conv import resolve_canon_kernel_sizes
+from .ffn import round_up_to
+from .looping import resolve_layer_execution_order
 from .masking import prepare_attention_mask
 
-_REMOTE_CODE_DEPS = (prepare_attention_mask,)
+_REMOTE_CODE_DEPS = (TRITON_AVAILABLE, prepare_attention_mask)
 
 __all__ = ["OplmConfig"]
 
