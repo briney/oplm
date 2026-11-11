@@ -286,9 +286,7 @@ def test_sliding_window_flex_matches_dense_across_blocks_on_cpu() -> None:
 
 @pytest.mark.slow
 @_requires_cuda
-def test_flex_stays_compiled_past_the_recompile_limit_on_gpu(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_flex_stays_compiled_past_the_recompile_limit_on_gpu() -> None:
     """A long-lived process sees many lengths; flex must never fall back to eager (#107).
 
     Past dynamo's recompile limit an uncompiled flex_attention materializes the full score
@@ -297,8 +295,11 @@ def test_flex_stays_compiled_past_the_recompile_limit_on_gpu(
     import warnings
 
     torch._dynamo.reset()
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 64)  # the production limit
-    with warnings.catch_warnings(record=True) as caught:
+    # the production limit; config.patch, not monkeypatch, whose undo hides torch config entries
+    with (
+        torch._dynamo.config.patch(recompile_limit=64),
+        warnings.catch_warnings(record=True) as caught,
+    ):
         warnings.simplefilter("always")
         for b in (1, 2, 3):
             for n in range(64, 64 + 24 * 32, 32):
