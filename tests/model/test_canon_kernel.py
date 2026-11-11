@@ -486,9 +486,16 @@ def _sm100_stack_bytes(fn, dtypes: dict[str, str], constexprs: dict, cfg) -> int
         for name in fn.arg_names
         if name not in constexprs  # pointers get a dtype; the rest are int32 sizes and strides
     }
+    # The runtime JIT marks pointers and ints divisible by 16; at training shapes that is these.
+    hinted = [
+        n for n in signature if n.endswith("_ptr") or n in ("T", "D", "stride_mb", "stride_sb")
+    ]
+    attrs = {(fn.arg_names.index(n),): [["tt.divisibility", 16]] for n in hinted}
     options = {"num_warps": cfg.num_warps, "num_stages": cfg.num_stages}
     compiled = triton.compile(
-        ASTSource(fn, signature, constexprs), target=GPUTarget("cuda", 100, 32), options=options
+        ASTSource(fn, signature, constexprs, attrs),
+        target=GPUTarget("cuda", 100, 32),
+        options=options,
     )
     cuobjdump = Path(triton.__file__).parent / "backends/nvidia/bin/cuobjdump"
     with tempfile.NamedTemporaryFile(suffix=".cubin") as f:
@@ -555,6 +562,8 @@ def test_shipped_configs_do_not_spill(phase):
         constexprs["HOIST"] = cfg.hoist
         rounding = ("ROUND_CONV", "ROUND_OUT") if phase == "fwd" else ("ROUND_G", "ROUND_DX")
         constexprs |= dict.fromkeys(rounding, False)
+        # The runtime JIT turns int arguments equal to 1 into constants.
+        constexprs |= dict.fromkeys(("stride_wk", "stride_mt", "stride_st"), 1)
         stack = _sm100_stack_bytes(fn, dtypes, constexprs, cfg)
         assert stack == 0, f"{phase} {cfg} ({x_dtype}, {conv_dtype}) spills: {stack} B stack"
 
