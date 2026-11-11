@@ -277,5 +277,10 @@ oplm eval outputs/run/checkpoint-10000 outputs/run/checkpoint-20000 \
   `--override KEY=VALUE` changes a config value, such as a dataset `path`.
 - Precision follows `train.mixed_precision` unless `--precision` is given.
 
+Expect agreement with the in-loop numbers to about three decimal places, not bit equality.
+`sequence` metrics depend on the number of ranks, because each batch's mask is seeded from a
+per-rank batch counter; a run scored on 1 GPU and in-loop on 32 ranks differ by a few thousandths
+of loss. `structure` metrics are the same for any number of ranks.
+
 `fold_monomer` is not supported here: it scores an `OplmForFolding` model, which this command
 does not load.
