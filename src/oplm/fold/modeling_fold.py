@@ -69,6 +69,7 @@ from oplm.fold.trunk import PairStack, Recurrence, fp32_autocast_off, pair_stack
 from oplm.model import OplmModel
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from torch import Tensor
@@ -201,6 +202,11 @@ def load_frozen_lm(
     for p in lm.parameters():
         p.requires_grad_(False)
     return lm
+
+
+def _constant(value: Tensor) -> Callable[[int], Tensor]:
+    """``inject`` for a loop-invariant injection; the closure is the tensor's only owner."""
+    return lambda _t: value
 
 
 class OplmForFolding(OplmFoldPreTrainedModel):
@@ -387,16 +393,15 @@ class OplmForFolding(OplmFoldPreTrainedModel):
             if z0 is None:
                 z0 = self.parcae.init_state(emb.z_init, generator=generator)
             drop = cfg.pair_dropout if self.training else 0.0
+            # Only intermediates read these after their stage; drop the rest (docs/FOLD.md §12).
             kept_lm_z = lm_z if return_intermediates else None
+            kept_z0 = z0 if return_intermediates else None
             if drop == 0 and not torch.is_grad_enabled():
-                # Loop-invariant without dropout or gradients: encode once and free the LM pair
-                # (docs/FOLD.md §12).
-                injected = emb.z_init + self.lm_encoder(lm_z.to(emb.z_init.dtype), pair_mask)
+                # Loop-invariant without dropout or gradients: encode once and free the LM pair.
+                inject = _constant(
+                    emb.z_init + self.lm_encoder(lm_z.to(emb.z_init.dtype), pair_mask)
+                )
                 del lm_z
-
-                def inject(_t: int) -> Tensor:
-                    return injected
-
             else:
 
                 def inject(_t: int) -> Tensor:
@@ -412,6 +417,7 @@ class OplmForFolding(OplmFoldPreTrainedModel):
                 grad_loops=cfg.recurrence_grad_loops if self.training else None,
                 return_states=return_intermediates,
             )
+            del inject, z0  # the injection and the initial state are not read again
             z = self.parcae.readout(z, pair_mask)
         z = z.float()
         # accelerate's outer autocast would otherwise make these logits bf16 (spec §5.4: fp32)
@@ -434,6 +440,8 @@ class OplmForFolding(OplmFoldPreTrainedModel):
             num_samples=samples,
         )
         coords = self.structure_head.sample(inp, num_steps=num_steps, generator=generator)
+        conditioned_pair = inp.z if return_intermediates else None
+        del inp  # the fp32 conditioning pair is not needed by the confidence head
         confidence = self.confidence_head(
             s_inputs=emb.s_inputs,
             z=z,
@@ -454,10 +462,10 @@ class OplmForFolding(OplmFoldPreTrainedModel):
                 "relpos": emb.relpos,
                 "bonds": emb.bonds,
                 "lm_z": kept_lm_z,
-                "z0": z0,
+                "z0": kept_z0,
                 "states": states,
                 "pair": z,
-                "conditioned_pair": inp.z,
+                "conditioned_pair": conditioned_pair,
             }
         return FoldOutput(
             distogram_logits=distogram_logits,
