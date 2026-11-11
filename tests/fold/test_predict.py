@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 from oplm.fold import ChainSpec, OplmForFolding, featurize
-from oplm.fold.predict import FoldResult, fold, parse_chain_arg, rank_samples, write_mmcif
+from oplm.fold.predict import (
+    FoldResult,
+    fold,
+    parse_chain_arg,
+    prefer_expandable_segments,
+    rank_samples,
+    write_mmcif,
+)
 from tests.fold.helpers import tiny_fold_config, tiny_lm
 
 if TYPE_CHECKING:
@@ -104,3 +112,14 @@ def test_fold_rejects_duplicate_chain_ids() -> None:
 def test_fold_requires_eval_mode() -> None:
     with pytest.raises(ValueError, match="eval-mode"):
         fold(_model().train(), [ChainSpec("MKV", "A")])
+
+
+def test_prefer_expandable_segments_defaults_but_never_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    prefer_expandable_segments()
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+    prefer_expandable_segments()
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:128"
