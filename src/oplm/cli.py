@@ -205,11 +205,14 @@ def eval_cmd(
     for ck, cfg, tasks in plans:
         model = load_model_for_inference(ck, cfg, device=acc.device)
         cfg.model = model.config  # the export's config wins over the YAML's model block
+        # Same mixed-precision wrapper the trainer's model carries into in-loop eval: autocast
+        # inside forward only, outputs cast back to fp32. Wrapping evaluate() in autocast
+        # instead runs the tasks' own post-forward math in bf16 and shifts the metrics.
+        model = acc.prepare_model(model, evaluation_mode=True)
         for entry, task_cls in tasks:
             task = task_cls(entry, cfg)
             start = time.time()
-            with acc.autocast():
-                metrics = task.evaluate(model, acc)
+            metrics = task.evaluate(model, acc)
             if not acc.is_main_process:
                 continue
             record = {"ckpt": ck, "task": entry.name, "seconds": round(time.time() - start, 1)}
