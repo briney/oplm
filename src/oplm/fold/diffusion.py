@@ -33,7 +33,7 @@ from oplm.fold.attention import (
     resolve_attention_backend,
     sliding_window_block_mask,
 )
-from oplm.fold.trunk import GatedMLP, Transition, cuda_bf16_autocast, fp32_autocast_off
+from oplm.fold.trunk import GatedMLP, Transition, cuda_bf16_autocast, fp32_autocast_off, map_rows
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -194,9 +194,9 @@ class DiffusionConditioning(nn.Module):
         self.fourier = FourierEmbedding(config.fourier_dim)
         self.pair_input_norm = nn.LayerNorm(2 * p, eps=eps)
         self.pair_proj = nn.Linear(2 * p, p, bias=False)
-        rows = config.inference_chunk_size
-        self.pair_transition_0 = Transition(p, mult, eps=eps, row_chunk_size=rows)
-        self.pair_transition_1 = Transition(p, mult, eps=eps, row_chunk_size=rows)
+        self.row_chunk_size = config.inference_chunk_size
+        self.pair_transition_0 = Transition(p, mult, eps=eps)
+        self.pair_transition_1 = Transition(p, mult, eps=eps)
         self.single_input_norm = nn.LayerNorm(s_in, eps=eps)
         self.single_proj = nn.Linear(s_in, w, bias=False)
         self.single_transition_0 = Transition(w, mult, eps=eps)
@@ -205,14 +205,22 @@ class DiffusionConditioning(nn.Module):
         self.noise_proj = nn.Linear(config.fourier_dim, w, bias=False)
 
     def pair(self, z_trunk: Tensor, relpos: Tensor) -> Tensor:
-        """``cat[z_trunk, relpos] -> LN -> proj -> two residual transitions`` (fp32 out)."""
-        z = self.pair_proj(
-            self.pair_input_norm(torch.cat([z_trunk.float(), relpos.float()], dim=-1))
-        )
-        with cuda_bf16_autocast(z.is_cuda):
-            z = z + self.pair_transition_0(z)
-            z = z + self.pair_transition_1(z)
-        return z.float()
+        """``cat[z_trunk, relpos] -> LN -> proj -> two residual transitions`` (fp32 out).
+
+        Per position, so at inference it runs ``inference_chunk_size`` rows at a time
+        (:func:`~oplm.fold.trunk.map_rows`).
+        """
+
+        def rows(sl: slice) -> Tensor:
+            z = self.pair_proj(
+                self.pair_input_norm(torch.cat([z_trunk[:, sl].float(), relpos[:, sl].float()], -1))
+            )
+            with cuda_bf16_autocast(z.is_cuda):
+                z = z + self.pair_transition_0(z)
+                z = z + self.pair_transition_1(z)
+            return z.float()
+
+        return map_rows(rows, z_trunk.shape[1], self.row_chunk_size)
 
     def single(self, s_inputs: Tensor, t_hat: Tensor) -> Tensor:
         """``proj(LN(s_inputs)) + noise_proj(LN(fourier(0.25 log(t/σ_d))))``, two transitions."""

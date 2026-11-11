@@ -41,6 +41,7 @@ __all__ = [
     "Transition",
     "cuda_bf16_autocast",
     "fp32_autocast_off",
+    "map_rows",
     "pair_stack_kwargs",
     "unloaded",
 ]
@@ -76,14 +77,33 @@ class GatedMLP(nn.Module):
         return self.down_proj(F.silu(a) * b)
 
 
+def map_rows(fn: Callable[[slice], Tensor], n: int, rows: int | None) -> Tensor:
+    """``fn(slice(None))``, or ``fn`` over row slices of ``rows`` stitched along axis 1.
+
+    For per-position pair work at inference (docs/FOLD.md §12): with gradients off and
+    ``rows < n``, ``fn`` sees one slice of the ``n`` rows at a time and writes into one output,
+    so its intermediates exist for one chunk only. ``fn`` must be per position along axis 1, so
+    the result equals the whole call. Under autograd the whole call runs: block checkpointing
+    already bounds training memory and chunking would only add a concat.
+    """
+    if rows is None or torch.is_grad_enabled() or n <= rows:
+        return fn(slice(None))
+    out: Tensor | None = None
+    for start in range(0, n, rows):
+        sl = slice(start, start + rows)
+        y = fn(sl)
+        if out is None:
+            out = y.new_empty(y.shape[0], n, *y.shape[2:])
+        out[:, sl] = y
+    assert out is not None
+    return out
+
+
 class Transition(nn.Module):
     """Pre-norm gated MLP returning the delta; the caller adds the residual.
 
-    With ``row_chunk_size`` and gradients off, axis 1 is processed in chunks of that many rows
-    written into one output, so the ``(1 + 2·expansion)``-width intermediates exist for one
-    chunk at a time (docs/FOLD.md §12). Every op is per position, so the result is the same as
-    the whole-tensor call. Under autograd the whole tensor runs: block checkpointing already
-    bounds training memory and chunking would only add a concat.
+    ``row_chunk_size`` runs it through :func:`map_rows`, so at inference the
+    ``(1 + 2·expansion)``-width intermediates exist for that many rows at a time.
     """
 
     def __init__(
@@ -104,17 +124,7 @@ class Transition(nn.Module):
         self.row_chunk_size = row_chunk_size
 
     def forward(self, x: Tensor) -> Tensor:
-        rows = self.row_chunk_size
-        if rows is None or torch.is_grad_enabled() or x.shape[1] <= rows:
-            return self.mlp(self.norm(x))
-        out: Tensor | None = None
-        for start in range(0, x.shape[1], rows):
-            y = self.mlp(self.norm(x[:, start : start + rows]))
-            if out is None:
-                out = y.new_empty(*x.shape[:-1], y.shape[-1])
-            out[:, start : start + rows] = y
-        assert out is not None
-        return out
+        return map_rows(lambda sl: self.mlp(self.norm(x[:, sl])), x.shape[1], self.row_chunk_size)
 
 
 class RowSharedDropout(nn.Module):
@@ -291,8 +301,8 @@ class Recurrence(nn.Module):
         for t in range(num_loops):
             ctx = torch.no_grad() if t < no_grad_loops else contextlib.nullcontext()
             with ctx:
-                injected = self.input_norm(inject(t))
-                z = a * z + F.linear(injected.to(z.dtype), b_mat)
+                # one expression: the fp32 normalized injection is freed before the trunk runs
+                z = a * z + F.linear(self.input_norm(inject(t)).to(z.dtype), b_mat)
                 z = trunk(z, pair_mask)
             if return_states:
                 states.append(z)

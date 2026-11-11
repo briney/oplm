@@ -285,3 +285,15 @@ def test_samples_are_scored_independently_and_keep_row_order() -> None:
                     torch.testing.assert_close(
                         getattr(out, field.name)[b * S + j], getattr(one, field.name)[0]
                     )
+
+
+def test_input_embedder_row_chunks_match_the_whole_call_without_grad() -> None:
+    torch.manual_seed(0)
+    whole = ConfidenceHead(tiny_fold_config(inference_chunk_size=None)).input_embedder
+    chunked = ConfidenceHead(tiny_fold_config(inference_chunk_size=3)).input_embedder
+    chunked.load_state_dict(whole.state_dict())
+    cfg = tiny_fold_config()
+    s = torch.randn(2, 7, cfg.single_inputs_width)
+    z, relpos, bonds = (torch.randn(2, 7, 7, cfg.pair_width) for _ in range(3))
+    with torch.no_grad():
+        torch.testing.assert_close(chunked(s, z, relpos, bonds), whole(s, z, relpos, bonds))

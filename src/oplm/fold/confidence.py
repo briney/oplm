@@ -22,7 +22,13 @@ from torch import nn
 
 from oplm.fold.atoms import gather_token_to_atom, intra_token_index, scatter_atom_to_token_mean
 from oplm.fold.pair import distance_bins
-from oplm.fold.trunk import PairStack, cuda_bf16_autocast, fp32_autocast_off, pair_stack_kwargs
+from oplm.fold.trunk import (
+    PairStack,
+    cuda_bf16_autocast,
+    fp32_autocast_off,
+    map_rows,
+    pair_stack_kwargs,
+)
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -102,17 +108,24 @@ class ConfidenceInputEmbedder(nn.Module):
         self.single_to_pair_prod_in1 = nn.Linear(s_in, p, bias=False)
         self.single_to_pair_prod_in2 = nn.Linear(s_in, p, bias=False)
         self.single_to_pair_prod_out = nn.Linear(p, p, bias=False)
+        self.row_chunk_size = config.inference_chunk_size
 
     def forward(self, s_inputs: Tensor, z: Tensor, relpos: Tensor, bonds: Tensor) -> Tensor:
+        """fp32 pair; per position, so at inference it runs in row chunks (``map_rows``)."""
         s = self.single_inputs_norm(s_inputs)
-        z = self.pair_norm(z) + relpos + bonds
-        z = z + self.single_to_pair(s)[:, :, None, :]
-        z = z + self.single_to_pair_transpose(s)[:, None, :, :]
-        prod = (
-            self.single_to_pair_prod_in1(s)[:, :, None, :]
-            * self.single_to_pair_prod_in2(s)[:, None, :, :]
-        )
-        return z + self.single_to_pair_prod_out(prod)
+        cols = self.single_to_pair_transpose(s)[:, None, :, :]
+        prod_cols = self.single_to_pair_prod_in2(s)[:, None, :, :]
+
+        def rows(sl: slice) -> Tensor:
+            si = s[:, sl]
+            zr = self.pair_norm(z[:, sl].float()) + relpos[:, sl].float() + bonds[:, sl].float()
+            zr = zr + self.single_to_pair(si)[:, :, None, :]
+            zr = zr + cols
+            return zr + self.single_to_pair_prod_out(
+                self.single_to_pair_prod_in1(si)[:, :, None, :] * prod_cols
+            )
+
+        return map_rows(rows, z.shape[1], self.row_chunk_size)
 
 
 class RowAttentionPooling(nn.Module):
@@ -206,7 +219,7 @@ class ConfidenceHead(nn.Module):
             )
         num_samples = coords.shape[0] // z.shape[0]
         with fp32_autocast_off(z.device):  # logits and scores stay fp32 (spec §5.4)
-            base = self.input_embedder(s_inputs, z.float(), relpos.float(), bonds.float())
+            base = self.input_embedder(s_inputs, z, relpos, bonds)
             per_sample = [
                 self._score(
                     base,
