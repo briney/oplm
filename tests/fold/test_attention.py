@@ -243,3 +243,42 @@ def test_ensure_flex_recompile_limit_only_raises() -> None:
     ensure_flex_recompile_limit(1)
     assert _dynamo.config.recompile_limit == before + 8
     _dynamo.config.recompile_limit = before
+
+
+def _windowed_valid(n: int) -> torch.Tensor:
+    valid = torch.ones(2, n, dtype=torch.bool)
+    valid[0, n - 70 :] = False  # trailing padding
+    valid[1, 100:260] = False  # an interior gap longer than a block
+    return valid
+
+
+def test_sliding_window_block_mask_covers_every_allowed_pair_and_stays_banded() -> None:
+    """Built from per-block key ranges, never an (N, N) mask: a superset of the exact blocks."""
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    n, hw = 640, 40
+    valid = _windowed_valid(n)
+    rank = torch.cumsum(valid.long(), 1) - 1
+
+    def exact(b: torch.Tensor, h: torch.Tensor, qi: torch.Tensor, ki: torch.Tensor) -> torch.Tensor:
+        return (valid[b, qi] & valid[b, ki] & ((rank[b, qi] - rank[b, ki]).abs() <= hw)) | (
+            qi == ki
+        )
+
+    ours = sliding_window_block_mask(valid, hw).to_dense().bool()
+    reference = create_block_mask(exact, 2, None, n, n, device="cpu").to_dense().bool()
+    assert (ours | ~reference).all(), "a block holding an allowed pair is missing"
+    assert ours.sum() < ours.numel()  # banded, not dense
+
+
+def test_sliding_window_flex_matches_dense_across_blocks_on_cpu() -> None:
+    n = 640
+    q, k, v = _qkv(n=n)
+    valid = _windowed_valid(n)
+    with torch.no_grad():
+        torch.testing.assert_close(
+            sliding_window_attention(q, k, v, valid, 40, backend="flex"),
+            sliding_window_attention(q, k, v, valid, 40, backend="dense"),
+            rtol=1e-4,
+            atol=1e-4,
+        )

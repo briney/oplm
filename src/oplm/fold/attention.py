@@ -21,13 +21,12 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 from torch.nn import functional as F
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from torch import Tensor
-    from torch.nn.attention.flex_attention import BlockMask
 
 __all__ = [
     "AttentionBackend",
@@ -87,8 +86,15 @@ def pair_bias_block_mask(key_mask: Tensor, n_queries: int | None = None) -> Bloc
     )
 
 
-def sliding_window_block_mask(valid: Tensor, half_window: int) -> BlockMask:
-    """Block mask for `sliding_window_attention` (rank-based window, self always visible)."""
+def sliding_window_block_mask(valid: Tensor, half_window: int, block: int = 128) -> BlockMask:
+    """Block mask for `sliding_window_attention` (rank-based window, self always visible).
+
+    Built from per-block key ranges, never an ``(N, N)`` mask: ``create_block_mask`` would
+    materialize ``B·N²`` elements, 14 GiB per row at ~43k atoms (docs/FOLD.md §12). ``rank`` is
+    non-decreasing, so a query's allowed keys lie in the index band whose rank is within
+    ``half_window`` of its own; each query block lists the key blocks that band touches (plus
+    its own, for padded queries) as partial blocks, and ``mask_mod`` decides inside them.
+    """
     batch, n = valid.shape
     rank = torch.cumsum(valid.to(torch.int64), dim=1) - 1
 
@@ -96,7 +102,27 @@ def sliding_window_block_mask(valid: Tensor, half_window: int) -> BlockMask:
         in_window = (rank[b, qi] - rank[b, ki]).abs() <= half_window
         return (valid[b, qi] & valid[b, ki] & in_window) | (qi == ki)
 
-    return create_block_mask(mask_mod, batch, None, n, n, device=valid.device)
+    n_blocks = -(-n // block)
+    lo = torch.searchsorted(rank, rank - half_window, side="left")  # first key in the band
+    hi = torch.searchsorted(rank, rank + half_window, side="right") - 1  # last key in the band
+    pad = n_blocks * block - n  # ragged last block: its rows repeat the last query's band
+    lo = F.pad(lo, (0, pad), mode="replicate") if pad else lo
+    hi = F.pad(hi, (0, pad), mode="replicate") if pad else hi
+    q_block = torch.arange(n_blocks, device=valid.device)
+    first = torch.minimum(lo.view(batch, n_blocks, block).amin(-1) // block, q_block)
+    last = torch.maximum(hi.view(batch, n_blocks, block).amax(-1) // block, q_block)
+    count = last - first + 1
+    # Full-width rows as create_block_mask makes them: BlockMask reads the index width as the
+    # key-block count (q-side transpose, to_dense). Entries past ``count`` are never read.
+    indices = first[..., None] + torch.arange(n_blocks, device=valid.device)
+    indices = indices.clamp(max=n_blocks - 1).to(torch.int32)
+    return BlockMask.from_kv_blocks(
+        count[:, None].to(torch.int32),
+        indices[:, None],
+        BLOCK_SIZE=block,
+        mask_mod=mask_mod,
+        seq_lengths=(n, n),
+    )
 
 
 def ensure_flex_recompile_limit(limit: int = 64) -> None:
