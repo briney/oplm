@@ -184,6 +184,7 @@ def test_pair_stack_kwargs_come_from_config() -> None:
         "eps": 1e-5,
         "chunk_size": None,
         "trimul_backend": "reference",
+        "row_chunk_size": 128,
     }
     stack = PairStack(cfg.trunk_blocks, cfg.pair_width, **kw)
     assert len(stack.layers) == 24
@@ -194,3 +195,36 @@ def test_pair_stack_kwargs_come_from_config() -> None:
 def test_block_rejects_bad_arguments(bad: dict) -> None:
     with pytest.raises(ValueError):
         PairUpdateBlock(_W, **bad)
+
+
+@pytest.mark.parametrize("rows", [1, 4, 5, 64])  # 4 does not divide 7; 64 exceeds the rows
+def test_transition_row_chunking_matches_the_whole_tensor_without_grad(rows: int) -> None:
+    torch.manual_seed(0)
+    whole = Transition(_W, 4)
+    chunked = Transition(_W, 4, row_chunk_size=rows)
+    chunked.load_state_dict(whole.state_dict())
+    z = _pair(n=7)
+    with torch.no_grad():
+        torch.testing.assert_close(chunked(z), whole(z))
+
+
+def test_transition_row_chunking_is_inference_only() -> None:
+    """Under autograd chunking would only add a concat: the whole tensor runs, gradients flow."""
+    torch.manual_seed(0)
+    whole = Transition(_W, 4)
+    chunked = Transition(_W, 4, row_chunk_size=2)
+    chunked.load_state_dict(whole.state_dict())
+    z = _pair(n=7).requires_grad_(True)
+    out = chunked(z)
+    assert out.grad_fn is not None and "Cat" not in type(out.grad_fn).__name__
+    torch.testing.assert_close(out, whole(z))
+
+
+def test_pair_update_block_row_chunking_matches_without_grad() -> None:
+    torch.manual_seed(0)
+    whole = PairUpdateBlock(_W, chunk_size=None, trimul_backend="reference")
+    chunked = PairUpdateBlock(_W, chunk_size=None, trimul_backend="reference", row_chunk_size=3)
+    chunked.load_state_dict(whole.state_dict())
+    z, mask = _pair(n=7), torch.ones(1, 7, 7)
+    with torch.no_grad():
+        torch.testing.assert_close(chunked(z, mask), whole(z, mask))

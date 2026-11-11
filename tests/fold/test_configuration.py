@@ -44,6 +44,8 @@ def test_defaults_match_the_released_fast_checkpoint() -> None:
         ("confidence_min_dist", 60.0, "confidence_min_dist"),
         ("distogram_max_dist", 1.0, "distogram_min_dist"),
         ("noise_scale", -1.0, "noise_scale"),
+        ("trimul_chunk_size", 0, "trimul_chunk_size"),
+        ("inference_chunk_size", 0, "inference_chunk_size"),
     ],
 )
 def test_validation(field: str, value: object, match: str) -> None:

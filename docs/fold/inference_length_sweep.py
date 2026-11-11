@@ -27,6 +27,7 @@ import torch
 from oplm.fold.configuration_fold import FoldConfig
 from oplm.fold.data.featurize import ChainSpec, featurize
 from oplm.fold.modeling_fold import OplmForFolding
+from oplm.fold.predict import prefer_expandable_segments
 
 GIB = 2**30
 AMINO = "ACDEFGHIKLMNPQRSTVWY"
@@ -166,6 +167,7 @@ def main() -> None:
     p.add_argument("--lengths", default="512,1024,1536,2048,3072,4096,5120,6144,7168,8192")
     p.add_argument("--trunk-blocks", type=int, default=24)
     args = p.parse_args()
+    prefer_expandable_segments()  # as `oplm fold predict` / `eval` do; before any CUDA allocation
     report: dict[str, Any] = {"env": environment(), "params_gib": {}, "cases": []}
 
     def emit(rec: dict[str, Any]) -> None:

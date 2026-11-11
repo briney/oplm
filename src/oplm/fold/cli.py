@@ -446,6 +446,9 @@ def _load_folder(model: Path, lm: str | None, device: str) -> tuple[OplmForFoldi
     import torch
 
     from oplm.fold.modeling_fold import OplmForFolding
+    from oplm.fold.predict import prefer_expandable_segments
+
+    prefer_expandable_segments()  # before the first CUDA allocation
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"

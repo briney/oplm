@@ -248,3 +248,87 @@ def test_outputs_stay_fp32_under_outer_autocast() -> None:
         got, want = getattr(autocast, field.name), getattr(plain, field.name)
         assert got.dtype == torch.float32, field.name
         torch.testing.assert_close(got, want, atol=1e-6, rtol=0), field.name
+
+
+def test_samples_are_scored_independently_and_keep_row_order() -> None:
+    """Rows are ``b · S + j``; each matches the head run on that example and sample alone."""
+    cfg = _cfg()
+    torch.manual_seed(0)
+    head = ConfidenceHead(cfg).eval()
+    with torch.no_grad():
+        head.plddt_weight.normal_()
+    f = featurize([ChainSpec("MKVL", "A"), ChainSpec("GG", "B")])
+    g = torch.Generator().manual_seed(1)
+    B, S, L, A = 2, 3, f.num_tokens, f.num_atoms
+    batch = {
+        k: torch.cat([getattr(f, k)] * B)
+        for k in ("distogram_atom_idx", "token_mask", "atom_to_token", "atom_mask", "asym_id")
+    }
+    s_inputs = torch.randn(B, L, cfg.single_inputs_width, generator=g)
+    pairs = [torch.randn(B, L, L, cfg.pair_width, generator=g) for _ in range(3)]
+    coords = torch.randn(B * S, A, 3, generator=g) * 5
+    with torch.no_grad():
+        out = head(
+            s_inputs=s_inputs, z=pairs[0], relpos=pairs[1], bonds=pairs[2], coords=coords, **batch
+        )
+        for b in range(B):
+            for j in range(S):
+                one = head(
+                    s_inputs=s_inputs[b : b + 1],
+                    z=pairs[0][b : b + 1],
+                    relpos=pairs[1][b : b + 1],
+                    bonds=pairs[2][b : b + 1],
+                    coords=coords[b * S + j : b * S + j + 1],
+                    **{k: v[b : b + 1] for k, v in batch.items()},
+                )
+                for field in fields(ConfidenceOutput):
+                    torch.testing.assert_close(
+                        getattr(out, field.name)[b * S + j], getattr(one, field.name)[0]
+                    )
+
+
+def test_input_embedder_row_chunks_match_the_whole_call_without_grad() -> None:
+    torch.manual_seed(0)
+    whole = ConfidenceHead(tiny_fold_config(inference_chunk_size=None)).input_embedder
+    chunked = ConfidenceHead(tiny_fold_config(inference_chunk_size=3)).input_embedder
+    chunked.load_state_dict(whole.state_dict())
+    cfg = tiny_fold_config()
+    s = torch.randn(2, 7, cfg.single_inputs_width)
+    z, relpos, bonds = (torch.randn(2, 7, 7, cfg.pair_width) for _ in range(3))
+    with torch.no_grad():
+        torch.testing.assert_close(chunked(s, z, relpos, bonds), whole(s, z, relpos, bonds))
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("grad", [False, True])
+def test_confidence_pair_stack_runs_bf16_on_cuda_for_training_and_inference(grad: bool) -> None:
+    cfg = _cfg()
+    head = ConfidenceHead(cfg).cuda().train(grad)
+    seen: list[torch.dtype] = []
+    head.folding_trunk.register_forward_pre_hook(lambda _m, args: seen.append(args[0].dtype))
+    f = featurize([ChainSpec("MKVL", "A")])
+    L, A = f.num_tokens, f.num_atoms
+    with torch.set_grad_enabled(grad):
+        out = head(
+            s_inputs=torch.randn(1, L, cfg.single_inputs_width, device="cuda"),
+            z=torch.randn(1, L, L, cfg.pair_width, device="cuda"),
+            relpos=torch.randn(1, L, L, cfg.pair_width, device="cuda"),
+            bonds=torch.randn(1, L, L, cfg.pair_width, device="cuda"),
+            coords=torch.randn(2, A, 3, device="cuda") * 5,
+            **{
+                k: getattr(f, k).cuda()
+                for k in (
+                    "distogram_atom_idx",
+                    "token_mask",
+                    "atom_to_token",
+                    "atom_mask",
+                    "asym_id",
+                )
+            },
+        )
+    assert seen == [torch.bfloat16, torch.bfloat16]
+    assert out.pae_logits.dtype == torch.float32 and out.plddt_logits.dtype == torch.float32
+    if grad:
+        out.plddt_logits.sum().backward()
+        assert head.folding_trunk.layers[0].tri_mul_out.proj_bundle.weight.grad is not None

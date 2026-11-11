@@ -7,6 +7,7 @@ gemmi; B-factors carry pLDDT × 100 (upstream's PDB writer leaves it on the 0–
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,7 +26,14 @@ if TYPE_CHECKING:
     from oplm.fold.data.featurize import FoldFeatures
     from oplm.fold.modeling_fold import OplmForFolding
 
-__all__ = ["FoldResult", "fold", "parse_chain_arg", "rank_samples", "write_mmcif"]
+__all__ = [
+    "FoldResult",
+    "fold",
+    "parse_chain_arg",
+    "prefer_expandable_segments",
+    "rank_samples",
+    "write_mmcif",
+]
 
 _RES_NAMES = {v: k for k, v in PROTEIN_RES_TYPES.items()}
 _ELEMENT_SYMBOLS = {6: "C", 7: "N", 8: "O", 16: "S"}
@@ -51,6 +59,15 @@ class FoldResult:
     best_sample: int
     features: FoldFeatures
     output: FoldOutput
+
+
+def prefer_expandable_segments() -> None:
+    """Default the CUDA caching allocator to expandable segments (docs/FOLD.md §12).
+
+    Prediction allocates L²-sized pair tensors of several sizes, which fragments fixed-size
+    segments. Call before the first CUDA allocation; an explicit ``PYTORCH_CUDA_ALLOC_CONF`` wins.
+    """
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def parse_chain_arg(text: str, default_id: str) -> ChainSpec:

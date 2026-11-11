@@ -170,6 +170,30 @@ def test_forward_end_to_end_is_deterministic_under_a_generator() -> None:
     torch.testing.assert_close(out.distogram_logits, again.distogram_logits)
 
 
+def test_inference_encodes_the_lm_pair_once_with_the_same_result() -> None:
+    """No dropout and no grad: the loop-invariant injection runs the LM encoder once."""
+    torch.manual_seed(0)
+    model = OplmForFolding(_tiny_cfg()).eval()
+    f = _features()
+    hs = torch.randn(1, f.num_tokens, 3, 32)
+    calls: list[int] = []
+    model.lm_encoder.register_forward_hook(lambda *_: calls.append(1))
+
+    def run() -> Any:
+        return model(
+            f, lm_hidden_states=hs, num_loops=3, generator=torch.Generator().manual_seed(0)
+        )
+
+    with torch.no_grad():
+        once = run()
+    assert len(calls) == 1
+    with torch.enable_grad():  # the per-loop path
+        per_loop = run()
+    assert len(calls) == 1 + 3
+    torch.testing.assert_close(once.pair, per_loop.pair.detach())
+    torch.testing.assert_close(once.coords, per_loop.coords.detach())
+
+
 def test_forward_accepts_precomputed_lm_states_and_z0() -> None:
     torch.manual_seed(0)
     model = OplmForFolding(_tiny_cfg()).eval()
@@ -252,14 +276,20 @@ def test_from_pretrained_resolves_an_esmc_identifier_through_the_adapter(
             self.config = type("C", (), {"hidden_size": 32, "num_hidden_layers": 2})()
             self.embed = torch.nn.Embedding(64, 32)
 
-        def forward(self, input_ids, attention_mask=None, output_hidden_states=True, return_dict=True):
+        def forward(
+            self, input_ids, attention_mask=None, output_hidden_states=True, return_dict=True
+        ):
             x = self.embed(input_ids)
             return type("O", (), {"hidden_states": torch.stack([x, x, x])})()
 
     monkeypatch.setattr(
-        esmc, "load_esmc", lambda name, **kw: esmc.FrozenEsmC(_Fake(), name=name, revision=kw.get("revision"))
+        esmc,
+        "load_esmc",
+        lambda name, **kw: esmc.FrozenEsmC(_Fake(), name=name, revision=kw.get("revision")),
     )
     model = OplmForFolding(_tiny_cfg(lm_name_or_path="esmc:esmc_fake", lm_revision="v1"))
     model.save_pretrained(tmp_path / "fold")
     reloaded = OplmForFolding.from_pretrained(tmp_path / "fold")
-    assert reloaded.lm is not None and reloaded.lm.name == "esmc_fake" and reloaded.lm.revision == "v1"
+    assert (
+        reloaded.lm is not None and reloaded.lm.name == "esmc_fake" and reloaded.lm.revision == "v1"
+    )

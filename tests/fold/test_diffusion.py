@@ -371,3 +371,13 @@ def test_expand_matches_prepare_with_num_samples() -> None:
     torch.testing.assert_close(three.c, direct.c)
     torch.testing.assert_close(three.z, direct.z)
     assert head.expand(base, 1) is base
+
+
+def test_pair_conditioning_row_chunks_match_the_whole_call_without_grad() -> None:
+    torch.manual_seed(0)
+    whole = DiffusionConditioning(tiny_fold_config(inference_chunk_size=None))
+    chunked = DiffusionConditioning(tiny_fold_config(inference_chunk_size=3))
+    chunked.load_state_dict(whole.state_dict())
+    z, relpos = torch.randn(2, 7, 7, 32), torch.randn(2, 7, 7, 32)
+    with torch.no_grad():
+        torch.testing.assert_close(chunked.pair(z, relpos), whole.pair(z, relpos))

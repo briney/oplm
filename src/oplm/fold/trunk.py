@@ -41,6 +41,7 @@ __all__ = [
     "Transition",
     "cuda_bf16_autocast",
     "fp32_autocast_off",
+    "map_rows",
     "pair_stack_kwargs",
     "unloaded",
 ]
@@ -76,18 +77,54 @@ class GatedMLP(nn.Module):
         return self.down_proj(F.silu(a) * b)
 
 
-class Transition(nn.Module):
-    """Pre-norm gated MLP returning the delta; the caller adds the residual."""
+def map_rows(fn: Callable[[slice], Tensor], n: int, rows: int | None) -> Tensor:
+    """``fn(slice(None))``, or ``fn`` over row slices of ``rows`` stitched along axis 1.
 
-    def __init__(self, width: int, expansion: int = 4, *, eps: float = 1e-5) -> None:
+    For per-position pair work at inference (docs/FOLD.md §12): with gradients off and
+    ``rows < n``, ``fn`` sees one slice of the ``n`` rows at a time and writes into one output,
+    so its intermediates exist for one chunk only. ``fn`` must be per position along axis 1, so
+    the result equals the whole call. Under autograd the whole call runs: block checkpointing
+    already bounds training memory and chunking would only add a concat.
+    """
+    if rows is None or torch.is_grad_enabled() or n <= rows:
+        return fn(slice(None))
+    out: Tensor | None = None
+    for start in range(0, n, rows):
+        sl = slice(start, start + rows)
+        y = fn(sl)
+        if out is None:
+            out = y.new_empty(y.shape[0], n, *y.shape[2:])
+        out[:, sl] = y
+    assert out is not None
+    return out
+
+
+class Transition(nn.Module):
+    """Pre-norm gated MLP returning the delta; the caller adds the residual.
+
+    ``row_chunk_size`` runs it through :func:`map_rows`, so at inference the
+    ``(1 + 2·expansion)``-width intermediates exist for that many rows at a time.
+    """
+
+    def __init__(
+        self,
+        width: int,
+        expansion: int = 4,
+        *,
+        eps: float = 1e-5,
+        row_chunk_size: int | None = None,
+    ) -> None:
         super().__init__()
         if expansion < 1:
             raise ValueError(f"expansion must be >= 1; got {expansion!r}")
+        if row_chunk_size is not None and row_chunk_size < 1:
+            raise ValueError(f"row_chunk_size must be >= 1 or None; got {row_chunk_size!r}")
         self.norm = nn.LayerNorm(width, eps=eps)
         self.mlp = GatedMLP(width, expansion * width)
+        self.row_chunk_size = row_chunk_size
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.mlp(self.norm(x))
+        return map_rows(lambda sl: self.mlp(self.norm(x[:, sl])), x.shape[1], self.row_chunk_size)
 
 
 class RowSharedDropout(nn.Module):
@@ -122,6 +159,7 @@ class PairUpdateBlock(nn.Module):
         eps: float = 1e-5,
         chunk_size: int | None = 64,
         trimul_backend: Backend = "auto",
+        row_chunk_size: int | None = None,
     ) -> None:
         super().__init__()
         self.tri_mul_out = TriangleMultiplication(
@@ -130,7 +168,7 @@ class PairUpdateBlock(nn.Module):
         self.tri_mul_in = TriangleMultiplication(
             width, "incoming", eps=eps, chunk_size=chunk_size, backend=trimul_backend
         )
-        self.pair_transition = Transition(width, expansion, eps=eps)
+        self.pair_transition = Transition(width, expansion, eps=eps, row_chunk_size=row_chunk_size)
         self.dropout = RowSharedDropout(dropout)
 
     def forward(self, z: Tensor, pair_mask: Tensor | None = None) -> Tensor:
@@ -166,6 +204,7 @@ def pair_stack_kwargs(config: FoldConfig) -> dict[str, Any]:
         "eps": config.layer_norm_eps,
         "chunk_size": config.trimul_chunk_size,
         "trimul_backend": config.trimul_backend,
+        "row_chunk_size": config.inference_chunk_size,
     }
 
 
@@ -262,8 +301,8 @@ class Recurrence(nn.Module):
         for t in range(num_loops):
             ctx = torch.no_grad() if t < no_grad_loops else contextlib.nullcontext()
             with ctx:
-                injected = self.input_norm(inject(t))
-                z = a * z + F.linear(injected.to(z.dtype), b_mat)
+                # one expression: the fp32 normalized injection is freed before the trunk runs
+                z = a * z + F.linear(self.input_norm(inject(t)).to(z.dtype), b_mat)
                 z = trunk(z, pair_mask)
             if return_states:
                 states.append(z)
