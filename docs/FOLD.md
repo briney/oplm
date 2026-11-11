@@ -254,7 +254,9 @@ LM held outside the module tree via `attach_lm` / `lm_name_or_path`;
 - `fold()` ranks samples by ipTM (complex) / pTM (monomer); upstream's `fold()` does not rank.
   It requires an eval-mode model (train mode would apply `pair_dropout`).
 - Coordinates, the sampler and the confidence math disable any outer autocast locally (spec
-  §5.4); the trunk portion of `forward` runs under bf16 autocast on CUDA only.
+  §5.4); the trunk portion of `forward` runs under bf16 autocast on CUDA only. On CUDA the
+  confidence head's pair stack is fed a bf16 pair (training and inference); its residual add
+  and every logit stay fp32 (§12).
 - The frozen LM is cast to bf16 only when loaded through `from_pretrained`/the CLI on CUDA; an
   explicitly attached LM keeps the caller's dtype.
 - Atoms pad to a multiple of 32 (upstream's layout), not spec §4.7's
@@ -668,21 +670,57 @@ constant number of units, so the maximum length on a device of `M` GiB is about
 `sqrt(M · 2³⁰ / (units · pair_width · 2))`. Compare phases by `start_gib` (pair state held when the
 phase begins) and `peak_gib` (its transient high-water mark).
 
-**Baseline** (job 35762, `28c97ac`, one B200 with 178 GiB, cuEquivariance 0.13.0;
-[`fold/inference-memory/28c97ac-baseline.json`](fold/inference-memory/28c97ac-baseline.json)):
+**Current** (job 35784, `788fece`, one B200 with 178 GiB, cuEquivariance 0.13.0,
+`expandable_segments`; [`fold/inference-memory/788fece.json`](fold/inference-memory/788fece.json)):
 
 | Width | Samples | Largest that ran | First OOM | OOM phase | Peak (units) |
 | --- | --- | --- | --- | --- | --- |
-| 128 | 1 | 4096 (141 GiB) | 5120 | trunk loop | 35 |
-| 128 | 5 | 2048 (132 GiB) | 3072 | confidence head | 132 |
-| 256 | 1 | 2048 (70 GiB) | 3072 | confidence head | 35 |
-| 256 | 5 | 1536 (148 GiB) | 2048 | confidence head | 131 |
+| 128 | 1 | 6144 (173 GiB) | 7168 | before the trunk | 19 |
+| 128 | 5 | 4096 (114 GiB) | 5120 | confidence head | 29 |
+| 256 | 1 | 4096 (149 GiB) | 5120 | before the trunk | 19 |
+| 256 | 5 | 3072 (103 GiB) | 4096 | confidence head | 23 |
 
-At width 256, 2048 tokens, 1 sample, the pair state held entering the trunk is 6.5 units and rises
-to 11 by the confidence head. Each pair-update block adds a transient of about 24 units (the trunk,
-the coda and the confidence head alike), the diffusion conditioning adds 12, and the confidence
-head repeats its 24 once per sample. Reserved memory runs 15–25 % above allocated.
+At width 256, 4096 tokens, 1 sample, the pair state held entering the trunk is 5 units. The trunk
+and the coda each add 9 at their peak (the fused trimul's own transient is 6 per call), the
+inputs embedder and the LM shim 5 each, and the confidence head 13 on top of the 6 held when it
+starts; with 5 samples its per-sample outputs add 4–9 more. Reserved memory is within 2 % of
+allocated except at width 128 with 5 samples (13–17 %).
 
-**How to change it.** Execution-only memory work is tracked on the board (#101–#104); multi-GPU
-inference beyond one device's capacity is milestone 6, Fold-CP (#105). Rerun the sweep after each
-change and replace the baseline here.
+**How to change it.** Everything here changes how prediction runs, not its results: the ESMFold2
+parity suite also runs a model with `inference_chunk_size: 7`, so every chunked path is checked
+against the upstream fixtures. The knobs:
+
+- `inference_chunk_size` (`FoldConfig`, default 128 rows): per-position pair work (pair
+  transitions, the diffusion pair conditioning, the confidence input embedder) runs this many
+  rows at a time when gradients are off (`oplm.fold.trunk.map_rows`). `None` runs whole tensors.
+- `oplm fold predict` / `eval` default `PYTORCH_CUDA_ALLOC_CONF` to `expandable_segments:True`
+  unless it is set (`oplm.fold.predict.prefer_expandable_segments`).
+
+Open work is on the board: the fused trimul's transient (#101), FlexAttention's eager fallback past
+dynamo's recompile limit (#107) and multi-GPU inference, milestone 6, Fold-CP (#105). Rerun the
+sweep after each change and replace the table above.
+
+**Why and what was ruled out.** The baseline (job 35762, `28c97ac`;
+[`fold/inference-memory/28c97ac-baseline.json`](fold/inference-memory/28c97ac-baseline.json))
+peaked at 35 units with one sample and 131 with five; the largest inputs were 4096 / 2048 tokens
+(width 128 / 256, one sample) and 2048 / 1536 with five. The held pair state was never the
+problem; transients were:
+
+- The SwiGLU pair transition (18 of a pair block's 19 units: fp32 LayerNorm output 4, `gate_up`
+  9, `silu·mul` 8) in every pair stack. Row chunking leaves the fused trimul's 6.
+- The confidence head scored all samples at once (+24 units per sample); it now scores one at a
+  time from a shared coordinate-independent embedding.
+- The confidence pair stack ran on an fp32 pair, so the fused trimul ran in fp32 at twice the
+  memory. It now gets bf16, as the main trunk does (spec §5.4). Scored on identical inputs (the
+  five ESMFold2 fixture cases, released weights, five samples), pLDDT moves by at most 0.0006,
+  PAE by 0.004–0.009 Å on average (0.09 Å at most) and pTM by at most 0.0004, with no consistent
+  sign: under 1/30 of an output bin (0.02 pLDDT, 0.5 Å PAE).
+- The atom sliding-window `BlockMask` came from `create_block_mask`, which evaluates the mask on
+  a dense `N × N` grid (14 GiB per sample at 43k atoms); it is now built from per-block key bands.
+- Smaller held tensors: the LM pair (encoded once per prediction now), the fp32 normalized
+  injection, `z0` and the fp32 diffusion conditioning pair, all dropped after their stage.
+- Fragmentation: reserved memory ran 15–25 % above allocated without expandable segments.
+
+Not done: a staged, row-chunked trimul (would remove most of its 6 units but give up the fused
+kernel's speed, #101), keeping `relpos`/`bonds` as features instead of full-width pairs (2 units
+held), and caching the diffusion pair biases (sampling is not the peak).
