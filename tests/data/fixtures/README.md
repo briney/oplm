@@ -23,6 +23,9 @@ subdirectories below; tests `pytest.skip` when a required fixture is absent.
   `variant_clinical/NP_000008.1.csv` (ACADM; 412-aa WT, 20 Pathogenic / 6 Benign).
   `test_real_clinical_fixture` and the slow `test_clinical_eval_auroc_*` tests
   load it directly.
+- `antibody/eval_gte2_head.parquet` — 10 real chains (4 IGH, 3 IGK, 3 IGL) from
+  `brineylab/oplm-antibody-sequences` (tag `v1.0.0`, CC BY 4.0) `eval_gte2.parquet`, the
+  first of each locus in file order. `tests/eval/test_antibody_cdr3_task.py` loads it.
 - `downstream/` — *(no dropped files required)*. The downstream-loader tests
   (Phase 8) build their own per-residue and sequence-level fixtures at test time
   from real protein sequences (the shared `real_records` fixture); only the task

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from oplm.eval.tasks import (
+    antibody_cdr3,  # noqa: F401
     everest,  # noqa: F401
     proteinglue,  # noqa: F401
     proteingym,  # noqa: F401

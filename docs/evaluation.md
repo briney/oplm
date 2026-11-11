@@ -22,6 +22,7 @@ callbacks (`on_eval_end`); there are no eval output files.
 | --- | --- | --- | --- |
 | `sequence` | implemented | `loss`, `accuracy`, `perplexity` | Masked-LM metrics over held-out parquet (same schema as training data). |
 | `structure` | implemented | `precision_at_L` | Unsupervised contact prediction from the categorical Jacobian over PDB/CIF structures. Also `precision_at_L_2`, `precision_at_L_5`. |
+| `antibody_cdr3` | implemented | `{loss,accuracy,perplexity}_{heavy,light,all}` | Per-position masked-LM metrics over antibody CDR3 residues, by chain type. |
 | `proteingym` | implemented | `spearman`, `auroc`, `top_k_precision` | ProteinGym DMS variant-effect prediction by per-position log-likelihood ratio. |
 | `proteingym_clinical` | implemented | `auroc` | ProteinGym clinical pathogenicity (Pathogenic vs Benign) by per-position log-likelihood ratio. |
 | `tape`, `proteinglue`, `everest` | stub | | Registered so configs parse; they raise `NotImplementedError` when run. |
@@ -105,6 +106,26 @@ metrics average over all sequences.
 > Agreement with Potts is **not** higher-is-better. A model can be right where coevolution
 > is silent (`p_at_L_beyond`), so read `coevo_*` next to `precision_at_L`: rising
 > agreement with flat or falling P@L means the model is learning coevolution, not contacts.
+
+### antibody_cdr3
+
+The task (`src/oplm/eval/tasks/antibody_cdr3.py`) scores antibody CDR3s, the
+non-templated region that whole-sequence loss hides behind easy germline frameworks. It
+reads one parquet file with `sequence`, `locus` (`IGH`, `IGK` or `IGL`) and `cdr_mask_aa`
+(one digit per residue, `3` marks CDR3): the held-out files of
+`brineylab/oplm-antibody-sequences` (see [data.md](data.md), *Antibody sequences*).
+
+Each CDR3 residue gets its own forward pass with `<mask>` at that position only, the rest of
+the chain (the rest of the CDR3 included) left visible: a CDR3-restricted
+pseudo-log-likelihood. Nothing is random, so values are comparable across checkpoints. `loss`,
+`accuracy` and `perplexity` (capped at 1000) are computed over CDR3 residues for heavy chains
+(`_heavy`), light chains (`_light`, `IGK` and `IGL`) and both (`_all`). Read `_heavy`: light
+chains are low-diversity and easy.
+
+Cost is one forward per CDR3 residue, about 12 per chain (15 for heavy chains), so a
+5,000-chain file is about 61,000 forwards of about 120 tokens. The held-out sets can sit
+under 90% identity from train sequences (the dataset README's *Gotchas*), so compare runs on
+the same files rather than reading absolute values.
 
 ### proteingym and proteingym_clinical
 
