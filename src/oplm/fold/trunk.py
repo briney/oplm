@@ -77,17 +77,44 @@ class GatedMLP(nn.Module):
 
 
 class Transition(nn.Module):
-    """Pre-norm gated MLP returning the delta; the caller adds the residual."""
+    """Pre-norm gated MLP returning the delta; the caller adds the residual.
 
-    def __init__(self, width: int, expansion: int = 4, *, eps: float = 1e-5) -> None:
+    With ``row_chunk_size`` and gradients off, axis 1 is processed in chunks of that many rows
+    written into one output, so the ``(1 + 2·expansion)``-width intermediates exist for one
+    chunk at a time (docs/FOLD.md §12). Every op is per position, so the result is the same as
+    the whole-tensor call. Under autograd the whole tensor runs: block checkpointing already
+    bounds training memory and chunking would only add a concat.
+    """
+
+    def __init__(
+        self,
+        width: int,
+        expansion: int = 4,
+        *,
+        eps: float = 1e-5,
+        row_chunk_size: int | None = None,
+    ) -> None:
         super().__init__()
         if expansion < 1:
             raise ValueError(f"expansion must be >= 1; got {expansion!r}")
+        if row_chunk_size is not None and row_chunk_size < 1:
+            raise ValueError(f"row_chunk_size must be >= 1 or None; got {row_chunk_size!r}")
         self.norm = nn.LayerNorm(width, eps=eps)
         self.mlp = GatedMLP(width, expansion * width)
+        self.row_chunk_size = row_chunk_size
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.mlp(self.norm(x))
+        rows = self.row_chunk_size
+        if rows is None or torch.is_grad_enabled() or x.shape[1] <= rows:
+            return self.mlp(self.norm(x))
+        out: Tensor | None = None
+        for start in range(0, x.shape[1], rows):
+            y = self.mlp(self.norm(x[:, start : start + rows]))
+            if out is None:
+                out = y.new_empty(*x.shape[:-1], y.shape[-1])
+            out[:, start : start + rows] = y
+        assert out is not None
+        return out
 
 
 class RowSharedDropout(nn.Module):
@@ -122,6 +149,7 @@ class PairUpdateBlock(nn.Module):
         eps: float = 1e-5,
         chunk_size: int | None = 64,
         trimul_backend: Backend = "auto",
+        row_chunk_size: int | None = None,
     ) -> None:
         super().__init__()
         self.tri_mul_out = TriangleMultiplication(
@@ -130,7 +158,7 @@ class PairUpdateBlock(nn.Module):
         self.tri_mul_in = TriangleMultiplication(
             width, "incoming", eps=eps, chunk_size=chunk_size, backend=trimul_backend
         )
-        self.pair_transition = Transition(width, expansion, eps=eps)
+        self.pair_transition = Transition(width, expansion, eps=eps, row_chunk_size=row_chunk_size)
         self.dropout = RowSharedDropout(dropout)
 
     def forward(self, z: Tensor, pair_mask: Tensor | None = None) -> Tensor:
@@ -166,6 +194,7 @@ def pair_stack_kwargs(config: FoldConfig) -> dict[str, Any]:
         "eps": config.layer_norm_eps,
         "chunk_size": config.trimul_chunk_size,
         "trimul_backend": config.trimul_backend,
+        "row_chunk_size": config.inference_chunk_size,
     }
 
 

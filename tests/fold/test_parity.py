@@ -42,13 +42,16 @@ def _case_fixture(fixtures_dir: Path, case: FixtureCase) -> dict[str, Tensor]:
     return load_fixture(fixtures_dir, case.name)
 
 
-@pytest.fixture(scope="module")
-def released(fixtures_dir: Path) -> OplmForFolding:
+# Fixture proteins are shorter than the default inference chunk (128 rows), so a second model
+# with a small chunk that does not divide the lengths runs every stage through the chunked path.
+@pytest.fixture(scope="module", params=[128, 7], ids=["whole", "row-chunked"])
+def released(fixtures_dir: Path, request: pytest.FixtureRequest) -> OplmForFolding:
     cfg = fold_config_from_upstream(
         json.loads((fixtures_dir / "config.json").read_text()),
         attention_backend="dense",
         trimul_backend="reference",
         trimul_chunk_size=None,
+        inference_chunk_size=request.param,
     )
     model = OplmForFolding(cfg).eval()
     missing, unexpected = model.load_state_dict(

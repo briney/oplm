@@ -194,8 +194,9 @@ class DiffusionConditioning(nn.Module):
         self.fourier = FourierEmbedding(config.fourier_dim)
         self.pair_input_norm = nn.LayerNorm(2 * p, eps=eps)
         self.pair_proj = nn.Linear(2 * p, p, bias=False)
-        self.pair_transition_0 = Transition(p, mult, eps=eps)
-        self.pair_transition_1 = Transition(p, mult, eps=eps)
+        rows = config.inference_chunk_size
+        self.pair_transition_0 = Transition(p, mult, eps=eps, row_chunk_size=rows)
+        self.pair_transition_1 = Transition(p, mult, eps=eps, row_chunk_size=rows)
         self.single_input_norm = nn.LayerNorm(s_in, eps=eps)
         self.single_proj = nn.Linear(s_in, w, bias=False)
         self.single_transition_0 = Transition(w, mult, eps=eps)

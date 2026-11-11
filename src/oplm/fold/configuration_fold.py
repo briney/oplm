@@ -29,7 +29,9 @@ class FoldConfig(PretrainedConfig):
     (upstream ``DropoutResidual``, 0 in the release). ``inference_num_loops`` counts iterations
     executed (upstream's ``num_loops + 1``; spec default 10, the release runs 21).
     ``distogram_{min,max}_dist`` are the training target's bin range (AF3/Boltz: 64 bins over
-    2-22 Å); they do not change the released head.
+    2-22 Å); they do not change the released head. ``inference_chunk_size`` is how many pair rows
+    the per-position work processes at a time when gradients are off (``None``: whole tensor);
+    it bounds inference memory and does not change results (docs/FOLD.md §12).
     """
 
     model_type = "oplm_fold"
@@ -108,6 +110,7 @@ class FoldConfig(PretrainedConfig):
         confidence_max_dist: float = 50.75,
         trimul_backend: str = "auto",
         trimul_chunk_size: int | None = 64,
+        inference_chunk_size: int | None = 128,
         attention_backend: str = "auto",
         layer_norm_eps: float = 1e-5,
         **kwargs: Any,
@@ -183,6 +186,9 @@ class FoldConfig(PretrainedConfig):
         self.confidence_max_dist = float(confidence_max_dist)
         self.trimul_backend = str(trimul_backend)
         self.trimul_chunk_size = None if trimul_chunk_size is None else int(trimul_chunk_size)
+        self.inference_chunk_size = (
+            None if inference_chunk_size is None else int(inference_chunk_size)
+        )
         self.attention_backend = str(attention_backend)
         self.layer_norm_eps = float(layer_norm_eps)
         self._validate()
@@ -287,6 +293,9 @@ class FoldConfig(PretrainedConfig):
             raise ValueError("distogram_min_dist must be positive and below distogram_max_dist.")
         if not 0 < self.confidence_min_dist < self.confidence_max_dist:
             raise ValueError("confidence_min_dist must be positive and below confidence_max_dist.")
+        for name in ("trimul_chunk_size", "inference_chunk_size"):
+            if getattr(self, name) is not None and getattr(self, name) < 1:
+                raise ValueError(f"{name} must be >= 1 or None; got {getattr(self, name)!r}.")
         if self.trimul_backend not in _VALID_TRIMUL_BACKENDS:
             raise ValueError(
                 f"trimul_backend must be one of {_VALID_TRIMUL_BACKENDS}; "
