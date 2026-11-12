@@ -76,7 +76,8 @@ Anything unmatched between arms, anything measured at a proxy scale, anything no
 | `config` | Config file path at that commit, plus any overrides. |
 | `step` | Step the metrics were read at. |
 
-Metric columns use the W&B metric name. `curves.csv` is long format: `arm`, `wandb_run`, `step`,
+Metric columns use the W&B metric name where the number was read from W&B, and a descriptive
+name otherwise (the record says which). `curves.csv` is long format: `arm`, `wandb_run`, `step`,
 `metric`, `value`, downsampled to what a figure needs.
 
 ## Status of a row

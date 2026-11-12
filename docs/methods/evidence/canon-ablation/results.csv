@@ -1,0 +1,6 @@
+arm,wandb_run,job_id,commit,config,step,canon_enabled,lr,eval/uniref70/loss,eval/pdb40/precision_at_L,eval/cameo/precision_at_L,eval/casp/precision_at_L
+canon-lr0.0063,d43jlqfa,33587,6e8b277,/mnt/home/briney/projects/oplm/mup_redo/sweeps-nocanon/decay/canon-decay-170M-lr0.0063-om1-a0-s42/decay.yaml,24000,true,0.0063,2.0791,0.3120,0.3377,0.2662
+nocanon-lr0.0025,wyuqrxzo,33583,6e8b277,/mnt/home/briney/projects/oplm/mup_redo/sweeps-nocanon/decay/nocanon-decay-170M-lr0.0025-om1-a0-s42/decay.yaml,24000,false,0.0025,2.0980,0.2777,0.3060,0.2491
+nocanon-lr0.004,885i6pdk,33584,6e8b277,/mnt/home/briney/projects/oplm/mup_redo/sweeps-nocanon/decay/nocanon-decay-170M-lr0.004-om1-a0-s42/decay.yaml,24000,false,0.004,2.0935,0.2856,0.3102,0.2519
+nocanon-lr0.0063,gousn0dq,33585,6e8b277,/mnt/home/briney/projects/oplm/mup_redo/sweeps-nocanon/decay/nocanon-decay-170M-lr0.0063-om1-a0-s42/decay.yaml,24000,false,0.0063,2.0905,0.2968,0.3163,0.2500
+nocanon-lr0.01,k6ouo9v5,33586,6e8b277,/mnt/home/briney/projects/oplm/mup_redo/sweeps-nocanon/decay/nocanon-decay-170M-lr0.01-om1-a0-s42/decay.yaml,24000,false,0.01,2.0884,0.3023,0.3313,0.2550
