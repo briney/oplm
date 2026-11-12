@@ -1,0 +1,106 @@
+# ESM-C μP funnel: mup-production-nogate.yaml with src/oplm/configs/train/esm-c.yaml merged
+# over it (ESM-C wins). Data, batch, context, eval and slurm are unchanged from the OPLM
+# no-gate funnel so the two are comparable. See docs/mup-lr.md, "ESM-C funnel".
+model:
+  # --- from the OPLM funnel config (not pinned by esm-c.yaml) ---
+  max_position_embeddings: 2048
+  packed_attention: flex
+  gradient_checkpointing: false
+
+  # --- ESM-C architecture (esm-c.yaml) ---
+  num_loops: 1
+  loop_strategy: stack
+  loop_start: 0
+  loop_end: null
+  rope_theta: 10000.0
+  rope_dim: null
+  nope_dim: 0
+  norm_type: layernorm
+  norm_eps: 1.0e-05
+  norm_strategy: pre
+  qk_norm: true
+  qk_norm_mode: full
+  qk_norm_l2_scale_init: null
+  post_embed_norm: false
+  mask_dropout: false
+  mask_dropout_reference_ratio: 0.12
+  residual_scaling: esmc
+  residual_gate: none
+  residual_gate_init: 1.0
+  attn_output_gate: none
+  value_residual: none
+  value_residual_lambda_init: 0.5
+  init_scale_output_projections: true
+  ffn_activation: swiglu
+  ffn_bias: false
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  tie_word_embeddings: false
+  mlm_head_activation: gelu
+  canon_enabled: false
+  canon_residual: true
+  canon_positions: [A, B, C, D]
+  canon_kernel_sizes: 7
+  canon_activation: none
+  mup_enable: true
+  mup_base_width: 768
+  mup_output_mult: 1.0          # placeholder; the sweep sets it per cell
+  initializer_range: 0.02
+
+train:
+  # --- ESM-C optimizer (esm-c.yaml) ---
+  optimizer: adamw
+  lr: 0.0016                    # placeholder; the sweep sets it per cell
+  weight_decay: 0.01            # the sweep requires 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_eps: 1.0e-08
+  mup_depth_lr_exponent: 0.5    # sweep pins 0 at 170M (24 layers: no-op); confirm uses 0.5
+  mup_depth_reference_layers: 24
+  adamw_lr_mult: 1.0
+  embedding_weight_decay: 0.0
+  weight_decay_to_init: 0.0
+
+  # --- from the OPLM funnel config ---
+  compile: true
+  compile_dynamic: false
+  tokens_per_step: 4194304
+  batch_tokens: 65536           # required alongside tokens_per_step; cells override it
+  wandb_project: oplm-mup-esmc-4M
+
+data:
+  pack_sequences: true
+  train:
+    uniref70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/train
+      fraction: 0.05
+    deepclust70:
+      path: /mnt/data/datasets/plm-training-data/deepclust70/train
+      fraction: 0.95
+  eval:
+    uniref70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/eval.parquet
+      type: sequence
+      every: {steps: 500}
+
+slurm:
+  partition: hpc-mid
+  time_limit:
+    default: "168:00:00"
+    analyze: "01:00:00"
+  cpus_per_task: 128
+  gpus_per_node: 8
+  exclusive: true
+  mem: "0"
+  log_dir: /mnt/home/briney/logs
+  env_file: /mnt/home/briney/.env
+  container_image: /mnt/data/containers/deeplearning_v2026-05-26.sqsh
+  container_mounts:
+    - /mnt/data:/mnt/data
+    - /tmp:/tmp
+  # 6e8b277 predates esm-c.yaml; pin a commit that has it, and keep it for every phase.
+  install: pip install "oplm[train] @ git+https://github.com/briney/oplm@90e8d9a"
+  max_concurrent: 4
+  nodes:
+    default: {170M: 4, 800M: 8}
+  max_batch_tokens: {170M: 65536, 800M: 32768}

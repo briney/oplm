@@ -48,9 +48,14 @@ after a decay.
 
 - **Optimizer and architecture change together,** so this does not say how much of the gap is
   Muon. The isolated ablation is #117.
-- **The ESM-C learning rate may not be at its optimum for this length.** Its sweep put the
-  24k-step optimum at 0.00063 to 0.001 (from session notes); 0.0004 was used here and was not
-  bracketed at 252k steps.
+- **The ESM-C learning rate is extrapolated, not tuned at this length.** Its sweep put the
+  24k-step optimum near 0.0008; 0.0004 is that value scaled by the ratio OPLM's optimum fell
+  between 24k and 300k steps (about 0.5). It was not bracketed at 252k steps, and a low learning
+  rate would shrink the ESM-C arm's gain from the decay. (Basis from session notes.)
+- **Stable and decay rows use different eval masks.** The stable runs evaluated on 8 nodes and the
+  decays on 4, and the masked positions depend on the node count, which moves held-out loss by
+  about 0.01. Compare oplm against esmc within a row pair, not stable against decay. P@L is
+  unaffected.
 - **Equal steps, not equal compute.** OPLM steps were about twice as slow as ESM-C steps when
   these ran (about 0.9 s against 0.42 s, from session notes, before the fused Canon kernel).
   Parameter counts are also not matched: Canon adds parameters at the same width and depth.

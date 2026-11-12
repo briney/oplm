@@ -1,0 +1,57 @@
+model:
+  residual_gate: none
+  norm_strategy: sandwich
+  canon_enabled: true
+  canon_positions: [A, B, C, D]
+  max_position_embeddings: 2048
+  packed_attention: flex
+  gradient_checkpointing: false
+
+train:
+  optimizer: muon                  # the sweep requires muon / original / 0.01
+  muon_adjust_lr_fn: original
+  weight_decay: 0.01
+  adamw_lr_mult: 0.333             # use the exact ÷3 value from scaling-v2.yaml
+  embedding_weight_decay: 0.01
+  weight_decay_to_init: 0.01
+  compile: true
+  compile_dynamic: false
+  tokens_per_step: 4194304
+  batch_tokens: 65536              # required alongside tokens_per_step; cells override it
+  wandb_project: oplm-mup-4M-nogate       # keeps ~40 sweep runs out of oplm-scaling
+
+data:
+  pack_sequences: true
+  train:
+    uniref70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/train
+      fraction: 0.05
+    deepclust70:
+      path: /mnt/data/datasets/plm-training-data/deepclust70/train   # guessed; use v2's path
+      fraction: 0.95
+  eval:
+    uniref70:
+      path: /mnt/data/datasets/plm-training-data/uniref70_omg70/uniref70/eval.parquet
+      type: sequence
+      every: {steps: 500}
+
+slurm:
+  partition: hpc-mid
+  time_limit:
+    default: "168:00:00"
+    analyze: "01:00:00"
+  cpus_per_task: 128
+  gpus_per_node: 8
+  exclusive: true
+  mem: "0"
+  log_dir: /mnt/home/briney/logs
+  env_file: /mnt/home/briney/.env
+  container_image: /mnt/data/containers/deeplearning_v2026-05-26.sqsh
+  container_mounts:
+    - /mnt/data:/mnt/data
+    - /tmp:/tmp
+  install: pip install "oplm[train] @ git+https://github.com/briney/oplm@6e8b277"   # replace with scaling-v2.yaml's line (installs your checkout)
+  max_concurrent: 4
+  nodes:
+    default: {170M: 4, 800M: 8}
+  max_batch_tokens: {170M: 65536, 800M: 32768}

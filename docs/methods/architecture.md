@@ -9,4 +9,4 @@ How the model works: [../architecture.md](../architecture.md). Sizes are the pre
 | Canon layers are on | `model.canon_enabled` in `src/oplm/configs/model/base.yaml` | [canon-ablation](evidence/canon-ablation/README.md) |
 | Layer looping (off by default; not decided for production) | `model.num_loops`, `model.loop_strategy` in `src/oplm/configs/model/base.yaml` | [looping](evidence/looping/README.md) |
 | Residual gate is off | `model.residual_gate` in `src/oplm/configs/model/base.yaml` | [residual-gate](evidence/residual-gate/README.md) |
-| Residual scaling and μP hooks | `src/oplm/configs/model/base.yaml` | to backfill (coordinate check, [../mup-lr.md](../mup-lr.md)) |
+| Residual scaling and μP hooks | `src/oplm/configs/model/base.yaml` | [mup-coordinate-check](evidence/mup-coordinate-check/README.md) |

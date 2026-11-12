@@ -1,0 +1,7 @@
+arm,wandb_run,job_id,commit,config,step,optimizer,scaling,mup,width_low,width_high,worst_module,worst_growth,raw
+oplm-width-mup,,36026,7150334,configs/mup-production-nogate.yaml,3,muon,width,on,384,1536,lm_head.decoder,1.51,raw/oplm_coord_check_width_muon_mup.csv
+oplm-width-control,,36026,7150334,configs/mup-production-nogate.yaml,3,muon,width,off,384,1536,lm_head.decoder,9.74,raw/oplm_coord_check_width_muon_nomup.csv
+oplm-ray-mup,,36026,7150334,configs/mup-production-nogate.yaml,3,muon,preset_ray,on,512,1280,lm_head.dense,1.23,raw/oplm_coord_check_preset_ray_muon_mup.csv
+esmc-width-mup,,33343,90e8d9a,configs/mup-esmc.yaml,3,adamw,width,on,384,1536,oplm.backbone.embed_tokens.embed_tokens,1.0,raw/esmc_coord_check_width_adamw_mup.csv
+esmc-width-control,,33343,90e8d9a,configs/mup-esmc.yaml,3,adamw,width,off,384,1536,oplm.backbone.layers.*.ffn.down_proj,20.62,raw/esmc_coord_check_width_adamw_nomup.csv
+esmc-ray-mup,,33343,90e8d9a,configs/mup-esmc.yaml,3,adamw,preset_ray,on,512,1280,lm_head.decoder,1.42,raw/esmc_coord_check_preset_ray_adamw_mup.csv
