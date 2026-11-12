@@ -1061,6 +1061,9 @@ class Trainer:
                 self._step_local_tokens = 0
                 local_samples = self._step_local_samples
                 self._step_local_samples = 0
+                # Triton/LLVM may have taken the C-level SIGUSR1 handler since the
+                # last step (first kernel compile); take it back (#113).
+                self._drain_signal.reassert()
                 with phase("sync"):
                     flags = self._reduce_step_flags(
                         local_tokens,

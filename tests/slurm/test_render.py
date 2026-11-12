@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
+import os
+import re
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -287,18 +292,54 @@ def test_inner_bash_ignores_usr1_so_the_drain_signal_cannot_kill_the_plumbing(
 ) -> None:
     """The `bash -c` wrapper starts with `trap "" USR1`.
 
-    Slurm's `--signal=USR1@600` is delivered to every process in the step's cgroup; the
-    task-leader bash and the `accelerate launch` parent have no USR1 handler and would
-    die instantly, tearing the step down before the trainer's drain checkpoint commits.
-    SIG_IGN is inherited across exec (shielding `accelerate launch` too), while the
-    trainer ranks explicitly re-install their own handler (signal.signal overrides an
-    inherited ignore), so the drain itself still works.
+    Slurm's USR1 reaches the task's process group, which includes `accelerate launch`;
+    with no handler it would die and tear the step down mid-checkpoint. SIG_IGN is
+    inherited by the background launcher, while the ranks re-install their own handler.
     """
     text = render_job(_array_spec(tmp_path), SLURM)
     assert 'bash -c \'trap "" USR1; ' in text
     # SIGTERM stays un-ignored: torchelastic installs its own TERM handler regardless,
     # and scancel's TERM->KILL teardown semantics must not change.
     assert 'trap "" USR1 TERM' not in text
+
+
+_FAKE_LAUNCHER = """\
+import signal, subprocess, sys
+# Like torchelastic: each rank in its own session, so a process-group signal misses it.
+rank = subprocess.Popen([sys.executable, "-c", '''
+import pathlib, signal, sys, time
+signal.signal(signal.SIGUSR1, lambda *a: (pathlib.Path("drained").write_text("1"), sys.exit(85)))
+pathlib.Path("ready").write_text("1")
+time.sleep(30)
+sys.exit(3)
+'''], start_new_session=True)
+sys.exit(1 if rank.wait() else 0)  # accelerate flattens a rank failure to 1
+"""
+
+
+@pytest.mark.skipif(shutil.which("pkill") is None, reason="pkill not available")
+def test_task_wrapper_forwards_usr1_to_rank_sessions(tmp_path: Path) -> None:
+    """Slurm signals only the srun task's process group, not the rank sessions (#113).
+
+    Runs the rendered `bash -c` task command around a fake launcher, sends USR1 to the
+    task's process group the way slurmstepd does, and checks the rank drains while the
+    plumbing survives to report the launcher's exit status.
+    """
+    (tmp_path / "launcher.py").write_text(_FAKE_LAUNCHER)
+    spec = JobSpec(name="t", nodes=1, time_limit="1:00:00", command="python3 launcher.py")
+    text = render_job(spec, dataclasses.replace(SLURM, install="true"))
+    task = re.search(r"bash -c '(.*?)'\nSTATUS=", text, re.DOTALL)
+    assert task is not None
+
+    proc = subprocess.Popen(["bash", "-c", task.group(1)], cwd=tmp_path, start_new_session=True)
+    deadline = time.monotonic() + 10
+    while not (tmp_path / "ready").exists():
+        assert time.monotonic() < deadline, "fake rank never started"
+        time.sleep(0.05)
+    os.killpg(proc.pid, signal.SIGUSR1)
+
+    assert proc.wait(timeout=10) == 1
+    assert (tmp_path / "drained").exists()
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
