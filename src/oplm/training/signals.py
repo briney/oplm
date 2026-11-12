@@ -140,6 +140,7 @@ class DrainSignal:
         self._env: Mapping[str, str] = os.environ if env is None else env
         self._signal_received = False
         self._installed = False
+        self._handlers: dict[int, Callable[[int, FrameType | None], None]] = {}
 
     def install(self) -> None:
         """Register SIGUSR1/SIGTERM handlers. Idempotent; safe to call more than once.
@@ -151,9 +152,23 @@ class DrainSignal:
         if self._installed:
             return
         for sig in _DRAIN_SIGNALS:
-            previous_handler = signal.getsignal(sig)
-            signal.signal(sig, self._make_handler(previous_handler))
+            handler = self._make_handler(signal.getsignal(sig))
+            signal.signal(sig, handler)
+            self._handlers[sig] = handler
         self._installed = True
+
+    def reassert(self) -> None:
+        """Point the C-level handlers back at Python's. Cheap; call once per step.
+
+        Triton's bundled LLVM installs its own C handlers the first time it compiles a
+        kernel, and its SIGUSR1 ("info signal") handler does not chain, so the signal
+        never reaches Python even though ``signal.getsignal`` still reports ours (#113).
+        ``signal.signal`` always re-issues ``sigaction``, which undoes that. A handler
+        some other code installed after ours at the Python level is left alone.
+        """
+        for sig, handler in self._handlers.items():
+            if signal.getsignal(sig) is handler:
+                signal.signal(sig, handler)
 
     def _make_handler(
         self, previous_handler: _SignalHandler

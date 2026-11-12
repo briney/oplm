@@ -7,8 +7,10 @@ that unconditionally, even on assertion failure.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -84,6 +86,40 @@ def test_install_chains_previous_non_default_handler() -> None:
 
     assert drain.requested is True
     assert calls == [signal.SIGUSR1]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs libc signal()")
+def test_reassert_recovers_from_a_c_level_handler_takeover() -> None:
+    """Triton's LLVM swaps the C-level SIGUSR1 handler behind Python's back (#113).
+
+    `signal.getsignal` keeps reporting DrainSignal's handler, but the signal never
+    reaches Python. Simulated here by setting SIG_IGN through libc directly.
+    """
+    drain = DrainSignal(env={})
+    drain.install()
+    libc = ctypes.CDLL(None)
+    libc.signal.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    libc.signal.restype = ctypes.c_void_p
+    libc.signal(signal.SIGUSR1, 1)  # SIG_IGN
+
+    os.kill(os.getpid(), signal.SIGUSR1)
+    assert drain.requested is False  # swallowed: the bug
+
+    drain.reassert()
+    os.kill(os.getpid(), signal.SIGUSR1)
+    assert drain.requested is True
+
+
+def test_reassert_leaves_a_later_python_handler_alone() -> None:
+    drain = DrainSignal(env={})
+    drain.install()
+
+    def _later(signum: int, frame: object) -> None:
+        pass
+
+    signal.signal(signal.SIGUSR1, _later)
+    drain.reassert()
+    assert signal.getsignal(signal.SIGUSR1) is _later
 
 
 def test_env_clock_triggers_within_margin() -> None:

@@ -175,19 +175,20 @@ def render_job(spec: JobSpec, slurm: SlurmConfig) -> str:
         f"  --container-mounts={mounts} \\",
         '  --container-workdir="$JOB_WORK_DIR" \\',
         "  --no-container-mount-home \\",
-        # `trap "" USR1` shields the launch plumbing from the drain signal. Slurm delivers
-        # `--signal=USR1@600` to EVERY process in the step's cgroup -- not just the trainer
-        # ranks, but also this task-leader bash and the `accelerate launch` parent between
-        # them, neither of which handles USR1, so both would die instantly (default
-        # disposition; verified: bash and python both exit 138 on unhandled USR1) and
-        # slurmstepd would tear the step down -- SIGKILLing the ranks mid-drain-checkpoint.
-        # SIG_IGN is inherited across exec, so `accelerate launch` survives too, while the
-        # trainer ranks still drain: signal.signal() overrides an inherited ignore (see
-        # oplm.training.signals.DrainSignal.install). SIGTERM is deliberately NOT ignored
-        # here -- torchelastic installs its own TERM handler regardless (an inherited ignore
-        # would be overridden), and scancel's TERM->KILL teardown semantics should stay.
-        f'  bash -c \'trap "" USR1; {slurm.install} && \\',
-        f"    {spec.command}'",
+        # The drain signal (`--signal=USR1@600`, `scancel --signal=USR1`) reaches only this
+        # task's process group: this bash and `accelerate launch`. torchelastic starts each
+        # rank in its own session, so the ranks never see it (#113). So: `accelerate
+        # launch` runs with USR1 ignored (an unhandled USR1 kills it and slurmstepd tears
+        # the step down mid-checkpoint; SIG_IGN is inherited, and the ranks override it
+        # in DrainSignal.install), and this bash forwards USR1 to the launcher's children,
+        # the ranks. A trap runs only while bash sits in `wait`, hence the background
+        # launch; the loop re-waits after each trap and the last `wait` returns the
+        # launcher's exit status. SIGTERM is deliberately left alone: scancel's TERM->KILL
+        # teardown semantics should stay.
+        f'  bash -c \'trap "" USR1; {slurm.install} || exit; \\',
+        f"    {spec.command} & L=$!; \\",
+        '    trap "pkill -USR1 -P \\$L" USR1; \\',
+        "    while kill -0 $L 2>/dev/null; do wait $L; done; wait $L'",
     ]
     lines += _requeue_wrapper(spec, slurm)
     lines.append("")

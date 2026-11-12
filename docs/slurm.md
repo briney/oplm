@@ -322,14 +322,18 @@ can never misclassify a later genuine crash as a drain.
 
 Two more delivery details make the drain actually reach the trainer intact:
 
-- `--signal=USR1@600` is delivered to **every** process in the step's cgroup — including the
-  `bash -c` task wrapper and the `accelerate launch` parent, neither of which handles `USR1`
-  (both would die instantly on it, tearing the step down mid-drain-checkpoint). The rendered
-  command therefore starts with `trap "" USR1`: `SIG_IGN` is inherited across `exec`, shielding
-  `accelerate launch` too, while the trainer ranks still drain because `signal.signal()`
-  overrides an inherited ignore.
-- `SIGTERM` is deliberately **not** ignored there — torchelastic installs its own `TERM` handler
-  regardless, and `scancel`'s TERM→KILL teardown semantics should stay unchanged.
+- Slurm delivers `USR1` (scheduled or from `scancel`) only to the srun task's process group:
+  the `bash -c` task wrapper and `accelerate launch`. torchelastic starts every rank in its own
+  session, so the ranks never see it. The rendered task command therefore launches `accelerate
+  launch` in the background with `USR1` ignored (unhandled, it would kill the launcher and
+  slurmstepd would tear the step down mid-checkpoint), and the wrapper bash traps `USR1` and
+  forwards it to the launcher's children — the ranks — with `pkill -USR1 -P`. The ranks still
+  catch it because `signal.signal()` overrides an inherited ignore.
+- Triton's bundled LLVM replaces the C-level `SIGUSR1` handler the first time it compiles a
+  kernel, and its handler swallows the signal (`signal.getsignal()` still reports Python's).
+  The trainer calls `DrainSignal.reassert()` every optimizer step to take it back.
+- `SIGTERM` is deliberately **not** forwarded or ignored — `scancel`'s TERM→KILL teardown
+  semantics should stay unchanged.
 
 ### The wrapper side: budget-capped, progress-aware requeue
 
