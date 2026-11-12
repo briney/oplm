@@ -34,7 +34,8 @@ arm, and 0.011 loss and 0.015 to 0.02 P@L at equal learning rate.
 
 ## Runs
 
-- W&B project `oplm-mup-4M-nocanon`; decay-run IDs and Slurm jobs are in `results.csv`.
+- W&B project `oplm-mup-4M-nocanon`; decay-run IDs and Slurm jobs are in `results.csv`, and each arm's
+  resolved config is in `configs/`.
 - The 20k-step constant-LR parents of the no-Canon arms are W&B `ckp33jpc`, `87ljdyr6`, `k6rijgcn`
   and `3cdsir0o` (lr 0.0025 to 0.01), under `sweeps-nocanon/refine/runs/` on the cluster. The Canon
   arm's parent is `sweeps/refine-nogate/runs/170M-lr0.0063-om1-a0-s42`.

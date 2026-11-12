@@ -1,0 +1,10 @@
+arm,wandb_run,job_id,commit,config,step,optimizer,lr,scheduler,eval/uniref70/loss
+lr0.0016-60k,f8hlwbio,32700,6e8b277,configs/lr0.0016-60k.yaml,60000,muon,0.0016,wsd_linear,2.0355
+lr0.004-60k,587aug1l,32174,6e8b277,configs/lr0.004-60k.yaml,60000,muon,0.004,wsd_linear,2.0256
+lr0.0063-60k,snzzi955,32172,6e8b277,configs/lr0.0063-60k.yaml,60000,muon,0.0063,wsd_linear,2.0265
+lr0.0016-120k,saiagmed,32701,6e8b277,configs/lr0.0016-120k.yaml,120000,muon,0.0016,wsd_linear,1.9974
+lr0.004-120k,23rlo2in,32176,6e8b277,configs/lr0.004-120k.yaml,120000,muon,0.004,wsd_linear,1.991
+lr0.0063-120k,qglrqwq3,32175,6e8b277,configs/lr0.0063-120k.yaml,120000,muon,0.0063,wsd_linear,1.9927
+lr0.0016-300k,0jqwzmb9,32228,6e8b277,configs/lr0.0016-300k.yaml,300000,muon,0.0016,wsd_linear,1.9537
+lr0.004-300k,llgj0oc0,31689,6e8b277,configs/lr0.004-300k.yaml,300000,muon,0.004,wsd_linear,1.9516
+lr0.0063-300k,204h4fcq,31688,6e8b277,configs/lr0.0063-300k.yaml,300000,muon,0.0063,wsd_linear,1.9549

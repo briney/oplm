@@ -14,7 +14,8 @@ history. Git history is the history.
   - [evaluation.md](evaluation.md)
   - [fold.md](fold.md)
 - **Evidence records** live in `evidence/<slug>/`, one directory per decision: a `README.md`, a
-  `results.csv`, and a `curves.csv` only when the figure is a curve.
+  `results.csv`, a `configs/` directory with each arm's resolved config, and a `curves.csv` only
+  when the figure is a curve.
 
 ## Rules
 
@@ -73,7 +74,7 @@ Anything unmatched between arms, anything measured at a proxy scale, anything no
 | `wandb_run` | W&B run ID (the 8-character ID, not the display name). |
 | `job_id` | Slurm job ID, empty if none. |
 | `commit` | Commit the run was launched from. |
-| `config` | Config file path at that commit, plus any overrides. |
+| `config` | `configs/<arm>.yaml`: the run's resolved config (`output/config.yaml` from the run directory), committed next to the CSV. |
 | `step` | Step the metrics were read at. |
 
 Metric columns use the W&B metric name where the number was read from W&B, and a descriptive

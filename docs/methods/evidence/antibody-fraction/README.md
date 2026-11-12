@@ -58,8 +58,8 @@ Every held-out loss is within 0.003 of the control. `results.csv` also has the s
 
 ## Runs
 
-- W&B IDs and Slurm jobs are in `results.csv`. Each arm's config and sbatch are in its `config`
-  directory on the cluster.
+- W&B IDs and Slurm jobs are in `results.csv`; each arm's resolved config is in `configs/`. Run
+  directories are under `~/projects/oplm/mup_redo/runs/overfit-1of35/` on the cluster.
 - The control's CDR3 numbers come from a standalone 1-GPU eval of its step-175k checkpoint (job
   35558), because the eval did not exist when the control ran. The eval is deterministic.
 - Seen/unseen numbers come from jobs 35786 and 35899, using
