@@ -81,7 +81,10 @@ instead of copying the files.
 | `step` | Step the metrics were read at. |
 
 Metric columns use the W&B metric name where the number was read from W&B, and a descriptive
-name otherwise (the record says which). `curves.csv` is long format: `arm`, `wandb_run`, `step`,
+name otherwise (the record says which). A record may add another CSV for results that are not training runs (an eval-only sweep, say);
+its README names the file and its columns.
+
+`curves.csv` is long format: `arm`, `wandb_run`, `step`,
 `metric`, `value`, downsampled to what a figure needs.
 
 ## Status of a row
