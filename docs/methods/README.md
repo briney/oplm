@@ -66,6 +66,9 @@ Anything unmatched between arms, anything measured at a proxy scale, anything no
 
 ## CSV conventions
 
+A record that reuses another record's runs points its `config` column at that record's `configs/`
+instead of copying the files.
+
 `results.csv` has one row per run, with these columns first and the metrics after them:
 
 | Column | Content |

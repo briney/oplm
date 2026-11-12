@@ -1,0 +1,5 @@
+arm,wandb_run,job_id,commit,config,step,phase,size,lr,output_mult,depth_lr_exponent,seed,residual_gate,weight_decay_to_init,eval/uniref70/loss
+refine-nogate-170M-lr0.0063-om1-a0-s42,4zr0z48v,,6e8b277,../base-lr-funnel/configs/refine-nogate-170M-lr0.0063-om1-a0-s42.yaml,20000,refine-nogate,170M,0.0063,1,0,42,none,0.01,2.1262
+refine-nogate-decay-170M-lr0.0063-om1-a0-s42,0u7rl2mu,,6e8b277,../base-lr-funnel/configs/refine-nogate-decay-170M-lr0.0063-om1-a0-s42.yaml,24000,refine-nogate-decay,170M,0.0063,1,0,42,none,0.01,2.079
+refine-nogate-wdi0.1-170M-lr0.0063-om1-a0-s42,8jqgod3y,,6e8b277,../base-lr-funnel/configs/refine-nogate-wdi0.1-170M-lr0.0063-om1-a0-s42.yaml,20000,refine-nogate-wdi0.1,170M,0.0063,1,0,42,none,0.1,2.1267
+refine-nogate-wdi0.1-decay-170M-lr0.0063-om1-a0-s42,i1r5uu75,,6e8b277,../base-lr-funnel/configs/refine-nogate-wdi0.1-decay-170M-lr0.0063-om1-a0-s42.yaml,24000,refine-nogate-wdi0.1-decay,170M,0.0063,1,0,42,none,0.1,2.0794
