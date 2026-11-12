@@ -20,6 +20,7 @@ import functools
 from typing import TYPE_CHECKING, Literal
 
 import torch
+from torch._dynamo.exc import FailOnRecompileLimitHit
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
@@ -64,10 +65,21 @@ def _flex(
     score_mod: Callable[..., Tensor] | None,
     block_mask: BlockMask | None,
 ) -> Tensor:
-    fn = _compiled_flex() if q.is_cuda else flex_attention  # CPU: eager, forward-only use
-    return fn(  # ty: ignore[invalid-return-type]  # typed Tensor | tuple; return_lse never requested
-        q, k, v, score_mod=score_mod, block_mask=block_mask
-    )
+    if not q.is_cuda:  # CPU: eager, forward-only use
+        return flex_attention(  # ty: ignore[invalid-return-type]  # return_lse never requested
+            q, k, v, score_mod=score_mod, block_mask=block_mask
+        )
+    if torch.compiler.is_compiling():  # traced into an outer compiled graph: no cache to manage
+        return _compiled_flex()(q, k, v, score_mod=score_mod, block_mask=block_mask)
+    # Each new shape is one more static compile (dynamic shapes cost 2-5x in kernel time). Past
+    # dynamo's recompile limit flex would silently run eagerly and materialize full score
+    # matrices (#107), so hitting the limit raises here instead and starts a fresh compile cache.
+    with torch._dynamo.config.patch(fail_on_recompile_limit_hit=True):
+        try:
+            return _compiled_flex()(q, k, v, score_mod=score_mod, block_mask=block_mask)
+        except FailOnRecompileLimitHit:
+            torch._dynamo.reset()  # also drops other compiled code; it recompiles on next use
+            return _compiled_flex()(q, k, v, score_mod=score_mod, block_mask=block_mask)
 
 
 def pair_bias_block_mask(key_mask: Tensor, n_queries: int | None = None) -> BlockMask:
@@ -126,11 +138,12 @@ def sliding_window_block_mask(valid: Tensor, half_window: int, block: int = 128)
 
 
 def ensure_flex_recompile_limit(limit: int = 64) -> None:
-    """Raise dynamo's recompile limit so bucketed shapes never fall back to eager flex.
+    """Raise dynamo's recompile limit: how many flex shapes compile before a cache reset.
 
-    `_compiled_flex` uses `dynamic=False`; each new `(B, N, dtype)` compiles once. Past
-    the limit dynamo silently runs the eager kernel, which materialises the full score
-    matrix (docs/FOLD.md §3). Only ever raises the limit.
+    `_compiled_flex` uses `dynamic=False`; each new `(B, N, dtype)` compiles once. When the
+    limit is hit, `_flex` resets dynamo and compiles afresh instead of letting flex fall back
+    to the eager kernel, which materialises the full score matrix (docs/FOLD.md §3, #107).
+    Only ever raises the limit.
     """
     from torch import _dynamo
 

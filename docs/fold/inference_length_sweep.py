@@ -98,8 +98,8 @@ def run_case(
         "steps": steps,
         "pair_unit_gib": pad * pad * cfg.pair_width * 2 / GIB,
     }
-    # Each case compiles new FlexAttention shapes; past dynamo's recompile limit flex silently
-    # runs eagerly with full score matrices, so start every case like a fresh process.
+    # Each case compiles new FlexAttention shapes; start every case like a fresh process so no
+    # case pays for (or benefits from) another's compile cache.
     torch._dynamo.reset()
     try:
         seq = "".join(AMINO[i] for i in torch.randint(0, len(AMINO), (length,)).tolist())

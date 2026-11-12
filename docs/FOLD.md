@@ -107,12 +107,14 @@ belong to the owning pair block (milestone 1), as upstream.
 formulation on CPU; FlexAttention has no CPU backward. Q/K/V dtypes are never
 changed by these functions. Gradient parity (incl. the bias) is a slow GPU test.
 
-**M1 entry criterion.** `_compiled_flex` uses `torch.compile(..., dynamic=False)` and both
-functions rebuild their `BlockMask` per call. Every new `(B, N, dtype)` recompiles, and past
-dynamo's recompile limit flex silently falls back to eager, which materializes the full
-score matrix. Before `AttentionPairBias`/atom attention call these in a training loop, M1
-must bucket shapes (crops are multiples of 128), accept a precomputed `BlockMask`, and raise
-`torch._dynamo.config.recompile_limit` as needed.
+**Compilation and shapes.** `_compiled_flex` uses `torch.compile(..., dynamic=False)`, so every
+new `(B, N, dtype)` compiles once (about a second on a B200). A dynamic-shape graph would compile
+once but runs 2–4× slower forward and 2.5–5× slower forward+backward (B200, token and atom shapes
+from 384 to 32768). Past dynamo's recompile limit (`ensure_flex_recompile_limit`: 64) flex would
+silently run eagerly and materialize the full score matrix, so `_flex` makes hitting the limit
+raise and then resets dynamo and compiles afresh (#107). A long-lived process (prediction server,
+`oplm fold eval` over many lengths) therefore recompiles shapes it saw before a reset, but never
+falls back. Tokens pad to multiples of 128 and callers pass precomputed `BlockMask`s.
 
 ## 4. Training seam and EMA
 
@@ -697,9 +699,8 @@ against the upstream fixtures. The knobs:
 - `oplm fold predict` / `eval` default `PYTORCH_CUDA_ALLOC_CONF` to `expandable_segments:True`
   unless it is set (`oplm.fold.predict.prefer_expandable_segments`).
 
-Open work is on the board: the fused trimul's transient (#101), FlexAttention's eager fallback past
-dynamo's recompile limit (#107) and multi-GPU inference, milestone 6, Fold-CP (#105). Rerun the
-sweep after each change and replace the table above.
+Open work is on the board: the fused trimul's transient (#101) and multi-GPU inference, milestone
+6, Fold-CP (#105). Rerun the sweep after each change and replace the table above.
 
 **Why and what was ruled out.** The baseline (job 35762, `28c97ac`;
 [`fold/inference-memory/28c97ac-baseline.json`](fold/inference-memory/28c97ac-baseline.json))

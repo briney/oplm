@@ -282,3 +282,34 @@ def test_sliding_window_flex_matches_dense_across_blocks_on_cpu() -> None:
             rtol=1e-4,
             atol=1e-4,
         )
+
+
+@pytest.mark.slow
+@_requires_cuda
+def test_flex_stays_compiled_past_the_recompile_limit_on_gpu() -> None:
+    """A long-lived process sees many lengths; flex must never fall back to eager (#107).
+
+    Past dynamo's recompile limit an uncompiled flex_attention materializes the full score
+    matrix; 72 distinct (batch, length) shapes per attention kind exceed the limit of 64.
+    """
+    import warnings
+
+    torch._dynamo.reset()
+    # the production limit; config.patch, not monkeypatch, whose undo hides torch config entries
+    with (
+        torch._dynamo.config.patch(recompile_limit=64),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        for b in (1, 2, 3):
+            for n in range(64, 64 + 24 * 32, 32):
+                q, k, v = (
+                    torch.randn(b, 2, n, 16, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+                )
+                mask = torch.ones(b, n, dtype=torch.bool, device="cuda")
+                mask[:, n - 5 :] = False
+                bias = torch.randn(b, 2, n, n, device="cuda")
+                pair_biased_attention(q, k, v, bias, mask, backend="flex")
+                sliding_window_attention(q, k, v, mask, 8, backend="flex")
+    eager = [w for w in caught if "without torch.compile" in str(w.message)]
+    assert not eager, f"flex fell back to eager: {eager[0].message}"
