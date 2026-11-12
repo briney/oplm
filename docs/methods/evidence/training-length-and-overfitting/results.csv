@@ -1,0 +1,9 @@
+arm,wandb_run,job_id,commit,config,step,optimizer,lr,scheduler,eval/cameo/precision_at_L,eval/casp/precision_at_L,eval/deepclust70_gte2/loss,eval/deepclust70_singletons/loss,eval/deepclust70_train/loss,eval/pdb40/precision_at_L,eval/pdb40_2048/precision_at_L,eval/uniref70_gte2/loss,eval/uniref70_singletons/loss,eval/uniref70_train_gte2/loss,eval/uniref70_train_singletons/loss
+oplm-stable252k,taqdsivi,34637,628d7bf,../oplm-vs-esmc-recipe/configs/oplm-stable252k.yaml,252000,muon,0.003,wsd_linear,0.3904,0.298,2.1233,2.217,1.9764,0.3671,0.3615,2.1056,2.1109,1.7911,1.9462
+esmc-stable252k,u9bc9lg9,35293,628d7bf,../oplm-vs-esmc-recipe/configs/esmc-stable252k.yaml,252000,adamw,0.0004,wsd_linear,0.3181,0.2632,2.1369,2.2257,1.9901,0.2972,0.2945,2.1189,2.124,1.8023,1.9539
+oplm-decay56k,nae95209,35393,628d7bf,../oplm-vs-esmc-recipe/configs/oplm-decay56k.yaml,70000,muon,0.003,wsd_linear,0.3745,0.3037,2.1125,2.2217,1.9695,0.3556,0.3463,2.0839,2.0896,1.7495,1.9056
+esmc-decay56k,ul3kiw2x,35386,628d7bf,../oplm-vs-esmc-recipe/configs/esmc-decay56k.yaml,70000,adamw,0.0004,wsd_linear,0.2889,0.2486,2.1517,2.2494,2.0125,0.2768,0.2687,2.1339,2.1338,1.8286,1.9679
+oplm-decay140k,01wo8hzi,35090,628d7bf,../oplm-vs-esmc-recipe/configs/oplm-decay140k.yaml,175000,muon,0.003,wsd_linear,0.4009,0.3267,2.0822,2.1988,1.9307,0.3754,0.3734,2.0364,2.0477,1.6667,1.8347
+esmc-decay140k,0arqlr7f,35389,628d7bf,../oplm-vs-esmc-recipe/configs/esmc-decay140k.yaml,175000,adamw,0.0004,wsd_linear,0.3172,0.2619,2.1218,2.2301,1.9736,0.2984,0.2935,2.0916,2.0974,1.7493,1.9008
+oplm-decay252k,pmqwbveg,35277,628d7bf,../oplm-vs-esmc-recipe/configs/oplm-decay252k.yaml,315000,muon,0.003,wsd_linear,0.4177,0.337,2.0628,2.1845,1.9041,0.3959,0.3905,2.0076,2.0233,1.6178,1.793
+esmc-decay252k,0mmudfjj,35401,628d7bf,../oplm-vs-esmc-recipe/configs/esmc-decay252k.yaml,315000,adamw,0.0004,wsd_linear,0.3248,0.2755,2.1049,2.2167,1.9524,0.3092,0.3026,2.0684,2.0775,1.7029,1.8634

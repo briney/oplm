@@ -17,4 +17,4 @@ How the learning rate was tuned: [../mup-lr.md](../mup-lr.md). Defaults are in
 | Decay toward init for gains, gates and biases | `train.weight_decay_to_init` | [weight-decay-to-init](evidence/weight-decay-to-init/README.md) |
 | Warmup, stable, linear decay schedule | `train.scheduler` | [decay-shape](evidence/decay-shape/README.md) |
 | Tokens per optimizer step | `train.tokens_per_step` | to backfill |
-| Stable and decay phase lengths | `train.stable_steps`, `train.max_steps` | to backfill (#70) |
+| Stable and decay phase lengths | `train.stable_steps`, `train.max_steps` | [training-length-and-overfitting](evidence/training-length-and-overfitting/README.md) (the lengths themselves are pending #70) |
