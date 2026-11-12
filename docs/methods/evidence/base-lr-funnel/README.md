@@ -62,3 +62,6 @@ Output multiplier, 170M seed 42 after the decay:
 - **Output multiplier 2 is ahead of 1 by up to 0.002** at all three learning rates. That is about
   the seed range at multiplier 1 (0.0016), and it was not replicated across seeds.
 - **The 800M check is short** (12k steps, one seed) and does not separate 0.0063 from 0.01.
+- **The depth LR correction was never switched off.** The 800M cells (40 layers against 24) all
+  ran with exponent 0.5, so they show the corrected learning rate transfers, not what happens
+  without the correction.

@@ -1,0 +1,5 @@
+arm,wandb_run,job_id,commit,config,step,adamw_lr_mult,eval/uniref70/loss,eval/deepclust70_gte2/loss,eval/deepclust70_singletons/loss,eval/omg70/loss,eval/casp14/precision_at_L
+div3,9hhksv5t,26574,6c27348,configs/div3.yaml,80000,0.33,2.0764,2.0983,2.1628,2.244,0.1434
+div10,qvxvz1sk,26575,6c27348,configs/div10.yaml,80000,0.1,2.073,2.0972,2.1626,2.244,0.1227
+div3-800k,q3jomyyb,26636,6c27348,configs/div3.yaml,800000,0.33,1.9982,2.033,2.1176,2.1975,0.1545
+div10-800k,0zoa8yn6,26637,6c27348,configs/div10.yaml,800000,0.1,1.9999,2.0381,2.1209,2.2008,0.1453
