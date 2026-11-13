@@ -22,7 +22,7 @@ class.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch.utils.data import DataLoader
@@ -229,12 +229,16 @@ def _build_dataloader(
     must then stay False.
     """
     num_workers = cfg.data.num_workers
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=cfg.data.pin_memory,
-        prefetch_factor=cfg.data.prefetch_factor if num_workers > 0 else None,
-        drop_last=drop_last,
+    # The collator turns row dicts into tensor batches, which the dataset's type can't express.
+    return cast(
+        "DataLoader[dict[str, Tensor]]",
+        DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=cfg.data.pin_memory,
+            prefetch_factor=cfg.data.prefetch_factor if num_workers > 0 else None,
+            drop_last=drop_last,
+        ),
     )
