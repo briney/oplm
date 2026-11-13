@@ -46,9 +46,8 @@ class SequenceEvalTask(EvalTask["OplmForMaskedLM"]):
 
         The DataLoader is lazily initialized on the first call to avoid
         loading eval data before training starts and to ensure the
-        accelerator is fully set up. ``build_sequence_eval_dataloader`` returns
-        a resetting loader that rewinds its deterministic collator on every
-        ``__iter__``, so no manual reset is needed between passes.
+        accelerator is fully set up. The loader's deterministic collator seeds each
+        sequence's mask from the sequence itself, so every pass masks identically.
 
         Args:
             model: The unwrapped model (already in eval mode).

@@ -6,13 +6,15 @@ replacement on top, supporting optional per-residue weighted masking.
 
 The masking scheme (docs/data.md, Masking) is **dynamic** (RoBERTa-style):
 masks are drawn fresh each call, so the same sequence is masked differently across
-epochs. Evaluation freezes them via ``deterministic=True`` — a per-batch seeded
-generator, *not* a separate collator class (docs/data.md, Deterministic eval masking). All token-id
-constants are derived from the tokenizer (``data/tokenizer.py``), never hardcoded.
+epochs. Evaluation freezes them via ``deterministic=True`` — a generator per row, seeded
+from the sequence, *not* a separate collator class (docs/data.md, Deterministic eval
+masking). All token-id constants are derived from the tokenizer (``data/tokenizer.py``),
+never hardcoded.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -195,9 +197,10 @@ class MLMCollator:
     masked token's replacement (``<mask>`` / random canonical AA / keep original).
     Uniform masking is the equal-weights special case of the same code path.
 
-    Masking is dynamic by default (fresh each call). With ``deterministic=True`` a
-    per-batch generator seeded by ``seed + batch_index`` makes a given batch index
-    reproducible without disturbing the global RNG — the evaluation policy.
+    Masking is dynamic by default (fresh each call). With ``deterministic=True`` each
+    row gets its own generator seeded from ``seed`` and the row's sequence, so a
+    sequence's mask doesn't depend on which batch, worker or GPU it lands in, and the
+    global RNG is left alone — the evaluation policy.
 
     Args:
         tokenizer: The canonical :class:`~oplm.model.OplmTokenizerFast`.
@@ -208,8 +211,8 @@ class MLMCollator:
             canonical amino acid. The remainder keep their original id.
         weighted_masking: Honor each row's ``masking_weights`` to bias selection.
             When ``False`` the column is ignored and masking is uniform.
-        deterministic: Freeze masks per batch index (evaluation policy).
-        seed: Base seed for the deterministic per-batch generator.
+        deterministic: Freeze each sequence's mask (evaluation policy).
+        seed: Base seed for the deterministic per-row generators.
         pad_to_multiple_of: Forwarded to :func:`tokenize_and_pad`. When set, the
             sequence axis is padded to the smallest multiple of this value ≥ the
             batch's longest member. ``None`` (default) pads to exactly the batch's
@@ -276,7 +279,6 @@ class MLMCollator:
         self._canonical_ids = canonical_amino_acid_ids(tokenizer)  # (20,) long
         self._non_maskable = torch.tensor(sorted(non_maskable_ids(tokenizer)), dtype=torch.long)
 
-        self._batch_idx = 0
         self._warned_missing_weights = False
 
     def __call__(
@@ -287,7 +289,7 @@ class MLMCollator:
         Also carries ``"sequence_ids"`` (a plain ``list[str]``, not collated into a
         tensor) when ``keep_sequence_ids=True``.
         """
-        generator = self._next_generator()
+        generators = self._row_generators(batch)
 
         raw_weights = self._collect_weights(batch) if self._weighted_masking else None
         encoded = tokenize_and_pad(
@@ -312,7 +314,7 @@ class MLMCollator:
             weights = torch.ones_like(input_ids, dtype=torch.float32)
         weights = weights.masked_fill(~eligible, 0.0)
 
-        self._mask_batch(input_ids, labels, eligible, weights, generator)
+        self._mask_batch(input_ids, labels, eligible, weights, generators, attention_mask)
         out: dict[str, Tensor | list[str] | int] = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -394,34 +396,23 @@ class MLMCollator:
         """
         return [_sequence_id_of(item) for item in batch]
 
-    def reset_batch_index(self) -> None:
-        """Reset the per-batch counter so the next call is batch index 0 again.
+    def _row_generators(
+        self, batch: Sequence[Mapping[str, object] | str]
+    ) -> list[torch.Generator] | None:
+        """One generator per row in deterministic mode, seeded from ``seed`` and the sequence.
 
-        Only meaningful under ``deterministic=True``, where the per-batch RNG is
-        seeded by ``seed + batch_index`` (docs/data.md,
-        Deterministic eval masking): resetting before a fresh pass
-        makes that pass reproduce the previous one exactly (identical masks),
-        which is what makes MLM-eval metrics comparable across training steps. The
-        sequence-eval dataloader calls this at the start of each iteration. The
-        one-time missing-weights warning flag is intentionally left untouched so
-        the warning does not re-fire every pass.
+        Dynamic mode returns ``None`` so sampling falls through to the global RNG and masks
+        stay fresh.
         """
-        self._batch_idx = 0
-
-    def _next_generator(self) -> torch.Generator | None:
-        """Return this call's RNG and advance the batch counter.
-
-        Deterministic mode returns a dedicated generator seeded by
-        ``seed + batch_index`` (global RNG untouched). Dynamic mode returns
-        ``None`` so sampling falls through to the global RNG and masks stay fresh.
-        """
-        if self._deterministic:
+        if not self._deterministic:
+            return None
+        generators = []
+        for item in batch:
+            key = f"{self._seed}:{_sequence_of(item)}".encode()
             generator = torch.Generator()
-            generator.manual_seed(self._seed + self._batch_idx)
-        else:
-            generator = None
-        self._batch_idx += 1
-        return generator
+            generator.manual_seed(int.from_bytes(hashlib.blake2b(key, digest_size=8).digest()))
+            generators.append(generator)
+        return generators
 
     def _collect_weights(
         self, batch: Sequence[Mapping[str, object] | str]
@@ -460,16 +451,24 @@ class MLMCollator:
         labels: Tensor,
         eligible: Tensor,
         weights: Tensor,
-        generator: torch.Generator | None,
+        generators: list[torch.Generator] | None,
+        attention_mask: Tensor,
     ) -> None:
         """Select and replace masked positions in place, row by row.
 
         Selection is Gumbel-top-k: ``key = log(weight) + gumbel`` and the top
         ``k_b`` keys are masked. ``k_b`` is clamped to the count of positive-weight
         eligible positions, so uniform masking (all weights 1) is the special case.
+        With per-row ``generators``, each row draws only over its own real tokens, so
+        its mask doesn't depend on the batch's padded width.
         """
         # Gumbel noise g = -log(-log(u)), u ~ Uniform(0, 1). (B, T)
-        u = torch.rand(input_ids.shape, generator=generator)
+        if generators is None:
+            u = torch.rand(input_ids.shape)
+        else:
+            u = torch.full(input_ids.shape, 0.5)  # padding: weight 0, never selected
+            for b, n in enumerate(attention_mask.sum(dim=1).tolist()):
+                u[b, :n] = torch.rand(n, generator=generators[b])
         gumbel = -torch.log(-torch.log(u))
         # key = log(w) + g; force -inf where weight == 0 (zero-weight + non-eligible)
         # so those positions are never in the top-k (and so NaNs from -inf+inf die).
@@ -487,7 +486,7 @@ class MLMCollator:
                 continue
             masked_idx = torch.topk(key[b], k_b).indices  # (k_b,)
             labels[b, masked_idx] = input_ids[b, masked_idx]
-            self._replace(input_ids, b, masked_idx, generator)
+            self._replace(input_ids, b, masked_idx, None if generators is None else generators[b])
 
     def _replace(
         self,
