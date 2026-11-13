@@ -1,0 +1,10 @@
+# Rebuilt from the eval venv's *.dist-info (job 36179's freeze step wrote nothing; see b200-m2c-eval.sbatch fix)
+accelerate==1.15.0
+cuequivariance==0.13.0
+cuequivariance_ops_cu13==0.13.0
+cuequivariance_ops_torch_cu13==0.13.0
+cuequivariance_torch==0.13.0
+esm==3.4.1.post1
+oplm==0.4.1.dev361+g7150334  # git+https://github.com/briney/oplm@fold-m2c-runs (7150334)
+torch==2.11.0
+transformers==4.57.6

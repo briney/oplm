@@ -52,8 +52,9 @@ python -m uv venv --allow-existing --seed --python 3.12 "$VENV"
 python -m uv pip install --quiet --python "$VENV/bin/python" \
   "oplm[train,fold,esmc] @ git+https://github.com/briney/oplm@$GIT_REF"
 python -m uv pip check --python "$VENV/bin/python" || { echo "install broken" >> "$RESULTS/status.txt"; exit 1; }
+# Before activating: the venv's own python has no uv module.
+python -m uv pip freeze --python "$VENV/bin/python" | grep -i -E '^(oplm|esm|torch|transformers|accelerate|cuequivariance)' > "$RESULTS/pip-freeze.txt"
 source "$VENV/bin/activate"
-python -m uv pip freeze | grep -i -E '^(oplm|esm|torch|transformers|accelerate|cuequivariance)' > "$RESULTS/pip-freeze.txt"
 nvidia-smi > "$RESULTS/nvidia-smi.txt" 2>&1 || true
 
 jobs=()

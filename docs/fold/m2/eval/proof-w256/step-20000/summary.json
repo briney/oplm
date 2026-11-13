@@ -1,0 +1,93 @@
+{
+ "model": "/mnt/data/briney/oplm-runs/fold-m2c/proof-w256/checkpoint-20000/hf_ema",
+ "weights": "ema",
+ "lm": "esmc:esmc_600m",
+ "data": "/mnt/data/briney/oplm-data/hf/wwpdb/2026-10-12",
+ "sampling": {
+  "num_loops": null,
+  "num_steps": null,
+  "num_samples": 1,
+  "seed": 0
+ },
+ "resolved_sampling": {
+  "num_loops": 10,
+  "num_steps": 14
+ },
+ "device": "cuda",
+ "versions": {
+  "oplm": "0.4.1.dev361+g7150334",
+  "torch": "2.11.0+cu130"
+ },
+ "started": "2026-11-13T16:38:32+00:00",
+ "seconds": 1841.5601143559907,
+ "target_sets": {
+  "cameo": {
+   "coverage": {
+    "listed": 755,
+    "missing": [
+     "7don_B",
+     "7uw7_A",
+     "8ahp_A"
+    ],
+    "skipped": {
+     "7dt1_A": "length 1047 > max_length 1024",
+     "7f60_D": "length 1817 > max_length 1024",
+     "7nit_D": "length 1304 > max_length 1024",
+     "7nsn_A": "length 1411 > max_length 1024",
+     "7os0_A": "length 1304 > max_length 1024",
+     "7pyv_C": "length 1045 > max_length 1024",
+     "7v53_A": "length 1099 > max_length 1024"
+    },
+    "selected": 745
+   },
+   "metrics": {
+    "tm_score": 0.8208381952717523,
+    "lddt_ca": 0.8424300945346558,
+    "lddt": 0.7716523966592965,
+    "plddt": 0.8116266654641836,
+    "ptm": 0.767436488892808,
+    "targets": 745.0,
+    "failed": 0.0
+   }
+  },
+  "casp14": {
+   "coverage": {
+    "listed": 133,
+    "missing": [
+     "9a13",
+     "9a8v"
+    ],
+    "skipped": {
+     "6vr4_A": "length 2194 > max_length 1024",
+     "7zhj_Z": "length 1219 > max_length 1024",
+     "7zn2_B": "length 1219 > max_length 1024",
+     "7zqb_CA": "length 1219 > max_length 1024",
+     "7zqp_B": "length 1219 > max_length 1024",
+     "8hdz_A": "length 1029 > max_length 1024",
+     "8hg1_A": "length 1031 > max_length 1024",
+     "8hoy_A": "length 1029 > max_length 1024",
+     "8hpa_A": "length 1029 > max_length 1024",
+     "8j86_A": "length 1029 > max_length 1024",
+     "8j8f_A": "length 1029 > max_length 1024",
+     "8j8g_A": "length 1029 > max_length 1024",
+     "8q3r_C": "length 1033 > max_length 1024",
+     "9k9r_A": "length 1031 > max_length 1024",
+     "9k9s_A": "length 1031 > max_length 1024",
+     "9k9t_A": "length 1031 > max_length 1024",
+     "9k9u_A": "length 1031 > max_length 1024",
+     "9k9v_A": "length 1031 > max_length 1024"
+    },
+    "selected": 230
+   },
+   "metrics": {
+    "tm_score": 0.6107054011816057,
+    "lddt_ca": 0.6682775585494515,
+    "lddt": 0.6017914832326255,
+    "plddt": 0.6670656973901002,
+    "ptm": 0.5653307778517838,
+    "targets": 230.0,
+    "failed": 0.0
+   }
+  }
+ }
+}
