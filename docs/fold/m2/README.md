@@ -191,3 +191,120 @@ Both settings are in [`configs/fold/proof-w128.yaml`](../../../configs/fold/proo
 [`proof-w256.yaml`](../../../configs/fold/proof-w256.yaml).
 `tests/fold/test_cli.py::test_proof_configs_load` checks that each config gives a global batch of
 128 on 8 devices.
+
+## Milestone 2c: proof runs and the width decision
+
+**Stopped early.** Both runs were cancelled at 17:12 UTC on 2026-11-13, short of the planned
+50k steps: w128 at step 34,200 and w256 at step 21,560. By then the width question was answered
+on the held-out sets at matched steps (below), and the M2c checkpoints do not carry into
+milestone 3: M3 retrains the head on an OPLM checkpoint, whose embeddings the ESM-C-trained LM
+projection cannot reuse. Finishing would have cost about 2,000 more GPU-hours (w256 needed
+another 47 h on 32 B200s) to measure only how the gap moves between 20k and 50k. Two plan steps
+change as a result, and both are recorded where they apply below: the acceptance comparisons use
+step 20000 instead of 50000, and the width choice puts accuracy first (the plan's rule required a
+lower confidence bound above 0.01 to pay for w256's extra cost; it clears that bound anyway).
+
+### The runs
+
+| | w128 | w256 |
+|---|---|---|
+| job | 35927 | 35928 |
+| W&B | [w8rh1p70](https://wandb.ai/thebrineylab/oplm-fold/runs/w8rh1p70) | [x9fr8xv2](https://wandb.ai/thebrineylab/oplm-fold/runs/x9fr8xv2) |
+| hardware | 4 nodes × 8 B200, DDP, global batch 128 | same |
+| wall time | 36.1 h (2026-11-12 05:06 → 2026-11-13 17:12 UTC) | 36.1 h |
+| last step | 34,200 | 21,560 |
+| step time | 3.78 s | 5.98 s (1.58× w128) |
+| requeues | 1 (forced drain at step 4432) | 1 (forced drain at step 2880) |
+
+Code: tag `fold-m2c-runs` = 7150334. Launch evidence and the forced resumes are in
+[`runs/`](runs/). The resumes were forced with SIGTERM sent to the ranks, because
+`scancel --signal=USR1` did not reach them on this cluster (#113, fixed after launch by PR #114).
+Steps ran about 40 % slower than the config estimates (2.7 s and 4.3 s); data wait was near zero.
+
+### Offline evaluation
+
+Job 36179 on `slurm-b200-192-027`, 35 min, one checkpoint per GPU, EMA weights, one sample,
+default sampling (10 loops, 14 steps), seed 0. Versions in [`eval/pip-freeze.txt`](eval/pip-freeze.txt);
+per-target rows and summaries in [`eval/`](eval/). Every evaluation exited 0
+([`eval/status.txt`](eval/status.txt)), with no failed targets. CAMEO scores 745 chains (7 longer
+than 1024 residues skipped, 3 listed chains absent from the snapshot), CASP14 230.
+
+| run | step | set | TM | lDDT-CA | lDDT | pLDDT | pTM |
+|---|---|---|---|---|---|---|---|
+| w128 | 10000 | cameo | 0.790 | 0.803 | 0.727 | 0.754 | 0.713 |
+| w128 | 10000 | casp14 | 0.575 | 0.632 | 0.566 | 0.595 | 0.495 |
+| w128 | 20000 | cameo | 0.806 | 0.823 | 0.749 | 0.786 | 0.742 |
+| w128 | 20000 | casp14 | 0.590 | 0.650 | 0.582 | 0.624 | 0.511 |
+| w128 | 30000 | cameo | 0.809 | 0.828 | 0.755 | 0.797 | 0.750 |
+| w128 | 30000 | casp14 | 0.580 | 0.648 | 0.581 | 0.632 | 0.511 |
+| w256 | 10000 | cameo | 0.808 | 0.827 | 0.755 | 0.795 | 0.753 |
+| w256 | 10000 | casp14 | 0.591 | 0.648 | 0.584 | 0.653 | 0.558 |
+| w256 | 20000 | cameo | 0.821 | 0.842 | 0.772 | 0.812 | 0.767 |
+| w256 | 20000 | casp14 | 0.611 | 0.668 | 0.602 | 0.667 | 0.565 |
+
+**Matched-step comparisons** (`oplm fold compare`, w256 − w128, paired over targets, bootstrap
+95 % CI, 10,000 resamples):
+
+| step | set | metric | n | Δ | 95 % CI | w256 better on |
+|---|---|---|---|---|---|---|
+| 10000 | pooled | TM | 975 | +0.017 | [0.013, 0.021] | 70 % |
+| 20000 | pooled | TM | 975 | **+0.016** | **[0.013, 0.020]** | 69 % |
+| 20000 | pooled | lDDT | 975 | +0.022 | [0.019, 0.024] | 78 % |
+| 20000 | cameo | TM | 745 | +0.015 | [0.011, 0.019] | 69 % |
+| 20000 | casp14 | TM | 230 | +0.020 | [0.012, 0.030] | 67 % |
+
+At matched compute w256 still wins: w128 at step 30000 (about the same GPU-hours as w256 at
+20000) trails w256 at 20000 by 0.016 TM pooled, CI [0.012, 0.020]. w128 gained nothing pooled
+from 20k to 30k (0.7550 → 0.7554).
+
+**In-training `valid` curves** (64 targets, [`eval/valid-curves.csv`](eval/valid-curves.csv)):
+
+| step | w128 TM / lDDT | w256 TM / lDDT |
+|---|---|---|
+| 10000 | 0.885 / 0.830 | 0.901 / 0.854 |
+| 20000 | 0.903 / 0.856 | 0.918 / 0.874 |
+| 30000 | 0.911 / 0.861 | — |
+
+w256 led at all ten matched `valid` evals from step 2000 to 20000 (+0.012 to +0.028 TM).
+
+### Acceptance
+
+1. **Held-out TM-score improves across checkpoints for both runs. Met, at 20k against 10k**
+   (plan: 50k against 10k). Every run × set CI lies above 0: w128 CAMEO +0.016 [0.012, 0.020],
+   CASP14 +0.015 [0.008, 0.022]; w256 CAMEO +0.013 [0.009, 0.017], CASP14 +0.020 [0.013, 0.027].
+   Non-monotone: w128's CASP14 mean fell from 0.590 at 20k to 0.580 at 30k.
+2. **Resume was exercised. Met** for both runs ([`runs/`](runs/)).
+3. **Width: 256.** The pooled step-20000 compare has `ci_low` = 0.0127, above the plan's 0.01
+   bar, so the preregistered rule also picks 256 (applied at 20k instead of 50k). The measured cost
+   ratio is 1.58× per optimizer step on 4 nodes (5.98 s against 3.78 s); the single-B200 table
+   above has 1.69× (17.31 s against 10.22 s).
+4. **Gates.** Width 256; global batch 128; 1000 warmup steps, linear decay to 0 at 50k.
+   **The effective peak LR was 3.33e-4, not the configured 1e-3.** The proof configs set
+   `lr: 1.0e-3` but inherit `adamw_lr_mult: 0.333` from `src/oplm/configs/train/base.yaml`, where
+   483e91a (2026-10-24, after these configs were written) put the MLM Muon recipe's AdamW
+   multiplier. Every fold parameter is on AdamW, so all of them trained at a third of the intended
+   LR (`train/lr` in W&B peaks at 3.33e-4; the runs' saved `config.yaml` shows the multiplier).
+   Both widths share it, so the comparison above is like for like, but spec §6.3's 1e-3 was never
+   tried, and the width gap could differ at that LR. Milestone 3 must set `adamw_lr_mult: 1.0` (as
+   `train/esm-c.yaml` does) and settle the LR before its long run. Training was otherwise stable:
+   the one loss spike (2.3× the local median, step 10,330) hit both runs on the same batch, since
+   they share the seed and data order, and both recovered by the next log. Mean `train/loss` per 4k
+   steps fell from 1.21 to 0.45 (w256 by 20k, w128 by 32k). Nothing in the curves argues for a
+   different global batch. Because the runs stopped early, the LR had decayed only to 1.9e-4
+   (w256) and 1.1e-4 (w128), so neither run shows what the low-LR end of the schedule adds.
+
+**Milestone 2 accepted 2026-11-13; pair width 256.**
+
+### Reproduce
+
+    # launch (Task 8), from a cluster checkout of the tag
+    git checkout fold-m2c-runs
+    oplm slurm generate --config $PWD/configs/fold/proof-w<W>.yaml --name fold-proof-w<W> --out ~/fold-m2c/jobs/w<W>
+    oplm slurm submit ~/fold-m2c/jobs/w<W>
+
+    # offline evaluation (Task 9): every checkpoint at a multiple of 10000
+    sbatch docs/fold/b200-m2c-eval.sbatch
+
+    # matched-step comparison
+    oplm fold compare docs/fold/m2/eval/proof-w128/step-20000 docs/fold/m2/eval/proof-w256/step-20000
+    oplm fold compare ... --target-set cameo      # or casp14; --metric lddt

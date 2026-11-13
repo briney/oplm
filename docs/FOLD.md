@@ -3,7 +3,7 @@
 Architecture contract for the folding head, in the role [`architecture.md`](architecture.md)
 plays for the language model. The agreed design is
 [`docs/superpowers/specs/2026-10-07-structure-prediction-head-design.md`](superpowers/specs/2026-10-07-structure-prediction-head-design.md);
-this file records what is implemented. **Status: milestone 2c (evaluation and proof runs) implemented, proof runs pending; milestone 2b (losses and training) accepted 2026-10-13 (measured on one B200; docs/fold/m2/); milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
+this file records what is implemented. **Status: milestone 2 (pipeline proof) accepted 2026-11-13: width 256 chosen (docs/fold/m2/); milestone 2b (losses and training) accepted 2026-10-13 (measured on one B200; docs/fold/m2/); milestone 2a (data) accepted 2026-10-12 (dataset published, tag `wwpdb-2026-10-12`); milestone 1 (inference port) accepted 2026-10-11.**
 Kernels, the model, prediction, the training data pipeline, the losses, the training step and the
 held-out evaluation package (`oplm.fold.eval`) exist (§7 holds the M1 acceptance evidence, §8 the
 data contract, §9 the losses and training, §10 the evaluation and the proof runs).
@@ -554,6 +554,16 @@ A resume is forced once per run with `scancel --signal=USR1 <jobid>` (`docs/slur
 `docs/fold/b200-m2c-eval.sbatch` then scores every permanent checkpoint's `hf_ema/` on CAMEO and
 CASP14. Results, the width decision and the reproduction commands are in
 [`docs/fold/m2/README.md`](fold/m2/README.md).
+
+**Results.** Both runs stopped early, on 2026-11-13: w128 at step 34,200 and w256 at 21,560. The
+width question was settled on the held-out sets at matched steps, and these ESM-C checkpoints do
+not carry into milestone 3. At step 20000, w256 scores TM 0.821 on CAMEO and 0.611 on CASP14;
+w128 scores 0.806 and 0.590. Pooled over 975 targets, w256 − w128 = +0.016 TM, 95 % CI
+[0.013, 0.020], which clears the plan's 0.01 bar. w256 also wins at matched compute (w128 at 30k).
+**Width 256 chosen.** Both runs trained at an effective peak LR of 3.33e-4, not 1e-3, because the
+configs inherit `adamw_lr_mult: 0.333` from the MLM base recipe (#119); milestone 3 must pin it to
+1.0. Details, acceptance evidence and the deviations from the plan are in
+[`docs/fold/m2/README.md`](fold/m2/README.md#milestone-2c-proof-runs-and-the-width-decision).
 
 ## 11. Structure eval sets (`oplm fold eval-sets`)
 
