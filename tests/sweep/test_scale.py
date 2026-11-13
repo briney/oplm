@@ -43,7 +43,7 @@ def _run_scale(confirm_phase: Path, out: Path, presets: str) -> None:
 def test_scale_writes_one_script_per_preset(confirm_phase: Path, tmp_path: Path) -> None:
     out = tmp_path / "scale"
     _run_scale(confirm_phase, out, "170M,400M")
-    for preset, nodes in (("170M", 4), ("400M", 8)):
+    for preset, nodes in (("170M", 8), ("400M", 8)):
         script = out / "jobs" / f"oplm-{preset}-scale.sbatch"
         assert script.exists()
         text = script.read_text()

@@ -64,14 +64,15 @@ def test_scaling_config_loads_the_fault_tolerance_knobs() -> None:
 
 
 def test_scaling_config_is_the_current_recipe() -> None:
-    """configs/scaling.yaml matches the 170M long run's recipe (W&B oplm-170M-long)."""
+    """configs/scaling.yaml matches the 170M mini-prod recipe (#121)."""
     cfg = load_config(["--config", str(_SCALING_CONFIG), "--preset", "170M"])
     assert cfg.train.tokens_per_step == 4_194_304
     assert cfg.data.pack_sequences is True
     assert cfg.model.max_position_embeddings == 2048
     assert cfg.model.residual_gate == "none"
     assert cfg.train.weight_decay_to_init == 0.1
-    assert cfg.train.lr == 0.0063
+    assert cfg.train.lr == 0.002
+    assert (cfg.train.stable_steps, cfg.train.max_steps) == (998_000, 1_200_000)
     assert cfg.model.packed_attention == "flex"
     assert cfg.train.mup_depth_lr_exponent == 0.5
 

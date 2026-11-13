@@ -5,9 +5,9 @@ monitor it, checkpoint it, resume it, and branch a decay off a published checkpo
 lives in `src/oplm/training/`.
 
 The recipe of record is [`configs/scaling.yaml`](../configs/scaling.yaml): token mode, a WSD
-schedule, packed sequences, auto-resume. It is the config behind the 170M long run, and this page
-points at it instead of copying its values. Its horizon, learning rate and data mix are
-still marked `PENDING` in the file, with the issue each waits on.
+schedule, packed sequences, auto-resume. It is set to the 170M mini-prod horizon (#121), and this
+page points at it instead of copying its values. The production horizon and learning rate are
+still marked `PENDING` in the file (#70).
 
 Related pages:
 
