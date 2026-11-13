@@ -265,21 +265,41 @@ def test_dynamic_masks_vary(tokenizer) -> None:
     assert len(seen) > 1  # masks are not frozen across calls
 
 
-def test_deterministic_identical_for_same_batch_index(tokenizer) -> None:
-    """Two deterministic collators yield identical masks for the same batch index."""
+def _row_masks(out: dict, n: int) -> list[tuple[list[int], list[int]]]:
+    """Each row's (input_ids, labels) over its real tokens, padding stripped."""
+    lengths = out["attention_mask"].sum(1).tolist()
+    return [
+        (out["input_ids"][i, : lengths[i]].tolist(), out["labels"][i, : lengths[i]].tolist())
+        for i in range(n)
+    ]
+
+
+def test_deterministic_mask_depends_only_on_the_sequence(tokenizer) -> None:
+    """A row's eval mask is the same whatever batch it lands in (#122).
+
+    Eval rows are striped over GPUs and DataLoader workers, so the batch a sequence
+    lands in, its position there and the batch's padded width all change with the
+    GPU count. None of them may change the mask.
+    """
+    kwargs = dict(max_length=_MAX_LENGTH, deterministic=True, seed=7)
+    whole = MLMCollator(tokenizer, **kwargs)(_batch(_SEQUENCES))
+    expected = _row_masks(whole, len(_SEQUENCES))
+
+    split = MLMCollator(tokenizer, **kwargs)  # one collator, several calls (a worker)
+    singles = [_row_masks(split(_batch([seq])), 1)[0] for seq in _SEQUENCES]
+    assert singles == expected
+
+    reversed_out = MLMCollator(tokenizer, **kwargs, pad_to_multiple_of=8)(
+        _batch(_SEQUENCES[::-1])
+    )
+    assert _row_masks(reversed_out, len(_SEQUENCES))[::-1] == expected
+
+
+def test_deterministic_mask_changes_with_seed(tokenizer) -> None:
+    """The seed still picks the masks: two seeds mask the same batch differently."""
     a = MLMCollator(tokenizer, max_length=_MAX_LENGTH, deterministic=True, seed=7)
-    b = MLMCollator(tokenizer, max_length=_MAX_LENGTH, deterministic=True, seed=7)
-    out_a, out_b = a(_batch(_SEQUENCES)), b(_batch(_SEQUENCES))
-    assert torch.equal(out_a["input_ids"], out_b["input_ids"])
-    assert torch.equal(out_a["labels"], out_b["labels"])
-
-
-def test_deterministic_advances_with_batch_index(tokenizer) -> None:
-    """Successive deterministic calls differ (batch index advances the seed)."""
-    collator = MLMCollator(tokenizer, max_length=_MAX_LENGTH, deterministic=True, seed=7)
-    first = collator(_batch(_SEQUENCES))
-    second = collator(_batch(_SEQUENCES))
-    assert not torch.equal(first["input_ids"], second["input_ids"])
+    b = MLMCollator(tokenizer, max_length=_MAX_LENGTH, deterministic=True, seed=8)
+    assert not torch.equal(a(_batch(_SEQUENCES))["labels"], b(_batch(_SEQUENCES))["labels"])
 
 
 def test_deterministic_leaves_global_rng_untouched(tokenizer) -> None:

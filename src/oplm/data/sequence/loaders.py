@@ -22,7 +22,7 @@ class.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch.utils.data import DataLoader
@@ -175,9 +175,10 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
     """Build a deterministic sequence-evaluation dataloader for one parquet path.
 
     Applies the **evaluation policy**: shard/row shuffling disabled and masking
-    frozen via ``deterministic=True`` so repeated passes yield byte-identical
-    batches. Masking probabilities and DataLoader settings are otherwise shared
-    with training (docs/data.md, Deterministic eval masking).
+    frozen via ``deterministic=True`` so each sequence gets the same mask on every
+    pass, at any GPU count, worker count or batch size. Masking probabilities and
+    DataLoader settings are otherwise shared with training (docs/data.md, Deterministic
+    eval masking).
 
     Args:
         path: A single ``.parquet`` file or directory of shards to evaluate on.
@@ -207,28 +208,7 @@ def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dic
         seed=_EVAL_SEED,
         pad_to_multiple_of=cfg.data.pad_to_multiple_of,
     )
-    return _build_dataloader(
-        dataset, collator, cfg, batch_size=cfg.train.batch_size, loader_cls=_ResettingDataLoader
-    )
-
-
-class _ResettingDataLoader(DataLoader):  # generic param set at call sites
-    """DataLoader that rewinds a deterministic collator at the start of each pass.
-
-    The deterministic :class:`MLMCollator` seeds its per-batch RNG from a running
-    batch counter (docs/data.md,
-    Deterministic eval masking); without a rewind, a second pass over the *same* loader
-    would continue the counter and draw different masks. Resetting in
-    ``__iter__`` — before any worker processes are spawned, so the rewound state
-    is what gets pickled to them — makes every pass reproduce the first, which is
-    the evaluation determinism contract. Training never uses this wrapper.
-    """
-
-    def __iter__(self):  # delegates to DataLoader.__iter__
-        reset = getattr(self.collate_fn, "reset_batch_index", None)
-        if callable(reset):
-            reset()
-        return super().__iter__()
+    return _build_dataloader(dataset, collator, cfg, batch_size=cfg.train.batch_size)
 
 
 def _build_dataloader(
@@ -237,27 +217,28 @@ def _build_dataloader(
     cfg: OplmConfig,
     *,
     batch_size: int | None,
-    loader_cls: type[DataLoader] = DataLoader,  # generic param set by return type
     drop_last: bool = False,
 ) -> DataLoader[dict[str, Tensor]]:
     """Wrap a dataset + collator in a DataLoader using ``cfg``'s worker settings.
 
     ``prefetch_factor`` must be ``None`` when ``num_workers == 0`` (PyTorch rejects
     a positive value with no worker processes), so it is gated accordingly.
-    ``loader_cls`` lets the eval builder substitute a determinism-preserving
-    subclass while training uses the plain :class:`~torch.utils.data.DataLoader`.
     ``drop_last`` drops each worker's partial final batch (training only; evaluation
     must score every row). ``batch_size=None`` disables DataLoader batching for a dataset
     that yields whole batches (:class:`TokenBatcher`, with ``collator=None``); ``drop_last``
     must then stay False.
     """
     num_workers = cfg.data.num_workers
-    return loader_cls(
-        dataset,
-        batch_size=batch_size,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=cfg.data.pin_memory,
-        prefetch_factor=cfg.data.prefetch_factor if num_workers > 0 else None,
-        drop_last=drop_last,
+    # The collator turns row dicts into tensor batches, which the dataset's type can't express.
+    return cast(
+        "DataLoader[dict[str, Tensor]]",
+        DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=cfg.data.pin_memory,
+            prefetch_factor=cfg.data.prefetch_factor if num_workers > 0 else None,
+            drop_last=drop_last,
+        ),
     )

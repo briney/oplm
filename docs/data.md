@@ -679,10 +679,11 @@ a length-mismatched weight array raises (a data-integrity bug surfaced loudly).
 ### Deterministic eval masking
 
 The sequence-eval dataloader builds the same `MLMCollator` with
-`deterministic=True`: the collator derives a per-batch RNG state from
-`seed + batch_index` before masking and restores the ambient RNG afterward, so a
-given batch always receives the same mask. This makes MLM eval loss comparable
-across training steps. Training uses `deterministic=False`. There is no separate
+`deterministic=True`: each row gets its own RNG, seeded from the eval seed and a
+hash of the row's sequence, and the ambient RNG is left alone. A sequence therefore
+gets the same mask on every pass, whichever batch, DataLoader worker or GPU it lands
+in, and however wide the batch is padded. This makes MLM eval loss comparable across
+training steps, and across runs on different GPU or worker counts (#122). Training uses `deterministic=False`. There is no separate
 eval collator class; it is a policy flag, not a fork (`build_train_dataloader`
 vs `build_sequence_eval_dataloader` in `src/oplm/data/sequence/loaders.py`).
 The sequence-eval builder also turns shard and row shuffling off.
