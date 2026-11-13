@@ -45,22 +45,22 @@ The full funnel (coarse, refine, decay every cell, replicate, confirm at 800M) i
 [mup-lr.md, *Commands*](mup-lr.md#commands). How the best LR falls with training length is in
 [*LR vs training length*](mup-lr.md#lr-vs-training-length).
 
-The current `train.lr` (0.0063) is tuned for 24k steps. For a production run of 1.5M–3M steps the
-long runs put the best LR at ~0.0014–0.002; see
+The funnel's `train.lr` (0.0063, in `base.yaml`) is tuned for 24k steps. `configs/scaling.yaml`
+uses 0.002, the best LR for its 1.2M-step mini-prod horizon; see
 [*LR vs training length*](mup-lr.md#lr-vs-training-length).
 
-> **Pending:** the production LR, set from that trend once the production horizon is fixed
-> (waiting on #70).
+> **Pending:** the production LR for a run of about 10M steps (waiting on #70).
 
 ## 3. Run the stable phase at production scale (or the whole schedule)
 
 Generate and submit the sbatch for your preset. The job auto-resumes after preemption, so submitting
 once is enough. The config's WSD schedule comes from `train.warmup_steps`, `train.stable_steps` and
-`train.max_steps`, and it includes its own decay tail at the 170M long-run horizon, so rendering it
+`train.max_steps`, and it includes its own decay tail at the 170M mini-prod horizon (998k stable
+plus a 200k decay), so rendering it
 as-is runs the whole schedule. Splitting the stable phase from the decay is what the branching in
 step 4 does.
 
-> **Pending:** the production horizon (waiting on #70).
+> **Pending:** the production horizon, about 10M steps (waiting on #70).
 
 ```bash
 oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/170M
@@ -106,9 +106,9 @@ The example is hypothetical, not a published run. Mechanics and rules:
 [training.md, *Branching a decay off a checkpoint*](training.md#branching-a-decay-off-a-checkpoint).
 Decay shape, length and floor: [mup-lr.md, *Decay recipe*](mup-lr.md#decay-recipe).
 
-> **Pending:** the production decay recipe (shape, length fraction, LR floor) (waiting on #58).
-
-> **Pending:** the production data mix for the stable and decay phases (waiting on #58).
+The production decay is 20% of the stable steps, `wsd_linear`, to `min_lr: 0.0`
+([mup-lr.md, *Decay recipe*](mup-lr.md#decay-recipe)), on the anneal mix in
+[data.md, *Training data*](data.md#training-data). Set that mix in the branch config's `data.train`.
 
 ## 5. Evaluate
 
@@ -120,7 +120,7 @@ step 1, then read the logged metrics. What each task computes and how to schedul
 [config.md, *Eval datasets*](config.md#eval-datasets). To embed sequences with the result, see
 [inference.md](inference.md).
 
-> **Pending:** the expected loss and precision@L ranges for the reference run (waiting on #70).
+> **Pending:** the expected loss and precision@L ranges for the reference run (waiting on #121).
 
 Before you trust a changed setup, run the tests in [testing.md](testing.md).
 
@@ -140,8 +140,8 @@ checkpoint, or a 20k decay off the 1.5M checkpoint. Only the plateau end and the
    `data.train` matches the checkpoint's exactly, paths included; any difference restarts the stream
    from row 0.
 3. Branch the decay with the commands in step 4, building the config from the checkpoint's own
-   `config.yaml`, not from `configs/scaling.yaml`, whose LR, mix and horizon are still pending and may
-   differ from the published run. Point its `data.eval` paths at your copies of the eval sets
+   `config.yaml`, not from `configs/scaling.yaml`, whose LR, mix and horizon may differ from the
+   published run. Point its `data.eval` paths at your copies of the eval sets
    (those paths do not affect the cursor). What must match the original run, and what can
    change freely (decay length, shape, LR floor, decay data mix), is in
    [training.md, *Branching a decay off a checkpoint*](training.md#branching-a-decay-off-a-checkpoint).

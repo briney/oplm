@@ -19,7 +19,20 @@ uniref70 `fraction: 0.05` and deepclust70 `fraction: 0.95`. Fractions are **rows
 not tokens, because the loader samples a source per row. Sequences differ in length
 between the two sets, so the token share is not the row share.
 
-> **Pending:** the production data mix for the stable and decay phases (waiting on #58).
+That is the **stable-phase** mix: 0.05 rows of uniref70, about 12% of tokens. The **decay**
+(anneal) branch changes it (#58, #78):
+
+| source | token share | rows (1/35 proxy) |
+| --- | --: | --: |
+| uniref70, `sample_members: true` | 25% | 0.109678 |
+| antibody (unpaired) | 1.5% | 0.020676 |
+| deepclust70 | the rest | 0.869646 |
+
+In the 1/35 overfit proxy, contact P@L was flat from 12% to 50% uniref70 tokens and dipped at
+65%; more uniref70 only traded uniref70 held-out CE against deepclust70's. The rows come from the
+proxy's sources; recompute them for the antibody set the production anneal uses.
+
+> **Pending:** the antibody training set for the anneal and its rows (waiting on #121).
 
 Rows to tokens: `tokens = rows x mean tokens per row`, with the mean taken per source.
 

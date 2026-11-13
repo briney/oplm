@@ -475,13 +475,14 @@ The basin is flat: at 300k the whole 4× bracket spans 0.0033, and a 2× miss co
 led at every horizon and by more the longer the run (2.0138 against 2.0289 for 0.004 at 250k), but
 its decay gain was only 75–80% of 0.004's, so it finished behind.
 
-The funnel ranks at 24k, so `train.lr` in `src/oplm/configs/train/base.yaml` (and in
-`configs/scaling.yaml`) is a 24k-horizon value, too high for a production run of millions of steps.
-Width transfer still holds: the extrapolated value is a base LR, used unchanged at every preset.
-The full analysis is on #55.
+The funnel ranks at 24k, so `train.lr` in `src/oplm/configs/train/base.yaml` (0.0063) is a
+24k-horizon value. It stays there as the base LR that sweeps and short runs start from.
+`configs/scaling.yaml` carries the horizon-adjusted value: **0.002** for the 170M mini-prod (1.2M
+steps; the power law gives 0.0019–0.0021). Width transfer still holds: the extrapolated value is a
+base LR, used unchanged at every preset. The full analysis is on #55.
 
-> **Pending:** the production LR, set from this trend once the production horizon is fixed
-> (waiting on #70).
+> **Pending:** the production LR for a run of about 10M steps (the power law gives about
+> 0.0009–0.0012) (waiting on #70).
 
 ## Decay recipe
 
@@ -503,9 +504,11 @@ Mid-decay, `wsd_sqrt` led linear by about 0.01 held-out CE at equal step, but th
 lower LR and was gone by the end. The published 1-sqrt advantage (Hägele et al. 2024, AdamW) doesn't
 show up under this Muon recipe.
 
-> **Pending:** the production decay length fraction and LR floor (waiting on #58).
+The production decay is **20% of the stable steps, `wsd_linear`, to `min_lr: 0.0`**: the
+fraction the funnel and the #55 long runs decayed over, and it performed well there. The decay data
+mix (the anneal) is in [data.md, *Training data*](data.md#training-data) (#58).
 
-Whatever the decay recipe turns out to be, keep the optimizer state through the stable-to-decay
+Keep the optimizer state through the stable-to-decay
 transition, including the data-mix change there: no momentum reset and no second warmup. A branch
 off the stable-phase checkpoint does this by default.
 
