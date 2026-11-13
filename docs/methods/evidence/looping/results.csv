@@ -1,0 +1,12 @@
+arm,wandb_run,job_id,commit,config,step,start_weights,num_loops,loop_strategy,loop_start,loop_end,batch_tokens,eval/cameo/precision_at_L,eval/casp/precision_at_L,eval/deepclust70_gte2/loss,eval/deepclust70_singletons/loss,eval/pdb40/precision_at_L,eval/pdb40_2048/precision_at_L,eval/uniref70/loss,eval/uniref70_gte2/loss,eval/uniref70_singletons/loss
+probe-interleave2,hjz8t5mm,33748,6e8b277,configs/probe-interleave2.yaml,50000,long-run step-250k weights,2,interleave,0,null,32768,0.4022,0.3243,,,0.381,0.3797,1.9475,,
+probe-interleave3,265od07e,33751,6e8b277,configs/probe-interleave3.yaml,,long-run step-250k weights,3,interleave,0,null,16384,,,,,,,,,
+probe-mid-interleave2,i6a4fgnn,33750,6e8b277,configs/probe-mid-interleave2.yaml,50000,long-run step-250k weights,2,interleave,8,16,32768,0.4032,0.3224,,,0.3823,0.3803,1.9535,,
+probe-stack2,gi9t5f4v,33749,6e8b277,configs/probe-stack2.yaml,50000,long-run step-250k weights,2,stack,0,null,32768,0.4087,0.3311,,,0.3928,0.3902,1.9428,,
+probe-x1,xszzn5uj,33588,6e8b277,configs/probe-x1.yaml,50000,long-run step-250k weights,1,stack,0,null,65536,0.4039,0.3283,,,0.3865,0.3812,1.9517,,
+proxy-56k-unlooped,nae95209,35393,628d7bf,configs/proxy-56k-unlooped.yaml,70000,proxy stable step 56k,1,stack,0,null,65536,0.3745,0.3037,2.1125,2.2217,0.3556,0.3463,,2.0839,2.0896
+proxy-56k-stack2,55q8avcy,35396,628d7bf,configs/proxy-56k-stack2.yaml,15000,proxy stable step 56k,2,stack,0,null,32768,0.3788,0.3007,2.105,2.2167,0.3572,0.3509,,2.0734,2.0788
+proxy-140k-unlooped,01wo8hzi,35090,628d7bf,configs/proxy-140k-unlooped.yaml,175000,proxy stable step 140k,1,stack,0,null,65536,0.4009,0.3267,2.0822,2.1988,0.3754,0.3734,,2.0364,2.0477
+proxy-140k-stack2,7a0iieze,35397,628d7bf,configs/proxy-140k-stack2.yaml,36000,proxy stable step 140k,2,stack,0,null,32768,0.409,0.3303,2.0708,2.1941,0.3851,0.3797,,2.0243,2.0371
+proxy-252k-unlooped,pmqwbveg,35277,628d7bf,configs/proxy-252k-unlooped.yaml,315000,proxy stable step 252k,1,stack,0,null,65536,0.4177,0.337,2.0628,2.1845,0.3959,0.3905,,2.0076,2.0233
+proxy-252k-stack2,rveif04q,35398,628d7bf,configs/proxy-252k-stack2.yaml,64000,proxy stable step 252k,2,stack,0,null,32768,0.4186,0.3459,2.0523,2.1802,0.3987,0.3948,,1.9938,2.0105

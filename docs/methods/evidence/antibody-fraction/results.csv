@@ -1,0 +1,5 @@
+arm,wandb_run,job_id,commit,config,step,antibody_token_share,antibody_passes,cdr3_loss_gte2_heavy,cdr3_loss_gte2_light,cdr3_loss_singletons_heavy,cdr3_loss_singletons_light,cdr3_loss_gte2_heavy_unseen,cdr3_loss_gte2_heavy_seen,cdr3_loss_gte2_light_unseen,cdr3_loss_gte2_light_seen,loss_deepclust70_gte2,loss_deepclust70_singletons,loss_uniref70_gte2,loss_uniref70_singletons,p_at_l_cameo,p_at_l_casp,p_at_l_pdb40,p_at_l_pdb40_2048
+control,01wo8hzi,35090,628d7bf,configs/control.yaml,175000,0,0,2.184,1.922,2.149,1.851,2.187,2.173,2.304,1.833,2.0822,2.1988,2.0364,2.0477,0.4009,0.3267,0.3754,0.3734
+ab1.5,y9gffq4c,35576,f28661e,configs/ab1.5.yaml,175000,0.015,3,1.451,0.839,1.401,0.802,1.496,1.305,1.445,0.699,2.0814,2.2003,2.0360,2.0495,0.3918,0.3288,0.3789,0.3740
+ab3,vclpbgbg,35577,f28661e,configs/ab3.yaml,175000,0.03,6,1.366,0.812,1.306,0.775,1.458,1.069,1.418,0.672,2.0827,2.1989,2.0354,2.0487,0.3896,0.3192,0.3770,0.3745
+ab6,43x0k8qv,35578,f28661e,configs/ab6.yaml,175000,0.06,12,1.264,0.785,1.196,0.739,1.412,0.793,1.373,0.649,2.0832,2.2019,2.0359,2.0484,0.3892,0.3228,0.3775,0.3736

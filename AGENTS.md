@@ -116,6 +116,10 @@ The README is for people using the models; the docs under `docs/` hold the detai
   (`https://github.com/briney/oplm/blob/<sha>/<path>`). There is no archive folder.
 - Cite other docs by heading name ("training.md, *Checkpointing and resume*"), never by section
   number. Mark missing content with `> **Pending:** <what is missing> (waiting on <issue or run>).`
+- `docs/methods/` holds the justification and results for every production choice, for the
+  paper's methods section. When a run decides something, or a PR changes a production value, add
+  or update the evidence record and the topic-page row in the same PR. Its rules and record
+  template are in [docs/methods/README.md](docs/methods/README.md), not rule 4 above.
 - `tests/test_docs.py` guards links, retired doc names, documented `oplm` commands, config fields
   and Pending markers.
 

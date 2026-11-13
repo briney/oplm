@@ -14,6 +14,7 @@ One line per doc. Start with the group that matches what you want to do.
 - [training.md](training.md): launching, schedule, checkpointing and resume, published checkpoints, branching a decay.
 - [slurm.md](slurm.md): turning a training config into Slurm jobs, requeue and arrays.
 - [evaluation.md](evaluation.md): eval tasks and metrics, scheduling, the published structure eval sets.
+- [methods/](methods/README.md): every production choice, where its value lives, and the results that justify it.
 
 ## Reference
 

@@ -1,0 +1,8 @@
+arm,wandb_run,job_id,commit,config,step,optimizer,lr,scheduler,eval/cameo/precision_at_L,eval/casp/precision_at_L,eval/deepclust70_gte2/loss,eval/deepclust70_singletons/loss,eval/deepclust70_train/loss,eval/pdb40/precision_at_L,eval/pdb40_2048/precision_at_L,eval/uniref70_gte2/loss,eval/uniref70_singletons/loss,eval/uniref70_train_gte2/loss,eval/uniref70_train_singletons/loss
+oplm-u12,8oz9q1g5,35392,628d7bf,configs/oplm-u12.yaml,175000,muon,0.003,wsd_linear,0.3979,0.3214,2.0761,2.1947,1.9246,0.3792,0.3724,2.063,2.0692,1.7176,1.8819
+oplm-u25,01wo8hzi,35090,628d7bf,configs/oplm-u25.yaml,175000,muon,0.003,wsd_linear,0.4009,0.3267,2.0822,2.1988,1.9307,0.3754,0.3734,2.0364,2.0477,1.6667,1.8347
+oplm-u50,az2xyk2w,35091,628d7bf,configs/oplm-u50.yaml,175000,muon,0.003,wsd_linear,0.3991,0.3272,2.0967,2.2132,1.9499,0.3769,0.3703,2.0034,2.0249,1.5856,1.7562
+oplm-u65,z5be6fti,35092,628d7bf,configs/oplm-u65.yaml,175000,muon,0.003,wsd_linear,0.3955,0.3235,2.1133,2.2219,1.968,0.3716,0.3647,1.9934,2.0197,1.5485,1.7171
+esmc-u25,0arqlr7f,35389,628d7bf,configs/esmc-u25.yaml,175000,adamw,0.0004,wsd_linear,0.3172,0.2619,2.1218,2.2301,1.9736,0.2984,0.2935,2.0916,2.0974,1.7493,1.9008
+esmc-u50,hfokh8e6,35390,628d7bf,configs/esmc-u50.yaml,175000,adamw,0.0004,wsd_linear,0.3143,0.2545,2.1323,2.2406,1.9872,0.2937,0.2884,2.0692,2.0812,1.6946,1.85
+esmc-u65,i97sqsml,35391,628d7bf,configs/esmc-u65.yaml,175000,adamw,0.0004,wsd_linear,0.3079,0.2513,2.1443,2.2479,2.0004,0.2904,0.2841,2.0613,2.0757,1.6669,1.8243
