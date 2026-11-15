@@ -348,3 +348,72 @@ def test_wsd_decay_shapes(scheduler: str, quarter: float) -> None:
     assert fn(520) == pytest.approx(r)  # past the end: held at the floor
     decay = [fn(s) for s in range(100, 521)]
     assert all(a >= b for a, b in zip(decay, decay[1:], strict=False))
+
+
+def _muon_toy(seed: int = 0) -> tuple[list[torch.nn.Parameter], list[dict]]:
+    """Square, wide and tall matrices (repeated shapes) over two LR groups."""
+    gen = torch.Generator().manual_seed(seed)
+    shapes = [(8, 8), (8, 24), (24, 8), (8, 8), (8, 24), (24, 8), (8, 8), (8, 8)]
+    params = [torch.nn.Parameter(torch.randn(s, generator=gen)) for s in shapes]
+    groups = [{"params": params[:5], "lr": 0.02}, {"params": params[5:], "lr": 0.01}]
+    return params, groups
+
+
+def _set_muon_toy_grads(params: list[torch.nn.Parameter], gen: torch.Generator) -> None:
+    """Random grads; params[0] gets an all-zero grad and params[-1] none at all."""
+    for p in params[:-1]:
+        p.grad = torch.randn(p.shape, generator=gen)
+    params[0].grad.zero_()
+
+
+@pytest.mark.parametrize("nesterov", [True, False])
+def test_muon_matches_torch_muon(nesterov: bool) -> None:
+    """The batched step is stock Muon within bf16 rounding, on every shape and group."""
+    from oplm.training.optim import Muon
+
+    kwargs = {"weight_decay": 0.01, "nesterov": nesterov, "adjust_lr_fn": "original"}
+    ours_params, ours_groups = _muon_toy()
+    ref_params, ref_groups = _muon_toy()
+    ours, ref = Muon(ours_groups, **kwargs), torch.optim.Muon(ref_groups, **kwargs)
+    untouched = ours_params[-1].detach().clone()
+
+    for step in range(4):
+        _set_muon_toy_grads(ours_params, torch.Generator().manual_seed(100 + step))
+        _set_muon_toy_grads(ref_params, torch.Generator().manual_seed(100 + step))
+        ours.step()
+        ref.step()
+        for a, b in zip(ours_params, ref_params, strict=True):
+            assert torch.isfinite(a).all()
+            # bf16 Newton-Schulz: batched and per-matrix kernels round differently.
+            torch.testing.assert_close(a, b, rtol=0, atol=2e-2 * 0.02)
+    assert torch.equal(ours_params[-1], untouched)
+    assert all(not ours.state[p] for p in ours_params[-1:])
+
+
+def test_muon_state_dict_interchangeable_with_torch_muon() -> None:
+    """Checkpoints written by either Muon load into the other and continue the same."""
+    from oplm.training.optim import Muon
+
+    def run(first: type, second: type) -> list[torch.Tensor]:
+        params, groups = _muon_toy()
+        opt = first(groups, weight_decay=0.01)
+        _set_muon_toy_grads(params, torch.Generator().manual_seed(1))
+        opt.step()
+        resumed = second(groups, weight_decay=0.01)
+        resumed.load_state_dict(opt.state_dict())
+        _set_muon_toy_grads(params, torch.Generator().manual_seed(2))
+        resumed.step()
+        return [p.detach().clone() for p in params]
+
+    for a, b in zip(run(torch.optim.Muon, Muon), run(Muon, torch.optim.Muon), strict=True):
+        torch.testing.assert_close(a, b, rtol=0, atol=2e-2 * 0.02)
+
+
+def test_hsdp_keeps_torch_muon() -> None:
+    """The distributed Muon needs replicated params, so HSDP stays on stock Muon."""
+    from oplm.training.optim import Muon, build_optimizers
+
+    ddp = build_optimizers(_model(), TrainConfig(optimizer="muon"))[0]
+    hsdp = build_optimizers(_model(), TrainConfig(optimizer="muon", parallelism="hsdp"))[0]
+    assert type(ddp) is Muon
+    assert type(hsdp) is torch.optim.Muon

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
+import torch.distributed as dist
+from torch.optim._muon import _adjust_lr
 from torch.optim.lr_scheduler import LambdaLR
 
 from oplm.training.mup import mup_lr_multiplier
@@ -197,6 +199,85 @@ class AdamW(torch.optim.AdamW):
         return None
 
 
+def _newton_schulz(
+    x: torch.Tensor, coefficients: tuple[float, float, float], steps: int, eps: float
+) -> torch.Tensor:
+    """Batched form of torch's Muon Newton-Schulz over a ``(k, rows, cols)`` bf16 stack."""
+    a, b, c = coefficients
+    tall = x.size(1) > x.size(2)
+    if tall:
+        x = x.mT
+    x = x / x.norm(dim=(1, 2), keepdim=True).clamp(min=eps)
+    for _ in range(steps):
+        gram = x @ x.mT
+        gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        x = torch.baddbmm(x, gram_update, x, beta=a)
+    return x.mT if tall else x
+
+
+class Muon(torch.optim.Muon):
+    """``torch.optim.Muon`` with batched Newton-Schulz, split across DDP ranks.
+
+    Same update and same state (one ``momentum_buffer`` per parameter) as the base class,
+    so checkpoints are interchangeable with it. Every rank updates every momentum buffer,
+    but orthogonalizes only the matrices it owns (round-robin), stacked by shape. Each
+    rank writes its results into a buffer that is zero elsewhere and one sum all-reduce
+    per shape fills in the rest, so every rank applies bit-identical updates. This relies
+    on DDP: full, identical gradients on every rank. A single process owns every matrix
+    and communicates nothing.
+    """
+
+    @torch.no_grad()
+    def step(self, closure=None):  # untyped like torch.optim.Muon.step
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        world, rank = (dist.get_world_size(), dist.get_rank()) if distributed else (1, 0)
+
+        for group in self.param_groups:
+            params: list[torch.Tensor] = []
+            grads: list[torch.Tensor] = []
+            bufs: list[torch.Tensor] = []
+            self._init_group(group, params, grads, bufs)
+            lr, momentum = group["lr"], group["momentum"]
+
+            by_shape: dict[torch.Size, list[int]] = {}
+            for i, (param, grad, buf) in enumerate(zip(params, grads, bufs, strict=True)):
+                buf.lerp_(grad, 1 - momentum)
+                by_shape.setdefault(param.shape, []).append(i)
+
+            for shape, indices in by_shape.items():
+                updates = torch.zeros(
+                    (len(indices), *shape), dtype=torch.bfloat16, device=params[indices[0]].device
+                )
+                # Ownership counts across the whole group, so a shape with fewer matrices
+                # than ranks does not pile onto rank 0.
+                owned = [slot for slot, i in enumerate(indices) if i % world == rank]
+                if owned:
+                    stack = torch.stack(
+                        [
+                            (
+                                grads[indices[slot]].lerp(bufs[indices[slot]], momentum)
+                                if group["nesterov"]
+                                else bufs[indices[slot]]
+                            ).bfloat16()
+                            for slot in owned
+                        ]
+                    )
+                    updates[owned] = _newton_schulz(
+                        stack, group["ns_coefficients"], group["ns_steps"], group["eps"]
+                    )
+                if distributed:
+                    dist.all_reduce(updates)
+                adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], shape)
+                for slot, i in enumerate(indices):
+                    params[i].mul_(1 - lr * group["weight_decay"])
+                    params[i].add_(updates[slot], alpha=-adjusted_lr)
+        return loss
+
+
 def _build_adamw_optimizer(
     adamw_groups: Sequence[AdamwParamGroup],
     cfg: TrainConfig,
@@ -272,7 +353,9 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
     if cfg.optimizer == "adamw":
         return [_build_adamw_optimizer(param_groups.adamw_groups, cfg)]
 
-    muon_optimizer = torch.optim.Muon(
+    # The distributed step needs full, replicated matrices; HSDP shards them (#128).
+    muon_cls = torch.optim.Muon if cfg.parallelism == "hsdp" else Muon
+    muon_optimizer = muon_cls(
         [
             {"params": list(group.params), "lr": cfg.lr * group.lr_mult}
             for group in param_groups.muon_groups
