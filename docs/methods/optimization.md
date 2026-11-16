@@ -10,6 +10,7 @@ How the learning rate was tuned: [../mup-lr.md](../mup-lr.md). Defaults are in
 | Choice | Where the value lives | Evidence |
 |---|---|---|
 | Muon for matrices, AdamW for the rest | `train.optimizer` | [oplm-vs-esmc-recipe](evidence/oplm-vs-esmc-recipe/README.md) (confounded with architecture; isolated ablation is #117) |
+| Muon step is batched and distributed across DDP ranks | `oplm.training.optim.Muon`, used by `build_optimizers` unless `train.parallelism=hsdp` | [distributed-muon](evidence/distributed-muon/README.md) |
 | Base learning rate | `train.lr` | [base-lr-funnel](evidence/base-lr-funnel/README.md) |
 | Learning rate vs training length | `train.lr` | [lr-vs-training-length](evidence/lr-vs-training-length/README.md) |
 | AdamW-side LR multiplier | `train.adamw_lr_mult` | [adamw-lr-multiplier](evidence/adamw-lr-multiplier/README.md) (runs predate the current recipe; matched rerun is #118) |
