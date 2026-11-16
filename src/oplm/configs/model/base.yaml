@@ -41,6 +41,7 @@ model:
   attn_output_gate: sigmoid # none | sigmoid | silu (post-SDPA G1 output gate, arXiv:2505.06708)
   value_residual: learnable # none | fixed | learnable (ResFormer value residual, arXiv:2410.17897)
   value_residual_lambda_init: 0.5 # constant lambda (fixed) or init (learnable); layers > 0 only
+  exclusive_attention: false # XSA (arXiv:2603.09078): drop the attention output's component along each token's own value
   init_scale_output_projections: true
 
   # Feed-forward

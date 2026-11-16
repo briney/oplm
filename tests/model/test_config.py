@@ -40,6 +40,7 @@ def test_defaults_match_architecture_spec():
     assert cfg.attn_output_gate == "none"
     assert cfg.value_residual == "none"
     assert cfg.value_residual_lambda_init == 0.5
+    assert cfg.exclusive_attention is False
     assert cfg.init_scale_output_projections is True
     assert cfg.ffn_activation == "swiglu"
     assert cfg.ffn_bias is False

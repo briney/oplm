@@ -58,7 +58,7 @@ parametrization)*, lists the fallback next to each default that differs.
 These toggles exist as literature-backed ablation switches. They are off by default and are not
 recommended for new runs unless you are reproducing an ablation or the ESM-C recipe: RMSNorm,
 `hybrid` and `post_sdpa` norm placement, `l2` QK-norm, partial RoPE, the residual gate, `geglu` and
-`relu2` FFNs, mask dropout, tied embeddings and the post-embedding norm. Each is described in its
+`relu2` FFNs, mask dropout, tied embeddings, the post-embedding norm and exclusive self attention. Each is described in its
 section below.
 
 ## Transformer block and norm placement
@@ -141,6 +141,12 @@ arXiv:2410.17897: layer 0 exposes its post-V-norm values `v1`, and every later l
 constant as a buffer with no new parameters. `none` adds nothing and keeps the two-element attention
 return. When enabled, attention and block return a third element carrying `v1`, and the stack threads
 it through the layer loop and both gradient-checkpointing paths. `v1` never leaves the stack.
+
+**Exclusive self attention** (`exclusive_attention`, off; available, not recommended). XSA of
+arXiv:2603.09078: after the kernel and before the output gate, each head's output `y` loses its
+component along the token's own value, `y - (y . v_hat) * v_hat`, with `v_hat` the unit vector of
+the value the kernel used (after Canon-B and the value residual). It is computed in fp32, adds no
+parameters and applies on every kernel path. The paper tested causal language models only.
 
 **Kernel paths.** Two paths share all parameters and pre-attention transforms. With
 `output_attentions=false` (training and normal inference) attention runs through

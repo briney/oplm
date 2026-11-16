@@ -46,6 +46,7 @@ model:
   attn_output_gate: none
   value_residual: none
   value_residual_lambda_init: 0.5
+  exclusive_attention: false
   init_scale_output_projections: true
 
   ffn_activation: swiglu

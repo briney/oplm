@@ -72,6 +72,11 @@ class OplmAttention(nn.Module):
     constant buffer. `"none"` (default) adds no parameters and keeps the
     two-element forward return.
 
+    Exclusive self attention (controlled by `config.exclusive_attention`): XSA,
+    arXiv:2603.09078. Per head, the kernel output loses its component along the
+    token's own value vector (the value the kernel used, after Canon-B and the
+    value residual): `y = y - (y . v_hat) * v_hat`. No parameters; off by default.
+
     Canon-B (controlled by `config.canon_enabled` + `"B" in
     config.canon_positions`): the "inside attention" Canon conv of "Physics of
     Language Models 4.1" (arXiv:2512.17351), equivalent to Primer's multi-DConv-
@@ -149,6 +154,7 @@ class OplmAttention(nn.Module):
                 "expected one of 'none', 'fixed', 'learnable'."
             )
         self.value_residual_enabled = self.value_residual != "none"
+        self.exclusive_attention = bool(getattr(config, "exclusive_attention", False))
         if self.value_residual_enabled and layer_idx > 0:
             lam_init = float(getattr(config, "value_residual_lambda_init", 0.5))
             if self.value_residual == "learnable":
@@ -305,6 +311,17 @@ class OplmAttention(nn.Module):
     def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.rotary.apply_rotary(q, k)
 
+    @staticmethod
+    def _exclude_self(out: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """XSA: remove from `out` its projection on each token's own value.
+
+        `out` and `v` are `(B, H, T, d_head)`. Computed in fp32 (the unit vector
+        needs a sum of squares) and returned in `out`'s dtype.
+        """
+        v_hat = F.normalize(v.float(), dim=-1)
+        y = out.float()
+        return (y - (y * v_hat).sum(dim=-1, keepdim=True) * v_hat).to(out.dtype)
+
     def _output_projection(self, attn_out: torch.Tensor, gate_input: torch.Tensor) -> torch.Tensor:
         """Reshape `(B, H, T, d_head)` back to `(B, T, D)`, gate (optional), project.
 
@@ -459,6 +476,8 @@ class OplmAttention(nn.Module):
             out = self._sdpa_attention(q, k, v, attention_mask, segment_ids)
             attn = None
 
+        if self.exclusive_attention:
+            out = self._exclude_self(out, v)
         out = self._output_projection(out, x)
         out = F.dropout(out, p=self.hidden_dropout, training=self.training)
         if self.value_residual_enabled:

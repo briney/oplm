@@ -165,6 +165,7 @@ are rejected, including for one loop. Effective depth is
 | `model.attn_output_gate` | `str` | `sigmoid` | Post-SDPA attention output gate (arXiv:2505.06708, G1): `none` (no new params), `sigmoid`, or `silu`. Adds a bias-free `(hidden_size, hidden_size)` `gate_proj` per layer; the merged attention output is multiplied elementwise by `act(gate_proj(x))` before `o_proj`. Run default `sigmoid`; dataclass fallback `none`. |
 | `model.value_residual` | `str` | `learnable` | ResFormer value residual (arXiv:2410.17897): `none` (no new params), `fixed` (constant λ buffer, no new params), or `learnable` (one scalar λ per layer after the first). Layer 0 exposes its post-V-norm values `v₁`; every later layer blends `v' = λ·v + (1 − λ)·v₁` right after the V projection. Run default `learnable`; dataclass fallback `none`. |
 | `model.value_residual_lambda_init` | `float` | `0.5` | Constant λ under `fixed`; initial value of the learnable λ under `learnable`. Must be finite. Inert when `value_residual=none`. |
+| `model.exclusive_attention` | `bool` | `false` | Exclusive self attention (XSA, arXiv:2603.09078): per head, remove the attention output's component along the token's own value vector, before the output gate and `o_proj`. No new params. Available, not recommended (untested on MLM). |
 | `model.init_scale_output_projections` | `bool` | `true` | Shrink residual-writing projections by `1/√(2L)` at init. |
 
 ### Feed-forward and dropout

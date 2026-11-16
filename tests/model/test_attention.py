@@ -32,6 +32,7 @@ def _config(
     attn_output_gate: str = "none",
     value_residual: str = "none",
     value_residual_lambda_init: float = 0.5,
+    exclusive_attention: bool = False,
     num_hidden_layers: int = 2,
     canon_enabled: bool = False,
     canon_residual: bool = True,
@@ -63,6 +64,7 @@ def _config(
         attn_output_gate=attn_output_gate,
         value_residual=value_residual,
         value_residual_lambda_init=value_residual_lambda_init,
+        exclusive_attention=exclusive_attention,
         num_hidden_layers=num_hidden_layers,
         canon_enabled=canon_enabled,
         canon_residual=canon_residual,
@@ -428,6 +430,34 @@ def test_l2_scale_receives_gradient():
     out.sum().backward()
     assert attn.qk_l2_scale.grad is not None
     assert attn.qk_l2_scale.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# Exclusive self attention (XSA, arXiv:2603.09078)
+# ---------------------------------------------------------------------------
+
+
+def test_exclude_self_output_is_orthogonal_to_own_value():
+    out, v = torch.randn(2, 4, 5, 8), torch.randn(2, 4, 5, 8)
+    z = OplmAttention._exclude_self(out, v)
+    assert torch.allclose((z * v).sum(-1), torch.zeros(2, 4, 5), atol=1e-5)
+    # Only the component along v is removed.
+    assert torch.allclose(
+        z + (out * v).sum(-1, keepdim=True) * v / v.pow(2).sum(-1, keepdim=True), out, atol=1e-5
+    )
+
+
+def test_exclusive_attention_changes_output_and_kernel_paths_agree():
+    kwargs = dict(hidden_size=32, num_attention_heads=4)
+    torch.manual_seed(0)
+    base = OplmAttention(_config(**kwargs)).eval()
+    xsa = OplmAttention(_config(exclusive_attention=True, **kwargs)).eval()
+    xsa.load_state_dict(base.state_dict())  # no new parameters
+    x, mask = torch.randn(2, 5, 32), _ones_mask(2, 5)
+    out, _ = xsa(x, mask)
+    assert not torch.allclose(out, base(x, mask)[0], atol=1e-4)
+    manual, _ = xsa(x, mask, output_attentions=True)
+    assert torch.allclose(out, manual, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

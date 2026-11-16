@@ -86,6 +86,7 @@ class OplmConfig(PretrainedConfig):
         attn_output_gate: str = "none",
         value_residual: str = "none",
         value_residual_lambda_init: float = 0.5,
+        exclusive_attention: bool = False,
         init_scale_output_projections: bool = True,
         ffn_activation: str = "swiglu",
         ffn_bias: bool = False,
@@ -152,6 +153,7 @@ class OplmConfig(PretrainedConfig):
         self.attn_output_gate = attn_output_gate
         self.value_residual = value_residual
         self.value_residual_lambda_init = float(value_residual_lambda_init)
+        self.exclusive_attention = bool(exclusive_attention)
         self.init_scale_output_projections = bool(init_scale_output_projections)
         self.ffn_activation = ffn_activation
         self.ffn_bias = bool(ffn_bias)
