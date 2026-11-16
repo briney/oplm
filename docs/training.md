@@ -257,6 +257,12 @@ step over NVLink, negligible next to the recompute SAC saves back.
   `torch.optim.Muon`, while embeddings, norms, biases, and the MLM head
   (`lm_head.*`) stay on an auxiliary AdamW. Tuned via `train.muon_*`. The default
   pairs with μP (below) and `muon_adjust_lr_fn=original`.
+
+  Under `train.parallelism=ddp` the Muon step is batched and distributed
+  (`oplm.training.optim.Muon`, same update and checkpoint state as `torch.optim.Muon`):
+  same-shape matrices are orthogonalized in one stacked call, each rank orthogonalizes only
+  the matrices it owns (round-robin), and one sum all-reduce per shape hands every rank the
+  full set of updates. `hsdp` uses `torch.optim.Muon` unchanged.
 - `adamw`: a single AdamW. 2-D weights get `weight_decay`; biases, norms, and
   embeddings are no-decay.
 

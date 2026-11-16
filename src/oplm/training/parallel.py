@@ -60,7 +60,9 @@ so an HSDP checkpoint loads under DDP and vice versa.
    only established that it *runs* and checkpoints, never that it matches). Nothing
    suggests it is wrong -- distributed matmul is the mathematically correct way to compute
    it -- but the composition of sharded NS with bf16 compute is unproven at scale. Watch
-   the first real Muon+HSDP run's loss curve against a DDP control.
+   the first real Muon+HSDP run's loss curve against a DDP control. The batched,
+   rank-distributed ``oplm.training.optim.Muon`` is DDP-only (it needs full replicated
+   matrices); an HSDP version is briney/oplm#128.
 """
 
 from __future__ import annotations

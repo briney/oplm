@@ -1,0 +1,7 @@
+arm,wandb_run,job_id,commit,config,model,nodes,step_ms,optimizer_ms,forward_ms,backward_ms,muon_step_traced_ms,eval/uniref70/loss
+170M-profile-old,oez5ta9u,36560,e13d8db,configs/prof-muon-old.yaml,170M,4,626.4,51.7,150.4,409.3,77.5,
+170M-profile-new,fy8e30y7,36559,6a52233,configs/prof-muon-new.yaml,170M,4,581.5,10.9,150.4,409.6,8.1,
+6B-profile-old,qtq8ecnn,36607,e13d8db,configs/prof-muon6bgc-old.yaml,6B,4,2165.5,471.4,322.2,1328.5,478.4,
+6B-profile-new,u9obko2x,36606,6a52233,configs/prof-muon6bgc-new.yaml,6B,4,1860.9,188.2,319.6,1325.1,184.0,
+170M-equivalence-old,z7s96acr,36564,e13d8db,configs/equiv-muon-old.yaml,170M,4,,,,,,2.3470
+170M-equivalence-new,09t1iv55,36563,6a52233,configs/equiv-muon-new.yaml,170M,4,,,,,,2.3461
