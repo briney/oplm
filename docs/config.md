@@ -145,6 +145,8 @@ are rejected, including for one loop. Effective depth is
 | `model.rope_theta` | `float` | `10000.0` | RoPE base frequency. |
 | `model.rope_dim` | `int \| null` | derived | Rotated channels per head. Defaults to `head_dim` (full RoPE). Must be even. |
 | `model.nope_dim` | `int` | `0` | Un-rotated (NoPE) channels per head. For partial RoPE set `rope_dim < head_dim` and `nope_dim = head_dim − rope_dim`. |
+| `model.rope_alt_every_n_layers` | `int` | `0` | Period of E1-style alternate positional layers: layer `i` is alternate when `(i + 1) % n == 0`. `0` disables. |
+| `model.rope_alt_theta` | `float \| null` | `500000.0` | RoPE base in alternate layers; `null` makes them NoPE (no rotation in any channel). Must be `> 0`. |
 
 ### Normalization
 

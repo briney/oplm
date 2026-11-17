@@ -71,6 +71,8 @@ class OplmConfig(PretrainedConfig):
         rope_theta: float = 10000.0,
         rope_dim: int | None = None,
         nope_dim: int = 0,
+        rope_alt_every_n_layers: int = 0,
+        rope_alt_theta: float | None = 500000.0,
         norm_type: str = "layernorm",
         norm_eps: float = 1e-6,
         norm_strategy: str = "pre",
@@ -135,6 +137,8 @@ class OplmConfig(PretrainedConfig):
         self.rope_theta = float(rope_theta)
         self.rope_dim = rope_dim if rope_dim is None else int(rope_dim)
         self.nope_dim = int(nope_dim)
+        self.rope_alt_every_n_layers = int(rope_alt_every_n_layers)
+        self.rope_alt_theta = rope_alt_theta if rope_alt_theta is None else float(rope_alt_theta)
         self.norm_type = norm_type
         self.norm_eps = float(norm_eps)
         self.norm_strategy = norm_strategy
@@ -268,6 +272,15 @@ class OplmConfig(PretrainedConfig):
             raise ValueError(
                 f"rope_dim must be even (each RoPE rotation consumes a channel pair); "
                 f"got {self.rope_dim}."
+            )
+
+        if self.rope_alt_every_n_layers < 0:
+            raise ValueError(
+                f"rope_alt_every_n_layers must be >= 0; got {self.rope_alt_every_n_layers}."
+            )
+        if self.rope_alt_theta is not None and self.rope_alt_theta <= 0:
+            raise ValueError(
+                f"rope_alt_theta must be > 0 or None (NoPE); got {self.rope_alt_theta}."
             )
 
         if self.norm_type not in _VALID_NORM_TYPES:

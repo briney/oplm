@@ -516,3 +516,12 @@ def test_accepts_esmc_qk_norm_and_residual_scaling():
     cfg = OplmConfig(qk_norm_mode="full", residual_scaling="esmc")
     assert cfg.qk_norm_mode == "full"
     assert cfg.residual_scaling == "esmc"
+
+
+def test_rope_alt_validation():
+    assert OplmConfig().rope_alt_every_n_layers == 0
+    assert OplmConfig(rope_alt_theta=None).rope_alt_theta is None
+    with pytest.raises(ValueError, match="rope_alt_every_n_layers"):
+        OplmConfig(rope_alt_every_n_layers=-1)
+    with pytest.raises(ValueError, match="rope_alt_theta"):
+        OplmConfig(rope_alt_theta=0)

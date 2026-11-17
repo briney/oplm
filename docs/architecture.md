@@ -22,7 +22,7 @@ with its type and default in [config.md](config.md). This document explains what
 | Residual gate | none | `residual_gate` |
 | Attention output gate | sigmoid, post-SDPA | `attn_output_gate` |
 | Value residual | learnable, one scalar per layer after the first | `value_residual` |
-| Attention | standard multi-head, no GQA, full RoPE (`theta` 10000), bidirectional | `rope_theta`, `rope_dim`, `nope_dim` |
+| Attention | standard multi-head, no GQA, full RoPE (`theta` 10000), bidirectional | `rope_theta`, `rope_dim`, `nope_dim`, `rope_alt_*` |
 | Feed-forward | SwiGLU, no bias, width `round_up(8/3 * hidden_size, 256)` | `ffn_activation`, `ffn_bias`, `intermediate_size` |
 | Canon | on at positions A, B, C, D, kernel size 7, residual | `canon_enabled`, `canon_positions`, `canon_kernel_sizes`, `canon_residual` |
 | Embeddings and head | untied; two-layer MLM head with GELU | `tie_word_embeddings`, `mlm_head_activation` |
@@ -167,6 +167,10 @@ Partial RoPE and NoPE (arXiv:2502.14837): when `nope_dim > 0`, `head_dim = rope_
 rotates only the first `rope_dim` channels, and the rest are position-invariant. The default is full
 RoPE (`nope_dim=0`). `rope_dim + nope_dim == head_dim` and even `rope_dim` are enforced at config
 time. Partial RoPE is available, not recommended.
+
+Alternate layers (E1-style, under ablation in #132): with `rope_alt_every_n_layers = n > 0`, every
+layer with `(layer_idx + 1) % n == 0` uses base `rope_alt_theta` (default 500000) instead of
+`rope_theta`, or no RoPE at all when `rope_alt_theta` is null. Off by default.
 
 ## Feed-forward
 

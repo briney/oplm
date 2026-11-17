@@ -835,3 +835,14 @@ def test_canon_b_no_pad_leakage_into_real_tokens():
         out1, _ = attn(x1, mask)
         out2, _ = attn(x2, mask)
     assert torch.allclose(out1[:, real, :], out2[:, real, :], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("alt_theta", "want"),
+    [(500000.0, [(8, 1e4), (8, 1e4), (8, 5e5)] * 2), (None, [(8, 1e4), (8, 1e4), (0, 1e4)] * 2)],
+)
+def test_rope_alt_every_n_layers_overrides_every_nth_layer(alt_theta, want):
+    cfg = _config(num_hidden_layers=6)
+    cfg.rope_alt_every_n_layers, cfg.rope_alt_theta = 3, alt_theta
+    got = [(a.rotary.rope_dim, a.rotary.base) for a in (OplmAttention(cfg, i) for i in range(6))]
+    assert got == want

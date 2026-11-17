@@ -192,11 +192,19 @@ class OplmAttention(nn.Module):
         else:
             self.v_norm = nn.Identity()
 
+        # E1-style alternate layers: every n-th layer (1-based, as in E1) swaps the
+        # RoPE base for `rope_alt_theta`, or drops RoPE entirely when it is None.
+        rope_dim, base = config.rope_dim, config.rope_theta
+        alt_every = getattr(config, "rope_alt_every_n_layers", 0)
+        if alt_every > 0 and (layer_idx + 1) % alt_every == 0:
+            base = config.rope_alt_theta
+            if base is None:
+                rope_dim, base = 0, config.rope_theta
         self.rotary = RotaryEmbedding(
             head_dim=head_dim,
-            rope_dim=config.rope_dim,
+            rope_dim=rope_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=base,
         )
 
         # Canon-B (Physics of LM 4.1, arXiv:2512.17351): depthwise convs on Q/K/V
