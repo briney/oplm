@@ -389,7 +389,7 @@ class TrainDatasetEntry:
     name: str
     path: str
     fraction: float
-    sample_members: bool = False
+    sample_members: bool | str = False  # False | True ("uniform") | "uniform" | "subcluster"
 
 
 _VALID_SCHEDULE_UNITS = ("steps", "tokens")  # "epochs" deferred (docs/evaluation.md)

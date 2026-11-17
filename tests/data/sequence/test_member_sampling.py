@@ -16,6 +16,7 @@ import oplm.data.sequence.dataset as dataset_mod
 from oplm.data.sequence.dataset import (
     MEMBER_IDS_COLUMN,
     MEMBER_SEQUENCES_COLUMN,
+    SUBCLUSTER_OFFSETS_COLUMN,
     Reshard,
     ShardedProteinDataset,
     _member_index,
@@ -185,4 +186,87 @@ def test_mismatched_member_lists_raise(
     pq.write_table(table, path)
     ds = ShardedProteinDataset(path, shuffle_rows=False, sample_members=True)
     with pytest.raises(ValueError, match=r"bad\.parquet.*row 1"):
+        _rows(ds)
+
+
+# One 50% cluster: subcluster 0 has 1 member, subcluster 1 has 9 (offsets [0, 1, 10]).
+_SUB_IDS = [f"k{0 if j == 0 else 1}m{j}" for j in range(10)]
+
+
+def _write_subclusters(tmp_path: Path, offsets: list[list[int]] | None = None) -> Path:
+    d = tmp_path / "sub"
+    d.mkdir()
+    n_rows = 400
+    table = pa.table(
+        {
+            "sequence_id": [f"r{i}" for i in range(n_rows)],
+            "sequence": ["AC"] * n_rows,
+            MEMBER_IDS_COLUMN: [_SUB_IDS] * n_rows,
+            MEMBER_SEQUENCES_COLUMN: [["AC" * (j + 1) for j in range(10)]] * n_rows,
+            SUBCLUSTER_OFFSETS_COLUMN: offsets or [[0, 1, 10]] * n_rows,
+        }
+    )
+    pq.write_table(table, d / "shard-0.parquet")
+    return d
+
+
+def test_subcluster_mode_is_uniform_over_subclusters(tmp_path: Path) -> None:
+    rows = _rows(ShardedProteinDataset(_write_subclusters(tmp_path), sample_members="subcluster"))
+    assert len(rows) == 400
+    singleton = sum(r["sequence_id"] == "k0m0" for r in rows)
+    assert 160 < singleton < 240  # ~1/2, vs ~1/10 under uniform member sampling
+    big = {r["sequence_id"] for r in rows} - {"k0m0"}
+    assert len(big) == 9  # every member of the big subcluster gets drawn
+    for r in rows:
+        j = _SUB_IDS.index(str(r["sequence_id"]))
+        assert r["sequence"] == "AC" * (j + 1)
+
+
+def test_true_and_uniform_are_the_same_mode(tmp_path: Path) -> None:
+    d = _write(tmp_path)
+    assert _rows(ShardedProteinDataset(d, seed=2, sample_members=True)) == _rows(
+        ShardedProteinDataset(d, seed=2, sample_members="uniform")
+    )
+
+
+def test_subcluster_same_member_across_topologies(tmp_path: Path) -> None:
+    ds = ShardedProteinDataset(_write_subclusters(tmp_path), seed=9, sample_members="subcluster")
+    one = sorted((str(r["sequence_id"]), str(r["sequence"])) for r in _rows(ds))
+    for world in (2, 3):
+        multi = sorted(
+            (str(r["sequence_id"]), str(r["sequence"]))
+            for rank in range(world)
+            for r in _rows(ds, rank, world)
+        )
+        assert multi == one
+
+
+def test_subcluster_draws_are_jointly_uniform() -> None:
+    counts = [[0] * 3 for _ in range(2)]
+    for shard in range(200):
+        for row in range(120):
+            k = _member_index(777, shard, row, 2)
+            counts[k][_member_index(777, shard, row, 3, dataset_mod._SUBCLUSTER_FOLD)] += 1
+    assert all(abs(c - 4_000) < 250 for block in counts for c in block)
+
+
+def test_subcluster_needs_offsets_column(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=SUBCLUSTER_OFFSETS_COLUMN):
+        ShardedProteinDataset(_write(tmp_path), sample_members="subcluster")
+
+
+def test_unknown_mode_raises(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="sample_members"):
+        ShardedProteinDataset(_write(tmp_path), sample_members="subclusters")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [[0, 1, 9], [1, 10], [0, 1, 1, 10], [0], []],
+    ids=["short", "nonzero", "empty", "k0", "none"],
+)
+def test_bad_offsets_raise(tmp_path: Path, bad: list[int]) -> None:
+    d = _write_subclusters(tmp_path, [[0, 1, 10]] + [bad] * 399)
+    ds = ShardedProteinDataset(d, shuffle_rows=False, sample_members="subcluster")
+    with pytest.raises(ValueError, match=r"row 1: subcluster_offsets"):
         _rows(ds)
