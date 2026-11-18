@@ -304,9 +304,15 @@ def test_parse_train_sample_members() -> None:
     assert parse_train_configs({"a": "/a"})[0].sample_members is False
 
 
-def test_parse_train_sample_members_must_be_bool() -> None:
-    with pytest.raises(ValueError, match="sample_members"):
-        parse_train_configs({"a": {"path": "/a", "sample_members": "yes"}})
+def test_parse_train_sample_members_modes() -> None:
+    for mode in ("uniform", "subcluster"):
+        assert (
+            parse_train_configs({"a": {"path": "/a", "sample_members": mode}})[0].sample_members
+            == mode
+        )
+    for bad in ("yes", 1, None):
+        with pytest.raises(ValueError, match="sample_members"):
+            parse_train_configs({"a": {"path": "/a", "sample_members": bad}})
 
 
 def test_parse_train_unknown_key_raises() -> None:

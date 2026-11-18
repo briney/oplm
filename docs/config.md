@@ -369,10 +369,13 @@ data:
     bfd:      { path: /data/bfd/,      fraction: 0.4 }
 ```
 
-`data.train.<name>.sample_members` (`bool`, default `false`) is phase-2 member sampling: each
-served row of a cluster-per-row dataset yields one uniformly chosen cluster member instead of
-the representative. The shards must carry the `member_ids` / `member_sequences` columns and
-it cannot be combined with `data.weighted_masking`. It is not part of the data fingerprint, so
+`data.train.<name>.sample_members` (`false` | `true` | `"uniform"` | `"subcluster"`, default
+`false`) is phase-2 member sampling: each served row of a cluster-per-row dataset yields one
+cluster member instead of the representative. `true` and `"uniform"` draw the member
+uniformly; `"subcluster"` draws a uniform subcluster, then a uniform member within it (for
+example a UniRef90 cluster inside a UniRef50 row, then a UniRef100 sequence). The shards must
+carry the `member_ids` / `member_sequences` columns (plus `subcluster_offsets` for
+`"subcluster"`), and it cannot be combined with `data.weighted_masking`. It is not part of the data fingerprint, so
 a `branch_from` that only flips the flag keeps the data cursor.
 
 ## Eval datasets

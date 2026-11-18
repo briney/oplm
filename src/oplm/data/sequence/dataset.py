@@ -39,6 +39,10 @@ _WEIGHTS_COLUMN = "masking_weights"
 # Optional per-cluster member columns (list[str], parallel), read only with ``sample_members``.
 MEMBER_IDS_COLUMN = "member_ids"
 MEMBER_SEQUENCES_COLUMN = "member_sequences"
+# CSR offsets (list[int], length K+1) grouping the member columns into K subclusters; read only
+# with ``sample_members="subcluster"``.
+SUBCLUSTER_OFFSETS_COLUMN = "subcluster_offsets"
+SAMPLE_MEMBERS_MODES = ("uniform", "subcluster")  # or a bool; True means "uniform"
 
 # --------------------------------------------------------------------------- #
 # Seed mixing (fixed constants — reproducibility contract, do not change)
@@ -51,6 +55,8 @@ _MASK64 = 0xFFFF_FFFF_FFFF_FFFF
 # Member-choice hash: splitmix64 finalizer constants (also part of the reproducibility contract).
 _SM_MUL1 = 0xBF58476D1CE4E5B9
 _SM_MUL2 = 0x94D049BB133111EB
+# Extra value folded into the member hash for the within-subcluster draw.
+_SUBCLUSTER_FOLD = 1
 
 
 def train_data_fingerprint(raw_train: Any) -> str:
@@ -94,15 +100,16 @@ def _shard_row_seed(epoch_seed: int, s: int) -> int:
     return (epoch_seed + 1009 + s) & _MASK32
 
 
-def _member_index(epoch_seed: int, shard_idx: int, row_idx: int, n: int) -> int:
+def _member_index(epoch_seed: int, shard_idx: int, row_idx: int, n: int, *fold: int) -> int:
     """Uniform member of an ``n``-member cluster row, a pure hash of its stream coordinates.
 
     Folds ``epoch_seed``, ``shard_idx`` and ``row_idx`` through the splitmix64 finalizer, so the
     choice depends on neither rank, worker nor cursor: resume, reshard and any topology serve
-    the same member, and every pass (epoch seed) redraws it.
+    the same member, and every pass (epoch seed) redraws it. Extra ``fold`` values are folded in
+    after ``row_idx`` for a further, distinct draw from the same coordinates.
     """
     z = epoch_seed & _MASK64
-    for v in (shard_idx, row_idx):
+    for v in (shard_idx, row_idx, *fold):
         z = ((z ^ v) + _PHI) & _MASK64
         z = ((z ^ (z >> 30)) * _SM_MUL1) & _MASK64
         z = ((z ^ (z >> 27)) * _SM_MUL2) & _MASK64
@@ -369,7 +376,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
     raw one-letter amino acids). An optional ``masking_weights`` column
     (``list[float]``, one weight per residue) is read only when
     ``load_masking_weights`` is set. With ``sample_members`` each shard instead needs the
-    parallel list columns ``member_ids`` / ``member_sequences`` (one row per cluster).
+    parallel list columns ``member_ids`` / ``member_sequences`` (one row per cluster), plus
+    ``subcluster_offsets`` for ``"subcluster"``.
 
     Args:
         path: A single ``.parquet``/``.parq``/``.pq`` file, or a directory of such
@@ -384,16 +392,18 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             ``total_rows // (world_size * num_workers)``, dropping the epoch's last
             few rows (fewer than one per stream) instead of handing some streams one
             extra row. Uneven streams make ranks finish an epoch at different steps.
-        sample_members: Yield one uniformly chosen cluster member per served row (phase-2
-            training on cluster-per-row data) instead of the representative. The choice is
-            a pure hash of ``(pass seed, shard, row)`` (:func:`_member_index`), so cursors
-            are unaffected. Incompatible with ``load_masking_weights``.
+        sample_members: ``True``/``"uniform"`` yields one uniformly chosen cluster member per
+            served row (phase-2 training on cluster-per-row data) instead of the
+            representative; ``"subcluster"`` picks a uniform subcluster, then a uniform member
+            within it. The choice is a pure hash of ``(pass seed, shard, row)``
+            (:func:`_member_index`), so cursors are unaffected. Incompatible with
+            ``load_masking_weights``.
 
     Raises:
         FileNotFoundError: If ``path`` is neither a parquet file nor a directory
             containing parquet shards.
-        ValueError: If ``sample_members`` is set with ``load_masking_weights``, or a shard
-            lacks the member columns.
+        ValueError: If ``sample_members`` is not a known mode, is set with
+            ``load_masking_weights``, or a shard lacks the columns it needs.
     """
 
     def __init__(
@@ -405,9 +415,14 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         seed: int = 0,
         load_masking_weights: bool = False,
         drop_remainder: bool = False,
-        sample_members: bool = False,
+        sample_members: bool | str = False,
     ) -> None:
         super().__init__()
+        if not (isinstance(sample_members, bool) or sample_members in SAMPLE_MEMBERS_MODES):
+            raise ValueError(
+                f"sample_members must be a bool or one of {SAMPLE_MEMBERS_MODES}, "
+                f"got {sample_members!r}"
+            )
         if sample_members and load_masking_weights:
             raise ValueError("sample_members is incompatible with load_masking_weights")
         self._path = Path(path)
@@ -416,7 +431,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._seed = seed
         self._load_masking_weights = load_masking_weights
         self._drop_remainder = drop_remainder
-        self._sample_members = sample_members
+        self._sample_members = bool(sample_members)
+        self._subcluster = sample_members == "subcluster"
         self._epoch = 0
 
         # Armed resume skip (Task 3.1): plain instance state, so it pickles into
@@ -443,14 +459,18 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             self._rows_per_shard.append(pf.metadata.num_rows)
             self._shard_has_weights.append(_WEIGHTS_COLUMN in pf.schema_arrow.names)
             if sample_members:
-                missing = {MEMBER_IDS_COLUMN, MEMBER_SEQUENCES_COLUMN} - set(pf.schema_arrow.names)
+                missing = set(self._member_columns()) - set(pf.schema_arrow.names)
                 if missing:
                     raise ValueError(
-                        f"sample_members needs columns {MEMBER_IDS_COLUMN!r} and "
-                        f"{MEMBER_SEQUENCES_COLUMN!r}; {shard} lacks {sorted(missing)}"
+                        f"sample_members={sample_members!r} needs columns "
+                        f"{self._member_columns()}; {shard} lacks {sorted(missing)}"
                     )
 
         self._total_rows = sum(self._rows_per_shard)
+
+    def _member_columns(self) -> list[str]:
+        cols = [MEMBER_IDS_COLUMN, MEMBER_SEQUENCES_COLUMN]
+        return [*cols, SUBCLUSTER_OFFSETS_COLUMN] if self._subcluster else cols
 
     @staticmethod
     def _discover_shards(path: Path) -> list[Path]:
@@ -707,11 +727,16 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
     def _read_members(
         self, shard_idx: int, row_indices: list[int], epoch_seed: int
     ) -> Iterator[dict[str, object]]:
-        """Yield one member per cluster row, chosen by :func:`_member_index`."""
+        """Yield one member per cluster row, chosen by :func:`_member_index`.
+
+        Subcluster mode draws block ``k = h1 % K``, then member ``offsets[k] + h2 % len(block)``,
+        ``h2`` folding :data:`_SUBCLUSTER_FOLD` into the same coordinates.
+        """
         path = self._shards[shard_idx]
-        table = pq.read_table(path, columns=[MEMBER_IDS_COLUMN, MEMBER_SEQUENCES_COLUMN])
+        table = pq.read_table(path, columns=self._member_columns())
         id_lists = table.column(MEMBER_IDS_COLUMN)
         seq_lists = table.column(MEMBER_SEQUENCES_COLUMN)
+        off_lists = table.column(SUBCLUSTER_OFFSETS_COLUMN) if self._subcluster else None
         for row_idx in row_indices:
             ids = id_lists[row_idx].as_py()
             seqs = seq_lists[row_idx].as_py()
@@ -720,7 +745,24 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                     f"{path} row {row_idx}: member_ids ({len(ids or [])}) and "
                     f"member_sequences ({len(seqs or [])}) must be non-empty and equal length"
                 )
-            j = _member_index(epoch_seed, shard_idx, row_idx, len(ids))
+            if off_lists is None:
+                j = _member_index(epoch_seed, shard_idx, row_idx, len(ids))
+            else:
+                offs = off_lists[row_idx].as_py() or []
+                # Strictly increasing from 0 to len(ids): K >= 1 non-empty blocks.
+                if (
+                    len(offs) < 2
+                    or offs[0] != 0
+                    or offs[-1] != len(ids)
+                    or any(a >= b for a, b in zip(offs, offs[1:], strict=False))
+                ):
+                    raise ValueError(
+                        f"{path} row {row_idx}: subcluster_offsets {offs} must rise strictly "
+                        f"from 0 to len(member_ids) = {len(ids)}"
+                    )
+                k = _member_index(epoch_seed, shard_idx, row_idx, len(offs) - 1)
+                lo, hi = offs[k], offs[k + 1]
+                j = lo + _member_index(epoch_seed, shard_idx, row_idx, hi - lo, _SUBCLUSTER_FOLD)
             yield {"sequence_id": ids[j], "sequence": seqs[j]}
 
 

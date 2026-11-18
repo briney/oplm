@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from oplm.config import EvalDatasetEntry, ScheduleSpec, TrainDatasetEntry, parse_schedule_block
+from oplm.data.sequence.dataset import SAMPLE_MEMBERS_MODES
 
 # Eval-entry keys with dedicated handling; everything else is folded into
 # ``EvalDatasetEntry.extra`` so task-specific config travels with the entry.
@@ -75,7 +76,7 @@ def _parse_train_mapping(raw: dict[Any, Any]) -> list[TrainDatasetEntry]:
     paths: list[str] = []
     # None marks an omitted fraction (resolved by splitting the remainder).
     fractions: list[float | None] = []
-    sample_members: list[bool] = []
+    sample_members: list[bool | str] = []
     for name, value in raw.items():
         if value is None:
             continue
@@ -102,9 +103,10 @@ def _parse_train_mapping(raw: dict[Any, Any]) -> list[TrainDatasetEntry]:
         if path is None or (isinstance(path, str) and not path.strip()):
             raise ValueError(f"data.train.{name} is missing required 'path'")
 
-        if not isinstance(members, bool):
+        if not (isinstance(members, bool) or members in SAMPLE_MEMBERS_MODES):
             raise ValueError(
-                f"data.train.{name}.sample_members must be a bool, got {type(members).__name__}"
+                f"data.train.{name}.sample_members must be a bool or one of "
+                f"{SAMPLE_MEMBERS_MODES}, got {members!r}"
             )
 
         names.append(str(name))

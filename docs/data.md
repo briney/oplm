@@ -562,6 +562,14 @@ loader reshard layers (any-topology resume) and any topology serve the same memb
 epoch redraws it. Re-cutting the files with `oplm data reshard` changes shard and row indices,
 and so the members drawn.
 
+Two-level datasets also group the members into subclusters with a `subcluster_offsets`
+column (`list[int]`, CSR offsets of length K+1: subcluster k is
+`member_*[offsets[k]:offsets[k+1]]`, `offsets[0] = 0`, `offsets[K] = len(member_ids)`, no empty
+subclusters). `sample_members: "subcluster"` draws subcluster `k = h1 % K`, then member
+`offsets[k] + h2 % (offsets[k+1] - offsets[k])`, where `h1` is the uniform-mode hash and `h2`
+folds one more constant into it, so the same resume and topology guarantees hold. Uniform
+mode and phase 1 ignore the column.
+
 Only the needed columns are read (`pq.read_table(columns=[...])`). There is no
 HuggingFace `datasets` integration; parquet is the only on-disk format.
 
