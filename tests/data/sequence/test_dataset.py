@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -378,3 +379,175 @@ def test_fingerprint_sees_content_and_fraction(tmp_path: Path) -> None:
         {"x": {"path": str(a), "fraction": 0.25}, "y": {"path": str(b), "fraction": 0.75}}
     )
     assert one != two
+
+
+# --------------------------------------------------------------------------- #
+# teacher_logits column and Neff gating
+# --------------------------------------------------------------------------- #
+
+
+def _write_distill_shard(
+    path: Path,
+    rows: list[tuple[str, str, bytes | None, float | None, float | None]],
+    *,
+    large_binary: bool = False,
+    include_neff: bool = True,
+) -> Path:
+    cols: dict[str, pa.Array] = {
+        "sequence_id": pa.array([r[0] for r in rows], type=pa.string()),
+        "sequence": pa.array([r[1] for r in rows], type=pa.string()),
+        "teacher_logits": pa.array(
+            [r[2] for r in rows],
+            type=pa.large_binary() if large_binary else pa.binary(),
+        ),
+    }
+    if include_neff:
+        cols["teacher_neff"] = pa.array([r[3] for r in rows], type=pa.float32())
+        cols["teacher_neff_sqrt_l"] = pa.array([r[4] for r in rows], type=pa.float32())
+    pq.write_table(pa.table(cols), path)
+    return path
+
+
+def test_teacher_logits_ignored_when_disabled(tmp_path: Path) -> None:
+    shard = _write_distill_shard(
+        tmp_path / "s.parquet", [("a", "ACDE", b"\x00" * 160, 50.0, 25.0)]
+    )
+    ds = ShardedProteinDataset(shard, shuffle_shards=False, shuffle_rows=False)
+    row = next(iter(ds))
+    assert "teacher_logits" not in row
+
+
+@pytest.mark.parametrize("large_binary", [False, True])
+def test_teacher_logits_loaded_and_neff_gated(tmp_path: Path, large_binary: bool) -> None:
+    payload = b"\x01" * 160
+    shard = _write_distill_shard(
+        tmp_path / "s.parquet",
+        [
+            ("pass_both", "ACDE", payload, 30.0, 5.0),
+            ("pass_boundary", "ACDE", payload, 20.0, 2.0),
+            ("fail_neff", "ACDE", payload, 10.0, 5.0),
+            ("fail_sqrt", "ACDE", payload, 30.0, 1.5),
+            ("nan_neff", "ACDE", payload, float("nan"), 5.0),
+            ("nan_sqrt", "ACDE", payload, 30.0, float("nan")),
+            ("none_neff", "ACDE", payload, None, 5.0),
+            ("none_sqrt", "ACDE", payload, 30.0, None),
+            ("null_logits", "ACDE", None, 50.0, 10.0),
+        ],
+        large_binary=large_binary,
+    )
+    ds = ShardedProteinDataset(
+        shard,
+        shuffle_shards=False,
+        shuffle_rows=False,
+        load_teacher_logits=True,
+        min_teacher_neff=20.0,
+        min_teacher_neff_sqrt_l=2.0,
+    )
+    got = {str(r["sequence_id"]): r["teacher_logits"] for r in ds}
+    assert got["pass_both"] == payload
+    assert got["pass_boundary"] == payload
+    for key in (
+        "fail_neff",
+        "fail_sqrt",
+        "nan_neff",
+        "nan_sqrt",
+        "none_neff",
+        "none_sqrt",
+        "null_logits",
+    ):
+        assert got[key] is None
+
+
+def test_teacher_logits_without_gates_does_not_require_neff_columns(tmp_path: Path) -> None:
+    payload = b"\x03" * 160
+    shard = _write_distill_shard(
+        tmp_path / "s.parquet",
+        [("a", "ACDE", payload, None, None)],
+        include_neff=False,
+    )
+    ds = ShardedProteinDataset(
+        shard, shuffle_shards=False, shuffle_rows=False, load_teacher_logits=True
+    )
+    row = next(iter(ds))
+    assert row["teacher_logits"] == payload
+
+
+def test_teacher_logits_missing_neff_column_raises(tmp_path: Path) -> None:
+    shard = _write_distill_shard(
+        tmp_path / "s.parquet", [("a", "ACDE", b"\x00" * 160, None, None)], include_neff=False
+    )
+    with pytest.raises(ValueError, match="teacher_neff"):
+        ShardedProteinDataset(shard, load_teacher_logits=True, min_teacher_neff=20.0)
+    with pytest.raises(ValueError, match="teacher_neff_sqrt_l"):
+        ShardedProteinDataset(shard, load_teacher_logits=True, min_teacher_neff_sqrt_l=2.0)
+
+
+def test_mixed_interleaved_distilled_plain_and_sample_members(tmp_path: Path) -> None:
+    distilled = _write_distill_shard(
+        tmp_path / "d.parquet", [("d0", "ACDE", b"\x02" * 160, 40.0, 6.0)]
+    )
+    plain = tmp_path / "plain.parquet"
+    pq.write_table(
+        pa.table({"sequence_id": ["p0", "p1"], "sequence": ["ACDE", "ACDF"]}),
+        plain,
+    )
+    members_shard = tmp_path / "members.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": ["m0"],
+                "sequence": ["ACDE"],
+                "member_ids": [["m0_a", "m0_b"]],
+                "member_sequences": [["ACDE", "ACDF"]],
+                "subcluster_offsets": [[0, 1, 2]],
+            }
+        ),
+        members_shard,
+    )
+    mix = InterleavedDataset(
+        [
+            ShardedProteinDataset(distilled, load_teacher_logits=True, min_teacher_neff_sqrt_l=2.0),
+            ShardedProteinDataset(plain, load_teacher_logits=True, min_teacher_neff_sqrt_l=2.0),
+            ShardedProteinDataset(
+                members_shard,
+                sample_members=True,
+                load_teacher_logits=True,
+                min_teacher_neff_sqrt_l=2.0,
+            ),
+            ShardedProteinDataset(
+                members_shard,
+                sample_members="subcluster",
+                load_teacher_logits=True,
+                min_teacher_neff_sqrt_l=2.0,
+            ),
+        ],
+        [0.25, 0.25, 0.25, 0.25],
+        num_samples=24,
+        seed=0,
+    )
+    rows = list(mix)
+    assert all("teacher_logits" in r for r in rows)
+    assert any(r["teacher_logits"] is not None for r in rows)
+    assert any(r["teacher_logits"] is None for r in rows)
+
+
+@pytest.mark.parametrize("mode", [True, "uniform", "subcluster"])
+def test_sample_members_with_teacher_logits_column_raises(
+    tmp_path: Path, mode: bool | str
+) -> None:
+    shard = tmp_path / "bad.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": ["m0"],
+                "sequence": ["ACDE"],
+                "member_ids": [["m0_a"]],
+                "member_sequences": [["ACDE"]],
+                "subcluster_offsets": [[0, 1]],
+                "teacher_logits": pa.array([b"\x00" * 160], type=pa.binary()),
+            }
+        ),
+        shard,
+    )
+    with pytest.raises(ValueError, match="sample_members"):
+        ShardedProteinDataset(shard, sample_members=mode, load_teacher_logits=True)
