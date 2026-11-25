@@ -14,10 +14,12 @@ from omegaconf import OmegaConf
 from oplm.config import (
     AVAILABLE_PRESETS,
     DataConfig,
+    DistillConfig,
     TrainConfig,
     load_config,
     resolve_token_accumulation,
     serialize_config,
+    validate_distill_compat,
     validate_token_batching,
 )
 from oplm.model import OplmConfig as OplmModelConfig
@@ -875,3 +877,83 @@ def test_resolve_token_accumulation_accepts_saved_value_and_rejects_others() -> 
     assert resolve_token_accumulation(saved, 2) == 2
     with pytest.raises(ValueError, match="leave it at 1"):
         resolve_token_accumulation(saved, 1)  # derived 4 here, so the saved 2 is stale
+
+
+# --- distillation block (distill.*) ---------------------------------------------
+
+
+def test_distill_defaults_to_none() -> None:
+    assert load_config([]).distill is None
+
+
+def test_distill_cli_dotlist_and_round_trip(tmp_path: Path) -> None:
+    cfg = load_config(["distill.alpha=0.7", "distill.min_neff_sqrt_l=2.0"])
+    assert isinstance(cfg.distill, DistillConfig)
+    assert cfg.distill.alpha == 0.7
+    assert cfg.distill.temperature == 1.5
+    assert cfg.distill.teacher_alphabet == "ARNDCEQGHILKMFPSTWYV"
+    assert cfg.distill.min_neff is None
+    assert cfg.distill.min_neff_sqrt_l == 2.0
+
+    dumped = tmp_path / "roundtrip.yaml"
+    dumped.write_text(serialize_config(cfg))
+    assert "distill:" in dumped.read_text()
+    reloaded = load_config(["--config", str(dumped)])
+    assert reloaded.distill == cfg.distill
+
+
+def test_distill_empty_yaml_block_uses_defaults(tmp_path: Path) -> None:
+    path = _write_yaml(tmp_path, "distill: {}\n")
+    cfg = load_config(["--config", path])
+    assert cfg.distill == DistillConfig()
+
+
+def test_distill_omitted_from_serialized_config_when_none() -> None:
+    assert "distill:" not in serialize_config(load_config([]))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"alpha": -0.1},
+        {"alpha": 1.1},
+        {"alpha": float("nan")},
+        {"alpha": float("inf")},
+        {"alpha": True},
+        {"temperature": 0.0},
+        {"temperature": -1.0},
+        {"temperature": float("inf")},
+        {"temperature": float("nan")},
+        {"temperature": True},
+        {"teacher_alphabet": "arndceqghilkmfpstwyv"},  # lowercase rejected
+        {"teacher_alphabet": "ARNDCEQGHILKMFPSTWYX"},  # non-canonical X
+        {"teacher_alphabet": "AARNDCEQGHILKMFPSTWY"},  # duplicate A
+        {"teacher_alphabet": "ARND"},  # wrong length
+        {"min_neff": -1.0},
+        {"min_neff": float("nan")},
+        {"min_neff": float("inf")},
+        {"min_neff": False},
+        {"min_neff_sqrt_l": -0.5},
+        {"min_neff_sqrt_l": float("nan")},
+        {"min_neff_sqrt_l": float("inf")},
+        {"min_neff_sqrt_l": True},
+    ],
+)
+def test_distill_config_rejects_invalid_values(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        DistillConfig(**kwargs)
+
+
+def test_distill_allows_zero_alpha_and_zero_neff() -> None:
+    cfg = DistillConfig(alpha=0.0, min_neff=0.0, min_neff_sqrt_l=0.0)
+    assert cfg.alpha == 0.0
+    assert cfg.min_neff == 0.0
+    assert cfg.min_neff_sqrt_l == 0.0
+
+
+def test_distill_and_fold_mutually_exclusive(tmp_path: Path) -> None:
+    path = _write_yaml(tmp_path, "fold:\n  lm: esmc:esmc_600m\ndistill:\n  alpha: 0.5\n")
+    with pytest.raises(ValueError, match="distill"):
+        load_config(["--config", path])
+    cfg = load_config(["distill.alpha=0.5"])
+    validate_distill_compat(cfg)
