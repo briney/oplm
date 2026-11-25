@@ -617,6 +617,57 @@ class FoldRunConfig:
                 raise ValueError(f"fold.{name} must be finite and >= 0, got {value}")
 
 
+_CANONICAL_AMINO_ACIDS = frozenset("LAGVSERTIDPKQNFYMHWC")
+
+
+@dataclass
+class DistillConfig:
+    """The ``distill:`` block for optional per-residue teacher-logit distillation.
+
+    Blends standard masked-LM cross-entropy with a temperature-scaled KL loss against
+    precomputed 20-channel teacher logits on masked canonical residues. ``None`` on
+    :class:`OplmConfig` disables distillation completely.
+    """
+
+    alpha: float = 0.5
+    temperature: float = 1.5
+    teacher_alphabet: str = "ARNDCEQGHILKMFPSTWYV"
+    min_neff: float | None = None
+    min_neff_sqrt_l: float | None = None
+
+    def __post_init__(self) -> None:
+        """Validate loss weights, temperature, teacher channel alphabet, and Neff gates."""
+        if (
+            isinstance(self.alpha, bool)
+            or not math.isfinite(self.alpha)
+            or not (0.0 <= self.alpha <= 1.0)
+        ):
+            raise ValueError(f"distill.alpha must be finite and in [0, 1], got {self.alpha!r}")
+        if (
+            isinstance(self.temperature, bool)
+            or not math.isfinite(self.temperature)
+            or self.temperature <= 0.0
+        ):
+            raise ValueError(
+                f"distill.temperature must be finite and > 0, got {self.temperature!r}"
+            )
+        if (
+            not isinstance(self.teacher_alphabet, str)
+            or len(self.teacher_alphabet) != 20
+            or set(self.teacher_alphabet) != _CANONICAL_AMINO_ACIDS
+        ):
+            raise ValueError(
+                "distill.teacher_alphabet must be a 20-character permutation of the "
+                f"uppercase canonical amino acids, got {self.teacher_alphabet!r}"
+            )
+        for name in ("min_neff", "min_neff_sqrt_l"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not math.isfinite(value) or value < 0.0
+            ):
+                raise ValueError(f"distill.{name} must be finite and >= 0, got {value!r}")
+
+
 @dataclass
 class OplmConfig:
     """Root configuration composing model, training, and data configs."""
@@ -628,6 +679,22 @@ class OplmConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     data: DataConfig = field(default_factory=DataConfig)
     fold: FoldRunConfig | None = None
+    distill: DistillConfig | None = None
+
+
+def validate_distill_compat(cfg: OplmConfig) -> None:
+    """Reject configs that enable both structure-head training and MLM distillation.
+
+    Called from :func:`load_config` and again in ``Trainer.__init__``, mirroring
+    :func:`validate_parallelism_compat` and :func:`validate_token_batching`.
+
+    Raises:
+        ValueError: Both ``cfg.fold`` and ``cfg.distill`` are set.
+    """
+    if cfg.fold is not None and cfg.distill is not None:
+        raise ValueError(
+            "fold and distill cannot be set together: distill only applies to MLM training"
+        )
 
 
 def validate_parallelism_compat(cfg: OplmConfig) -> None:
@@ -906,10 +973,13 @@ def load_config(argv: list[str]) -> OplmConfig:
     # `model` is an Any field so it round-trips as a plain dict here.
     cfg: OplmConfig = OmegaConf.to_object(base)  # ty: ignore[invalid-assignment]  # OmegaConf union
 
-    # ``fold`` is an optional structured node: ``to_object`` yields FoldRunConfig or None.
-    # A plain dict can only appear if OmegaConf typed the node loosely; normalize it.
+    # ``fold`` and ``distill`` are optional structured nodes: ``to_object`` yields the
+    # dataclass or None. A plain dict can appear if OmegaConf typed the node loosely;
+    # normalize it so __post_init__ validation always runs.
     if isinstance(cfg.fold, dict):
         cfg.fold = FoldRunConfig(**cast("dict[str, Any]", cfg.fold))
+    if isinstance(cfg.distill, dict):
+        cfg.distill = DistillConfig(**cast("dict[str, Any]", cfg.distill))
 
     # Instantiate the HF model config from the merged `model` subtree. HF owns
     # derivation (head_dim, intermediate_size, rope_dim/nope_dim) and validation.
@@ -937,10 +1007,11 @@ def load_config(argv: list[str]) -> OplmConfig:
                 f"{max_pos} % {ptm} = {max_pos % ptm}"
             )
 
-    # Cross-section compatibility (train.parallelism vs data.eval); also re-checked at
-    # Trainer.__init__ for configs built without load_config.
+    # Cross-section compatibility (train.parallelism vs data.eval, token mode, fold vs
+    # distill); also re-checked at Trainer.__init__ for configs built without load_config.
     validate_parallelism_compat(cfg)
     validate_token_batching(cfg)
+    validate_distill_compat(cfg)
 
     cfg.train.config_path = config_path
 
@@ -959,8 +1030,8 @@ def serialize_config(cfg: OplmConfig, *, gradient_checkpointing: bool | None = N
     """Serialize a resolved :class:`OplmConfig` to reloadable YAML text.
 
     The ``model`` subtree is an HF ``OplmConfig`` (serialized via ``to_dict``);
-    ``train``, ``data``, and ``fold`` (when present) are dataclasses. The result
-    round-trips through ``load_config(["--config", <path>])``. Shared by the
+    ``train``, ``data``, ``fold`` (when present), and ``distill`` (when present) are
+    dataclasses. The result round-trips through ``load_config(["--config", <path>])``. Shared by the
     top-level run config dump and the per-checkpoint ``config.yaml``.
 
     ``gradient_checkpointing``, when given, overrides ``model.gradient_checkpointing``: once
@@ -993,4 +1064,6 @@ def serialize_config(cfg: OplmConfig, *, gradient_checkpointing: bool | None = N
     }
     if cfg.fold is not None:
         config_dict["fold"] = asdict(cfg.fold)
+    if cfg.distill is not None:
+        config_dict["distill"] = asdict(cfg.distill)
     return OmegaConf.to_yaml(OmegaConf.create(config_dict))

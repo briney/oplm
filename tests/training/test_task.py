@@ -6,12 +6,23 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
+import torch.nn.functional as F
 
+from oplm.config import DistillConfig, FoldRunConfig, load_config
+from oplm.data.sequence.collate import MLMCollator
+from oplm.data.tokenizer import get_tokenizer
 from oplm.training.flops import estimate_flops_per_token
-from oplm.training.task import MLMTask, StepResult, TrainTask
-from tests.training.conftest import FullRecordingCallback, tiny_train_cfg
+from oplm.training.task import DistillMLMTask, MLMTask, StepResult, TrainTask
+from tests.training.conftest import (
+    FullRecordingCallback,
+    configure_accelerator_device,
+    tiny_train_cfg,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -91,3 +102,363 @@ def test_custom_task_metrics_and_flop_policy_flow_through_trainer(
     # steps per log window at accumulation 1, so 2 * mean == the window's token delta.
     (_, first), (_, second) = callback.train_logs
     assert second["train/aux"] * 2 == pytest.approx(second["train/tokens"] - first["train/tokens"])
+
+
+# --------------------------------------------------------------------------- #
+# DistillMLMTask and Trainer integration
+# --------------------------------------------------------------------------- #
+
+
+class _FixedLogitsModel(torch.nn.Module):
+    """Minimal stub returning a fixed logits tensor without an underlying transformer."""
+
+    def __init__(self, logits: torch.Tensor) -> None:
+        super().__init__()
+        self._logits = logits
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        assert labels is None
+        return {"logits": self._logits}
+
+
+def _write_mixed_distill_parquet(path: Path) -> Path:
+    rng = np.random.default_rng(0)
+    seqs = [
+        "ACDEFGHIKLMNPQRSTVWY",
+        "MKTAYIAKQRQISFVKSHFSRQ",
+        "GIVEQCCTSICSLYQLENYCN",
+        "FVNQHLCGSHLVEALYLVCGERGFFYTPKT",
+    ]
+    payloads = [
+        rng.normal(size=(len(s), 20)).astype("<f2").tobytes() if i < 2 else None
+        for i, s in enumerate(seqs)
+    ]
+    neff_sqrt_l = [6.0, 6.0, None, None]
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": [f"s{i}" for i in range(len(seqs))],
+                "sequence": seqs,
+                "teacher_logits": pa.array(payloads, type=pa.binary()),
+                "teacher_neff": pa.array([40.0, 40.0, None, None], type=pa.float32()),
+                "teacher_neff_sqrt_l": pa.array(neff_sqrt_l, type=pa.float32()),
+            }
+        ),
+        path,
+    )
+    return path
+
+
+def test_distill_task_alpha_zero_matches_mlm_loss_and_grads(tmp_path: Path) -> None:
+    cfg = tiny_train_cfg(
+        tmp_path,
+        _write_mixed_distill_parquet(tmp_path / "m.parquet"),
+        batch_size=4,
+        mask_prob=0.5,
+        drop_last=False,
+    )
+    cfg.distill = DistillConfig(alpha=0.0, temperature=1.5, min_neff_sqrt_l=2.0)
+    mlm_task = MLMTask()
+    distill_task = DistillMLMTask(cfg.distill)
+    assert isinstance(distill_task, MLMTask)
+    assert isinstance(distill_task, TrainTask)
+
+    model_a = mlm_task.build_model(cfg, None)
+    model_b = distill_task.build_model(cfg, None)
+    model_b.load_state_dict(model_a.state_dict())
+    model_a.eval()
+    model_b.eval()
+
+    batch = next(iter(distill_task.build_dataloader(cfg)))
+    r_mlm = mlm_task.step(model_a, batch)
+    r_dist = distill_task.step(model_b, batch)
+
+    assert torch.allclose(r_dist.loss, r_mlm.loss, atol=1e-6)
+    r_mlm.loss.backward()
+    r_dist.loss.backward()
+    for p_a, p_b in zip(model_a.parameters(), model_b.parameters(), strict=True):
+        if p_a.grad is not None:
+            assert p_b.grad is not None
+            assert torch.allclose(p_b.grad, p_a.grad, atol=1e-5)
+    assert r_dist.metrics["loss_ce"] == pytest.approx(r_mlm.loss.item(), abs=1e-6)
+    assert "loss_kl" in r_dist.metrics
+    assert math.isfinite(r_dist.metrics["loss_kl"])
+    assert 0.0 < r_dist.metrics["distill_frac"] < 1.0
+
+
+def test_distill_task_channel_order_maps_teacher_alphabet_to_tokenizer_ids() -> None:
+    # 'A' is channel 0 in ARNDCEQGHILKMFPSTWYV, token id 5 in OplmTokenizerFast ('L' is id 4).
+    tok = get_tokenizer()
+    assert tok.convert_tokens_to_ids("L") == 4
+    assert tok.convert_tokens_to_ids("A") == 5
+
+    logits = torch.zeros((1, 3, tok.vocab_size), dtype=torch.float32, requires_grad=True)
+    teacher = torch.zeros((1, 3, 20), dtype=torch.float16)
+    teacher[0, 1, 0] = 10.0  # strong spike on channel 0 ('A')
+    batch = {
+        "input_ids": torch.tensor([[0, 32, 2]]),
+        "attention_mask": torch.tensor([[1, 1, 1]]),
+        "labels": torch.tensor([[-100, 5, -100]]),
+        "teacher_logits": teacher,
+        "teacher_mask": torch.tensor([[False, True, False]]),
+    }
+    stub = _FixedLogitsModel(logits)
+    result = DistillMLMTask(DistillConfig(alpha=1.0, temperature=1.0)).step(stub, batch)
+    result.loss.backward()
+    assert logits.grad is not None
+    assert logits.grad[0, 1, 5].item() < -0.5  # pushes 'A' (id 5) UP
+    assert logits.grad[0, 1, 4].item() > 0.0  # pushes 'L' (id 4) DOWN
+    assert logits.grad[0, 1, 0].item() == 0.0  # non-canonical token untouched at alpha=1.0
+
+    # With ESM-C alphabet order ('L' at channel 0), channel 0 pushes 'L' (id 4) UP instead.
+    logits2 = torch.zeros((1, 3, tok.vocab_size), dtype=torch.float32, requires_grad=True)
+    result2 = DistillMLMTask(
+        DistillConfig(alpha=1.0, temperature=1.0, teacher_alphabet="LAGVSERTIDPKQNFYMHWC")
+    ).step(_FixedLogitsModel(logits2), batch)
+    result2.loss.backward()
+    assert logits2.grad is not None
+    assert logits2.grad[0, 1, 4].item() < -0.5  # pushes 'L' (id 4) UP
+    assert logits2.grad[0, 1, 5].item() > 0.0  # pushes 'A' (id 5) DOWN
+
+
+def test_distill_task_blended_loss_formula_and_temperature_scaling() -> None:
+    tok = get_tokenizer()
+    torch.manual_seed(0)
+    logits = torch.randn((1, 4, tok.vocab_size), dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn((1, 4, 20), dtype=torch.float16)
+    labels = torch.tensor([[-100, 5, 4, -100]])  # pos 1 distilled ('A'), pos 2 plain ('L')
+    teacher_mask = torch.tensor([[False, True, False, False]])
+    batch = {
+        "input_ids": torch.tensor([[0, 32, 32, 2]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 1]]),
+        "labels": labels,
+        "teacher_logits": teacher,
+        "teacher_mask": teacher_mask,
+    }
+    cfg = DistillConfig(alpha=0.6, temperature=2.0)
+    result = DistillMLMTask(cfg).step(_FixedLogitsModel(logits), batch)
+
+    ce1 = F.cross_entropy(logits[0, 1:2], labels[0, 1:2])
+    ce2 = F.cross_entropy(logits[0, 2:3], labels[0, 2:3])
+    token_ids = torch.tensor(
+        [tok.convert_tokens_to_ids(aa) for aa in cfg.teacher_alphabet], dtype=torch.long
+    )
+    s20 = logits[0, 1, token_ids]
+    t20 = teacher[0, 1].float()
+    temp = cfg.temperature
+    kl1 = (
+        F.kl_div(
+            F.log_softmax(s20 / temp, dim=-1),
+            F.softmax(t20 / temp, dim=-1),
+            reduction="sum",
+        )
+        * temp
+        * temp
+    )
+    expected_loss = (ce2 + (1.0 - cfg.alpha) * ce1 + cfg.alpha * kl1) / 2.0
+    assert torch.allclose(result.loss, expected_loss, atol=1e-6)
+    assert result.metrics["loss_ce"] == pytest.approx(((ce1 + ce2) / 2.0).item(), abs=1e-6)
+    assert result.metrics["loss_kl"] == pytest.approx(kl1.item(), abs=1e-6)
+    assert result.metrics["distill_frac"] == pytest.approx(0.5)
+
+
+def test_distill_task_packed_matches_unpacked_loss(tmp_path: Path) -> None:
+    tok = get_tokenizer()
+    seqs = ["ACDEFGHIKLMNPQRSTVWY", "MKTAYIAKQRQISFVKSHFSRQ"]
+    rng = np.random.default_rng(1)
+    items = [
+        {
+            "sequence_id": "0",
+            "sequence": seqs[0],
+            "teacher_logits": rng.normal(size=(len(seqs[0]), 20)).astype("<f2").tobytes(),
+        },
+        {"sequence_id": "1", "sequence": seqs[1], "teacher_logits": None},
+    ]
+    unpacked = MLMCollator(
+        tok, max_length=64, mask_prob=0.5, deterministic=True, seed=3, load_teacher_logits=True
+    )(items)
+    packed = MLMCollator(
+        tok,
+        max_length=64,
+        mask_prob=0.5,
+        deterministic=True,
+        seed=3,
+        pack_sequences=True,
+        pack_rows=1,
+        load_teacher_logits=True,
+    )(items)
+
+    cfg = tiny_train_cfg(tmp_path, tmp_path / "unused.parquet")
+    task = DistillMLMTask(DistillConfig(alpha=0.5, temperature=1.5))
+    model = task.build_model(cfg, None)
+    model.eval()
+
+    unpacked_result = task.step(model, unpacked)
+    packed_result = task.step(model, packed)
+    assert torch.allclose(packed_result.loss, unpacked_result.loss, atol=1e-5)
+    assert packed_result.metrics["loss_ce"] == pytest.approx(
+        unpacked_result.metrics["loss_ce"], abs=1e-5
+    )
+    assert packed_result.metrics["loss_kl"] == pytest.approx(
+        unpacked_result.metrics["loss_kl"], abs=1e-5
+    )
+    assert packed_result.metrics["distill_frac"] == pytest.approx(
+        unpacked_result.metrics["distill_frac"]
+    )
+
+
+def test_distill_task_handles_zero_distilled_and_zero_masked_batches() -> None:
+    tok = get_tokenizer()
+    task = DistillMLMTask(DistillConfig(alpha=0.5, temperature=1.5))
+
+    # 1) teacher_mask all False (mirrors _canon_self_check [:4] slicing with no distilled rows)
+    logits = torch.randn((4, 6, tok.vocab_size), dtype=torch.float32, requires_grad=True)
+    labels = torch.full((4, 6), -100, dtype=torch.long)
+    labels[:, 2] = 5
+    plain_batch = {
+        "input_ids": torch.ones((4, 6), dtype=torch.long),
+        "attention_mask": torch.ones((4, 6), dtype=torch.long),
+        "labels": labels,
+        "teacher_logits": torch.zeros((4, 6, 20), dtype=torch.float16),
+        "teacher_mask": torch.zeros((4, 6), dtype=torch.bool),
+    }
+    r_plain = task.step(_FixedLogitsModel(logits), plain_batch)
+    expected_ce = F.cross_entropy(logits.view(-1, tok.vocab_size), labels.view(-1))
+    assert torch.allclose(r_plain.loss, expected_ce, atol=1e-6)
+    assert "loss_kl" not in r_plain.metrics
+    assert r_plain.metrics["loss_ce"] == pytest.approx(expected_ce.item(), abs=1e-6)
+    assert r_plain.metrics["distill_frac"] == 0.0
+    r_plain.loss.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+    # 2) labels all -100 (zero masked tokens)
+    logits_empty = torch.randn((2, 4, tok.vocab_size), dtype=torch.float32, requires_grad=True)
+    empty_batch = {
+        "input_ids": torch.ones((2, 4), dtype=torch.long),
+        "attention_mask": torch.ones((2, 4), dtype=torch.long),
+        "labels": torch.full((2, 4), -100, dtype=torch.long),
+        "teacher_logits": torch.zeros((2, 4, 20), dtype=torch.float16),
+        "teacher_mask": torch.zeros((2, 4), dtype=torch.bool),
+    }
+    r_empty = task.step(_FixedLogitsModel(logits_empty), empty_batch)
+    assert r_empty.loss.item() == 0.0
+    assert r_empty.loss.requires_grad
+    r_empty.loss.backward()
+    assert logits_empty.grad is not None and torch.isfinite(logits_empty.grad).all()
+    assert r_empty.metrics == {}
+
+
+def test_trainer_distill_compat_and_mixed_packed_branch_from_plain_mlm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oplm.training.trainer import Trainer
+
+    configure_accelerator_device("cpu", monkeypatch)
+
+    # 1) Trainer.__init__ rejects fold + distill even when bypassing load_config
+    plain_shard = tmp_path / "plain.parquet"
+    seqs = [
+        "ACDEFGHIKLMNPQRSTVWY",
+        "MKTAYIAKQRQISFVKSHFSRQ",
+        "GIVEQCCTSICSLYQLENYCN",
+        "FVNQHLCGSHLVEALYLVCGERGFFYTPKT",
+    ] * 4
+    pq.write_table(
+        pa.table({"sequence_id": [f"p{i}" for i in range(len(seqs))], "sequence": seqs}),
+        plain_shard,
+    )
+    bad_cfg = tiny_train_cfg(tmp_path / "bad", plain_shard)
+    bad_cfg.fold = FoldRunConfig()
+    bad_cfg.distill = DistillConfig()
+    with pytest.raises(ValueError, match="distill"):
+        Trainer(bad_cfg)
+
+    # 2) Stage 1: plain MLM for 2 steps -> checkpoint-2
+    stage1_dir = tmp_path / "stage1"
+    stage1_cfg = tiny_train_cfg(
+        stage1_dir,
+        plain_shard,
+        max_steps=2,
+        log_every=1,
+        save_final=True,
+        pack_sequences=True,
+        tokens_per_step=128,
+        batch_tokens=128,
+        mask_prob=0.5,
+    )
+    Trainer(stage1_cfg).train()
+    ckpt2 = stage1_dir / "checkpoint-2"
+    assert ckpt2.is_dir()
+
+    # 3) Stage 2: branch_from checkpoint-2 into mixed packed distill anneal
+    rng = np.random.default_rng(7)
+    distilled_shard = tmp_path / "distilled.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": [f"d{i}" for i in range(len(seqs))],
+                "sequence": seqs,
+                "teacher_logits": pa.array(
+                    [rng.normal(size=(len(s), 20)).astype("<f2").tobytes() for s in seqs],
+                    type=pa.binary(),
+                ),
+                "teacher_neff": pa.array([40.0] * len(seqs), type=pa.float32()),
+                "teacher_neff_sqrt_l": pa.array([6.0] * len(seqs), type=pa.float32()),
+            }
+        ),
+        distilled_shard,
+    )
+    members_shard = tmp_path / "members.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": [f"m{i}" for i in range(len(seqs))],
+                "sequence": seqs,
+                "member_ids": [[f"m{i}_a", f"m{i}_b"] for i in range(len(seqs))],
+                "member_sequences": [[s, s] for s in seqs],
+            }
+        ),
+        members_shard,
+    )
+
+    stage2_dir = tmp_path / "stage2"
+    stage2_cfg = tiny_train_cfg(
+        stage2_dir,
+        plain_shard,
+        max_steps=4,
+        log_every=1,
+        save_final=True,
+        branch_from=str(ckpt2),
+        pack_sequences=True,
+        tokens_per_step=128,
+        batch_tokens=128,
+        mask_prob=0.5,
+    )
+    stage2_cfg.data.train = {
+        "distilled": {"path": str(distilled_shard), "fraction": 0.5},
+        "plain": {"path": str(plain_shard), "fraction": 0.25},
+        "members": {"path": str(members_shard), "fraction": 0.25, "sample_members": True},
+    }
+    stage2_cfg.distill = DistillConfig(alpha=0.5, temperature=1.5, min_neff_sqrt_l=2.0)
+
+    cb = FullRecordingCallback()
+    trainer = Trainer(stage2_cfg, callbacks=[cb])
+    assert isinstance(trainer.task, DistillMLMTask)
+    assert isinstance(trainer.task, MLMTask)
+    trainer.train()
+
+    assert cb.train_log_steps == [3, 4]
+    for _, m in cb.train_logs:
+        assert math.isfinite(m["train/loss_ce"])
+        assert 0.0 <= m["train/distill_frac"] <= 1.0
+    assert any("train/loss_kl" in m and math.isfinite(m["train/loss_kl"]) for _, m in cb.train_logs)
+
+    reloaded = load_config(["--config", str(stage2_dir / "checkpoint-4" / "config.yaml")])
+    assert reloaded.distill == stage2_cfg.distill

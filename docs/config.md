@@ -467,6 +467,23 @@ clinical-substitution CSVs (`protein_sequence`, `mutant`, `DMS_bin_score`).
 Registered but currently documented stubs; they consume no task-specific keys
 yet. See [evaluation.md](evaluation.md), *Tasks and metrics* for status.
 
+## Distillation fields (`distill.*`)
+
+Backed by `oplm.config.DistillConfig`; optional per-residue teacher-logit KL distillation
+for MLM runs ([training.md, *Training tasks (`TrainTask`)*](training.md#training-tasks-traintask)).
+The block is absent (`null`) by default, leaving plain MLM training, collation, and batch
+keys untouched. Setting both `fold:` and `distill:` raises a `ValueError` at load and
+trainer-construction time. On-disk Parquet column requirements are in
+[data.md, *Dataset formats*](data.md#dataset-formats).
+
+| Override | Type | Default | Valid values / notes |
+| --- | --- | --- | --- |
+| `distill.alpha` | `float` | `0.5` | Weight of the temperature-scaled KL term on distilled masked tokens (CE weight on those tokens is `1 - alpha`); finite, in `[0, 1]`. `0.0` matches plain MLM loss and gradients while still logging `train/loss_kl` and `train/distill_frac`. |
+| `distill.temperature` | `float` | `1.5` | Softmax temperature `T` applied to both student and teacher 20-channel logits (KL is scaled by `T²`); finite, `> 0`. |
+| `distill.teacher_alphabet` | `str` | `ARNDCEQGHILKMFPSTWYV` | 20-character permutation of the uppercase canonical amino acids giving the teacher payload's channel order (default matches `msa-pairformer`). Mapped dynamically to `OplmTokenizerFast` token IDs rather than assuming ESM-C order. |
+| `distill.min_neff` | `float \| null` | `null` | Optional minimum `teacher_neff` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` must include `teacher_neff`; rows with missing, non-finite, or smaller values fall back to plain CE. |
+| `distill.min_neff_sqrt_l` | `float \| null` | `null` | Optional minimum `teacher_neff_sqrt_l` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` must include `teacher_neff_sqrt_l`; rows with missing, non-finite, or smaller values fall back to plain CE. |
+
 ## Fold fields (`fold.*`)
 
 Backed by `oplm.config.FoldRunConfig`; the structure-head training block

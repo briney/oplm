@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,11 @@ _PARQUET_SUFFIXES = frozenset({".parquet", ".parq", ".pq"})
 
 # Optional per-residue masking-weight column (read only when requested).
 _WEIGHTS_COLUMN = "masking_weights"
+
+# Optional teacher-logit distillation columns (read only when requested).
+TEACHER_LOGITS_COLUMN = "teacher_logits"
+TEACHER_NEFF_COLUMN = "teacher_neff"
+TEACHER_NEFF_SQRT_L_COLUMN = "teacher_neff_sqrt_l"
 
 # Optional per-cluster member columns (list[str], parallel), read only with ``sample_members``.
 MEMBER_IDS_COLUMN = "member_ids"
@@ -397,13 +403,24 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             representative; ``"subcluster"`` picks a uniform subcluster, then a uniform member
             within it. The choice is a pure hash of ``(pass seed, shard, row)``
             (:func:`_member_index`), so cursors are unaffected. Incompatible with
-            ``load_masking_weights``.
+            ``load_masking_weights`` and with shards carrying ``teacher_logits``.
+        load_teacher_logits: Read the optional ``teacher_logits`` binary column and attach
+            it to each row (``bytes | None``; ``None`` for plain shards, null rows, or rows
+            gated out by ``min_teacher_neff`` / ``min_teacher_neff_sqrt_l``). When ``False``,
+            teacher columns are never read.
+        min_teacher_neff: Optional minimum ``teacher_neff`` threshold for shards carrying
+            ``teacher_logits``; rows with missing, non-finite, or smaller values yield
+            ``teacher_logits=None``.
+        min_teacher_neff_sqrt_l: Optional minimum ``teacher_neff_sqrt_l`` threshold for
+            shards carrying ``teacher_logits``; rows with missing, non-finite, or smaller
+            values yield ``teacher_logits=None``.
 
     Raises:
         FileNotFoundError: If ``path`` is neither a parquet file nor a directory
             containing parquet shards.
         ValueError: If ``sample_members`` is not a known mode, is set with
-            ``load_masking_weights``, or a shard lacks the columns it needs.
+            ``load_masking_weights``, a shard lacks required columns, or a shard carries
+            ``teacher_logits`` under ``sample_members`` / missing gated Neff columns.
     """
 
     def __init__(
@@ -416,6 +433,9 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         load_masking_weights: bool = False,
         drop_remainder: bool = False,
         sample_members: bool | str = False,
+        load_teacher_logits: bool = False,
+        min_teacher_neff: float | None = None,
+        min_teacher_neff_sqrt_l: float | None = None,
     ) -> None:
         super().__init__()
         if not (isinstance(sample_members, bool) or sample_members in SAMPLE_MEMBERS_MODES):
@@ -433,6 +453,9 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._drop_remainder = drop_remainder
         self._sample_members = bool(sample_members)
         self._subcluster = sample_members == "subcluster"
+        self._load_teacher_logits = load_teacher_logits
+        self._min_teacher_neff = min_teacher_neff
+        self._min_teacher_neff_sqrt_l = min_teacher_neff_sqrt_l
         self._epoch = 0
 
         # Armed resume skip (Task 3.1): plain instance state, so it pickles into
@@ -453,17 +476,41 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._shards: list[Path] = []
         self._rows_per_shard: list[int] = []
         self._shard_has_weights: list[bool] = []
+        self._shard_has_teacher_logits: list[bool] = []
         for shard in shard_paths:
             pf = pq.ParquetFile(shard)
+            schema_names = set(pf.schema_arrow.names)
             self._shards.append(shard)
             self._rows_per_shard.append(pf.metadata.num_rows)
-            self._shard_has_weights.append(_WEIGHTS_COLUMN in pf.schema_arrow.names)
+            self._shard_has_weights.append(_WEIGHTS_COLUMN in schema_names)
+            has_teacher = TEACHER_LOGITS_COLUMN in schema_names
+            self._shard_has_teacher_logits.append(has_teacher)
             if sample_members:
-                missing = set(self._member_columns()) - set(pf.schema_arrow.names)
+                missing = set(self._member_columns()) - schema_names
                 if missing:
                     raise ValueError(
                         f"sample_members={sample_members!r} needs columns "
                         f"{self._member_columns()}; {shard} lacks {sorted(missing)}"
+                    )
+            if load_teacher_logits and has_teacher:
+                if self._sample_members:
+                    raise ValueError(
+                        f"sample_members={sample_members!r} is incompatible with shards "
+                        f"containing {TEACHER_LOGITS_COLUMN!r} ({shard}): cluster members "
+                        "do not align with representative teacher logits"
+                    )
+                if min_teacher_neff is not None and TEACHER_NEFF_COLUMN not in schema_names:
+                    raise ValueError(
+                        f"min_teacher_neff={min_teacher_neff} requires column "
+                        f"{TEACHER_NEFF_COLUMN!r}, which is missing from {shard}"
+                    )
+                if (
+                    min_teacher_neff_sqrt_l is not None
+                    and TEACHER_NEFF_SQRT_L_COLUMN not in schema_names
+                ):
+                    raise ValueError(
+                        f"min_teacher_neff_sqrt_l={min_teacher_neff_sqrt_l} requires column "
+                        f"{TEACHER_NEFF_SQRT_L_COLUMN!r}, which is missing from {shard}"
                     )
 
         self._total_rows = sum(self._rows_per_shard)
@@ -704,14 +751,29 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             yield from self._read_members(shard_idx, row_indices, epoch_seed)
             return
         has_weights = self._load_masking_weights and self._shard_has_weights[shard_idx]
+        has_teacher = self._load_teacher_logits and self._shard_has_teacher_logits[shard_idx]
+        min_neff = self._min_teacher_neff
+        min_neff_sqrt_l = self._min_teacher_neff_sqrt_l
+        read_neff = has_teacher and min_neff is not None
+        read_neff_sqrt_l = has_teacher and min_neff_sqrt_l is not None
+
         columns = ["sequence_id", "sequence"]
         if has_weights:
             columns.append(_WEIGHTS_COLUMN)
+        if has_teacher:
+            columns.append(TEACHER_LOGITS_COLUMN)
+        if read_neff:
+            columns.append(TEACHER_NEFF_COLUMN)
+        if read_neff_sqrt_l:
+            columns.append(TEACHER_NEFF_SQRT_L_COLUMN)
 
         table = pq.read_table(self._shards[shard_idx], columns=columns)
         seq_ids = table.column("sequence_id")
         sequences = table.column("sequence")
         weights = table.column(_WEIGHTS_COLUMN) if has_weights else None
+        teacher_logits_col = table.column(TEACHER_LOGITS_COLUMN) if has_teacher else None
+        neff_col = table.column(TEACHER_NEFF_COLUMN) if read_neff else None
+        neff_sqrt_l_col = table.column(TEACHER_NEFF_SQRT_L_COLUMN) if read_neff_sqrt_l else None
 
         for row_idx in row_indices:
             row: dict[str, object] = {
@@ -722,6 +784,25 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                 # Column-absent shards (and absent rows) surface None; the
                 # collator falls back to uniform weights with a one-time warning.
                 row["masking_weights"] = weights[row_idx].as_py() if weights is not None else None
+            if self._load_teacher_logits:
+                logits: object = None
+                if teacher_logits_col is not None:
+                    keep = True
+                    if neff_col is not None and min_neff is not None:
+                        neff = neff_col[row_idx].as_py()
+                        if neff is None or not math.isfinite(neff) or neff < min_neff:
+                            keep = False
+                    if keep and neff_sqrt_l_col is not None and min_neff_sqrt_l is not None:
+                        neff_sqrt_l = neff_sqrt_l_col[row_idx].as_py()
+                        if (
+                            neff_sqrt_l is None
+                            or not math.isfinite(neff_sqrt_l)
+                            or neff_sqrt_l < min_neff_sqrt_l
+                        ):
+                            keep = False
+                    if keep:
+                        logits = teacher_logits_col[row_idx].as_py()
+                row[TEACHER_LOGITS_COLUMN] = logits
             yield row
 
     def _read_members(
@@ -763,7 +844,10 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                 k = _member_index(epoch_seed, shard_idx, row_idx, len(offs) - 1)
                 lo, hi = offs[k], offs[k + 1]
                 j = lo + _member_index(epoch_seed, shard_idx, row_idx, hi - lo, _SUBCLUSTER_FOLD)
-            yield {"sequence_id": ids[j], "sequence": seqs[j]}
+            row: dict[str, object] = {"sequence_id": ids[j], "sequence": seqs[j]}
+            if self._load_teacher_logits:
+                row[TEACHER_LOGITS_COLUMN] = None
+            yield row
 
 
 # Returned by `_next_or_refill` when a source yields nothing for this (rank,

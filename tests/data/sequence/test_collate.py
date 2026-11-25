@@ -12,6 +12,9 @@ than biological data.
 
 from __future__ import annotations
 
+import warnings
+
+import numpy as np
 import pytest
 import torch
 
@@ -679,3 +682,133 @@ def test_fixed_shape_pack_checks_token_lengths(
     collator = MLMCollator(tokenizer, max_length=16, pack_sequences=True, pack_rows=4)
     with pytest.raises(ValueError, match="token_length"):
         collator(_seqs())
+
+
+# --------------------------------------------------------------------------- #
+# Teacher-logit collation and packing
+# --------------------------------------------------------------------------- #
+
+
+def _encode_logits(arr: np.ndarray) -> bytes:
+    return np.asarray(arr, dtype="<f2").tobytes()
+
+
+def test_teacher_logits_disabled_omits_keys(tokenizer) -> None:
+    seq = "ACDEFGHIKLMNPQRSTVWY"
+    arr = np.zeros((len(seq), 20), dtype="<f2")
+    collator = MLMCollator(tokenizer, max_length=64, mask_prob=0.5, deterministic=True, seed=0)
+    out = collator([{"sequence_id": "0", "sequence": seq, "teacher_logits": _encode_logits(arr)}])
+    assert "teacher_logits" not in out
+    assert "teacher_mask" not in out
+
+
+def test_teacher_logits_preserves_exact_masks_and_alignment(tokenizer) -> None:
+    seqs = ["ACDEFGHIKLMNPQRSTVWY", "MKTAYIAKQRQISFVKSHFSRQ"]
+    arrays = [np.arange(len(s) * 20, dtype="<f2").reshape(len(s), 20) / 100.0 for s in seqs]
+    plain_batch = _batch(seqs)
+    distill_batch = [
+        {"sequence_id": "0", "sequence": seqs[0], "teacher_logits": _encode_logits(arrays[0])},
+        {"sequence_id": "1", "sequence": seqs[1], "teacher_logits": None},
+    ]
+    c_plain = MLMCollator(tokenizer, max_length=64, mask_prob=0.5, deterministic=True, seed=7)
+    c_dist = MLMCollator(
+        tokenizer,
+        max_length=64,
+        mask_prob=0.5,
+        deterministic=True,
+        seed=7,
+        load_teacher_logits=True,
+    )
+    out_plain = c_plain(plain_batch)
+    out_dist = c_dist(distill_batch)
+    assert torch.equal(out_plain["input_ids"], out_dist["input_ids"])
+    assert torch.equal(out_plain["labels"], out_dist["labels"])
+    assert out_dist["teacher_logits"].dtype == torch.float16
+    assert out_dist["teacher_logits"].shape == (*out_dist["labels"].shape, 20)
+    assert out_dist["teacher_mask"].dtype == torch.bool
+    # Row 0: every masked position has teacher_mask=True and matches arrays[0][pos - 1]
+    masked0 = (out_dist["labels"][0] != -100).nonzero(as_tuple=False).squeeze(-1)
+    assert torch.equal(out_dist["teacher_mask"][0], out_dist["labels"][0] != -100)
+    for pos in masked0.tolist():
+        expected = torch.tensor(arrays[0][pos - 1], dtype=torch.float16)
+        assert torch.equal(out_dist["teacher_logits"][0, pos], expected)
+    # Row 1: teacher_logits=None -> all False
+    assert not out_dist["teacher_mask"][1].any()
+
+
+def test_teacher_logits_truncation_nan_noncanonical_and_memoryview(tokenizer) -> None:
+    # Raw length 20 truncated to max_length-2 = 10; position 2 is X (noncanonical);
+    # position 4 has NaN in channel 0 (K=2 uncomputed fold); position 6 has +inf.
+    seq = "ACXEFGHIKLMNPQRSTVWY"
+    arr = np.ones((len(seq), 20), dtype="<f2")
+    arr[4, 0] = np.nan
+    arr[6, 19] = np.inf
+    raw = memoryview(arr.tobytes())
+    collator = MLMCollator(
+        tokenizer,
+        max_length=12,
+        mask_prob=1.0,
+        deterministic=True,
+        seed=0,
+        load_teacher_logits=True,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = collator([{"sequence_id": "0", "sequence": seq, "teacher_logits": raw}])
+    non_writable = [w for w in caught if "not writable" in str(w.message)]
+    assert not non_writable
+    # Clipped residues occupy token indices 1..10 (raw indices 0..9):
+    # raw idx 2 ('X' -> token pos 3), idx 4 (NaN -> pos 5), idx 6 (inf -> pos 7) must be False.
+    assert not out["teacher_mask"][0, 3]
+    assert not out["teacher_mask"][0, 5]
+    assert not out["teacher_mask"][0, 7]
+    assert out["teacher_mask"][0].sum().item() == 7
+    assert torch.isfinite(out["teacher_logits"][out["teacher_mask"]]).all()
+
+
+def test_teacher_logits_byte_length_mismatch_raises(tokenizer) -> None:
+    collator = MLMCollator(tokenizer, max_length=32, mask_prob=0.5, load_teacher_logits=True)
+    with pytest.raises(ValueError, match="teacher_logits"):
+        collator([{"sequence_id": "0", "sequence": "ACDE", "teacher_logits": b"\x00" * 40}])
+
+
+@pytest.mark.parametrize("pack_rows", [1, None])
+def test_teacher_logits_packing_matches_unpacked(tokenizer, pack_rows: int | None) -> None:
+    seqs = ["ACDEFGHIKL", "MNPQRSTVWY"]
+    arrays = [
+        np.arange(200, dtype="<f2").reshape(10, 20) / 10.0,
+        np.ones((10, 20), dtype="<f2") * 3.0,
+    ]
+    items = [
+        {"sequence_id": "0", "sequence": seqs[0], "teacher_logits": _encode_logits(arrays[0])},
+        {"sequence_id": "1", "sequence": seqs[1], "teacher_logits": _encode_logits(arrays[1])},
+    ]
+    unpacked = MLMCollator(
+        tokenizer,
+        max_length=32,
+        mask_prob=0.5,
+        deterministic=True,
+        seed=3,
+        load_teacher_logits=True,
+    )(items)
+    packed = MLMCollator(
+        tokenizer,
+        max_length=32,
+        mask_prob=0.5,
+        deterministic=True,
+        seed=3,
+        pack_sequences=True,
+        pack_rows=pack_rows,
+        pad_to_multiple_of=8 if pack_rows is None else None,
+        load_teacher_logits=True,
+    )(items)
+    expected_width = 32 if pack_rows == 1 else 24
+    assert packed["teacher_logits"].shape == (1, expected_width, 20)
+    assert packed["teacher_mask"].shape == (1, expected_width)
+    # Segment 1 occupies [0:12], segment 2 occupies [12:24]
+    assert torch.equal(packed["teacher_logits"][0, :12], unpacked["teacher_logits"][0, :12])
+    assert torch.equal(packed["teacher_mask"][0, :12], unpacked["teacher_mask"][0, :12])
+    assert torch.equal(packed["teacher_logits"][0, 12:24], unpacked["teacher_logits"][1, :12])
+    assert torch.equal(packed["teacher_mask"][0, 12:24], unpacked["teacher_mask"][1, :12])
+    pad = packed["attention_mask"] == 0
+    assert not packed["teacher_mask"][pad].any()

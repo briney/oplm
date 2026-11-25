@@ -552,6 +552,9 @@ columns:
 | `sequence_id` | `str` | Stable identifier. |
 | `sequence` | `str` | Raw one-letter amino acids, **no special tokens**. |
 | `masking_weights` | `list[float]` | Optional, one weight per residue. Read only when `data.weighted_masking=true`. |
+| `teacher_logits` | `binary` / `large_binary` | Optional little-endian `float16` bytes of shape `(len(sequence), 20)` in `distill.teacher_alphabet` channel order (`null` falls back to plain CE). Read only when `distill:` is set. |
+| `teacher_neff` | `float32` | Optional MSA raw effective sequence count (`Neff`). Read only when `distill.min_neff` is set. |
+| `teacher_neff_sqrt_l` | `float32` | Optional length-normalized `Neff / sqrt(L)`. Read only when `distill.min_neff_sqrt_l` is set. |
 
 Cluster-per-row datasets (one row per cluster, the representative in
 `sequence_id` / `sequence`) add two optional parallel `list[str]` columns,
@@ -569,6 +572,20 @@ subclusters). `sample_members: "subcluster"` draws subcluster `k = h1 % K`, then
 `offsets[k] + h2 % (offsets[k+1] - offsets[k])`, where `h1` is the uniform-mode hash and `h2`
 folds one more constant into it, so the same resume and topology guarantees hold. Uniform
 mode and phase 1 ignore the column.
+
+Optional distillation shards carry `teacher_logits` (plus `teacher_neff` and/or
+`teacher_neff_sqrt_l` when runtime gating is configured via
+[config.md, *Distillation fields (`distill.*`)*](config.md#distillation-fields-distill)).
+When `distill:` is unset, these columns are ignored. When `distill:` is set, distilled
+sources may be interleaved freely with plain sources (including plain `sample_members`
+sources); shards that carry `teacher_logits` themselves reject `sample_members` and
+require any configured `Neff` gate column at dataset construction. Rows with null,
+non-finite, or below-threshold `Neff` values fall back to plain CE. During collation,
+only masked canonical amino-acid positions are decoded (aligned to the pre-truncation
+prefix if the sequence is clipped to `model.max_position_embeddings - 2`); any masked
+position with a non-finite (`NaN`/`±inf`) teacher channel or a non-canonical residue
+(`X`, `B`, `U`, `Z`, `O`) falls back per-position to plain CE, supporting partial-fold
+teachers (e.g. `K=2`). Evaluation dataloaders never load teacher logits.
 
 Only the needed columns are read (`pq.read_table(columns=[...])`). There is no
 HuggingFace `datasets` integration; parquet is the only on-disk format.

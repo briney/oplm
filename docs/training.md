@@ -1158,6 +1158,41 @@ window; the keys the trainer emits itself (`loss`, `lr`, `epoch`, `samples`,
 moved through their own `.to`, and `train/<term>` metrics come from `StepResult.metrics`
 ([FOLD.md, *Milestone 2b: losses and training*](FOLD.md#9-milestone-2b-losses-and-training-oplmfoldlosses-oplmfoldtraining)).
 
+`DistillMLMTask` (`oplm.training.task.DistillMLMTask`, a subclass of `MLMTask`) is
+selected automatically by `Trainer(cfg)` whenever `distill:` is configured
+([config.md, *Distillation fields (`distill.*`)*](config.md#distillation-fields-distill))
+and no explicit `task` is passed. Each masked position contributes equal total weight
+`1.0`: plain masked positions get standard cross-entropy, while distilled masked
+canonical positions get `(1 - alpha) * CE + alpha * T² * KL(softmax(t / T) || softmax(s / T))`
+over the 20 canonical amino-acid channels mapped from `distill.teacher_alphabet`.
+`DistillMLMTask` logs `train/loss_ce` (CE over all masked tokens), `train/distill_frac`
+(fraction of masked tokens with active teacher supervision), and `train/loss_kl` (mean
+`T²·KL` over distilled tokens, omitted on micro-batches with zero distilled tokens).
+
+A typical WSD decay branch (`train.branch_from`) mixes distilled UniRef50 shards with
+plain or member-sampled sources ([data.md, *Dataset formats*](data.md#dataset-formats));
+`Trainer` detects the changed `data.train` fingerprint and drops the stale pretraining
+data cursor while keeping model and optimizer state:
+
+```yaml
+train:
+  branch_from: outputs/pretrain/checkpoint-100000
+  scheduler: wsd_cosine
+  max_steps: 120000
+
+data:
+  pack_sequences: true
+  train:
+    uniref50_distill: {path: /data/uniref50_teacher_shards, fraction: 0.6}
+    uniref70_members: {path: /data/uniref70_clusters, fraction: 0.2, sample_members: subcluster}
+    antibodies: {path: /data/oas_antibodies, fraction: 0.2}
+
+distill:
+  alpha: 0.5
+  temperature: 1.5
+  min_neff_sqrt_l: 2.0
+```
+
 ---
 
 ## Training a separate looped stage

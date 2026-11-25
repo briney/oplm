@@ -9,7 +9,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from oplm.cli import app
-from oplm.config import DataConfig, FoldRunConfig, TrainConfig
+from oplm.config import DataConfig, DistillConfig, FoldRunConfig, TrainConfig
 from oplm.model import OplmConfig
 
 REPO = Path(__file__).resolve().parents[1]
@@ -120,10 +120,15 @@ def test_documented_cli_commands_exist() -> None:
 
 
 def test_documented_config_fields_exist() -> None:
-    classes = {"train": TrainConfig, "data": DataConfig, "fold": FoldRunConfig}
+    classes = {
+        "train": TrainConfig,
+        "data": DataConfig,
+        "fold": FoldRunConfig,
+        "distill": DistillConfig,
+    }
     fields = {k: {f.name for f in dataclasses.fields(c)} for k, c in classes.items()}
     model = OplmConfig()
-    pat = re.compile(r"(?:`|\s)(model|train|data|fold)\.([a-z_][a-z0-9_]*)(?=[`=.\[])")
+    pat = re.compile(r"(?:`|\s)(model|train|data|fold|distill)\.([a-z_][a-z0-9_]*)(?=[`=.\[])")
     failures = []
     checked = 0
     for doc in TREE_DOCS:
