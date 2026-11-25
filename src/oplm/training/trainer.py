@@ -259,25 +259,35 @@ class Trainer:
         from accelerate.utils import DataLoaderConfiguration, InitProcessGroupKwargs, set_seed
         from rich.console import Console
 
-        from oplm.config import validate_parallelism_compat, validate_token_batching
+        from oplm.config import (
+            validate_distill_compat,
+            validate_parallelism_compat,
+            validate_token_batching,
+        )
         from oplm.data import DeviceDataLoader, train_data_fingerprint
         from oplm.training.optim import build_optimizers, build_schedulers
         from oplm.training.preflight import run_preflight
-        from oplm.training.task import MLMTask
+        from oplm.training.task import DistillMLMTask, MLMTask
 
         self.cfg = cfg
         self._data_fingerprint = train_data_fingerprint(cfg.data.train)
         self.callbacks = list(callbacks or [])
         # Objective-specific model/data/step (docs/training.md, "Training tasks"). The default
-        # reproduces MLM training exactly; fold stages pass FoldTask (milestone 2).
-        self.task: TrainTask = task if task is not None else MLMTask()
+        # reproduces MLM training exactly; distill blocks select DistillMLMTask; fold stages
+        # pass FoldTask (milestone 2).
+        if task is not None:
+            self.task: TrainTask = task
+        elif cfg.distill is not None:
+            self.task = DistillMLMTask(cfg.distill)
+        else:
+            self.task = MLMTask()
 
-        # Cross-section config guard (Task 5.1), first thing and before any process-group
-        # work: a config built directly (tests, sweeps, notebooks) never went through
-        # load_config's copy of this check. Currently refuses hsdp + configured eval --
-        # see validate_parallelism_compat for the deadlock it prevents.
+        # Cross-section config guards, first thing and before any process-group work:
+        # a config built directly (tests, sweeps, notebooks) never went through
+        # load_config's copy of these checks.
         validate_parallelism_compat(cfg)
         validate_token_batching(cfg)
+        validate_distill_compat(cfg)
 
         # Drain trigger (Task 1.5): SIGUSR1/SIGTERM handlers plus the Slurm
         # SLURM_JOB_END_TIME wall-clock margin. Installed immediately so a signal
@@ -2685,6 +2695,9 @@ def _config_to_flat_dict(cfg: OplmConfig) -> dict[str, Any]:
         section = asdict(getattr(cfg, section_name))
         for key, value in section.items():
             flat[f"{section_name}/{key}"] = value
+    if cfg.distill is not None:
+        for key, value in asdict(cfg.distill).items():
+            flat[f"distill/{key}"] = value
     return flat
 
 
