@@ -15,10 +15,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
-from oplm.config import DataConfig, OplmConfig, TrainConfig
+from oplm.config import DataConfig, DistillConfig, OplmConfig, TrainConfig
 from oplm.data.sequence.dataset import InterleavedDataset, ShardedProteinDataset
 from oplm.data.sequence.loaders import build_sequence_eval_dataloader, build_train_dataloader
 from oplm.data.tokenizer import get_tokenizer, pad_token_id
@@ -240,3 +243,66 @@ def test_prefetch_factor_set_with_workers(sequence_shards: Path) -> None:
     loader = build_train_dataloader(cfg)
     assert loader.num_workers == 2
     assert loader.prefetch_factor == cfg.data.prefetch_factor
+
+
+# --------------------------------------------------------------------------- #
+# Distillation teacher_logits wiring (train vs. eval)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("token_mode", [False, True])
+def test_teacher_logits_train_loader_enabled_and_eval_loader_omits(
+    tmp_path: Path, token_mode: bool
+) -> None:
+    seqs = [
+        "ACDEFGHIKLMNPQRSTVWY",
+        "MKTAYIAKQRQISFVKSHFSRQ",
+        "GIVEQCCTSICSLYQLENYCN",
+        "FVNQHLCGSHLVEALYLVCGERGFFYTPKT",
+        "ACDEFGHIKLMNPQRSTVWYACDEFGHIKL",
+        "MNPQRSTVWYACDEFGHIKLMNPQRSTVWY",
+    ]
+    payloads = [np.full((len(s), 20), 0.5, dtype="<f2").tobytes() for s in seqs]
+    neff_sqrt_l = [5.0, 5.0, 5.0, 5.0, 1.0, 1.0]
+    shard = tmp_path / "distill.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": [f"s{i}" for i in range(len(seqs))],
+                "sequence": seqs,
+                "teacher_logits": pa.array(payloads, type=pa.binary()),
+                "teacher_neff": pa.array([40.0, 40.0, 40.0, 40.0, 5.0, 5.0], type=pa.float32()),
+                "teacher_neff_sqrt_l": pa.array(neff_sqrt_l, type=pa.float32()),
+            }
+        ),
+        shard,
+    )
+    cfg = _make_config(str(shard))
+    cfg.data.drop_last = False
+    cfg.data.mask_prob = 0.5
+    cfg.distill = DistillConfig(min_neff_sqrt_l=2.0)
+    if token_mode:
+        cfg.data.pack_sequences = True
+        cfg.train.tokens_per_step = 128
+        cfg.train.batch_tokens = 128  # 2 rows x 64 tokens
+
+    train_batches = _batches(build_train_dataloader(cfg))
+    assert train_batches
+    total_masked = 0
+    total_distilled = 0
+    for batch in train_batches:
+        assert "teacher_logits" in batch
+        assert "teacher_mask" in batch
+        assert batch["teacher_logits"].dtype == torch.float16
+        assert batch["teacher_logits"].shape == (*batch["labels"].shape, 20)
+        assert batch["teacher_mask"].dtype == torch.bool
+        assert batch["teacher_mask"].shape == batch["labels"].shape
+        total_masked += int((batch["labels"] != _IGNORE_INDEX).sum().item())
+        total_distilled += int(batch["teacher_mask"].sum().item())
+    assert 0 < total_distilled < total_masked
+
+    eval_batches = _batches(build_sequence_eval_dataloader(str(shard), cfg))
+    assert eval_batches
+    for batch in eval_batches:
+        assert "teacher_logits" not in batch
+        assert "teacher_mask" not in batch

@@ -19,6 +19,7 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -42,6 +43,10 @@ _IGNORE_INDEX = -100
 
 # Per-residue masking-weight field carried on row dicts (see dataset.py).
 _WEIGHTS_KEY = "masking_weights"
+# Optional teacher-logit binary payload field carried on row dicts (see dataset.py).
+_TEACHER_LOGITS_KEY = "teacher_logits"
+_TEACHER_CHANNELS = 20
+_TEACHER_BYTES_PER_RESIDUE = _TEACHER_CHANNELS * 2  # little-endian float16
 
 __all__ = ["MLMCollator", "RowFiller", "first_fit", "token_length", "tokenize_and_pad"]
 
@@ -232,6 +237,10 @@ class MLMCollator:
             ``max_length`` (token mode), laid out by :func:`first_fit` in input order;
             raises if the sequences do not fit. ``None`` keeps first-fit-decreasing into
             as few rows as needed.
+        load_teacher_logits: Decode each row's optional ``teacher_logits`` binary payload
+            at masked canonical positions into ``"teacher_logits"`` ``(R, T, 20)`` float16
+            and ``"teacher_mask"`` ``(R, T)`` bool batch tensors (packed alongside the
+            other tensors when ``pack_sequences=True``). Off by default.
 
     Raises:
         ValueError: If any probability is outside ``[0, 1]``,
@@ -254,6 +263,7 @@ class MLMCollator:
         keep_sequence_ids: bool = False,
         pack_sequences: bool = False,
         pack_rows: int | None = None,
+        load_teacher_logits: bool = False,
     ) -> None:
         _validate_probs(mask_prob, mask_token_prob, random_token_prob)
         if pack_rows is not None and (not pack_sequences or pack_rows < 1):
@@ -272,6 +282,7 @@ class MLMCollator:
         self._keep_sequence_ids = keep_sequence_ids
         self._pack_sequences = pack_sequences
         self._pack_rows = pack_rows
+        self._load_teacher_logits = load_teacher_logits
 
         # Derived id constants (computed once from the tokenizer, never hardcoded).
         self._mask_token_id = mask_token_id(tokenizer)
@@ -315,11 +326,21 @@ class MLMCollator:
         weights = weights.masked_fill(~eligible, 0.0)
 
         self._mask_batch(input_ids, labels, eligible, weights, generators, attention_mask)
+        teacher_logits: Tensor | None = None
+        teacher_mask: Tensor | None = None
+        if self._load_teacher_logits:
+            raw_lengths = [len(_sequence_of(item)) for item in batch]
+            teacher_logits, teacher_mask = _collect_teacher_logits(
+                batch, labels, self._canonical_ids, raw_lengths
+            )
         out: dict[str, Tensor | list[str] | int] = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
         }
+        if teacher_logits is not None and teacher_mask is not None:
+            out["teacher_logits"] = teacher_logits
+            out["teacher_mask"] = teacher_mask
         if self._pack_sequences:
             if self._pack_rows is not None:
                 expected = [token_length(_sequence_of(item), self._max_length) for item in batch]
@@ -328,13 +349,25 @@ class MLMCollator:
                         "tokenized lengths differ from token_length(); the token batcher's "
                         "placement no longer matches the batch"
                     )
-            out = self._pack(input_ids, attention_mask, labels)
+            out = self._pack(
+                input_ids,
+                attention_mask,
+                labels,
+                teacher_logits=teacher_logits,
+                teacher_mask=teacher_mask,
+            )
         if self._keep_sequence_ids:
             out["sequence_ids"] = self._collect_sequence_ids(batch)
         return out
 
     def _pack(
-        self, input_ids: Tensor, attention_mask: Tensor, labels: Tensor
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        labels: Tensor,
+        *,
+        teacher_logits: Tensor | None = None,
+        teacher_mask: Tensor | None = None,
     ) -> dict[str, Tensor | list[str] | int]:
         """Pack right-padded rows back to back into rows of at most ``max_length`` tokens.
 
@@ -376,6 +409,9 @@ class MLMCollator:
             "labels": labels.new_full(shape, _IGNORE_INDEX),
             "segment_ids": attention_mask.new_zeros(shape),
         }
+        if teacher_logits is not None and teacher_mask is not None:
+            packed["teacher_logits"] = teacher_logits.new_zeros((*shape, teacher_logits.shape[-1]))
+            packed["teacher_mask"] = teacher_mask.new_zeros(shape)
         for r, members in enumerate(rows):
             start = 0
             for segment, i in enumerate(members, start=1):
@@ -384,6 +420,9 @@ class MLMCollator:
                 packed["attention_mask"][r, start:end] = 1
                 packed["labels"][r, start:end] = labels[i, : lengths[i]]
                 packed["segment_ids"][r, start:end] = segment
+                if teacher_logits is not None and teacher_mask is not None:
+                    packed["teacher_logits"][r, start:end] = teacher_logits[i, : lengths[i]]
+                    packed["teacher_mask"][r, start:end] = teacher_mask[i, : lengths[i]]
                 start = end
         return {**packed, "num_sequences": len(lengths)}
 
@@ -516,6 +555,55 @@ class MLMCollator:
                 0, int(self._canonical_ids.numel()), (n_random,), generator=generator
             )
             input_ids[row, random_idx] = self._canonical_ids[choice]
+
+
+def _collect_teacher_logits(
+    batch: Sequence[Mapping[str, object] | str],
+    labels: Tensor,
+    canonical_ids: Tensor,
+    raw_lengths: Sequence[int],
+) -> tuple[Tensor, Tensor]:
+    """Decode masked canonical positions' teacher logits into ``(B, T, 20)`` fp16 + ``(B, T)`` bool.
+
+    Each raw payload is little-endian float16 bytes of shape ``(raw_len, 20)`` where
+    ``raw_len == len(sequence)``. Token index ``pos`` (1-based after ``<cls>``) maps to
+    residue ``pos - 1`` in the raw payload, so truncated sequences stay aligned on their
+    kept prefix. Non-canonical masked residues (e.g. ``X``) and any position with a
+    non-finite teacher channel fall back to ``teacher_mask = False`` (plain CE).
+    """
+    bsz, width = labels.shape
+    teacher_logits = torch.zeros((bsz, width, _TEACHER_CHANNELS), dtype=torch.float16)
+    teacher_mask = torch.zeros((bsz, width), dtype=torch.bool)
+    eligible = (labels != _IGNORE_INDEX) & torch.isin(labels, canonical_ids)
+
+    for row_idx, (item, raw_len) in enumerate(zip(batch, raw_lengths, strict=True)):
+        if isinstance(item, str):
+            continue
+        raw = item.get(_TEACHER_LOGITS_KEY)
+        if raw is None:
+            continue
+        if not isinstance(raw, (bytes, bytearray, memoryview)):
+            raise ValueError(f"teacher_logits must be bytes-like or None, got {type(raw).__name__}")
+        nbytes = raw.nbytes if isinstance(raw, memoryview) else len(raw)
+        expected_bytes = raw_len * _TEACHER_BYTES_PER_RESIDUE
+        if nbytes != expected_bytes:
+            raise ValueError(
+                f"teacher_logits byte length ({nbytes}) disagrees with raw sequence length "
+                f"{raw_len} (expected {expected_bytes} bytes for ({raw_len}, 20) float16)"
+            )
+        positions = eligible[row_idx].nonzero(as_tuple=False).squeeze(-1)
+        if positions.numel() == 0:
+            continue
+        arr = np.frombuffer(raw, dtype="<f2").reshape(raw_len, _TEACHER_CHANNELS)
+        res_idx = (positions - 1).numpy()
+        picked = np.array(arr[res_idx], dtype=np.float16, copy=True)
+        finite = np.isfinite(picked).all(axis=-1)
+        if not finite.any():
+            continue
+        valid_pos = positions[torch.from_numpy(finite)]
+        teacher_logits[row_idx, valid_pos] = torch.from_numpy(picked[finite])
+        teacher_mask[row_idx, valid_pos] = True
+    return teacher_logits, teacher_mask
 
 
 def _validate_probs(mask_prob: float, mask_token_prob: float, random_token_prob: float) -> None:
