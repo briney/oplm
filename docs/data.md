@@ -581,11 +581,12 @@ sources may be interleaved freely with plain sources (including plain `sample_me
 sources); shards that carry `teacher_logits` themselves reject `sample_members` and
 require any configured `Neff` gate column at dataset construction. Rows with null,
 non-finite, or below-threshold `Neff` values fall back to plain CE. During collation,
-only masked canonical amino-acid positions are decoded (aligned to the pre-truncation
-prefix if the sequence is clipped to `model.max_position_embeddings - 2`); any masked
-position with a non-finite (`NaN`/`±inf`) teacher channel or a non-canonical residue
-(`X`, `B`, `U`, `Z`, `O`) falls back per-position to plain CE, supporting partial-fold
-teachers (e.g. `K=2`). Evaluation dataloaders never load teacher logits.
+only `<mask>`-replaced canonical amino-acid positions are decoded (aligned to the pre-truncation
+prefix if the sequence is clipped to `model.max_position_embeddings - 2`); BERT's kept-unchanged
+and random-AA replacement positions, non-canonical residues (`X`, `B`, `U`, `Z`, `O`), and any
+position with a non-finite (`NaN`/`±inf`) teacher channel stay on plain CE so query-masked
+teacher logits only supervise `<mask>` inputs (also supporting partial-fold teachers like `K=2`).
+Evaluation dataloaders never load teacher logits.
 
 Only the needed columns are read (`pq.read_table(columns=[...])`). There is no
 HuggingFace `datasets` integration; parquet is the only on-disk format.

@@ -269,6 +269,41 @@ def test_distill_task_blended_loss_formula_and_temperature_scaling() -> None:
     assert result.metrics["distill_frac"] == pytest.approx(0.5)
 
 
+def test_distill_task_ignores_teacher_mask_on_kept_and_random_inputs() -> None:
+    """Query-masked teacher KL must only apply where input_ids == <mask>, not kept/rand tokens."""
+    tok = get_tokenizer()
+    torch.manual_seed(1)
+    logits = torch.randn((1, 5, tok.vocab_size), dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn((1, 5, 20), dtype=torch.float16)
+    # pos 1: <mask> (id 32), pos 2: kept-unchanged ('A'=5), pos 3: random-AA ('L'=4, label='A'=5)
+    labels = torch.tensor([[-100, 5, 5, 5, -100]])
+    batch = {
+        "input_ids": torch.tensor([[0, tok.mask_token_id, 5, 4, 2]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
+        "labels": labels,
+        "teacher_logits": teacher,
+        "teacher_mask": torch.tensor([[False, True, True, True, False]]),
+    }
+    cfg = DistillConfig(alpha=0.5, temperature=1.0)
+    result = DistillMLMTask(cfg).step(_FixedLogitsModel(logits), batch)
+
+    ce1 = F.cross_entropy(logits[0, 1:2], labels[0, 1:2])
+    ce2 = F.cross_entropy(logits[0, 2:3], labels[0, 2:3])
+    ce3 = F.cross_entropy(logits[0, 3:4], labels[0, 3:4])
+    token_ids = torch.tensor(
+        [tok.convert_tokens_to_ids(aa) for aa in cfg.teacher_alphabet], dtype=torch.long
+    )
+    kl1 = F.kl_div(
+        F.log_softmax(logits[0, 1, token_ids], dim=-1),
+        F.softmax(teacher[0, 1].float(), dim=-1),
+        reduction="sum",
+    )
+    expected = (ce2 + ce3 + (1.0 - cfg.alpha) * ce1 + cfg.alpha * kl1) / 3.0
+    assert torch.allclose(result.loss, expected, atol=1e-6)
+    assert result.metrics["distill_frac"] == pytest.approx(1.0 / 3.0)
+    assert result.metrics["loss_kl"] == pytest.approx(kl1.item(), abs=1e-6)
+
+
 def test_distill_task_packed_matches_unpacked_loss(tmp_path: Path) -> None:
     tok = get_tokenizer()
     seqs = ["ACDEFGHIKLMNPQRSTVWY", "MKTAYIAKQRQISFVKSHFSRQ"]

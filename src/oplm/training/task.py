@@ -163,6 +163,7 @@ class DistillMLMTask(MLMTask):
                 "to valid tokenizer ids"
             )
         self._teacher_token_ids = torch.tensor(token_ids, dtype=torch.long)
+        self._mask_token_id = int(tok.mask_token_id)
         self._device_token_ids: torch.Tensor | None = None
 
     def _token_ids_for(self, device: torch.device) -> torch.Tensor:
@@ -192,7 +193,9 @@ class DistillMLMTask(MLMTask):
                 metrics={},
             )
 
-        teacher_mask: torch.Tensor = batch["teacher_mask"] & masked
+        teacher_mask: torch.Tensor = (
+            batch["teacher_mask"] & masked & (batch["input_ids"] == self._mask_token_id)
+        )
         n_distill = int(teacher_mask.sum().item())
 
         ce = F.cross_entropy(
