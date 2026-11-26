@@ -618,25 +618,27 @@ class FoldRunConfig:
 
 
 _CANONICAL_AMINO_ACIDS = frozenset("LAGVSERTIDPKQNFYMHWC")
+_VALID_DISTILL_LOSS_TYPES = ("forward_kl", "reverse_kl", "js")
 
 
 @dataclass
 class DistillConfig:
     """The ``distill:`` block for optional per-residue teacher-logit distillation.
 
-    Blends standard masked-LM cross-entropy with a temperature-scaled KL loss against
-    precomputed 20-channel teacher logits on masked canonical residues. ``None`` on
-    :class:`OplmConfig` disables distillation completely.
+    Blends standard masked-LM cross-entropy with a temperature-scaled divergence loss
+    against precomputed 20-channel teacher logits on ``<mask>``-replaced canonical
+    residues. ``None`` on :class:`OplmConfig` disables distillation completely.
     """
 
     alpha: float = 0.5
     temperature: float = 1.5
+    loss_type: str = "forward_kl"
     teacher_alphabet: str = "ARNDCEQGHILKMFPSTWYV"
     min_neff: float | None = None
     min_neff_sqrt_l: float | None = None
 
     def __post_init__(self) -> None:
-        """Validate loss weights, temperature, teacher channel alphabet, and Neff gates."""
+        """Validate loss weights, temperature, loss_type, channel alphabet, and Neff gates."""
         if (
             isinstance(self.alpha, bool)
             or not math.isfinite(self.alpha)
@@ -650,6 +652,11 @@ class DistillConfig:
         ):
             raise ValueError(
                 f"distill.temperature must be finite and > 0, got {self.temperature!r}"
+            )
+        if self.loss_type not in _VALID_DISTILL_LOSS_TYPES:
+            raise ValueError(
+                f"distill.loss_type must be one of {_VALID_DISTILL_LOSS_TYPES}, "
+                f"got {self.loss_type!r}"
             )
         if (
             not isinstance(self.teacher_alphabet, str)

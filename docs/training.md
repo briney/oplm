@@ -1164,7 +1164,8 @@ selected automatically by `Trainer(cfg)` whenever `distill:` is configured
 and no explicit `task` is passed. Each masked position contributes equal total weight
 `1.0`: plain masked positions (including BERT's kept-unchanged and random-AA replacements) get
 standard cross-entropy, while distilled `<mask>`-replaced canonical positions get
-`(1 - alpha) * CE + alpha * T² * KL(softmax(t / T) || softmax(s / T))`
+`(1 - alpha) * CE + alpha * T² * D(p_teacher_T, p_student_T)` (`D` selected by
+`distill.loss_type`: `forward_kl`, `reverse_kl`, or `js`)
 over the 20 canonical amino-acid channels mapped from `distill.teacher_alphabet`.
 `DistillMLMTask` logs `train/loss_ce` (CE over all masked tokens), `train/distill_frac`
 (fraction of masked tokens with active teacher supervision), and `train/loss_kl` (mean

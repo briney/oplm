@@ -791,7 +791,9 @@ def test_fold_block_defaults_to_none_and_parses_from_overrides(tmp_path: Path) -
     from oplm.config import FoldRunConfig, load_config, serialize_config
 
     assert load_config([]).fold is None
-    cfg = load_config(["fold.crop_size=256", "fold.model.pair_width=128", "fold.diffusion_microbatch=4"])
+    cfg = load_config(
+        ["fold.crop_size=256", "fold.model.pair_width=128", "fold.diffusion_microbatch=4"]
+    )
     assert isinstance(cfg.fold, FoldRunConfig)
     assert cfg.fold.crop_size == 256 and cfg.fold.diffusion_microbatch == 4
     assert cfg.fold.model == {"pair_width": 128}
@@ -891,6 +893,7 @@ def test_distill_cli_dotlist_and_round_trip(tmp_path: Path) -> None:
     assert isinstance(cfg.distill, DistillConfig)
     assert cfg.distill.alpha == 0.7
     assert cfg.distill.temperature == 1.5
+    assert cfg.distill.loss_type == "forward_kl"
     assert cfg.distill.teacher_alphabet == "ARNDCEQGHILKMFPSTWYV"
     assert cfg.distill.min_neff is None
     assert cfg.distill.min_neff_sqrt_l == 2.0
@@ -925,6 +928,8 @@ def test_distill_omitted_from_serialized_config_when_none() -> None:
         {"temperature": float("inf")},
         {"temperature": float("nan")},
         {"temperature": True},
+        {"loss_type": "mse"},
+        {"loss_type": ""},
         {"teacher_alphabet": "arndceqghilkmfpstwyv"},  # lowercase rejected
         {"teacher_alphabet": "ARNDCEQGHILKMFPSTWYX"},  # non-canonical X
         {"teacher_alphabet": "AARNDCEQGHILKMFPSTWY"},  # duplicate A

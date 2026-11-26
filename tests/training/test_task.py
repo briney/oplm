@@ -304,6 +304,47 @@ def test_distill_task_ignores_teacher_mask_on_kept_and_random_inputs() -> None:
     assert result.metrics["loss_kl"] == pytest.approx(kl1.item(), abs=1e-6)
 
 
+@pytest.mark.parametrize("loss_type", ["reverse_kl", "js"])
+def test_distill_task_reverse_kl_and_js_formulas_and_grads(loss_type: str) -> None:
+    tok = get_tokenizer()
+    torch.manual_seed(7)
+    logits = torch.randn((1, 3, tok.vocab_size), dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn((1, 3, 20), dtype=torch.float16)
+    labels = torch.tensor([[-100, 5, -100]])
+    batch = {
+        "input_ids": torch.tensor([[0, tok.mask_token_id, 2]]),
+        "attention_mask": torch.tensor([[1, 1, 1]]),
+        "labels": labels,
+        "teacher_logits": teacher,
+        "teacher_mask": torch.tensor([[False, True, False]]),
+    }
+    temp = 1.25
+    cfg = DistillConfig(alpha=1.0, temperature=temp, loss_type=loss_type)
+    result = DistillMLMTask(cfg).step(_FixedLogitsModel(logits), batch)
+
+    token_ids = torch.tensor(
+        [tok.convert_tokens_to_ids(aa) for aa in cfg.teacher_alphabet], dtype=torch.long
+    )
+    s20 = logits[0, 1, token_ids]
+    t20 = teacher[0, 1].float()
+    ps = F.softmax(s20 / temp, dim=-1)
+    pt = F.softmax(t20 / temp, dim=-1)
+    if loss_type == "reverse_kl":
+        expected = (ps * (ps.log() - pt.log())).sum() * (temp * temp)
+    else:
+        m = 0.5 * (ps + pt)
+        expected = (
+            0.5
+            * ((pt * (pt.log() - m.log())).sum() + (ps * (ps.log() - m.log())).sum())
+            * (temp * temp)
+        )
+    assert torch.allclose(result.loss, expected, atol=1e-5)
+    assert result.metrics["loss_kl"] == pytest.approx(expected.item(), abs=1e-5)
+    result.loss.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    assert logits.grad[0, 1, token_ids].abs().sum().item() > 0.0
+
+
 def test_distill_task_packed_matches_unpacked_loss(tmp_path: Path) -> None:
     tok = get_tokenizer()
     seqs = ["ACDEFGHIKLMNPQRSTVWY", "MKTAYIAKQRQISFVKSHFSRQ"]
