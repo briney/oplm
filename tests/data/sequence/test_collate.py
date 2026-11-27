@@ -997,3 +997,12 @@ def test_mlm_collator_contacts_unpacked_and_packed(tokenizer, pack_sequences: bo
     assert empty_out["teacher_contact_meta"] == []
     assert empty_out["teacher_contact_values"].shape == (0,)
     assert empty_out["teacher_contact_values"].dtype == torch.uint8
+
+    # Header with stored_min_sep == 0 must be rejected loudly
+    import struct
+
+    from oplm.data.sequence.collate import decode_teacher_contacts
+
+    bad_sep0 = struct.pack("<BBH", 1, 0, 4) + bytes(10)
+    with pytest.raises(ValueError, match="min_sep"):
+        decode_teacher_contacts(bad_sep0, raw_len=4, res_len=4, contact_min_sep=6)

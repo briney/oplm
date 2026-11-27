@@ -314,3 +314,60 @@ def test_distill_aux_sidecar_roundtrip_and_missing_warning(
         )
     assert state3["distill_aux_restored"] is False
     assert any(DISTILL_AUX_SIDECAR_NAME in rec.message for rec in caplog.records)
+
+
+def test_distill_aux_branch_shape_mismatch_does_not_mutate_fresh_head(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Branching into an incompatible contact_layers keeps fresh head weights untouched."""
+    from oplm.config import DistillConfig
+    from oplm.training.contact_distill import DISTILL_AUX_SIDECAR_NAME
+    from oplm.training.task import DistillMLMTask
+
+    cfg1 = _cfg()
+    cfg1.distill = DistillConfig(contact_weight=1.0, contact_head="attention", contact_layers=1)
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg1)
+    task1 = DistillMLMTask(cfg1.distill)
+    task1.prepare_aux(accelerator.unwrap_model(model), accelerator, cfg1, total_steps=50)
+    assert task1._aux is not None
+    with torch.no_grad():
+        task1._aux.head.proj.bias.fill_(99.0)
+
+    ckpt_path = save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg1,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+        distill_aux_task=task1,
+    )
+    assert (ckpt_path / DISTILL_AUX_SIDECAR_NAME).is_file()
+
+    cfg2 = _cfg()
+    cfg2.distill = DistillConfig(contact_weight=1.0, contact_head="attention", contact_layers=2)
+    task2 = DistillMLMTask(cfg2.distill)
+    _, model2, opt2, sched2 = _prepared_model(cfg2)
+    task2.prepare_aux(accelerator.unwrap_model(model2), accelerator, cfg2, total_steps=50)
+    assert task2._aux is not None
+    assert task2._aux.head.proj.bias.item() == pytest.approx(-3.0)
+
+    with caplog.at_level("WARNING"):
+        state = load_checkpoint(
+            accelerator,
+            model2,
+            [opt2],
+            [sched2],
+            str(ckpt_path),
+            cfg2,
+            validate_schedule=False,
+            distill_aux_task=task2,
+            reset_aux_hparams=True,
+        )
+    assert state["distill_aux_restored"] is False
+    # Fresh bias (-3.0) must NOT have been partially overwritten by saved bias (99.0)!
+    assert task2._aux.head.proj.bias.item() == pytest.approx(-3.0)

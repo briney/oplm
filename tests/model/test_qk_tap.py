@@ -131,3 +131,14 @@ def test_return_qk_layers_gradients_under_checkpointing_and_loops(
         assert layer.attention.k_proj.weight.grad is not None
         assert torch.isfinite(layer.attention.q_proj.weight.grad).all()
         assert layer.attention.q_proj.weight.grad.abs().sum().item() > 0.0
+
+
+def test_return_qk_layers_rejects_out_of_range_indices() -> None:
+    cfg = _small_config(num_hidden_layers=2, num_loops=1)
+    model = OplmForMaskedLM(cfg).eval()
+    input_ids = torch.tensor([[0, 5, 6, 7, 2]])
+    attention_mask = torch.ones_like(input_ids)
+    with pytest.raises(ValueError, match="return_qk_layers"):
+        model(input_ids=input_ids, attention_mask=attention_mask, return_qk_layers=(-1,))
+    with pytest.raises(ValueError, match="return_qk_layers"):
+        model(input_ids=input_ids, attention_mask=attention_mask, return_qk_layers=(2,))

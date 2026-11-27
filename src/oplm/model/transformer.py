@@ -488,7 +488,16 @@ class OplmStack(nn.Module):
 
         hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
         attentions: tuple[torch.Tensor | None, ...] | None = () if output_attentions else None
-        qk_layer_set = set(return_qk_layers) if return_qk_layers is not None else None
+        if return_qk_layers is not None:
+            effective_depth = len(self.layer_execution_order)
+            invalid = [idx for idx in return_qk_layers if idx < 0 or idx >= effective_depth]
+            if invalid:
+                raise ValueError(
+                    f"return_qk_layers indices {invalid} out of range [0, {effective_depth})"
+                )
+            qk_layer_set: set[int] | None = set(return_qk_layers)
+        else:
+            qk_layer_set = None
         qk_states: list[tuple[torch.Tensor, torch.Tensor]] | None = (
             [] if qk_layer_set is not None else None
         )

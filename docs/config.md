@@ -487,15 +487,15 @@ are in [data.md, *Dataset formats*](data.md#dataset-formats).
 | `distill.teacher_alphabet` | `str` | `ARNDCEQGHILKMFPSTWYV` | 20-character permutation of the uppercase canonical amino acids giving the teacher payload's channel order (default matches `msa-pairformer`). Mapped dynamically to `OplmTokenizerFast` token IDs rather than assuming ESM-C order. |
 | `distill.min_neff` | `float \| null` | `null` | Optional minimum `teacher_neff` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` or `teacher_contacts` must include `teacher_neff`; rows with missing, non-finite, or smaller values fall back to plain CE / skip contact supervision. |
 | `distill.min_neff_sqrt_l` | `float \| null` | `null` | Optional minimum `teacher_neff_sqrt_l` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` or `teacher_contacts` must include `teacher_neff_sqrt_l`; rows with missing, non-finite, or smaller values fall back to plain CE / skip contact supervision. |
-| `distill.contact_weight` | `float` | `0.0` | Weight on the auxiliary 2D contact soft-BCE loss; finite, `≥ 0`. `0.0` disables 2D contact loading, tapping, and auxiliary head creation completely. |
+| `distill.contact_weight` | `float` | `0.0` | Weight on the auxiliary 2D contact soft-BCE loss; finite, `≥ 0`. `0.0` disables 2D contact loading, tapping, and auxiliary head creation completely. Refuses `train.mixed_precision=fp16` when `> 0` (use `bf16` or `no`). |
 | `distill.contact_head` | `str` | `attention` | Training-only discarded student 2D head: `attention` (ESM-style logistic regression over symmetrized APC-corrected upper-layer post-RoPE `(Q, K)` maps) or `pair` (symmetric `[u_i * u_j, \|u_i - u_j\|]` MLP over a learned softmax mix of top-`K` hidden states). |
 | `distill.contact_layers` | `int` | `6` | Number of final executed layers (`K ≥ 1`, `≤` effective model depth) tapped by the 2D contact head. |
 | `distill.contact_min_sep` | `int` | `6` | Minimum sequence separation `j - i` scored in the 2D contact loss (`≥ 1`). Must be `≥` the shard header's `stored_min_sep` (rows with larger `stored_min_sep` raise). |
 | `distill.contact_pos_weight` | `float` | `1.0` | Positive-pair weight multiplier `1 + (w - 1) * p_teacher` applied inside soft BCE (`> 0`, finite). |
-| `distill.contact_pair_dim` | `int` | `128` | Projection width `d_p` for `contact_head=pair` (`≥ 1`). |
+| `distill.contact_pair_dim` | `int` | `128` | Projection width `d_p` for `contact_head=pair` (`≥ 16`). |
 | `distill.contact_head_lr` | `float` | `0.001` | Peak learning rate for the auxiliary contact head's standalone AdamW optimizer (`> 0`, finite). |
 | `distill.contact_head_warmup_steps` | `int` | `200` | Linear warmup ramp applied to the auxiliary head when initialized fresh (including on `branch_from` off a plain MLM checkpoint); `≥ 0`. |
-| `distill.contact_max_chunk_pairs` | `int` | `2_000_000` | Maximum padded `C * (L_max + 2)^2` pair elements materialized per chunked contact-head forward (`≥ 1`). |
+| `distill.contact_max_chunk_pairs` | `int` | `2_000_000` | Maximum padded `C * (L_max + 2)^2` pair elements materialized per chunked contact-head forward (`≥ 10_000`). |
 
 ## Fold fields (`fold.*`)
 

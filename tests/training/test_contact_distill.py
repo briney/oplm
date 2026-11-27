@@ -210,3 +210,31 @@ def test_aux_contact_manager_branch_warmup_and_decay() -> None:
     assert mgr.lr_for_step(1_012_500) == pytest.approx(0.5e-3, rel=1e-5)
     # Step 1,025,000: decayed cleanly to 0.0 (never stuck on stable_steps)
     assert mgr.lr_for_step(1_025_000) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_contact_heads_emit_fp32_under_bf16_autocast_and_skip_zero_pair_segments() -> None:
+    torch.manual_seed(4)
+    attn_head = AttentionContactHead(num_layers=1, num_heads=2, attn_scales=(0.5,))
+    pair_head = PairContactHead(num_layers=1, hidden_size=8, pair_dim=4)
+    q = torch.randn(1, 2, 10, 4)
+    k = torch.randn(1, 2, 10, 4)
+    h = torch.randn(1, 10, 8)
+    meta_ok = [(0, 0, 8, 8, 0)]
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        assert attn_head.forward_chunk([(q, k)], meta_ok).dtype == torch.float32
+        assert pair_head.forward_chunk([h], meta_ok).dtype == torch.float32
+
+    # Direct call with contact_len <= contact_min_sep produces finite 0.0 (never NaN).
+    loss_empty, pos_rate = compute_contact_distill_loss(
+        head=attn_head,
+        qk_states=[(q, k)],
+        hidden_states=None,
+        contact_meta=[(0, 0, 6, 6, 0)],
+        contact_values=torch.empty((0,), dtype=torch.uint8),
+        contact_min_sep=6,
+        pos_weight=1.0,
+        max_chunk_pairs=1_000_000,
+    )
+    assert torch.isfinite(loss_empty)
+    assert loss_empty.item() == 0.0
+    assert pos_rate == 0.0

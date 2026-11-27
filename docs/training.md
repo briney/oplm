@@ -1194,7 +1194,7 @@ so `hf/` inference exports stay vanilla `OplmForMaskedLM` checkpoints with zero 
 Its standalone AdamW optimizer follows `contact_head_lr * backbone_schedule(step) * warmup_ramp(step)`,
 where `warmup_ramp` ramps linearly over `distill.contact_head_warmup_steps` from the step the head
 was initialized (e.g. `global_step` when branching off a plain MLM checkpoint via `train.branch_from`)
-while decaying cleanly to `min_lr` with the backbone schedule. Auxiliary head and optimizer state
+while decaying cleanly to `contact_head_lr * (train.min_lr / train.lr)` with the backbone schedule. Auxiliary head and optimizer state
 persist in the checkpoint sidecar `distill_aux.pt` (also mirrored by `RemoteStore`) and are restored
 on `resume_from`/`auto_resume` (or started fresh with a warning if absent or incompatible on a
 `branch_from`). Setting `distill.alpha: 0.0` with `distill.contact_weight > 0` runs pure-2D

@@ -1055,3 +1055,9 @@ def test_validate_distill_compat_contact_layers_depth() -> None:
         ]
     )
     validate_distill_compat(cfg_looped)
+    # fp16 is refused when 2D contact distillation is enabled (standalone aux optimizer
+    # is outside Accelerate's GradScaler); allowed when contact_weight=0.0.
+    with pytest.raises(ValueError, match="fp16"):
+        load_config(["train.mixed_precision=fp16", "distill.contact_weight=1.0"])
+    cfg_fp16_1d = load_config(["train.mixed_precision=fp16", "distill.contact_weight=0.0"])
+    validate_distill_compat(cfg_fp16_1d)

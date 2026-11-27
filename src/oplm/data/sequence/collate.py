@@ -709,6 +709,8 @@ def decode_teacher_contacts(
         raise ValueError(
             f"unsupported teacher_contacts version {version}; expected {CONTACT_FORMAT_VERSION}"
         )
+    if stored_min_sep < 1:
+        raise ValueError(f"teacher_contacts stored min_sep must be >= 1, got {stored_min_sep}")
     if stored_min_sep > contact_min_sep:
         raise ValueError(
             f"teacher_contacts stored min_sep ({stored_min_sep}) exceeds requested "

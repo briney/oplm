@@ -146,7 +146,8 @@ class AttentionContactHead(nn.Module):
             head_maps.append(masked_apc(sym_attn, contact_lens))
 
         stacked = torch.cat(head_maps, dim=1)  # (C, K*H, L_max, L_max)
-        logits = self.proj(stacked.permute(0, 2, 3, 1)).squeeze(-1)  # (C, L_max, L_max)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            logits = self.proj(stacked.float().permute(0, 2, 3, 1)).squeeze(-1)
         return logits
 
 
@@ -188,14 +189,15 @@ class PairContactHead(nn.Module):
             gathered_layers.append(h_chunk.float())
 
         stacked = torch.stack(gathered_layers, dim=2)  # (C, L_max, K, D)
-        proj = self.proj(self.input_norm(stacked))  # (C, L_max, K, d_p)
-        weights = F.softmax(self.layer_weights.float(), dim=0)
-        u = torch.einsum("k,blkc->blc", weights, proj)  # (C, L_max, d_p)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            proj = self.proj(self.input_norm(stacked))  # (C, L_max, K, d_p)
+            weights = F.softmax(self.layer_weights.float(), dim=0)
+            u = torch.einsum("k,blkc->blc", weights, proj)  # (C, L_max, d_p)
 
-        ui = u[:, :, None, :]
-        uj = u[:, None, :, :]
-        pair = torch.cat([ui * uj, (ui - uj).abs()], dim=-1)  # (C, L_max, L_max, 2*d_p)
-        logits = self.fc2(F.gelu(self.fc1(pair))).squeeze(-1)  # (C, L_max, L_max)
+            ui = u[:, :, None, :]
+            uj = u[:, None, :, :]
+            pair = torch.cat([ui * uj, (ui - uj).abs()], dim=-1)  # (C, L_max, L_max, 2*d_p)
+            logits = self.fc2(F.gelu(self.fc1(pair))).squeeze(-1)  # (C, L_max, L_max)
         # Mask out padded residue rows/cols cleanly
         c_lens_t = torch.tensor([m[3] for m in chunk_meta], device=device)
         valid = torch.arange(l_max, device=device)[None, :] < c_lens_t[:, None]
@@ -258,7 +260,7 @@ def compute_contact_distill_loss(
     chunks = chunk_contact_segments(contact_meta, max_chunk_pairs)
     device = contact_values.device
     seq_losses: list[Tensor] = []
-    pos_sum = 0.0
+    pos_sum_t = contact_values.new_zeros((), dtype=torch.float32)
     total_pairs = 0
     triu_cache: dict[int, tuple[Tensor, Tensor]] = {}
 
@@ -276,17 +278,27 @@ def compute_contact_distill_loss(
             else:
                 ii, jj = triu_cache[contact_len]
             n_pairs = int(ii.numel())
+            if n_pairs == 0:
+                continue
             pred_triu = pred_logits[idx, ii, jj]
             target_p = contact_values[offset : offset + n_pairs].float() / 255.0
             bce = F.binary_cross_entropy_with_logits(pred_triu, target_p, reduction="none")
             if pos_weight != 1.0:
                 bce = bce * (1.0 + (pos_weight - 1.0) * target_p)
             seq_losses.append(bce.mean())
-            pos_sum += float(target_p.detach().sum().item())
+            pos_sum_t = pos_sum_t + target_p.detach().sum()
             total_pairs += n_pairs
 
+    if not seq_losses:
+        ref = (
+            qk_states[0][0]
+            if qk_states
+            else (hidden_states[0] if hidden_states else contact_values)
+        )
+        return ref.new_zeros((), dtype=torch.float32), 0.0
+
     loss = torch.stack(seq_losses).mean()
-    mean_pos_rate = pos_sum / max(1, total_pairs)
+    mean_pos_rate = float(pos_sum_t.item()) / max(1, total_pairs)
     return loss, mean_pos_rate
 
 
@@ -391,8 +403,32 @@ class AuxContactManager:
                 f"distill_aux.pt head_type {saved_type!r} does not match configured "
                 f"distill.contact_head {self.head_type!r}"
             )
-        self.head.load_state_dict(state["head"])
-        self.optimizer.load_state_dict(state["optimizer"])
+        saved_head = state.get("head")
+        if not isinstance(saved_head, dict):
+            raise ValueError("distill_aux.pt is missing a valid 'head' state dict")
+        expected_head = self.head.state_dict()
+        if set(saved_head.keys()) != set(expected_head.keys()):
+            raise ValueError(
+                f"distill_aux.pt head keys {sorted(saved_head.keys())} do not match "
+                f"expected keys {sorted(expected_head.keys())}"
+            )
+        for key, expected_tensor in expected_head.items():
+            saved_tensor = saved_head[key]
+            if not isinstance(saved_tensor, Tensor) or tuple(saved_tensor.shape) != tuple(
+                expected_tensor.shape
+            ):
+                raise ValueError(
+                    f"distill_aux.pt parameter {key!r} has incompatible shape "
+                    f"{getattr(saved_tensor, 'shape', type(saved_tensor).__name__)} "
+                    f"(expected {tuple(expected_tensor.shape)})"
+                )
+        head_backup = {k: v.detach().clone() for k, v in expected_head.items()}
+        try:
+            self.head.load_state_dict(saved_head)
+            self.optimizer.load_state_dict(state["optimizer"])
+        except Exception:
+            self.head.load_state_dict(head_backup)
+            raise
         self.aux_start_step = int(state.get("aux_start_step", 0))
         if reset_hparams:
             for group in self.optimizer.param_groups:

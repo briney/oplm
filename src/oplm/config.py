@@ -744,6 +744,12 @@ def validate_distill_compat(cfg: OplmConfig) -> None:
             "fold and distill cannot be set together: distill only applies to MLM training"
         )
     if cfg.distill is not None and cfg.distill.contact_weight > 0.0:
+        if cfg.train.mixed_precision == "fp16":
+            raise ValueError(
+                "train.mixed_precision='fp16' is not supported when distill.contact_weight > 0 "
+                "(the auxiliary contact head's standalone optimizer is outside Accelerate's "
+                "GradScaler); use 'bf16' or 'no'."
+            )
         from oplm.model.looping import resolve_layer_execution_order
 
         model = cfg.model
