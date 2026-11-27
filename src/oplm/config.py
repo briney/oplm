@@ -619,15 +619,18 @@ class FoldRunConfig:
 
 _CANONICAL_AMINO_ACIDS = frozenset("LAGVSERTIDPKQNFYMHWC")
 _VALID_DISTILL_LOSS_TYPES = ("forward_kl", "reverse_kl", "js")
+_VALID_DISTILL_CONTACT_HEADS = ("attention", "pair")
 
 
 @dataclass
 class DistillConfig:
-    """The ``distill:`` block for optional per-residue teacher-logit distillation.
+    """The ``distill:`` block for optional 1D teacher-logit and 2D contact distillation.
 
     Blends standard masked-LM cross-entropy with a temperature-scaled divergence loss
     against precomputed 20-channel teacher logits on ``<mask>``-replaced canonical
-    residues. ``None`` on :class:`OplmConfig` disables distillation completely.
+    residues, and optionally adds a 2D soft-BCE loss against precomputed teacher Cβ
+    contact probabilities via a discarded auxiliary head (``contact_weight > 0``).
+    ``None`` on :class:`OplmConfig` disables distillation completely.
     """
 
     alpha: float = 0.5
@@ -636,9 +639,18 @@ class DistillConfig:
     teacher_alphabet: str = "ARNDCEQGHILKMFPSTWYV"
     min_neff: float | None = None
     min_neff_sqrt_l: float | None = None
+    contact_weight: float = 0.0
+    contact_head: str = "attention"
+    contact_layers: int = 6
+    contact_min_sep: int = 6
+    contact_pos_weight: float = 1.0
+    contact_pair_dim: int = 128
+    contact_head_lr: float = 1e-3
+    contact_head_warmup_steps: int = 200
+    contact_max_chunk_pairs: int = 2_000_000
 
     def __post_init__(self) -> None:
-        """Validate loss weights, temperature, loss_type, channel alphabet, and Neff gates."""
+        """Validate 1D logit and 2D contact distillation settings."""
         if (
             isinstance(self.alpha, bool)
             or not math.isfinite(self.alpha)
@@ -673,6 +685,33 @@ class DistillConfig:
                 isinstance(value, bool) or not math.isfinite(value) or value < 0.0
             ):
                 raise ValueError(f"distill.{name} must be finite and >= 0, got {value!r}")
+        if (
+            isinstance(self.contact_weight, bool)
+            or not math.isfinite(self.contact_weight)
+            or self.contact_weight < 0.0
+        ):
+            raise ValueError(
+                f"distill.contact_weight must be finite and >= 0, got {self.contact_weight!r}"
+            )
+        if self.contact_head not in _VALID_DISTILL_CONTACT_HEADS:
+            raise ValueError(
+                f"distill.contact_head must be one of {_VALID_DISTILL_CONTACT_HEADS}, "
+                f"got {self.contact_head!r}"
+            )
+        for name, floor in (
+            ("contact_layers", 1),
+            ("contact_min_sep", 1),
+            ("contact_pair_dim", 16),
+            ("contact_head_warmup_steps", 0),
+            ("contact_max_chunk_pairs", 10_000),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+                raise ValueError(f"distill.{name} must be an int >= {floor}, got {value!r}")
+        for name in ("contact_pos_weight", "contact_head_lr"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"distill.{name} must be finite and > 0, got {value!r}")
 
 
 @dataclass
@@ -690,18 +729,51 @@ class OplmConfig:
 
 
 def validate_distill_compat(cfg: OplmConfig) -> None:
-    """Reject configs that enable both structure-head training and MLM distillation.
+    """Reject invalid distillation combinations across config sections.
 
     Called from :func:`load_config` and again in ``Trainer.__init__``, mirroring
     :func:`validate_parallelism_compat` and :func:`validate_token_batching`.
 
     Raises:
-        ValueError: Both ``cfg.fold`` and ``cfg.distill`` are set.
+        ValueError: Both ``cfg.fold`` and ``cfg.distill`` are set, or
+            ``cfg.distill.contact_layers`` exceeds the model's executed depth when
+            2D contact distillation is active.
     """
     if cfg.fold is not None and cfg.distill is not None:
         raise ValueError(
             "fold and distill cannot be set together: distill only applies to MLM training"
         )
+    if cfg.distill is not None and cfg.distill.contact_weight > 0.0:
+        from oplm.model.looping import resolve_layer_execution_order
+
+        model = cfg.model
+        if isinstance(model, dict):
+            num_layers = model.get("num_hidden_layers")
+            num_loops = model.get("num_loops", 1)
+            loop_strategy = model.get("loop_strategy", "stack")
+            loop_start = model.get("loop_start", 0)
+            loop_end = model.get("loop_end")
+        else:
+            num_layers = getattr(model, "num_hidden_layers", None)
+            num_loops = getattr(model, "num_loops", 1)
+            loop_strategy = getattr(model, "loop_strategy", "stack")
+            loop_start = getattr(model, "loop_start", 0)
+            loop_end = getattr(model, "loop_end", None)
+        if num_layers is not None:
+            effective_depth = len(
+                resolve_layer_execution_order(
+                    int(num_layers),
+                    num_loops=int(num_loops),
+                    loop_strategy=str(loop_strategy),
+                    loop_start=int(loop_start),
+                    loop_end=int(loop_end) if loop_end is not None else None,
+                )
+            )
+            if cfg.distill.contact_layers > effective_depth:
+                raise ValueError(
+                    f"distill.contact_layers ({cfg.distill.contact_layers}) exceeds model "
+                    f"effective depth ({effective_depth})"
+                )
 
 
 def validate_parallelism_compat(cfg: OplmConfig) -> None:

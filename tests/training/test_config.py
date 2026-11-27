@@ -962,3 +962,92 @@ def test_distill_and_fold_mutually_exclusive(tmp_path: Path) -> None:
         load_config(["--config", path])
     cfg = load_config(["distill.alpha=0.5"])
     validate_distill_compat(cfg)
+
+
+def test_distill_config_contact_defaults_and_roundtrip(tmp_path: Path) -> None:
+    cfg = DistillConfig()
+    assert cfg.contact_weight == 0.0
+    assert cfg.contact_head == "attention"
+    assert cfg.contact_layers == 6
+    assert cfg.contact_min_sep == 6
+    assert cfg.contact_pos_weight == 1.0
+    assert cfg.contact_pair_dim == 128
+    assert cfg.contact_head_lr == 1e-3
+    assert cfg.contact_head_warmup_steps == 200
+    assert cfg.contact_max_chunk_pairs == 2_000_000
+
+    loaded = load_config(
+        [
+            "distill.alpha=0.0",
+            "distill.contact_weight=1.0",
+            "distill.contact_head=pair",
+            "distill.contact_layers=4",
+            "distill.contact_min_sep=24",
+            "distill.contact_pos_weight=2.0",
+            "distill.contact_pair_dim=64",
+            "distill.contact_head_lr=5e-4",
+            "distill.contact_head_warmup_steps=50",
+            "distill.contact_max_chunk_pairs=500000",
+        ]
+    )
+    assert loaded.distill is not None
+    assert loaded.distill.contact_head == "pair"
+    assert loaded.distill.contact_layers == 4
+    dumped = tmp_path / "distill_2d.yaml"
+    dumped.write_text(serialize_config(loaded))
+    reloaded = load_config(["--config", str(dumped)])
+    assert reloaded.distill == loaded.distill
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"contact_weight": -0.1},
+        {"contact_weight": float("nan")},
+        {"contact_weight": float("inf")},
+        {"contact_weight": True},
+        {"contact_head": "unknown"},
+        {"contact_head": ""},
+        {"contact_layers": 0},
+        {"contact_layers": -2},
+        {"contact_layers": True},
+        {"contact_min_sep": 0},
+        {"contact_min_sep": False},
+        {"contact_pos_weight": 0.0},
+        {"contact_pos_weight": -1.0},
+        {"contact_pos_weight": float("inf")},
+        {"contact_pos_weight": True},
+        {"contact_pair_dim": 8},
+        {"contact_pair_dim": True},
+        {"contact_head_lr": 0.0},
+        {"contact_head_lr": -1e-3},
+        {"contact_head_lr": float("nan")},
+        {"contact_head_lr": True},
+        {"contact_head_warmup_steps": -1},
+        {"contact_head_warmup_steps": True},
+        {"contact_max_chunk_pairs": 1000},
+        {"contact_max_chunk_pairs": True},
+    ],
+)
+def test_distill_config_contact_validation_errors(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        DistillConfig(**kwargs)
+
+
+def test_validate_distill_compat_contact_layers_depth() -> None:
+    # Too many contact layers for a 4-layer non-looped model when enabled
+    with pytest.raises(ValueError, match="contact_layers"):
+        load_config(["model.num_hidden_layers=4", "distill.contact_weight=1.0", "distill.contact_layers=6"])
+    # Allowed when 2D contact distillation is disabled (contact_weight=0.0)
+    cfg_disabled = load_config(["model.num_hidden_layers=4", "distill.contact_weight=0.0", "distill.contact_layers=6"])
+    validate_distill_compat(cfg_disabled)
+    # Allowed when looped effective depth >= contact_layers (4 * 2 = 8 >= 6)
+    cfg_looped = load_config(
+        [
+            "model.num_hidden_layers=4",
+            "model.num_loops=2",
+            "distill.contact_weight=1.0",
+            "distill.contact_layers=6",
+        ]
+    )
+    validate_distill_compat(cfg_looped)
