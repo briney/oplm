@@ -243,10 +243,8 @@ class OplmBlock(nn.Module):
         value_residual: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor | None]
-        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
-    ):
+        return_qk: bool = False,
+    ) -> tuple[torch.Tensor | None, ...]:
         # Attention sublayer. Hybrid feeds raw `x` (QKV-norm lives inside the
         # attention module); every other strategy applies the outer pre-norm.
         # Canon is restricted to norm_strategy="pre", so when conv_a exists
@@ -268,12 +266,22 @@ class OplmBlock(nn.Module):
             value_residual=value_residual,
             segment_ids=segment_ids,
             block_mask=block_mask,
+            return_qk=return_qk,
         )
+        q_out: torch.Tensor | None = None
+        k_out: torch.Tensor | None = None
         if self.value_residual_enabled:
-            attn_out, attn_weights, v1 = attn_result
+            if return_qk:
+                attn_out, attn_weights, v1, q_out, k_out = attn_result
+            else:
+                attn_out, attn_weights, v1 = attn_result
         else:
-            attn_out, attn_weights = attn_result
             v1 = None
+            if return_qk:
+                attn_out, attn_weights, q_out, k_out = attn_result
+            else:
+                attn_out, attn_weights = attn_result
+        assert attn_out is not None
 
         if self.norm_strategy in {"sandwich", "post_sdpa"}:
             attn_out = self.attn_post_norm(attn_out)
@@ -299,7 +307,11 @@ class OplmBlock(nn.Module):
             y = h + self.alpha * self._gate_ffn(ffn_out)
 
         if self.value_residual_enabled:
+            if return_qk:
+                return y, attn_weights, v1, q_out, k_out
             return y, attn_weights, v1
+        if return_qk:
+            return y, attn_weights, q_out, k_out
         return y, attn_weights
 
     def forward(
@@ -310,10 +322,8 @@ class OplmBlock(nn.Module):
         value_residual: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor | None]
-        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
-    ):
+        return_qk: bool = False,
+    ) -> tuple[torch.Tensor | None, ...]:
         """Run one transformer block.
 
         Args:
@@ -325,12 +335,11 @@ class OplmBlock(nn.Module):
                 ResFormer value residual (later layers only); `None` otherwise.
             segment_ids: `(B, T)` segment ids of a packed batch, or `None` (see `OplmAttention`).
             block_mask: FlexAttention block mask shared by every block of this forward, or `None`.
+            return_qk: When `True`, also return post-RoPE `q, k` tensors from `OplmAttention`.
 
         Returns:
-            `(y, attn_weights_or_None)` — `y` has shape `(B, T, D)`;
-            `attn_weights_or_None` has shape `(B, H, T, T)` when requested.
-            When the value residual is enabled, a third element carries the
-            layer-0 values v1 (`layer_idx == 0` only, else `None`).
+            Flat tuple starting with `(y, attn_weights_or_None)`, followed by
+            `v1_or_None` (when `value_residual` is enabled) and/or `q, k` (when `return_qk=True`).
         """
         if self.gradient_checkpointing and self.training:
             if self.gradient_checkpointing_mode == "selective":
@@ -351,6 +360,7 @@ class OplmBlock(nn.Module):
                     value_residual,
                     segment_ids,
                     block_mask,
+                    return_qk,
                     use_reentrant=False,
                     context_fn=context_fn,
                 )
@@ -363,10 +373,17 @@ class OplmBlock(nn.Module):
                 value_residual,
                 segment_ids,
                 block_mask,
+                return_qk,
                 use_reentrant=False,
             )
         return self._forward_impl(
-            x, attention_mask, output_attentions, value_residual, segment_ids, block_mask
+            x,
+            attention_mask,
+            output_attentions,
+            value_residual,
+            segment_ids,
+            block_mask,
+            return_qk,
         )
 
 
@@ -434,11 +451,20 @@ class OplmStack(nn.Module):
         output_attentions: bool = False,
         inputs_embeds: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        tuple[torch.Tensor, ...] | None,
-        tuple[torch.Tensor | None, ...] | None,
-    ]:
+        return_qk_layers: tuple[int, ...] | None = None,
+    ) -> (
+        tuple[
+            torch.Tensor,
+            tuple[torch.Tensor, ...] | None,
+            tuple[torch.Tensor | None, ...] | None,
+        ]
+        | tuple[
+            torch.Tensor,
+            tuple[torch.Tensor, ...] | None,
+            tuple[torch.Tensor | None, ...] | None,
+            tuple[tuple[torch.Tensor, torch.Tensor], ...],
+        ]
+    ):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Provide exactly one of `input_ids` or `inputs_embeds`.")
 
@@ -462,6 +488,10 @@ class OplmStack(nn.Module):
 
         hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
         attentions: tuple[torch.Tensor | None, ...] | None = () if output_attentions else None
+        qk_layer_set = set(return_qk_layers) if return_qk_layers is not None else None
+        qk_states: list[tuple[torch.Tensor, torch.Tensor]] | None = (
+            [] if qk_layer_set is not None else None
+        )
 
         # ResFormer: retain the first execution of layer 0 as the global value
         # reference, including when that physical block is revisited.
@@ -476,8 +506,9 @@ class OplmStack(nn.Module):
             and getattr(self.config, "packed_attention", "sdpa") == "flex"
         ):
             block_mask = segment_block_mask(segment_ids)
-        for layer_index in self.layer_execution_order:
+        for exec_idx, layer_index in enumerate(self.layer_execution_order):
             block = self.layers[layer_index]
+            want_qk = qk_layer_set is not None and exec_idx in qk_layer_set
             result = block(
                 x,
                 attention_mask,
@@ -485,17 +516,30 @@ class OplmStack(nn.Module):
                 value_residual=v1,
                 segment_ids=segment_ids,
                 block_mask=block_mask,
+                return_qk=want_qk,
             )
             if self.value_residual_enabled:
-                x, attn, v = result
+                if want_qk:
+                    x, attn, v, q_out, k_out = result
+                else:
+                    x, attn, v = result
                 if v1 is None:
                     v1 = v
             else:
-                x, attn = result
+                if want_qk:
+                    x, attn, q_out, k_out = result
+                else:
+                    x, attn = result
+            assert x is not None
+            if want_qk and qk_states is not None:
+                assert q_out is not None and k_out is not None
+                qk_states.append((q_out, k_out))
             if hidden_states is not None:
                 hidden_states = hidden_states + (x,)
             if attentions is not None:
                 attentions = attentions + (attn,)
 
         last_hidden = self.final_norm(x)
+        if qk_states is not None:
+            return last_hidden, hidden_states, attentions, tuple(qk_states)
         return last_hidden, hidden_states, attentions

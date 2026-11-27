@@ -8,6 +8,7 @@ files. Internal building blocks live in their own modules and are imported here.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -59,6 +60,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "OplmPreTrainedModel",
+    "OplmBaseModelOutput",
+    "OplmMaskedLMOutput",
     "OplmModel",
     "OplmForMaskedLM",
     "OplmForSequenceClassification",
@@ -66,6 +69,20 @@ __all__ = [
     "OplmMLMHead",
     "EsmcCompatMixin",
 ]
+
+
+@dataclass
+class OplmBaseModelOutput(BaseModelOutput):
+    """BaseModelOutput carrying optional post-RoPE ``(q, k)`` pairs for selected layers."""
+
+    qk_states: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None
+
+
+@dataclass
+class OplmMaskedLMOutput(MaskedLMOutput):
+    """MaskedLMOutput carrying optional post-RoPE ``(q, k)`` pairs for selected layers."""
+
+    qk_states: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None
 
 
 _MLM_HEAD_ACTIVATIONS = {"gelu": F.gelu, "silu": F.silu, "relu": F.relu}
@@ -329,6 +346,7 @@ class OplmModel(OplmPreTrainedModel, EsmcCompatMixin):
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         segment_ids: torch.Tensor | None = None,
+        return_qk_layers: tuple[int, ...] | None = None,
     ) -> BaseModelOutput | tuple:
         output_attentions = (
             output_attentions if output_attentions is not None else self.config.output_attentions
@@ -340,14 +358,28 @@ class OplmModel(OplmPreTrainedModel, EsmcCompatMixin):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        last_hidden, hidden_states, attentions = self.backbone(
+        backbone_out = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             segment_ids=segment_ids,
+            return_qk_layers=return_qk_layers,
         )
+        if return_qk_layers is not None:
+            last_hidden, hidden_states, attentions, qk_states = backbone_out
+            if not return_dict:
+                return tuple(
+                    v for v in (last_hidden, hidden_states, attentions, qk_states) if v is not None
+                )
+            return OplmBaseModelOutput(
+                last_hidden_state=last_hidden,
+                hidden_states=hidden_states,
+                attentions=attentions,
+                qk_states=qk_states,
+            )
+        last_hidden, hidden_states, attentions = backbone_out
 
         if not return_dict:
             return tuple(v for v in (last_hidden, hidden_states, attentions) if v is not None)
@@ -420,6 +452,7 @@ class OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin):
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         segment_ids: torch.Tensor | None = None,
+        return_qk_layers: tuple[int, ...] | None = None,
     ) -> MaskedLMOutput | tuple:
         # segment_ids: (B, T) for a packed batch (several sequences per row): 1..n per
         # sequence, 0 at pads. Each sequence then sees only itself, as if it had its own row.
@@ -433,6 +466,7 @@ class OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin):
             output_hidden_states=output_hidden_states,
             return_dict=True,
             segment_ids=segment_ids,
+            return_qk_layers=return_qk_layers,
         )
         logits = self.lm_head(outputs.last_hidden_state).float()
 
@@ -442,6 +476,20 @@ class OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin):
                 logits.view(-1, self.config.vocab_size),
                 labels.view(-1),
                 ignore_index=-100,
+            )
+
+        if return_qk_layers is not None:
+            qk_states = getattr(outputs, "qk_states", None)
+            if not return_dict:
+                output = (logits, outputs.hidden_states, outputs.attentions, qk_states)
+                output = tuple(v for v in output if v is not None)
+                return ((loss,) + output) if loss is not None else output
+            return OplmMaskedLMOutput(
+                loss=loss,  # ty: ignore[invalid-argument-type]
+                logits=logits,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                qk_states=qk_states,
             )
 
         if not return_dict:
