@@ -726,14 +726,41 @@ def test_teacher_logits_preserves_exact_masks_and_alignment(tokenizer) -> None:
     assert out_dist["teacher_logits"].dtype == torch.float16
     assert out_dist["teacher_logits"].shape == (*out_dist["labels"].shape, 20)
     assert out_dist["teacher_mask"].dtype == torch.bool
-    # Row 0: every masked position has teacher_mask=True and matches arrays[0][pos - 1]
-    masked0 = (out_dist["labels"][0] != -100).nonzero(as_tuple=False).squeeze(-1)
-    assert torch.equal(out_dist["teacher_mask"][0], out_dist["labels"][0] != -100)
-    for pos in masked0.tolist():
+    # Row 0: only <mask>-replaced labeled positions have teacher_mask=True -> arrays[0][pos - 1]
+    expected_mask0 = (out_dist["labels"][0] != -100) & (
+        out_dist["input_ids"][0] == tokenizer.mask_token_id
+    )
+    assert torch.equal(out_dist["teacher_mask"][0], expected_mask0)
+    assert expected_mask0.any()
+    for pos in expected_mask0.nonzero(as_tuple=False).squeeze(-1).tolist():
         expected = torch.tensor(arrays[0][pos - 1], dtype=torch.float16)
         assert torch.equal(out_dist["teacher_logits"][0, pos], expected)
     # Row 1: teacher_logits=None -> all False
     assert not out_dist["teacher_mask"][1].any()
+
+
+def test_teacher_logits_excludes_kept_and_random_positions(tokenizer) -> None:
+    seq = "ACDEFGHIKLMNPQRSTVWY" * 5  # 100 residues so 80/10/10 hits all three buckets
+    arr = np.ones((len(seq), 20), dtype="<f2")
+    collator = MLMCollator(
+        tokenizer,
+        max_length=128,
+        mask_prob=0.5,
+        mask_token_prob=0.6,
+        random_token_prob=0.2,
+        deterministic=True,
+        seed=11,
+        load_teacher_logits=True,
+    )
+    out = collator([{"sequence_id": "0", "sequence": seq, "teacher_logits": _encode_logits(arr)}])
+    labeled = out["labels"][0] != -100
+    is_mask = labeled & (out["input_ids"][0] == tokenizer.mask_token_id)
+    is_kept = labeled & (out["input_ids"][0] == out["labels"][0])
+    is_rand = labeled & ~is_mask & ~is_kept
+    assert is_mask.any() and is_kept.any() and is_rand.any()
+    assert torch.equal(out["teacher_mask"][0], is_mask)
+    assert not out["teacher_mask"][0][is_kept].any()
+    assert not out["teacher_mask"][0][is_rand].any()
 
 
 def test_teacher_logits_truncation_nan_noncanonical_and_memoryview(tokenizer) -> None:
@@ -748,6 +775,8 @@ def test_teacher_logits_truncation_nan_noncanonical_and_memoryview(tokenizer) ->
         tokenizer,
         max_length=12,
         mask_prob=1.0,
+        mask_token_prob=1.0,
+        random_token_prob=0.0,
         deterministic=True,
         seed=0,
         load_teacher_logits=True,

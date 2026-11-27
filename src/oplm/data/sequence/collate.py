@@ -331,7 +331,7 @@ class MLMCollator:
         if self._load_teacher_logits:
             raw_lengths = [len(_sequence_of(item)) for item in batch]
             teacher_logits, teacher_mask = _collect_teacher_logits(
-                batch, labels, self._canonical_ids, raw_lengths
+                batch, input_ids, labels, self._canonical_ids, self._mask_token_id, raw_lengths
             )
         out: dict[str, Tensor | list[str] | int] = {
             "input_ids": input_ids,
@@ -559,22 +559,28 @@ class MLMCollator:
 
 def _collect_teacher_logits(
     batch: Sequence[Mapping[str, object] | str],
+    input_ids: Tensor,
     labels: Tensor,
     canonical_ids: Tensor,
+    mask_token_id: int,
     raw_lengths: Sequence[int],
 ) -> tuple[Tensor, Tensor]:
-    """Decode masked canonical positions' teacher logits into ``(B, T, 20)`` fp16 + ``(B, T)`` bool.
+    """Decode ``<mask>``-replaced canonical teacher logits into ``(B, T, 20)`` fp16 + bool mask.
 
     Each raw payload is little-endian float16 bytes of shape ``(raw_len, 20)`` where
     ``raw_len == len(sequence)``. Token index ``pos`` (1-based after ``<cls>``) maps to
     residue ``pos - 1`` in the raw payload, so truncated sequences stay aligned on their
-    kept prefix. Non-canonical masked residues (e.g. ``X``) and any position with a
-    non-finite teacher channel fall back to ``teacher_mask = False`` (plain CE).
+    kept prefix. BERT kept-unchanged and random-AA replacement positions, non-canonical
+    residues (e.g. ``X``), and any position with a non-finite teacher channel stay
+    ``teacher_mask = False`` (plain CE) so query-masked teacher logits only supervise
+    positions where the student actually sees ``<mask>``.
     """
     bsz, width = labels.shape
     teacher_logits = torch.zeros((bsz, width, _TEACHER_CHANNELS), dtype=torch.float16)
     teacher_mask = torch.zeros((bsz, width), dtype=torch.bool)
-    eligible = (labels != _IGNORE_INDEX) & torch.isin(labels, canonical_ids)
+    eligible = (
+        (input_ids == mask_token_id) & (labels != _IGNORE_INDEX) & torch.isin(labels, canonical_ids)
+    )
 
     for row_idx, (item, raw_len) in enumerate(zip(batch, raw_lengths, strict=True)):
         if isinstance(item, str):

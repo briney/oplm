@@ -479,7 +479,8 @@ trainer-construction time. On-disk Parquet column requirements are in
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
 | `distill.alpha` | `float` | `0.5` | Weight of the temperature-scaled KL term on distilled masked tokens (CE weight on those tokens is `1 - alpha`); finite, in `[0, 1]`. `0.0` matches plain MLM loss and gradients while still logging `train/loss_kl` and `train/distill_frac`. |
-| `distill.temperature` | `float` | `1.5` | Softmax temperature `T` applied to both student and teacher 20-channel logits (KL is scaled by `T²`); finite, `> 0`. |
+| `distill.temperature` | `float` | `1.5` | Softmax temperature `T` applied to both student and teacher 20-channel logits (divergence is scaled by `T²`); finite, `> 0`. |
+| `distill.loss_type` | `str` | `forward_kl` | Divergence between teacher `p` and student `q` at temperature `T`: `forward_kl` (`KL(p \|\| q)`, mean-seeking), `reverse_kl` (`KL(q \|\| p)`, mode-seeking), or `js` (Jensen-Shannon `0.5·KL(p \|\| m) + 0.5·KL(q \|\| m)`). |
 | `distill.teacher_alphabet` | `str` | `ARNDCEQGHILKMFPSTWYV` | 20-character permutation of the uppercase canonical amino acids giving the teacher payload's channel order (default matches `msa-pairformer`). Mapped dynamically to `OplmTokenizerFast` token IDs rather than assuming ESM-C order. |
 | `distill.min_neff` | `float \| null` | `null` | Optional minimum `teacher_neff` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` must include `teacher_neff`; rows with missing, non-finite, or smaller values fall back to plain CE. |
 | `distill.min_neff_sqrt_l` | `float \| null` | `null` | Optional minimum `teacher_neff_sqrt_l` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` must include `teacher_neff_sqrt_l`; rows with missing, non-finite, or smaller values fall back to plain CE. |

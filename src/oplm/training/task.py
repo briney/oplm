@@ -9,6 +9,7 @@ the default and reproduces the pre-seam masked-language-model behaviour exactly.
 
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -163,6 +164,7 @@ class DistillMLMTask(MLMTask):
                 "to valid tokenizer ids"
             )
         self._teacher_token_ids = torch.tensor(token_ids, dtype=torch.long)
+        self._mask_token_id = int(tok.mask_token_id)
         self._device_token_ids: torch.Tensor | None = None
 
     def _token_ids_for(self, device: torch.device) -> torch.Tensor:
@@ -192,7 +194,9 @@ class DistillMLMTask(MLMTask):
                 metrics={},
             )
 
-        teacher_mask: torch.Tensor = batch["teacher_mask"] & masked
+        teacher_mask: torch.Tensor = (
+            batch["teacher_mask"] & masked & (batch["input_ids"] == self._mask_token_id)
+        )
         n_distill = int(teacher_mask.sum().item())
 
         ce = F.cross_entropy(
@@ -212,11 +216,22 @@ class DistillMLMTask(MLMTask):
                 s20 = logits[teacher_mask].index_select(-1, token_ids)
                 t20 = batch["teacher_logits"][teacher_mask].float()
                 temp = self._distill.temperature
-                kl_per_token = F.kl_div(
-                    F.log_softmax(s20 / temp, dim=-1),
-                    F.softmax(t20 / temp, dim=-1),
-                    reduction="none",
-                ).sum(dim=-1) * (temp * temp)
+                log_ps = F.log_softmax(s20 / temp, dim=-1)
+                log_pt = F.log_softmax(t20 / temp, dim=-1)
+                loss_type = self._distill.loss_type
+                if loss_type == "forward_kl":
+                    div_per_token = F.kl_div(log_ps, log_pt.exp(), reduction="none").sum(dim=-1)
+                elif loss_type == "reverse_kl":
+                    div_per_token = (log_ps.exp() * (log_ps - log_pt)).sum(dim=-1)
+                elif loss_type == "js":
+                    log_m = torch.logaddexp(log_ps, log_pt) - math.log(2.0)
+                    div_per_token = 0.5 * (
+                        (log_pt.exp() * (log_pt - log_m)).sum(dim=-1)
+                        + (log_ps.exp() * (log_ps - log_m)).sum(dim=-1)
+                    )
+                else:
+                    raise ValueError(f"Unsupported distill.loss_type: {loss_type!r}")
+                kl_per_token = div_per_token * (temp * temp)
                 kl_sum = kl_per_token.sum()
         else:
             kl_sum = logits.new_zeros(())
