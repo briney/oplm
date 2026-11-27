@@ -360,6 +360,7 @@ outputs/medium-uniref50/
     ├── hf/                    # HuggingFace export: config.json + model.safetensors + tokenizer
     ├── ema.pt                 # EMA tracker (averaged tensors + count); when `train.ema_decay` is set
     ├── hf_ema/                # HuggingFace export of the EMA weights; when `train.ema_decay` is set
+    ├── distill_aux.pt         # 2D contact distillation head + AdamW state; when `distill.contact_weight > 0`
     ├── .metadata + shard files  # model, optimizer(s), scheduler(s): torch.distributed.checkpoint
     └── rng_state_<rank>.pt    # per-rank RNG (Python, NumPy, torch CPU/CUDA), for resuming
 ```
@@ -1170,6 +1171,34 @@ over the 20 canonical amino-acid channels mapped from `distill.teacher_alphabet`
 `DistillMLMTask` logs `train/loss_ce` (CE over all masked tokens), `train/distill_frac`
 (fraction of masked tokens with active teacher supervision), and `train/loss_kl` (mean
 `T²·KL` over distilled tokens, omitted on micro-batches with zero distilled tokens).
+
+When `distill.contact_weight > 0`, `DistillMLMTask` adds a 2D contact-pair soft-BCE loss
+(`loss + contact_weight * loss_contact`, averaged equally per contact-bearing sequence across
+upper-triangle pairs `j - i ≥ distill.contact_min_sep` in length-sorted chunks bounded by
+`distill.contact_max_chunk_pairs`) and logs `train/contact_frac` (fraction of sequences in the
+batch with active contact targets), `train/loss_contact`, and `train/contact_pos_rate` (mean
+teacher contact probability; the last two omitted when a micro-batch has no contact targets).
+Two discarded, training-only auxiliary heads are supported behind `distill.contact_head`:
+
+- **`attention` (default):** taps post-RoPE `(Q, K)` from the final `distill.contact_layers`
+  executed layers via an opt-in `return_qk_layers` argument on `OplmForMaskedLM` (preserving
+  packed `FlexAttention` and activation checkpointing inside the backbone), computes per-segment
+  residue attention maps with symmetrization and masked APC, and projects `K × H` head maps
+  through a learned linear layer (`AttentionContactHead`).
+- **`pair`:** taps the final `distill.contact_layers` hidden states (`output_hidden_states=True`),
+  learns a softmax layer mix, projects to `distill.contact_pair_dim`, and scores symmetric
+  `[u_i * u_j, |u_i - u_j|]` outer interactions with a 2-layer GELU MLP (`PairContactHead`).
+
+The auxiliary head lives outside `OplmForMaskedLM` inside `DistillMLMTask` (`AuxContactManager`),
+so `hf/` inference exports stay vanilla `OplmForMaskedLM` checkpoints with zero auxiliary keys.
+Its standalone AdamW optimizer follows `contact_head_lr * backbone_schedule(step) * warmup_ramp(step)`,
+where `warmup_ramp` ramps linearly over `distill.contact_head_warmup_steps` from the step the head
+was initialized (e.g. `global_step` when branching off a plain MLM checkpoint via `train.branch_from`)
+while decaying cleanly to `min_lr` with the backbone schedule. Auxiliary head and optimizer state
+persist in the checkpoint sidecar `distill_aux.pt` (also mirrored by `RemoteStore`) and are restored
+on `resume_from`/`auto_resume` (or started fresh with a warning if absent or incompatible on a
+`branch_from`). Setting `distill.alpha: 0.0` with `distill.contact_weight > 0` runs pure-2D
+contact distillation without requiring `teacher_logits` in the shards.
 
 A typical WSD decay branch (`train.branch_from`) mixes distilled UniRef50 shards with
 plain or member-sampled sources ([data.md, *Dataset formats*](data.md#dataset-formats));

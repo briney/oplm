@@ -1037,9 +1037,13 @@ def test_distill_config_contact_validation_errors(kwargs: dict[str, Any]) -> Non
 def test_validate_distill_compat_contact_layers_depth() -> None:
     # Too many contact layers for a 4-layer non-looped model when enabled
     with pytest.raises(ValueError, match="contact_layers"):
-        load_config(["model.num_hidden_layers=4", "distill.contact_weight=1.0", "distill.contact_layers=6"])
+        load_config(
+            ["model.num_hidden_layers=4", "distill.contact_weight=1.0", "distill.contact_layers=6"]
+        )
     # Allowed when 2D contact distillation is disabled (contact_weight=0.0)
-    cfg_disabled = load_config(["model.num_hidden_layers=4", "distill.contact_weight=0.0", "distill.contact_layers=6"])
+    cfg_disabled = load_config(
+        ["model.num_hidden_layers=4", "distill.contact_weight=0.0", "distill.contact_layers=6"]
+    )
     validate_distill_compat(cfg_disabled)
     # Allowed when looped effective depth >= contact_layers (4 * 2 = 8 >= 6)
     cfg_looped = load_config(

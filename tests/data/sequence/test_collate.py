@@ -941,10 +941,22 @@ def test_mlm_collator_contacts_unpacked_and_packed(tokenizer, pack_sequences: bo
         3: np.zeros((5, 5), dtype=np.float32),
     }
     items = [
-        {"sequence_id": "0", "sequence": seqs[0], "teacher_contacts": encode_teacher_contacts(mats[0])},
+        {
+            "sequence_id": "0",
+            "sequence": seqs[0],
+            "teacher_contacts": encode_teacher_contacts(mats[0]),
+        },
         {"sequence_id": "1", "sequence": seqs[1], "teacher_contacts": None},
-        {"sequence_id": "2", "sequence": seqs[2], "teacher_contacts": encode_teacher_contacts(mats[2])},
-        {"sequence_id": "3", "sequence": seqs[3], "teacher_contacts": encode_teacher_contacts(mats[3])},
+        {
+            "sequence_id": "2",
+            "sequence": seqs[2],
+            "teacher_contacts": encode_teacher_contacts(mats[2]),
+        },
+        {
+            "sequence_id": "3",
+            "sequence": seqs[3],
+            "teacher_contacts": encode_teacher_contacts(mats[3]),
+        },
     ]
     collator = MLMCollator(
         tokenizer,
@@ -979,7 +991,9 @@ def test_mlm_collator_contacts_unpacked_and_packed(tokenizer, pack_sequences: bo
         np.testing.assert_array_equal(values[offset : offset + n_pairs].numpy(), expected)
 
     # All-None batch emits empty meta and (0,) uint8 tensor
-    empty_out = collator([{"sequence_id": "x", "sequence": "ACDEFGHIKLMNPQ", "teacher_contacts": None}])
+    empty_out = collator(
+        [{"sequence_id": "x", "sequence": "ACDEFGHIKLMNPQ", "teacher_contacts": None}]
+    )
     assert empty_out["teacher_contact_meta"] == []
     assert empty_out["teacher_contact_values"].shape == (0,)
     assert empty_out["teacher_contact_values"].dtype == torch.uint8

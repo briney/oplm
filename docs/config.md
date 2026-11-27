@@ -469,21 +469,33 @@ yet. See [evaluation.md](evaluation.md), *Tasks and metrics* for status.
 
 ## Distillation fields (`distill.*`)
 
-Backed by `oplm.config.DistillConfig`; optional per-residue teacher-logit KL distillation
-for MLM runs ([training.md, *Training tasks (`TrainTask`)*](training.md#training-tasks-traintask)).
+Backed by `oplm.config.DistillConfig`; optional per-residue 1D teacher-logit KL and/or 2D
+contact-pair distillation for MLM runs
+([training.md, *Training tasks (`TrainTask`)*](training.md#training-tasks-traintask)).
 The block is absent (`null`) by default, leaving plain MLM training, collation, and batch
 keys untouched. Setting both `fold:` and `distill:` raises a `ValueError` at load and
-trainer-construction time. On-disk Parquet column requirements are in
-[data.md, *Dataset formats*](data.md#dataset-formats).
+trainer-construction time. When `distill.contact_weight > 0`, `distill.contact_layers` must
+not exceed the model's effective layer depth (`len(resolve_layer_execution_order(...))`),
+also validated at config load and trainer construction. On-disk Parquet column requirements
+are in [data.md, *Dataset formats*](data.md#dataset-formats).
 
 | Override | Type | Default | Valid values / notes |
 | --- | --- | --- | --- |
-| `distill.alpha` | `float` | `0.5` | Weight of the temperature-scaled KL term on distilled masked tokens (CE weight on those tokens is `1 - alpha`); finite, in `[0, 1]`. `0.0` matches plain MLM loss and gradients while still logging `train/loss_kl` and `train/distill_frac`. |
+| `distill.alpha` | `float` | `0.5` | Weight of the temperature-scaled KL term on distilled masked tokens (CE weight on those tokens is `1 - alpha`); finite, in `[0, 1]`. `0.0` matches plain MLM loss and gradients (useful for 2D-only runs when `contact_weight > 0`, or logging `train/loss_kl` and `train/distill_frac` without 1D KL gradients). |
 | `distill.temperature` | `float` | `1.5` | Softmax temperature `T` applied to both student and teacher 20-channel logits (divergence is scaled by `T²`); finite, `> 0`. |
 | `distill.loss_type` | `str` | `forward_kl` | Divergence between teacher `p` and student `q` at temperature `T`: `forward_kl` (`KL(p \|\| q)`, mean-seeking), `reverse_kl` (`KL(q \|\| p)`, mode-seeking), or `js` (Jensen-Shannon `0.5·KL(p \|\| m) + 0.5·KL(q \|\| m)`). |
 | `distill.teacher_alphabet` | `str` | `ARNDCEQGHILKMFPSTWYV` | 20-character permutation of the uppercase canonical amino acids giving the teacher payload's channel order (default matches `msa-pairformer`). Mapped dynamically to `OplmTokenizerFast` token IDs rather than assuming ESM-C order. |
-| `distill.min_neff` | `float \| null` | `null` | Optional minimum `teacher_neff` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` must include `teacher_neff`; rows with missing, non-finite, or smaller values fall back to plain CE. |
-| `distill.min_neff_sqrt_l` | `float \| null` | `null` | Optional minimum `teacher_neff_sqrt_l` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` must include `teacher_neff_sqrt_l`; rows with missing, non-finite, or smaller values fall back to plain CE. |
+| `distill.min_neff` | `float \| null` | `null` | Optional minimum `teacher_neff` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` or `teacher_contacts` must include `teacher_neff`; rows with missing, non-finite, or smaller values fall back to plain CE / skip contact supervision. |
+| `distill.min_neff_sqrt_l` | `float \| null` | `null` | Optional minimum `teacher_neff_sqrt_l` threshold; finite `≥ 0` when set. Shards carrying `teacher_logits` or `teacher_contacts` must include `teacher_neff_sqrt_l`; rows with missing, non-finite, or smaller values fall back to plain CE / skip contact supervision. |
+| `distill.contact_weight` | `float` | `0.0` | Weight on the auxiliary 2D contact soft-BCE loss; finite, `≥ 0`. `0.0` disables 2D contact loading, tapping, and auxiliary head creation completely. |
+| `distill.contact_head` | `str` | `attention` | Training-only discarded student 2D head: `attention` (ESM-style logistic regression over symmetrized APC-corrected upper-layer post-RoPE `(Q, K)` maps) or `pair` (symmetric `[u_i * u_j, \|u_i - u_j\|]` MLP over a learned softmax mix of top-`K` hidden states). |
+| `distill.contact_layers` | `int` | `6` | Number of final executed layers (`K ≥ 1`, `≤` effective model depth) tapped by the 2D contact head. |
+| `distill.contact_min_sep` | `int` | `6` | Minimum sequence separation `j - i` scored in the 2D contact loss (`≥ 1`). Must be `≥` the shard header's `stored_min_sep` (rows with larger `stored_min_sep` raise). |
+| `distill.contact_pos_weight` | `float` | `1.0` | Positive-pair weight multiplier `1 + (w - 1) * p_teacher` applied inside soft BCE (`> 0`, finite). |
+| `distill.contact_pair_dim` | `int` | `128` | Projection width `d_p` for `contact_head=pair` (`≥ 1`). |
+| `distill.contact_head_lr` | `float` | `0.001` | Peak learning rate for the auxiliary contact head's standalone AdamW optimizer (`> 0`, finite). |
+| `distill.contact_head_warmup_steps` | `int` | `200` | Linear warmup ramp applied to the auxiliary head when initialized fresh (including on `branch_from` off a plain MLM checkpoint); `≥ 0`. |
+| `distill.contact_max_chunk_pairs` | `int` | `2_000_000` | Maximum padded `C * (L_max + 2)^2` pair elements materialized per chunked contact-head forward (`≥ 1`). |
 
 ## Fold fields (`fold.*`)
 
