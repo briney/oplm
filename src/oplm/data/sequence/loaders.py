@@ -117,6 +117,8 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
         raise ValueError("cfg.data.train resolved to no datasets; nothing to train on")
 
     distill = cfg.distill
+    load_teacher_contacts = distill is not None and distill.contact_weight > 0.0
+    load_teacher_logits = distill is not None and (distill.alpha > 0.0 or not load_teacher_contacts)
     sources = [
         ShardedProteinDataset(
             entry.path,
@@ -126,7 +128,8 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
             load_masking_weights=cfg.data.weighted_masking,
             drop_remainder=cfg.data.drop_last,
             sample_members=entry.sample_members,
-            load_teacher_logits=distill is not None,
+            load_teacher_logits=load_teacher_logits,
+            load_teacher_contacts=load_teacher_contacts,
             min_teacher_neff=distill.min_neff if distill is not None else None,
             min_teacher_neff_sqrt_l=distill.min_neff_sqrt_l if distill is not None else None,
         )
@@ -163,7 +166,9 @@ def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
         pad_to_multiple_of=cfg.data.pad_to_multiple_of,
         pack_sequences=cfg.data.pack_sequences,
         pack_rows=rows,
-        load_teacher_logits=distill is not None,
+        load_teacher_logits=load_teacher_logits,
+        load_teacher_contacts=load_teacher_contacts,
+        contact_min_sep=distill.contact_min_sep if distill is not None else 6,
     )
     if rows is not None:
         # Token mode: each worker builds whole (rows, width) batches; no DataLoader batching.

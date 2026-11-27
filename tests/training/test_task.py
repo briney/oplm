@@ -538,3 +538,259 @@ def test_trainer_distill_compat_and_mixed_packed_branch_from_plain_mlm(
 
     reloaded = load_config(["--config", str(stage2_dir / "checkpoint-4" / "config.yaml")])
     assert reloaded.distill == stage2_cfg.distill
+
+
+@pytest.mark.parametrize("contact_head", ["attention", "pair"])
+@pytest.mark.parametrize("alpha", [0.0, 0.5])
+def test_distill_mlm_task_2d_step_and_empty_contacts(
+    tmp_path: Path, contact_head: str, alpha: float
+) -> None:
+    from accelerate import Accelerator
+
+    from oplm.data.sequence.collate import MLMCollator, encode_teacher_contacts
+    from oplm.data.tokenizer import get_tokenizer
+
+    torch.manual_seed(11)
+    seqs = ["ACDEFGHIKLMNPQRSTVWY", "MKTAYIAKQRQISFVKSHFSRQ"]
+    rng = np.random.default_rng(11)
+    items = []
+    for i, s in enumerate(seqs):
+        mat = rng.uniform(0.0, 1.0, (len(s), len(s))).astype(np.float32)
+        mat = 0.5 * (mat + mat.T)
+        row: dict[str, object] = {
+            "sequence_id": f"s{i}",
+            "sequence": s,
+            "teacher_contacts": encode_teacher_contacts(mat, min_sep=6),
+        }
+        if alpha > 0.0:
+            row["teacher_logits"] = rng.normal(size=(len(s), 20)).astype("<f2").tobytes()
+        items.append(row)
+
+    collator = MLMCollator(
+        get_tokenizer(),
+        max_length=64,
+        mask_prob=0.5,
+        deterministic=True,
+        seed=0,
+        pack_sequences=True,
+        pack_rows=1,
+        load_teacher_logits=alpha > 0.0,
+        load_teacher_contacts=True,
+        contact_min_sep=6,
+    )
+    batch = collator(items)
+
+    cfg = tiny_train_cfg(tmp_path, tmp_path / "unused.parquet", max_steps=10)
+    cfg.distill = DistillConfig(
+        alpha=alpha,
+        temperature=1.0,
+        contact_weight=1.0,
+        contact_head=contact_head,
+        contact_layers=2,
+        contact_min_sep=6,
+        contact_pair_dim=16,
+    )
+    task = DistillMLMTask(cfg.distill)
+    model = task.build_model(cfg, initialization_source=None)
+    acc = Accelerator(cpu=True)
+    task.prepare_aux(model, acc, cfg, total_steps=10)
+    task.sync_aux_schedule(0, fresh_start=True)
+
+    result = task.step(model, batch)
+    assert math.isfinite(result.loss.item())
+    assert "loss_contact" in result.metrics and math.isfinite(result.metrics["loss_contact"])
+    assert result.metrics["contact_frac"] == pytest.approx(1.0)
+    assert 0.0 <= result.metrics["contact_pos_rate"] <= 1.0
+    if alpha > 0.0:
+        assert "loss_kl" in result.metrics
+    else:
+        assert "loss_kl" not in result.metrics
+
+    result.loss.backward()
+    task.step_aux(acc, max_grad_norm=1.0, global_step=0)
+
+    # Empty-contact batch (M == 0): zero 2D loss, step_aux zero-fills grads without error
+    model.zero_grad()
+    empty_batch = collator([{"sequence_id": "e0", "sequence": seqs[0], "teacher_contacts": None}])
+    empty_res = task.step(model, empty_batch)
+    assert math.isfinite(empty_res.loss.item())
+    assert empty_res.metrics["contact_frac"] == 0.0
+    assert "loss_contact" not in empty_res.metrics
+    empty_res.loss.backward()
+    task.step_aux(acc, max_grad_norm=1.0, global_step=1)
+
+
+@pytest.mark.parametrize("contact_head", ["attention", "pair"])
+def test_trainer_2d_contact_distill_branch_resume_and_clean_hf_export(
+    tmp_path: Path, contact_head: str
+) -> None:
+    from oplm.data.sequence.collate import encode_teacher_contacts
+    from oplm.model import OplmForMaskedLM
+    from oplm.training.contact_distill import DISTILL_AUX_SIDECAR_NAME
+    from oplm.training.trainer import Trainer
+
+    seqs = [
+        "ACDEFGHIKLMNPQRSTVWY",
+        "MKTAYIAKQRQISFVKSHFSRQ",
+        "GIVEQCCTSICSLYQLENYCN",
+        "FVNQHLCGSHLVEALYLVCGERGFFYTPKT",
+    ] * 4
+    plain_shard = tmp_path / "plain.parquet"
+    pq.write_table(
+        pa.table({"sequence_id": [f"p{i}" for i in range(len(seqs))], "sequence": seqs}),
+        plain_shard,
+    )
+
+    # 1) Plain MLM for 2 steps -> checkpoint-2 (no distill_aux.pt)
+    stage1_dir = tmp_path / "stage1"
+    stage1_cfg = tiny_train_cfg(
+        stage1_dir,
+        plain_shard,
+        max_steps=2,
+        log_every=1,
+        save_final=True,
+        pack_sequences=True,
+        tokens_per_step=128,
+        batch_tokens=128,
+        mask_prob=0.5,
+    )
+    Trainer(stage1_cfg).train()
+    ckpt2 = stage1_dir / "checkpoint-2"
+    assert not (ckpt2 / DISTILL_AUX_SIDECAR_NAME).exists()
+
+    # 2) Build contact-bearing shard and branch from checkpoint-2 into 2D distill
+    rng = np.random.default_rng(13)
+    contacts = []
+    for s in seqs:
+        m = rng.uniform(0.0, 1.0, (len(s), len(s))).astype(np.float32)
+        contacts.append(encode_teacher_contacts(0.5 * (m + m.T), min_sep=6))
+    distill_shard = tmp_path / "distill_2d.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": [f"d{i}" for i in range(len(seqs))],
+                "sequence": seqs,
+                "teacher_contacts": pa.array(contacts, type=pa.large_binary()),
+                "teacher_neff_sqrt_l": pa.array([5.0] * len(seqs), type=pa.float32()),
+            }
+        ),
+        distill_shard,
+    )
+
+    stage2_dir = tmp_path / "stage2"
+    stage2_cfg = tiny_train_cfg(
+        stage2_dir,
+        plain_shard,
+        max_steps=4,
+        log_every=1,
+        save_final=True,
+        branch_from=str(ckpt2),
+        scheduler="wsd_linear",
+        warmup_steps=1,
+        stable_steps=1,
+        pack_sequences=True,
+        tokens_per_step=128,
+        batch_tokens=128,
+        mask_prob=0.5,
+    )
+    stage2_cfg.data.train = {
+        "distilled": {"path": str(distill_shard), "fraction": 0.5},
+        "plain": {"path": str(plain_shard), "fraction": 0.5},
+    }
+    stage2_cfg.distill = DistillConfig(
+        alpha=0.0,
+        contact_weight=1.0,
+        contact_head=contact_head,
+        contact_layers=2,
+        contact_min_sep=6,
+        contact_pair_dim=16,
+        contact_head_warmup_steps=2,
+        min_neff_sqrt_l=2.0,
+    )
+
+    cb = FullRecordingCallback()
+    trainer = Trainer(stage2_cfg, callbacks=[cb])
+    assert isinstance(trainer.task, DistillMLMTask)
+    assert trainer.task._aux is not None
+    assert trainer.task._aux.aux_start_step == 2
+    trainer.train()
+
+    assert cb.train_log_steps == [3, 4]
+    assert any(
+        "train/loss_contact" in m and math.isfinite(m["train/loss_contact"])
+        for _, m in cb.train_logs
+    )
+    ckpt4 = stage2_dir / "checkpoint-4"
+    assert (ckpt4 / DISTILL_AUX_SIDECAR_NAME).is_file()
+
+    # Clean HF inference checkpoint: loads cleanly with zero missing/unexpected keys
+    reloaded, info = OplmForMaskedLM.from_pretrained(str(ckpt4 / "hf"), output_loading_info=True)
+    assert not info["missing_keys"]
+    assert not info["unexpected_keys"]
+    assert reloaded is not None
+
+    # 3) Auto-resume from checkpoint-4 to step 6 restores distill_aux.pt & aux_start_step == 2
+    stage2_cfg.train.max_steps = 6
+    stage2_cfg.train.auto_resume = True
+    cb_resume = FullRecordingCallback()
+    trainer_resume = Trainer(stage2_cfg, callbacks=[cb_resume])
+    assert isinstance(trainer_resume.task, DistillMLMTask)
+    assert trainer_resume.task._aux is not None
+    assert trainer_resume.task._aux.aux_start_step == 2
+    trainer_resume.train()
+    assert cb_resume.train_log_steps == [5, 6]
+
+
+def test_canon_self_check_slices_2d_contact_batch_past_row_four(tmp_path: Path) -> None:
+    """_canon_self_check trims batches to 4 rows without indexing OOB in teacher_contact_meta."""
+    from oplm.data.sequence.collate import encode_teacher_contacts
+    from oplm.training.trainer import Trainer
+
+    seqs = ["ACDEFGHIKLMNPQRSTVWY"] * 6
+    rng = np.random.default_rng(7)
+    contacts = [
+        encode_teacher_contacts(
+            0.5 * (m + m.T),
+            min_sep=6,
+        )
+        for m in (rng.uniform(0.0, 1.0, (len(s), len(s))).astype(np.float32) for s in seqs)
+    ]
+    shard = tmp_path / "canon_2d.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": [f"c{i}" for i in range(len(seqs))],
+                "sequence": seqs,
+                "teacher_contacts": pa.array(contacts, type=pa.large_binary()),
+                "teacher_neff_sqrt_l": pa.array([5.0] * len(seqs), type=pa.float32()),
+            }
+        ),
+        shard,
+    )
+    cfg = tiny_train_cfg(
+        tmp_path / "run",
+        shard,
+        max_steps=1,
+        batch_size=6,
+        pack_sequences=False,
+    )
+    cfg.model.canon_enabled = True
+    cfg.model.canon_positions = ["A", "B", "C", "D"]
+    cfg.model.canon_kernel_sizes = [4] * cfg.model.num_hidden_layers
+    cfg.distill = DistillConfig(
+        alpha=0.0,
+        contact_weight=1.0,
+        contact_head="attention",
+        contact_layers=2,
+        contact_min_sep=6,
+        min_neff_sqrt_l=2.0,
+    )
+    trainer = Trainer(cfg)
+    batch = next(iter(trainer.dataloader))
+    assert batch["input_ids"].shape[0] == 6
+    assert any(m[0] >= 4 for m in batch["teacher_contact_meta"])
+    # Exercise the exact slicing helper; CanonConv.forward runs on CPU (no Triton kernel),
+    # so patch canon_self_check to just execute run_forward and verify no IndexError occurs.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("oplm.model.canon_kernel.canon_self_check", lambda _m, fn: (fn(), 1)[1])
+        trainer._canon_self_check(batch)

@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import struct
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -43,12 +44,24 @@ _IGNORE_INDEX = -100
 
 # Per-residue masking-weight field carried on row dicts (see dataset.py).
 _WEIGHTS_KEY = "masking_weights"
-# Optional teacher-logit binary payload field carried on row dicts (see dataset.py).
+# Optional teacher-distillation binary payload fields carried on row dicts (see dataset.py).
 _TEACHER_LOGITS_KEY = "teacher_logits"
+_TEACHER_CONTACTS_KEY = "teacher_contacts"
 _TEACHER_CHANNELS = 20
 _TEACHER_BYTES_PER_RESIDUE = _TEACHER_CHANNELS * 2  # little-endian float16
+CONTACT_FORMAT_VERSION = 1
+_CONTACT_HEADER_STRUCT = struct.Struct("<BBH")  # (version, stored_min_sep, stored_len)
 
-__all__ = ["MLMCollator", "RowFiller", "first_fit", "token_length", "tokenize_and_pad"]
+__all__ = [
+    "CONTACT_FORMAT_VERSION",
+    "MLMCollator",
+    "RowFiller",
+    "decode_teacher_contacts",
+    "encode_teacher_contacts",
+    "first_fit",
+    "token_length",
+    "tokenize_and_pad",
+]
 
 
 def _sequence_of(item: Mapping[str, object] | str) -> str:
@@ -264,12 +277,16 @@ class MLMCollator:
         pack_sequences: bool = False,
         pack_rows: int | None = None,
         load_teacher_logits: bool = False,
+        load_teacher_contacts: bool = False,
+        contact_min_sep: int = 6,
     ) -> None:
         _validate_probs(mask_prob, mask_token_prob, random_token_prob)
         if pack_rows is not None and (not pack_sequences or pack_rows < 1):
             raise ValueError(
                 f"pack_rows requires pack_sequences=True and pack_rows >= 1, got {pack_rows}"
             )
+        if isinstance(contact_min_sep, bool) or contact_min_sep < 1:
+            raise ValueError(f"contact_min_sep must be an int >= 1, got {contact_min_sep!r}")
         self._tokenizer = tokenizer
         self._max_length = max_length
         self._mask_prob = mask_prob
@@ -283,6 +300,8 @@ class MLMCollator:
         self._pack_sequences = pack_sequences
         self._pack_rows = pack_rows
         self._load_teacher_logits = load_teacher_logits
+        self._load_teacher_contacts = load_teacher_contacts
+        self._contact_min_sep = contact_min_sep
 
         # Derived id constants (computed once from the tokenizer, never hardcoded).
         self._mask_token_id = mask_token_id(tokenizer)
@@ -292,9 +311,7 @@ class MLMCollator:
 
         self._warned_missing_weights = False
 
-    def __call__(
-        self, batch: Sequence[Mapping[str, object] | str]
-    ) -> dict[str, Tensor | list[str] | int]:
+    def __call__(self, batch: Sequence[Mapping[str, object] | str]) -> dict[str, Any]:
         """Collate ``batch`` into ``{input_ids, attention_mask, labels}``.
 
         Also carries ``"sequence_ids"`` (a plain ``list[str]``, not collated into a
@@ -326,14 +343,25 @@ class MLMCollator:
         weights = weights.masked_fill(~eligible, 0.0)
 
         self._mask_batch(input_ids, labels, eligible, weights, generators, attention_mask)
+        raw_lengths: list[int] | None = None
+        if self._load_teacher_logits or self._load_teacher_contacts:
+            raw_lengths = [len(_sequence_of(item)) for item in batch]
         teacher_logits: Tensor | None = None
         teacher_mask: Tensor | None = None
         if self._load_teacher_logits:
-            raw_lengths = [len(_sequence_of(item)) for item in batch]
+            assert raw_lengths is not None
             teacher_logits, teacher_mask = _collect_teacher_logits(
                 batch, input_ids, labels, self._canonical_ids, self._mask_token_id, raw_lengths
             )
-        out: dict[str, Tensor | list[str] | int] = {
+        # Per-input-row contact entries: row_idx -> (seg_res_len, contact_len, uint8_1d)
+        row_contacts: dict[int, tuple[int, int, np.ndarray]] | None = None
+        if self._load_teacher_contacts:
+            assert raw_lengths is not None
+            seq_tok_lens = attention_mask.sum(1).tolist()
+            row_contacts = _collect_teacher_contacts(
+                batch, raw_lengths, seq_tok_lens, self._contact_min_sep
+            )
+        out: dict[str, Any] = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
@@ -355,7 +383,17 @@ class MLMCollator:
                 labels,
                 teacher_logits=teacher_logits,
                 teacher_mask=teacher_mask,
+                row_contacts=row_contacts,
             )
+        elif row_contacts is not None:
+            meta, values = _finalize_contact_batch(
+                [
+                    (row_idx, 0, seg_res_len, contact_len, arr)
+                    for row_idx, (seg_res_len, contact_len, arr) in row_contacts.items()
+                ]
+            )
+            out["teacher_contact_meta"] = meta
+            out["teacher_contact_values"] = values
         if self._keep_sequence_ids:
             out["sequence_ids"] = self._collect_sequence_ids(batch)
         return out
@@ -368,7 +406,8 @@ class MLMCollator:
         *,
         teacher_logits: Tensor | None = None,
         teacher_mask: Tensor | None = None,
-    ) -> dict[str, Tensor | list[str] | int]:
+        row_contacts: dict[int, tuple[int, int, np.ndarray]] | None = None,
+    ) -> dict[str, Any]:
         """Pack right-padded rows back to back into rows of at most ``max_length`` tokens.
 
         Without ``pack_rows``: first-fit-decreasing into as few rows as needed, trimmed to
@@ -403,7 +442,7 @@ class MLMCollator:
             if self._pad_to_multiple_of:
                 width = -(-width // self._pad_to_multiple_of) * self._pad_to_multiple_of
         shape = (len(rows), width)
-        packed = {
+        packed: dict[str, Any] = {
             "input_ids": input_ids.new_full(shape, self._pad_token_id),
             "attention_mask": attention_mask.new_zeros(shape),
             "labels": labels.new_full(shape, _IGNORE_INDEX),
@@ -412,6 +451,7 @@ class MLMCollator:
         if teacher_logits is not None and teacher_mask is not None:
             packed["teacher_logits"] = teacher_logits.new_zeros((*shape, teacher_logits.shape[-1]))
             packed["teacher_mask"] = teacher_mask.new_zeros(shape)
+        contact_entries: list[tuple[int, int, int, int, np.ndarray]] = []
         for r, members in enumerate(rows):
             start = 0
             for segment, i in enumerate(members, start=1):
@@ -423,7 +463,14 @@ class MLMCollator:
                 if teacher_logits is not None and teacher_mask is not None:
                     packed["teacher_logits"][r, start:end] = teacher_logits[i, : lengths[i]]
                     packed["teacher_mask"][r, start:end] = teacher_mask[i, : lengths[i]]
+                if row_contacts is not None and i in row_contacts:
+                    seg_res_len, contact_len, arr = row_contacts[i]
+                    contact_entries.append((r, start, seg_res_len, contact_len, arr))
                 start = end
+        if row_contacts is not None:
+            meta, values = _finalize_contact_batch(contact_entries)
+            packed["teacher_contact_meta"] = meta
+            packed["teacher_contact_values"] = values
         return {**packed, "num_sequences": len(lengths)}
 
     def _collect_sequence_ids(self, batch: Sequence[Mapping[str, object] | str]) -> list[str]:
@@ -610,6 +657,132 @@ def _collect_teacher_logits(
         teacher_logits[row_idx, valid_pos] = torch.from_numpy(picked[finite])
         teacher_mask[row_idx, valid_pos] = True
     return teacher_logits, teacher_mask
+
+
+def _expected_triu_pairs(length: int, min_sep: int) -> int:
+    n = length - min_sep
+    return 0 if n <= 0 else (n * (n + 1)) // 2
+
+
+def encode_teacher_contacts(probs: np.ndarray, *, min_sep: int = 6) -> bytes:
+    """Encode an ``(L, L)`` contact probability matrix into the v1 ``teacher_contacts`` payload.
+
+    Layout: 4-byte little-endian header ``<BBH`` ``(version=1, stored_min_sep, stored_len)``
+    followed by row-major ``uint8`` quantized upper-triangle entries at offset ``min_sep``
+    (``round(clip(p, 0, 1) * 255)``).
+    """
+    arr = np.asarray(probs, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        raise ValueError(f"probs must be a square 2D array, got shape {arr.shape}")
+    if not (1 <= min_sep <= 255):
+        raise ValueError(f"min_sep must be in [1, 255], got {min_sep}")
+    length = int(arr.shape[0])
+    if length > 65535:
+        raise ValueError(f"sequence length {length} exceeds uint16 header limit (65535)")
+    header = _CONTACT_HEADER_STRUCT.pack(CONTACT_FORMAT_VERSION, min_sep, length)
+    if length <= min_sep:
+        return header
+    ii, jj = np.triu_indices(length, k=min_sep)
+    quant = np.rint(np.clip(arr[ii, jj], 0.0, 1.0) * 255.0).astype(np.uint8)
+    return header + quant.tobytes()
+
+
+def decode_teacher_contacts(
+    raw: bytes | bytearray | memoryview,
+    raw_len: int,
+    res_len: int,
+    contact_min_sep: int,
+) -> tuple[int, np.ndarray] | None:
+    """Validate and decode a v1 ``teacher_contacts`` payload for ``res_len`` kept residues.
+
+    Returns ``(contact_len, uint8_triu_values)`` matching ``np.triu_indices(contact_len,
+    k=contact_min_sep)``, where ``contact_len = min(stored_len, res_len)``, or ``None``
+    when ``contact_len <= contact_min_sep`` (zero scorable pairs).
+    """
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise ValueError(f"teacher_contacts must be bytes-like or None, got {type(raw).__name__}")
+    view = memoryview(raw)
+    if view.nbytes < _CONTACT_HEADER_STRUCT.size:
+        raise ValueError(f"teacher_contacts header truncated ({view.nbytes} bytes; expected >= 4)")
+    version, stored_min_sep, stored_len = _CONTACT_HEADER_STRUCT.unpack_from(view, 0)
+    if version != CONTACT_FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported teacher_contacts version {version}; expected {CONTACT_FORMAT_VERSION}"
+        )
+    if stored_min_sep < 1:
+        raise ValueError(f"teacher_contacts stored min_sep must be >= 1, got {stored_min_sep}")
+    if stored_min_sep > contact_min_sep:
+        raise ValueError(
+            f"teacher_contacts stored min_sep ({stored_min_sep}) exceeds requested "
+            f"contact_min_sep ({contact_min_sep})"
+        )
+    if stored_len > raw_len:
+        raise ValueError(
+            f"teacher_contacts stored_len ({stored_len}) exceeds raw sequence length ({raw_len})"
+        )
+    expected_bytes = _CONTACT_HEADER_STRUCT.size + _expected_triu_pairs(stored_len, stored_min_sep)
+    if view.nbytes != expected_bytes:
+        raise ValueError(
+            f"teacher_contacts byte length ({view.nbytes}) disagrees with header "
+            f"(stored_len={stored_len}, stored_min_sep={stored_min_sep}, expected {expected_bytes})"
+        )
+    contact_len = min(stored_len, res_len)
+    if contact_len <= contact_min_sep:
+        return None
+    body = np.frombuffer(view[_CONTACT_HEADER_STRUCT.size :], dtype=np.uint8)
+    if contact_len == stored_len and contact_min_sep == stored_min_sep:
+        return contact_len, np.array(body, dtype=np.uint8, copy=True)
+    ii, jj = np.triu_indices(contact_len, k=contact_min_sep)
+    span = stored_len - stored_min_sep
+    flat_idx = ii * span - (ii * (ii - 1)) // 2 + (jj - ii - stored_min_sep)
+    return contact_len, np.array(body[flat_idx], dtype=np.uint8, copy=True)
+
+
+def _collect_teacher_contacts(
+    batch: Sequence[Mapping[str, object] | str],
+    raw_lengths: Sequence[int],
+    seq_tok_lens: Sequence[int],
+    contact_min_sep: int,
+) -> dict[int, tuple[int, int, np.ndarray]]:
+    """Decode each row's optional ``teacher_contacts`` payload keyed by batch row index."""
+    out: dict[int, tuple[int, int, np.ndarray]] = {}
+    for row_idx, (item, raw_len, tok_len) in enumerate(
+        zip(batch, raw_lengths, seq_tok_lens, strict=True)
+    ):
+        if isinstance(item, str):
+            continue
+        raw = item.get(_TEACHER_CONTACTS_KEY)
+        if raw is None:
+            continue
+        seg_res_len = max(0, tok_len - 2)
+        decoded = decode_teacher_contacts(
+            raw,  # ty: ignore[invalid-argument-type]  # validated inside decode_teacher_contacts
+            raw_len=raw_len,
+            res_len=seg_res_len,
+            contact_min_sep=contact_min_sep,
+        )
+        if decoded is not None:
+            contact_len, vals = decoded
+            out[row_idx] = (seg_res_len, contact_len, vals)
+    return out
+
+
+def _finalize_contact_batch(
+    entries: list[tuple[int, int, int, int, np.ndarray]],
+) -> tuple[list[tuple[int, int, int, int, int]], Tensor]:
+    """Sort contact segments by length ascending and concatenate into one ``uint8`` tensor."""
+    if not entries:
+        return [], torch.empty((0,), dtype=torch.uint8)
+    entries.sort(key=lambda e: (e[3], e[2]))  # sort by (contact_len, seg_res_len) ascending
+    meta: list[tuple[int, int, int, int, int]] = []
+    chunks: list[np.ndarray] = []
+    offset = 0
+    for row_idx, start_pos, seg_res_len, contact_len, arr in entries:
+        meta.append((row_idx, start_pos, seg_res_len, contact_len, offset))
+        chunks.append(arr)
+        offset += int(arr.size)
+    combined = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+    return meta, torch.from_numpy(combined)
 
 
 def _validate_probs(mask_prob: float, mask_token_prob: float, random_token_prob: float) -> None:

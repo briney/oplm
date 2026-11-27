@@ -552,7 +552,8 @@ columns:
 | `sequence_id` | `str` | Stable identifier. |
 | `sequence` | `str` | Raw one-letter amino acids, **no special tokens**. |
 | `masking_weights` | `list[float]` | Optional, one weight per residue. Read only when `data.weighted_masking=true`. |
-| `teacher_logits` | `binary` / `large_binary` | Optional little-endian `float16` bytes of shape `(len(sequence), 20)` in `distill.teacher_alphabet` channel order (`null` falls back to plain CE). Read only when `distill:` is set. |
+| `teacher_logits` | `binary` / `large_binary` | Optional little-endian `float16` bytes of shape `(len(sequence), 20)` in `distill.teacher_alphabet` channel order (`null` falls back to plain CE). Read only when `distill:` is set (skipped on pure-2D runs with `alpha=0` and `contact_weight > 0`). |
+| `teacher_contacts` | `binary` / `large_binary` | Optional 4-byte `<BBH` header `(version=1, stored_min_sep, stored_len)` followed by row-major upper-triangle `uint8` quantized Cβ contact probabilities (`round(p * 255)`) for `0 ≤ i < j < stored_len` with `j - i ≥ stored_min_sep` (`null` skips contact supervision). Read only when `distill.contact_weight > 0`. |
 | `teacher_neff` | `float32` | Optional MSA raw effective sequence count (`Neff`). Read only when `distill.min_neff` is set. |
 | `teacher_neff_sqrt_l` | `float32` | Optional length-normalized `Neff / sqrt(L)`. Read only when `distill.min_neff_sqrt_l` is set. |
 
@@ -573,20 +574,26 @@ subclusters). `sample_members: "subcluster"` draws subcluster `k = h1 % K`, then
 folds one more constant into it, so the same resume and topology guarantees hold. Uniform
 mode and phase 1 ignore the column.
 
-Optional distillation shards carry `teacher_logits` (plus `teacher_neff` and/or
-`teacher_neff_sqrt_l` when runtime gating is configured via
+Optional distillation shards carry `teacher_logits` and/or `teacher_contacts` (plus
+`teacher_neff` and/or `teacher_neff_sqrt_l` when runtime gating is configured via
 [config.md, *Distillation fields (`distill.*`)*](config.md#distillation-fields-distill)).
 When `distill:` is unset, these columns are ignored. When `distill:` is set, distilled
 sources may be interleaved freely with plain sources (including plain `sample_members`
-sources); shards that carry `teacher_logits` themselves reject `sample_members` and
-require any configured `Neff` gate column at dataset construction. Rows with null,
-non-finite, or below-threshold `Neff` values fall back to plain CE. During collation,
-only `<mask>`-replaced canonical amino-acid positions are decoded (aligned to the pre-truncation
-prefix if the sequence is clipped to `model.max_position_embeddings - 2`); BERT's kept-unchanged
-and random-AA replacement positions, non-canonical residues (`X`, `B`, `U`, `Z`, `O`), and any
-position with a non-finite (`NaN`/`±inf`) teacher channel stay on plain CE so query-masked
-teacher logits only supervise `<mask>` inputs (also supporting partial-fold teachers like `K=2`).
-Evaluation dataloaders never load teacher logits.
+sources); shards that carry `teacher_logits` or `teacher_contacts` themselves reject
+`sample_members` and require any configured `Neff` gate column at dataset construction.
+Rows with null, non-finite, or below-threshold `Neff` values fall back to plain CE (and
+drop contact supervision). During 1D collation, only `<mask>`-replaced canonical
+amino-acid positions are decoded (aligned to the pre-truncation prefix if the sequence is
+clipped to `model.max_position_embeddings - 2`); BERT's kept-unchanged and random-AA
+replacement positions, non-canonical residues (`X`, `B`, `U`, `Z`, `O`), and any position
+with a non-finite (`NaN`/`±inf`) teacher channel stay on plain CE so query-masked teacher
+logits only supervise `<mask>` inputs (also supporting partial-fold teachers like `K=2`).
+During 2D collation (`distill.contact_weight > 0`), valid `teacher_contacts` payloads are
+decoded for `min(seg_res_len, stored_len)` prefix residues at `contact_min_sep ≥ stored_min_sep`,
+length-sorted, and packed into `teacher_contact_meta` (list of `(row_idx, start_pos,
+seg_res_len, contact_len, value_offset)` tuples) plus one flat `uint8` tensor
+`teacher_contact_values` for both unpacked and packed batches. Evaluation dataloaders
+never load teacher logits or contacts.
 
 Only the needed columns are read (`pq.read_table(columns=[...])`). There is no
 HuggingFace `datasets` integration; parquet is the only on-disk format.

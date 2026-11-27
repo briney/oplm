@@ -37,8 +37,9 @@ _PARQUET_SUFFIXES = frozenset({".parquet", ".parq", ".pq"})
 # Optional per-residue masking-weight column (read only when requested).
 _WEIGHTS_COLUMN = "masking_weights"
 
-# Optional teacher-logit distillation columns (read only when requested).
+# Optional teacher-distillation columns (read only when requested).
 TEACHER_LOGITS_COLUMN = "teacher_logits"
+TEACHER_CONTACTS_COLUMN = "teacher_contacts"
 TEACHER_NEFF_COLUMN = "teacher_neff"
 TEACHER_NEFF_SQRT_L_COLUMN = "teacher_neff_sqrt_l"
 
@@ -434,6 +435,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         drop_remainder: bool = False,
         sample_members: bool | str = False,
         load_teacher_logits: bool = False,
+        load_teacher_contacts: bool = False,
         min_teacher_neff: float | None = None,
         min_teacher_neff_sqrt_l: float | None = None,
     ) -> None:
@@ -454,6 +456,7 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._sample_members = bool(sample_members)
         self._subcluster = sample_members == "subcluster"
         self._load_teacher_logits = load_teacher_logits
+        self._load_teacher_contacts = load_teacher_contacts
         self._min_teacher_neff = min_teacher_neff
         self._min_teacher_neff_sqrt_l = min_teacher_neff_sqrt_l
         self._epoch = 0
@@ -477,14 +480,17 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         self._rows_per_shard: list[int] = []
         self._shard_has_weights: list[bool] = []
         self._shard_has_teacher_logits: list[bool] = []
+        self._shard_has_teacher_contacts: list[bool] = []
         for shard in shard_paths:
             pf = pq.ParquetFile(shard)
             schema_names = set(pf.schema_arrow.names)
             self._shards.append(shard)
             self._rows_per_shard.append(pf.metadata.num_rows)
             self._shard_has_weights.append(_WEIGHTS_COLUMN in schema_names)
-            has_teacher = TEACHER_LOGITS_COLUMN in schema_names
-            self._shard_has_teacher_logits.append(has_teacher)
+            has_logits = TEACHER_LOGITS_COLUMN in schema_names
+            has_contacts = TEACHER_CONTACTS_COLUMN in schema_names
+            self._shard_has_teacher_logits.append(has_logits)
+            self._shard_has_teacher_contacts.append(has_contacts)
             if sample_members:
                 missing = set(self._member_columns()) - schema_names
                 if missing:
@@ -492,12 +498,15 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                         f"sample_members={sample_members!r} needs columns "
                         f"{self._member_columns()}; {shard} lacks {sorted(missing)}"
                     )
-            if load_teacher_logits and has_teacher:
+            uses_logits = load_teacher_logits and has_logits
+            uses_contacts = load_teacher_contacts and has_contacts
+            if uses_logits or uses_contacts:
                 if self._sample_members:
+                    bad_col = TEACHER_LOGITS_COLUMN if uses_logits else TEACHER_CONTACTS_COLUMN
                     raise ValueError(
                         f"sample_members={sample_members!r} is incompatible with shards "
-                        f"containing {TEACHER_LOGITS_COLUMN!r} ({shard}): cluster members "
-                        "do not align with representative teacher logits"
+                        f"containing {bad_col!r} ({shard}): cluster members "
+                        "do not align with representative teacher targets"
                     )
                 if min_teacher_neff is not None and TEACHER_NEFF_COLUMN not in schema_names:
                     raise ValueError(
@@ -751,17 +760,21 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             yield from self._read_members(shard_idx, row_indices, epoch_seed)
             return
         has_weights = self._load_masking_weights and self._shard_has_weights[shard_idx]
-        has_teacher = self._load_teacher_logits and self._shard_has_teacher_logits[shard_idx]
+        has_logits = self._load_teacher_logits and self._shard_has_teacher_logits[shard_idx]
+        has_contacts = self._load_teacher_contacts and self._shard_has_teacher_contacts[shard_idx]
+        has_any_teacher = has_logits or has_contacts
         min_neff = self._min_teacher_neff
         min_neff_sqrt_l = self._min_teacher_neff_sqrt_l
-        read_neff = has_teacher and min_neff is not None
-        read_neff_sqrt_l = has_teacher and min_neff_sqrt_l is not None
+        read_neff = has_any_teacher and min_neff is not None
+        read_neff_sqrt_l = has_any_teacher and min_neff_sqrt_l is not None
 
         columns = ["sequence_id", "sequence"]
         if has_weights:
             columns.append(_WEIGHTS_COLUMN)
-        if has_teacher:
+        if has_logits:
             columns.append(TEACHER_LOGITS_COLUMN)
+        if has_contacts:
+            columns.append(TEACHER_CONTACTS_COLUMN)
         if read_neff:
             columns.append(TEACHER_NEFF_COLUMN)
         if read_neff_sqrt_l:
@@ -771,7 +784,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
         seq_ids = table.column("sequence_id")
         sequences = table.column("sequence")
         weights = table.column(_WEIGHTS_COLUMN) if has_weights else None
-        teacher_logits_col = table.column(TEACHER_LOGITS_COLUMN) if has_teacher else None
+        teacher_logits_col = table.column(TEACHER_LOGITS_COLUMN) if has_logits else None
+        teacher_contacts_col = table.column(TEACHER_CONTACTS_COLUMN) if has_contacts else None
         neff_col = table.column(TEACHER_NEFF_COLUMN) if read_neff else None
         neff_sqrt_l_col = table.column(TEACHER_NEFF_SQRT_L_COLUMN) if read_neff_sqrt_l else None
 
@@ -784,25 +798,32 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
                 # Column-absent shards (and absent rows) surface None; the
                 # collator falls back to uniform weights with a one-time warning.
                 row["masking_weights"] = weights[row_idx].as_py() if weights is not None else None
-            if self._load_teacher_logits:
-                logits: object = None
-                if teacher_logits_col is not None:
-                    keep = True
-                    if neff_col is not None and min_neff is not None:
-                        neff = neff_col[row_idx].as_py()
-                        if neff is None or not math.isfinite(neff) or neff < min_neff:
-                            keep = False
-                    if keep and neff_sqrt_l_col is not None and min_neff_sqrt_l is not None:
-                        neff_sqrt_l = neff_sqrt_l_col[row_idx].as_py()
-                        if (
-                            neff_sqrt_l is None
-                            or not math.isfinite(neff_sqrt_l)
-                            or neff_sqrt_l < min_neff_sqrt_l
-                        ):
-                            keep = False
-                    if keep:
-                        logits = teacher_logits_col[row_idx].as_py()
-                row[TEACHER_LOGITS_COLUMN] = logits
+            if self._load_teacher_logits or self._load_teacher_contacts:
+                keep = has_any_teacher
+                if keep and neff_col is not None and min_neff is not None:
+                    neff = neff_col[row_idx].as_py()
+                    if neff is None or not math.isfinite(neff) or neff < min_neff:
+                        keep = False
+                if keep and neff_sqrt_l_col is not None and min_neff_sqrt_l is not None:
+                    neff_sqrt_l = neff_sqrt_l_col[row_idx].as_py()
+                    if (
+                        neff_sqrt_l is None
+                        or not math.isfinite(neff_sqrt_l)
+                        or neff_sqrt_l < min_neff_sqrt_l
+                    ):
+                        keep = False
+                if self._load_teacher_logits:
+                    row[TEACHER_LOGITS_COLUMN] = (
+                        teacher_logits_col[row_idx].as_py()
+                        if (keep and teacher_logits_col is not None)
+                        else None
+                    )
+                if self._load_teacher_contacts:
+                    row[TEACHER_CONTACTS_COLUMN] = (
+                        teacher_contacts_col[row_idx].as_py()
+                        if (keep and teacher_contacts_col is not None)
+                        else None
+                    )
             yield row
 
     def _read_members(
@@ -847,6 +868,8 @@ class ShardedProteinDataset(IterableDataset[dict[str, object]]):
             row: dict[str, object] = {"sequence_id": ids[j], "sequence": seqs[j]}
             if self._load_teacher_logits:
                 row[TEACHER_LOGITS_COLUMN] = None
+            if self._load_teacher_contacts:
+                row[TEACHER_CONTACTS_COLUMN] = None
             yield row
 
 

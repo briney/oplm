@@ -407,10 +407,8 @@ class OplmAttention(nn.Module):
         value_residual: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor | None]
-        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
-    ):
+        return_qk: bool = False,
+    ) -> tuple[torch.Tensor | None, ...]:
         """Run dual-path multi-head attention.
 
         Args:
@@ -427,13 +425,13 @@ class OplmAttention(nn.Module):
             block_mask: FlexAttention block mask of a packed batch, built once per forward by
                 OplmStack when `config.packed_attention == "flex"`; replaces the dense segment
                 mask in the SDPA path.
+            return_qk: When `True`, append post-RoPE `(q, k)` tensors (each `(B, H, T, d_head)`)
+                to the returned tuple while leaving FlexAttention/SDPA untouched.
 
         Returns:
-            A `(output, attn_weights_or_None)` tuple. `output` has shape
-            `(B, T, D)`; `attn_weights_or_None` has shape `(B, H, T, T)` in fp32
-            when requested, otherwise `None`. When the value residual is
-            enabled, a third element carries this layer's post-V-norm values at
-            `layer_idx == 0` (`(B, H, T, d_head)`) and `None` on later layers.
+            `(output, attn_weights_or_None)` when `value_residual` and `return_qk` are both off;
+            otherwise appends `v1_or_None` (when `value_residual` is enabled) and/or `q, k`
+            (when `return_qk=True`) as flat tuple elements.
         """
         q, k, v = self._project_qkv(x)
         q, k = self._qk_norm(q, k)
@@ -462,5 +460,10 @@ class OplmAttention(nn.Module):
         out = self._output_projection(out, x)
         out = F.dropout(out, p=self.hidden_dropout, training=self.training)
         if self.value_residual_enabled:
-            return out, attn, (v if self.layer_idx == 0 else None)
+            v1 = v if self.layer_idx == 0 else None
+            if return_qk:
+                return out, attn, v1, q, k
+            return out, attn, v1
+        if return_qk:
+            return out, attn, q, k
         return out, attn

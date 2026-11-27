@@ -306,3 +306,46 @@ def test_teacher_logits_train_loader_enabled_and_eval_loader_omits(
     for batch in eval_batches:
         assert "teacher_logits" not in batch
         assert "teacher_mask" not in batch
+
+
+def test_build_train_dataloader_pure_2d_without_teacher_logits(tmp_path: Path) -> None:
+    from oplm.data.sequence.collate import encode_teacher_contacts
+
+    seqs = [
+        "ACDEFGHIKLMNPQRSTVWY",
+        "MKTAYIAKQRQISFVKSHFSRQ",
+        "GIVEQCCTSICSLYQLENYCN",
+        "FVNQHLCGSHLVEALYLVCGERGFFYTPKT",
+    ]
+    contacts = [
+        encode_teacher_contacts(np.full((len(s), len(s)), 0.25, dtype=np.float32), min_sep=6)
+        for s in seqs
+    ]
+    shard = tmp_path / "contacts_only.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": [f"s{i}" for i in range(len(seqs))],
+                "sequence": seqs,
+                "teacher_contacts": pa.array(contacts, type=pa.large_binary()),
+                "teacher_neff_sqrt_l": pa.array([5.0, 5.0, 5.0, 1.0], type=pa.float32()),
+            }
+        ),
+        shard,
+    )
+    cfg = _make_config(str(shard))
+    cfg.data.drop_last = False
+    cfg.data.pack_sequences = True
+    cfg.train.tokens_per_step = 128
+    cfg.train.batch_tokens = 128
+    cfg.distill = DistillConfig(alpha=0.0, contact_weight=1.0, min_neff_sqrt_l=2.0)
+
+    train_batches = _batches(build_train_dataloader(cfg))
+    assert train_batches
+    total_contact_segs = 0
+    for batch in train_batches:
+        assert "teacher_logits" not in batch
+        assert "teacher_contact_meta" in batch
+        assert "teacher_contact_values" in batch
+        total_contact_segs += len(batch["teacher_contact_meta"])
+    assert total_contact_segs == 3  # 1 row gated out by min_neff_sqrt_l=2.0

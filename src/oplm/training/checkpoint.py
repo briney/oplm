@@ -20,6 +20,7 @@ from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
+from oplm.training.contact_distill import DISTILL_AUX_SIDECAR_NAME
 from oplm.training.ema import EMA_HF_DIRNAME, EMA_SIDECAR_NAME, sync_ema_buffers
 
 if TYPE_CHECKING:
@@ -328,6 +329,63 @@ def _restore_ema_sidecar(checkpoint_dir: Path, ema: AveragedModel | None) -> Non
         )
 
 
+def _write_distill_aux_sidecar(tmp_dir: Path, task: Any) -> None:
+    """Write ``distill_aux.pt`` when ``task`` owns an auxiliary distillation head (rank 0 only)."""
+    aux_state_fn = getattr(task, "aux_state_dict", None)
+    if not callable(aux_state_fn):
+        return
+    aux_state = aux_state_fn()
+    if aux_state is None:
+        return
+    torch.save(aux_state, tmp_dir / DISTILL_AUX_SIDECAR_NAME)
+
+
+def _restore_distill_aux_sidecar(
+    checkpoint_dir: Path,
+    task: Any,
+    *,
+    reset_hparams: bool = False,
+) -> bool:
+    """Restore ``distill_aux.pt`` onto ``task`` on every rank; return whether state was restored."""
+    sidecar_path = checkpoint_dir / DISTILL_AUX_SIDECAR_NAME
+    aux_state_fn = getattr(task, "aux_state_dict", None)
+    load_fn = getattr(task, "load_aux_state_dict", None)
+    has_aux = callable(aux_state_fn) and callable(load_fn) and aux_state_fn() is not None
+
+    if has_aux and sidecar_path.is_file():
+        aux_state: dict[str, Any] = torch.load(sidecar_path, map_location="cpu", weights_only=True)
+        try:
+            load_fn(aux_state, reset_hparams=reset_hparams)
+        except (ValueError, RuntimeError) as exc:
+            if not reset_hparams:
+                raise
+            logger.warning(
+                "Checkpoint %s has %s incompatible with the branched config (%s); "
+                "starting the auxiliary distillation head fresh.",
+                checkpoint_dir,
+                DISTILL_AUX_SIDECAR_NAME,
+                exc,
+            )
+            return False
+        return True
+    if has_aux:
+        logger.warning(
+            "2D contact distillation is active but checkpoint %s has no %s; "
+            "starting the auxiliary contact head fresh.",
+            checkpoint_dir,
+            DISTILL_AUX_SIDECAR_NAME,
+        )
+        return False
+    if sidecar_path.is_file():
+        logger.warning(
+            "Checkpoint %s has auxiliary distillation state (%s) but the current run has "
+            "no auxiliary distillation head; not restored.",
+            checkpoint_dir,
+            DISTILL_AUX_SIDECAR_NAME,
+        )
+    return False
+
+
 @dataclass
 class PendingSave:
     """Handle for an in-flight async checkpoint save awaiting its deferred commit.
@@ -551,6 +609,7 @@ def save_checkpoint(
     blocking: bool = True,
     process_group: ProcessGroup | None = None,
     ema: AveragedModel | None = None,
+    distill_aux_task: Any = None,
 ) -> Path | PendingSave:
     """Save a training checkpoint atomically via a tmp-dir + rename commit.
 
@@ -769,6 +828,8 @@ def save_checkpoint(
         get_tokenizer().save_pretrained(hf_dir)  # tokenizer files for round-trip
         if ema is not None:
             _write_ema_artifacts(tmp_dir, ema, unwrapped)
+        if distill_aux_task is not None:
+            _write_distill_aux_sidecar(tmp_dir, distill_aux_task)
 
     if blocking:
         return _commit_checkpoint(
@@ -1034,6 +1095,8 @@ def load_checkpoint(
     *,
     validate_schedule: bool = True,
     ema: AveragedModel | None = None,
+    distill_aux_task: Any = None,
+    reset_aux_hparams: bool = False,
 ) -> dict[str, Any]:
     """Load a training checkpoint and return trainer state metadata.
 
@@ -1126,6 +1189,10 @@ def load_checkpoint(
     _restore_rng_sidecar(ckpt_path, accelerator.process_index, cfg.train.seed)
     _restore_scaler_sidecar(ckpt_path, accelerator)
     _restore_ema_sidecar(ckpt_path, ema)
+    if distill_aux_task is not None:
+        state["distill_aux_restored"] = _restore_distill_aux_sidecar(
+            ckpt_path, distill_aux_task, reset_hparams=reset_aux_hparams
+        )
 
     return state
 

@@ -841,3 +841,168 @@ def test_teacher_logits_packing_matches_unpacked(tokenizer, pack_rows: int | Non
     assert torch.equal(packed["teacher_mask"][0, 12:24], unpacked["teacher_mask"][1, :12])
     pad = packed["attention_mask"] == 0
     assert not packed["teacher_mask"][pad].any()
+
+
+def test_encode_decode_teacher_contacts_roundtrip() -> None:
+    from oplm.data.sequence.collate import (
+        CONTACT_FORMAT_VERSION,
+        decode_teacher_contacts,
+        encode_teacher_contacts,
+    )
+
+    rng = np.random.default_rng(7)
+    mat = rng.uniform(0.0, 1.0, size=(20, 20)).astype(np.float32)
+    mat = 0.5 * (mat + mat.T)
+    raw = encode_teacher_contacts(mat, min_sep=6)
+    assert len(raw) == 4 + (14 * 15) // 2
+    assert raw[0] == CONTACT_FORMAT_VERSION
+    assert raw[1] == 6
+    assert int.from_bytes(raw[2:4], "little") == 20
+
+    decoded = decode_teacher_contacts(raw, raw_len=20, res_len=20, contact_min_sep=6)
+    assert decoded is not None
+    contact_len, vals = decoded
+    assert contact_len == 20
+    ii, jj = np.triu_indices(20, k=6)
+    expected = np.rint(mat[ii, jj] * 255.0).astype(np.uint8)
+    np.testing.assert_array_equal(vals, expected)
+
+
+def test_decode_teacher_contacts_truncated_cropped_larger_sep_and_errors() -> None:
+    from oplm.data.sequence.collate import decode_teacher_contacts, encode_teacher_contacts
+
+    rng = np.random.default_rng(11)
+    mat = rng.uniform(0.0, 1.0, size=(30, 30)).astype(np.float32)
+    mat = 0.5 * (mat + mat.T)
+    raw = encode_teacher_contacts(mat, min_sep=6)
+
+    # Truncated sequence (res_len=18 < stored_len=30)
+    res = decode_teacher_contacts(raw, raw_len=30, res_len=18, contact_min_sep=6)
+    assert res is not None
+    c_len, vals = res
+    assert c_len == 18
+    ii, jj = np.triu_indices(18, k=6)
+    np.testing.assert_array_equal(vals, np.rint(mat[ii, jj] * 255.0).astype(np.uint8))
+
+    # Larger runtime min_sep=12 > stored_min_sep=6
+    res2 = decode_teacher_contacts(raw, raw_len=30, res_len=30, contact_min_sep=12)
+    assert res2 is not None
+    c_len2, vals2 = res2
+    assert c_len2 == 30
+    ii2, jj2 = np.triu_indices(30, k=12)
+    np.testing.assert_array_equal(vals2, np.rint(mat[ii2, jj2] * 255.0).astype(np.uint8))
+
+    # Both truncated + larger min_sep
+    res3 = decode_teacher_contacts(memoryview(raw), raw_len=30, res_len=20, contact_min_sep=10)
+    assert res3 is not None
+    c_len3, vals3 = res3
+    assert c_len3 == 20
+    ii3, jj3 = np.triu_indices(20, k=10)
+    np.testing.assert_array_equal(vals3, np.rint(mat[ii3, jj3] * 255.0).astype(np.uint8))
+
+    # Prefix-cropped stored_len=20 < raw_len=30
+    cropped = encode_teacher_contacts(mat[:20, :20], min_sep=6)
+    res_crop = decode_teacher_contacts(cropped, raw_len=30, res_len=30, contact_min_sep=6)
+    assert res_crop is not None
+    assert res_crop[0] == 20
+    ii4, jj4 = np.triu_indices(20, k=6)
+    np.testing.assert_array_equal(res_crop[1], np.rint(mat[ii4, jj4] * 255.0).astype(np.uint8))
+
+    # Too short to have any pairs -> None
+    assert decode_teacher_contacts(raw, raw_len=30, res_len=6, contact_min_sep=6) is None
+
+    # Invalid payloads raise ValueError
+    with pytest.raises(ValueError, match="header"):
+        decode_teacher_contacts(b"\x01\x06", raw_len=30, res_len=30, contact_min_sep=6)
+    with pytest.raises(ValueError, match="version"):
+        decode_teacher_contacts(b"\x02" + raw[1:], raw_len=30, res_len=30, contact_min_sep=6)
+    with pytest.raises(ValueError, match="min_sep"):
+        decode_teacher_contacts(raw, raw_len=30, res_len=30, contact_min_sep=4)
+    with pytest.raises(ValueError, match="stored_len"):
+        decode_teacher_contacts(raw, raw_len=25, res_len=25, contact_min_sep=6)
+    with pytest.raises(ValueError, match="byte length"):
+        decode_teacher_contacts(raw[:-1], raw_len=30, res_len=30, contact_min_sep=6)
+
+
+@pytest.mark.parametrize("pack_sequences", [False, True])
+def test_mlm_collator_contacts_unpacked_and_packed(tokenizer, pack_sequences: bool) -> None:
+    from oplm.data.sequence.collate import encode_teacher_contacts
+
+    rng = np.random.default_rng(19)
+    seqs = [
+        "ACDEFGHIKLMNPQRSTVWY",  # L=20 (has contacts)
+        "MNPQRSTVWYAC",  # L=12 (no contacts)
+        "ACDEFGHIKLMNPQ",  # L=14 (has contacts, shorter -> should sort before L=20)
+        "ACDEF",  # L=5 (too short for min_sep=6 -> skipped)
+    ]
+    mats = {
+        0: 0.5 * (a := rng.uniform(0, 1, (20, 20)).astype(np.float32)) + 0.5 * a.T,
+        2: 0.5 * (b := rng.uniform(0, 1, (14, 14)).astype(np.float32)) + 0.5 * b.T,
+        3: np.zeros((5, 5), dtype=np.float32),
+    }
+    items = [
+        {
+            "sequence_id": "0",
+            "sequence": seqs[0],
+            "teacher_contacts": encode_teacher_contacts(mats[0]),
+        },
+        {"sequence_id": "1", "sequence": seqs[1], "teacher_contacts": None},
+        {
+            "sequence_id": "2",
+            "sequence": seqs[2],
+            "teacher_contacts": encode_teacher_contacts(mats[2]),
+        },
+        {
+            "sequence_id": "3",
+            "sequence": seqs[3],
+            "teacher_contacts": encode_teacher_contacts(mats[3]),
+        },
+    ]
+    collator = MLMCollator(
+        tokenizer,
+        max_length=64,
+        mask_prob=0.15,
+        deterministic=True,
+        seed=5,
+        pack_sequences=pack_sequences,
+        pack_rows=2 if pack_sequences else None,
+        load_teacher_contacts=True,
+        contact_min_sep=6,
+    )
+    out = collator(items)
+    meta = out["teacher_contact_meta"]
+    values = out["teacher_contact_values"]
+    assert isinstance(meta, list)
+    assert isinstance(values, torch.Tensor) and values.dtype == torch.uint8
+    assert len(meta) == 2
+    # Sorted ascending by contact_len: L=14 first, then L=20
+    assert [m[3] for m in meta] == [14, 20]
+    cls_id = tokenizer.cls_token_id
+    eos_id = tokenizer.eos_token_id
+    for (row_idx, start_pos, seg_res_len, contact_len, offset), src_mat in zip(
+        meta, [mats[2], mats[0]], strict=True
+    ):
+        assert seg_res_len == contact_len
+        assert out["input_ids"][row_idx, start_pos].item() == cls_id
+        assert out["input_ids"][row_idx, start_pos + seg_res_len + 1].item() == eos_id
+        ii, jj = np.triu_indices(contact_len, k=6)
+        n_pairs = len(ii)
+        expected = np.rint(src_mat[ii, jj] * 255.0).astype(np.uint8)
+        np.testing.assert_array_equal(values[offset : offset + n_pairs].numpy(), expected)
+
+    # All-None batch emits empty meta and (0,) uint8 tensor
+    empty_out = collator(
+        [{"sequence_id": "x", "sequence": "ACDEFGHIKLMNPQ", "teacher_contacts": None}]
+    )
+    assert empty_out["teacher_contact_meta"] == []
+    assert empty_out["teacher_contact_values"].shape == (0,)
+    assert empty_out["teacher_contact_values"].dtype == torch.uint8
+
+    # Header with stored_min_sep == 0 must be rejected loudly
+    import struct
+
+    from oplm.data.sequence.collate import decode_teacher_contacts
+
+    bad_sep0 = struct.pack("<BBH", 1, 0, 4) + bytes(10)
+    with pytest.raises(ValueError, match="min_sep"):
+        decode_teacher_contacts(bad_sep0, raw_len=4, res_len=4, contact_min_sep=6)

@@ -20,10 +20,12 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from accelerate import Accelerator
     from torch import nn
     from torch.utils.data import DataLoader
 
     from oplm.config import DistillConfig, OplmConfig
+    from oplm.training.contact_distill import AuxContactManager
 
 __all__ = ["DistillMLMTask", "MLMTask", "StepResult", "TrainTask"]
 
@@ -143,13 +145,15 @@ class MLMTask:
 
 
 class DistillMLMTask(MLMTask):
-    """MLM task with optional per-residue teacher-logit KL distillation.
+    """MLM task with optional 1D teacher-logit KL and 2D contact-pair distillation.
 
     Inherits model building, dataloader building, and FLOP accounting from
     :class:`MLMTask`. In :meth:`step`, each masked position gets standard
     cross-entropy when ``teacher_mask`` is ``False``, and
-    ``(1 - alpha) * CE + alpha * T^2 * KL(p_teacher_T || p_student_T)`` over the
-    20 canonical amino-acid channels when ``teacher_mask`` is ``True``.
+    ``(1 - alpha) * CE + alpha * T^2 * D(p_teacher_T, p_student_T)`` over the
+    20 canonical amino-acid channels when ``teacher_mask`` is ``True``. When
+    ``distill.contact_weight > 0``, adds a soft-BCE contact loss computed via a
+    discarded training-only auxiliary head owned by this task.
     """
 
     def __init__(self, distill_cfg: DistillConfig) -> None:
@@ -166,6 +170,50 @@ class DistillMLMTask(MLMTask):
         self._teacher_token_ids = torch.tensor(token_ids, dtype=torch.long)
         self._mask_token_id = int(tok.mask_token_id)
         self._device_token_ids: torch.Tensor | None = None
+        self._aux: AuxContactManager | None = None
+        self._qk_layers: tuple[int, ...] | None = None
+
+    @property
+    def has_contact_distill(self) -> bool:
+        """Whether 2D contact-pair distillation is enabled."""
+        return self._distill.contact_weight > 0.0
+
+    def prepare_aux(
+        self,
+        model: nn.Module,
+        accelerator: Accelerator,
+        cfg: OplmConfig,
+        total_steps: int,
+    ) -> None:
+        """Instantiate and broadcast the discarded 2D contact head when ``contact_weight > 0``."""
+        if not self.has_contact_distill:
+            return
+        from oplm.training.contact_distill import AuxContactManager, build_contact_head
+
+        head, qk_layers = build_contact_head(self._distill, model)
+        head.to(accelerator.device)
+        self._qk_layers = qk_layers
+        self._aux = AuxContactManager(head, self._distill, cfg.train, total_steps)
+        self._aux.broadcast_weights()
+
+    def sync_aux_schedule(self, global_step: int, *, fresh_start: bool) -> None:
+        """Align the auxiliary head's LR schedule after init, resume, or branch."""
+        if self._aux is not None:
+            self._aux.sync_schedule(global_step, fresh_start=fresh_start)
+
+    def step_aux(self, accelerator: Accelerator, max_grad_norm: float, global_step: int) -> None:
+        """Synchronize auxiliary contact-head gradients and take one optimizer step."""
+        if self._aux is not None:
+            self._aux.step(accelerator, max_grad_norm, global_step)
+
+    def aux_state_dict(self) -> dict[str, Any] | None:
+        """Return auxiliary head/optimizer state for ``distill_aux.pt``, or ``None``."""
+        return self._aux.state_dict() if self._aux is not None else None
+
+    def load_aux_state_dict(self, state: dict[str, Any], *, reset_hparams: bool = False) -> None:
+        """Restore auxiliary head/optimizer state from ``distill_aux.pt``."""
+        if self._aux is not None:
+            self._aux.load_state_dict(state, reset_hparams=reset_hparams)
 
     def _token_ids_for(self, device: torch.device) -> torch.Tensor:
         if self._device_token_ids is None or self._device_token_ids.device != device:
@@ -173,12 +221,25 @@ class DistillMLMTask(MLMTask):
         return self._device_token_ids
 
     def step(self, model: nn.Module, batch: Any) -> StepResult:
-        outputs = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=None,
-            segment_ids=batch.get("segment_ids"),  # packed batches only
-        )
+        use_contacts = self.has_contact_distill
+        if use_contacts and self._aux is None:
+            raise RuntimeError(
+                "DistillMLMTask.prepare_aux() must be called before step() when "
+                "distill.contact_weight > 0"
+            )
+        forward_kwargs: dict[str, Any] = {
+            "input_ids": batch["input_ids"],
+            "attention_mask": batch["attention_mask"],
+            "labels": None,
+            "segment_ids": batch.get("segment_ids"),  # packed batches only
+        }
+        if use_contacts:
+            if self._distill.contact_head == "attention":
+                forward_kwargs["return_qk_layers"] = self._qk_layers
+            else:
+                forward_kwargs["output_hidden_states"] = True
+
+        outputs = model(**forward_kwargs)
         logits = outputs["logits"].float()  # (R, T, V) fp32
         labels: torch.Tensor = batch["labels"]
         tokens = int(batch["attention_mask"].sum().item())
@@ -186,66 +247,94 @@ class DistillMLMTask(MLMTask):
 
         masked = labels != -100
         n_masked = int(masked.sum().item())
-        if n_masked == 0:
-            return StepResult(
-                loss=logits.sum() * 0.0,
-                tokens=tokens,
-                samples=samples,
-                metrics={},
-            )
+        metrics: dict[str, float] = {}
 
-        teacher_mask: torch.Tensor = (
-            batch["teacher_mask"] & masked & (batch["input_ids"] == self._mask_token_id)
-        )
-        n_distill = int(teacher_mask.sum().item())
+        if n_masked > 0:
+            has_1d = "teacher_mask" in batch and "teacher_logits" in batch
+            if has_1d:
+                teacher_mask: torch.Tensor = (
+                    batch["teacher_mask"] & masked & (batch["input_ids"] == self._mask_token_id)
+                )
+                n_distill = int(teacher_mask.sum().item())
+            else:
+                teacher_mask = torch.zeros_like(masked)
+                n_distill = 0
 
-        ce = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
-            labels.reshape(-1),
-            ignore_index=-100,
-            reduction="none",
-        ).view_as(labels)
-        plain_ce_sum = ce[masked & ~teacher_mask].sum()
-        distill_ce_sum = ce[teacher_mask].sum()
+            ce = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                labels.reshape(-1),
+                ignore_index=-100,
+                reduction="none",
+            ).view_as(labels)
+            plain_ce_sum = ce[masked & ~teacher_mask].sum()
+            distill_ce_sum = ce[teacher_mask].sum()
 
-        alpha = self._distill.alpha
-        if n_distill > 0:
-            token_ids = self._token_ids_for(logits.device)
-            kl_ctx = torch.no_grad() if alpha == 0.0 else nullcontext()
-            with kl_ctx:
-                s20 = logits[teacher_mask].index_select(-1, token_ids)
-                t20 = batch["teacher_logits"][teacher_mask].float()
-                temp = self._distill.temperature
-                log_ps = F.log_softmax(s20 / temp, dim=-1)
-                log_pt = F.log_softmax(t20 / temp, dim=-1)
-                loss_type = self._distill.loss_type
-                if loss_type == "forward_kl":
-                    div_per_token = F.kl_div(log_ps, log_pt.exp(), reduction="none").sum(dim=-1)
-                elif loss_type == "reverse_kl":
-                    div_per_token = (log_ps.exp() * (log_ps - log_pt)).sum(dim=-1)
-                elif loss_type == "js":
-                    log_m = torch.logaddexp(log_ps, log_pt) - math.log(2.0)
-                    div_per_token = 0.5 * (
-                        (log_pt.exp() * (log_pt - log_m)).sum(dim=-1)
-                        + (log_ps.exp() * (log_ps - log_m)).sum(dim=-1)
-                    )
+            alpha = self._distill.alpha
+            if n_distill > 0:
+                token_ids = self._token_ids_for(logits.device)
+                kl_ctx = torch.no_grad() if alpha == 0.0 else nullcontext()
+                with kl_ctx:
+                    s20 = logits[teacher_mask].index_select(-1, token_ids)
+                    t20 = batch["teacher_logits"][teacher_mask].float()
+                    temp = self._distill.temperature
+                    log_ps = F.log_softmax(s20 / temp, dim=-1)
+                    log_pt = F.log_softmax(t20 / temp, dim=-1)
+                    loss_type = self._distill.loss_type
+                    if loss_type == "forward_kl":
+                        div_per_token = F.kl_div(log_ps, log_pt.exp(), reduction="none").sum(dim=-1)
+                    elif loss_type == "reverse_kl":
+                        div_per_token = (log_ps.exp() * (log_ps - log_pt)).sum(dim=-1)
+                    elif loss_type == "js":
+                        log_m = torch.logaddexp(log_ps, log_pt) - math.log(2.0)
+                        div_per_token = 0.5 * (
+                            (log_pt.exp() * (log_pt - log_m)).sum(dim=-1)
+                            + (log_ps.exp() * (log_ps - log_m)).sum(dim=-1)
+                        )
+                    else:
+                        raise ValueError(f"Unsupported distill.loss_type: {loss_type!r}")
+                    kl_per_token = div_per_token * (temp * temp)
+                    kl_sum = kl_per_token.sum()
+            else:
+                kl_sum = logits.new_zeros(())
+
+            if alpha == 0.0:
+                loss = (plain_ce_sum + distill_ce_sum) / n_masked
+            else:
+                loss = (plain_ce_sum + (1.0 - alpha) * distill_ce_sum + alpha * kl_sum) / n_masked
+
+            metrics["loss_ce"] = float((plain_ce_sum + distill_ce_sum).detach().item() / n_masked)
+            metrics["distill_frac"] = float(n_distill / n_masked)
+            if n_distill > 0:
+                metrics["loss_kl"] = float(kl_sum.detach().item() / n_distill)
+        else:
+            loss = logits.sum() * 0.0
+
+        if use_contacts:
+            from oplm.training.contact_distill import compute_contact_distill_loss
+
+            assert self._aux is not None
+            contact_meta = batch.get("teacher_contact_meta") or []
+            contact_values = batch.get("teacher_contact_values")
+            metrics["contact_frac"] = float(len(contact_meta) / max(1, samples))
+            if contact_meta and contact_values is not None:
+                if self._distill.contact_head == "attention":
+                    qk_states = outputs["qk_states"]
+                    h_states = None
                 else:
-                    raise ValueError(f"Unsupported distill.loss_type: {loss_type!r}")
-                kl_per_token = div_per_token * (temp * temp)
-                kl_sum = kl_per_token.sum()
-        else:
-            kl_sum = logits.new_zeros(())
-
-        if alpha == 0.0:
-            loss = (plain_ce_sum + distill_ce_sum) / n_masked
-        else:
-            loss = (plain_ce_sum + (1.0 - alpha) * distill_ce_sum + alpha * kl_sum) / n_masked
-
-        metrics: dict[str, float] = {
-            "loss_ce": float((plain_ce_sum + distill_ce_sum).detach().item() / n_masked),
-            "distill_frac": float(n_distill / n_masked),
-        }
-        if n_distill > 0:
-            metrics["loss_kl"] = float(kl_sum.detach().item() / n_distill)
+                    qk_states = None
+                    h_states = outputs["hidden_states"][-self._distill.contact_layers :]
+                loss_contact, pos_rate = compute_contact_distill_loss(
+                    head=self._aux.head,
+                    qk_states=qk_states,
+                    hidden_states=h_states,
+                    contact_meta=contact_meta,
+                    contact_values=contact_values,
+                    contact_min_sep=self._distill.contact_min_sep,
+                    pos_weight=self._distill.contact_pos_weight,
+                    max_chunk_pairs=self._distill.contact_max_chunk_pairs,
+                )
+                loss = loss + self._distill.contact_weight * loss_contact
+                metrics["loss_contact"] = float(loss_contact.detach().item())
+                metrics["contact_pos_rate"] = float(pos_rate)
 
         return StepResult(loss=loss, tokens=tokens, samples=samples, metrics=metrics)
