@@ -538,3 +538,83 @@ def test_trainer_distill_compat_and_mixed_packed_branch_from_plain_mlm(
 
     reloaded = load_config(["--config", str(stage2_dir / "checkpoint-4" / "config.yaml")])
     assert reloaded.distill == stage2_cfg.distill
+
+
+@pytest.mark.parametrize("contact_head", ["attention", "pair"])
+@pytest.mark.parametrize("alpha", [0.0, 0.5])
+def test_distill_mlm_task_2d_step_and_empty_contacts(
+    tmp_path: Path, contact_head: str, alpha: float
+) -> None:
+    from accelerate import Accelerator
+
+    from oplm.data.sequence.collate import MLMCollator, encode_teacher_contacts
+    from oplm.data.tokenizer import get_tokenizer
+
+    torch.manual_seed(11)
+    seqs = ["ACDEFGHIKLMNPQRSTVWY", "MKTAYIAKQRQISFVKSHFSRQ"]
+    rng = np.random.default_rng(11)
+    items = []
+    for i, s in enumerate(seqs):
+        mat = rng.uniform(0.0, 1.0, (len(s), len(s))).astype(np.float32)
+        mat = 0.5 * (mat + mat.T)
+        row: dict[str, object] = {
+            "sequence_id": f"s{i}",
+            "sequence": s,
+            "teacher_contacts": encode_teacher_contacts(mat, min_sep=6),
+        }
+        if alpha > 0.0:
+            row["teacher_logits"] = rng.normal(size=(len(s), 20)).astype("<f2").tobytes()
+        items.append(row)
+
+    collator = MLMCollator(
+        get_tokenizer(),
+        max_length=64,
+        mask_prob=0.5,
+        deterministic=True,
+        seed=0,
+        pack_sequences=True,
+        pack_rows=1,
+        load_teacher_logits=alpha > 0.0,
+        load_teacher_contacts=True,
+        contact_min_sep=6,
+    )
+    batch = collator(items)
+
+    cfg = tiny_train_cfg(tmp_path, tmp_path / "unused.parquet", max_steps=10)
+    cfg.distill = DistillConfig(
+        alpha=alpha,
+        temperature=1.0,
+        contact_weight=1.0,
+        contact_head=contact_head,
+        contact_layers=2,
+        contact_min_sep=6,
+        contact_pair_dim=16,
+    )
+    task = DistillMLMTask(cfg.distill)
+    model = task.build_model(cfg, initialization_source=None)
+    acc = Accelerator(cpu=True)
+    task.prepare_aux(model, acc, cfg, total_steps=10)
+    task.sync_aux_schedule(0, fresh_start=True)
+
+    result = task.step(model, batch)
+    assert math.isfinite(result.loss.item())
+    assert "loss_contact" in result.metrics and math.isfinite(result.metrics["loss_contact"])
+    assert result.metrics["contact_frac"] == pytest.approx(1.0)
+    assert 0.0 <= result.metrics["contact_pos_rate"] <= 1.0
+    if alpha > 0.0:
+        assert "loss_kl" in result.metrics
+    else:
+        assert "loss_kl" not in result.metrics
+
+    result.loss.backward()
+    task.step_aux(acc, max_grad_norm=1.0, global_step=0)
+
+    # Empty-contact batch (M == 0): zero 2D loss, step_aux zero-fills grads without error
+    model.zero_grad()
+    empty_batch = collator([{"sequence_id": "e0", "sequence": seqs[0], "teacher_contacts": None}])
+    empty_res = task.step(model, empty_batch)
+    assert math.isfinite(empty_res.loss.item())
+    assert empty_res.metrics["contact_frac"] == 0.0
+    assert "loss_contact" not in empty_res.metrics
+    empty_res.loss.backward()
+    task.step_aux(acc, max_grad_norm=1.0, global_step=1)
