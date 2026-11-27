@@ -551,3 +551,70 @@ def test_sample_members_with_teacher_logits_column_raises(
     )
     with pytest.raises(ValueError, match="sample_members"):
         ShardedProteinDataset(shard, sample_members=mode, load_teacher_logits=True)
+
+
+def test_dataset_load_teacher_contacts_shared_neff_gate_and_guards(tmp_path: Path) -> None:
+    import numpy as np
+
+    from oplm.data.sequence.collate import encode_teacher_contacts
+
+    c0 = encode_teacher_contacts(np.zeros((10, 10), dtype=np.float32), min_sep=6)
+    c1 = encode_teacher_contacts(np.ones((10, 10), dtype=np.float32), min_sep=6)
+    shard = tmp_path / "distill_1d2d.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": ["s0", "s1"],
+                "sequence": ["ACDEFGHIKL", "MNPQRSTVWY"],
+                "teacher_logits": pa.array([b"\x01" * 400, b"\x02" * 400], type=pa.large_binary()),
+                "teacher_contacts": pa.array([c0, c1], type=pa.large_binary()),
+                "teacher_neff": pa.array([50.0, 5.0], type=pa.float32()),
+                "teacher_neff_sqrt_l": pa.array([4.0, 1.0], type=pa.float32()),
+            }
+        ),
+        shard,
+    )
+    ds = ShardedProteinDataset(
+        shard,
+        shuffle_shards=False,
+        shuffle_rows=False,
+        load_teacher_logits=True,
+        load_teacher_contacts=True,
+        min_teacher_neff_sqrt_l=2.0,
+    )
+    rows = list(ds)
+    assert rows[0]["teacher_logits"] is not None
+    assert rows[0]["teacher_contacts"] == c0
+    assert rows[1]["teacher_logits"] is None
+    assert rows[1]["teacher_contacts"] is None
+
+    # Plain shard missing teacher_contacts yields None gracefully
+    plain = tmp_path / "plain.parquet"
+    pq.write_table(pa.table({"sequence_id": ["p0"], "sequence": ["ACDEFGHIKL"]}), plain)
+    plain_rows = list(
+        ShardedProteinDataset(
+            plain,
+            shuffle_shards=False,
+            shuffle_rows=False,
+            load_teacher_contacts=True,
+            min_teacher_neff_sqrt_l=2.0,
+        )
+    )
+    assert plain_rows[0]["teacher_contacts"] is None
+
+    # sample_members rejected on shards carrying teacher_contacts
+    bad_members = tmp_path / "bad_members.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sequence_id": ["m0"],
+                "sequence": ["ACDEFGHIKL"],
+                "member_ids": [["m0_a"]],
+                "member_sequences": [["ACDEFGHIKL"]],
+                "teacher_contacts": pa.array([c0], type=pa.large_binary()),
+            }
+        ),
+        bad_members,
+    )
+    with pytest.raises(ValueError, match="sample_members"):
+        ShardedProteinDataset(bad_members, sample_members=True, load_teacher_contacts=True)
