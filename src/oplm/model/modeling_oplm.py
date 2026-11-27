@@ -347,6 +347,7 @@ class OplmModel(OplmPreTrainedModel, EsmcCompatMixin):
         return_dict: bool | None = None,
         segment_ids: torch.Tensor | None = None,
         return_qk_layers: tuple[int, ...] | None = None,
+        return_hidden_layers: tuple[int, ...] | None = None,
     ) -> BaseModelOutput | tuple:
         output_attentions = (
             output_attentions if output_attentions is not None else self.config.output_attentions
@@ -366,6 +367,7 @@ class OplmModel(OplmPreTrainedModel, EsmcCompatMixin):
             output_attentions=output_attentions,
             segment_ids=segment_ids,
             return_qk_layers=return_qk_layers,
+            return_hidden_layers=return_hidden_layers,
         )
         if return_qk_layers is not None:
             last_hidden, hidden_states, attentions, qk_states = backbone_out
@@ -453,6 +455,7 @@ class OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin):
         return_dict: bool | None = None,
         segment_ids: torch.Tensor | None = None,
         return_qk_layers: tuple[int, ...] | None = None,
+        return_hidden_layers: tuple[int, ...] | None = None,
     ) -> MaskedLMOutput | tuple:
         # segment_ids: (B, T) for a packed batch (several sequences per row): 1..n per
         # sequence, 0 at pads. Each sequence then sees only itself, as if it had its own row.
@@ -467,6 +470,7 @@ class OplmForMaskedLM(OplmPreTrainedModel, EsmcCompatMixin):
             return_dict=True,
             segment_ids=segment_ids,
             return_qk_layers=return_qk_layers,
+            return_hidden_layers=return_hidden_layers,
         )
         logits = self.lm_head(outputs.last_hidden_state).float()
 

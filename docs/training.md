@@ -1185,7 +1185,7 @@ Two discarded, training-only auxiliary heads are supported behind `distill.conta
   packed `FlexAttention` and activation checkpointing inside the backbone), computes per-segment
   residue attention maps with symmetrization and masked APC, and projects `K × H` head maps
   through a learned linear layer (`AttentionContactHead`).
-- **`pair`:** taps the final `distill.contact_layers` hidden states (`output_hidden_states=True`),
+- **`pair`:** taps the final `distill.contact_layers` hidden states via `return_hidden_layers`,
   learns a softmax layer mix, projects to `distill.contact_pair_dim`, and scores symmetric
   `[u_i * u_j, |u_i - u_j|]` outer interactions with a 2-layer GELU MLP (`PairContactHead`).
 

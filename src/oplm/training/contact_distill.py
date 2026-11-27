@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -13,7 +15,7 @@ from torch import Tensor, nn
 from oplm.training.optim import get_schedule_fn
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from accelerate import Accelerator
 
@@ -34,6 +36,140 @@ DISTILL_AUX_SIDECAR_NAME = "distill_aux.pt"
 
 # (row_idx, start_pos, seg_res_len, contact_len, value_offset)
 ContactMeta = tuple[int, int, int, int, int]
+
+
+class _GatherPackedQK(torch.autograd.Function):
+    """Gather packed ``(B, H, S, D)`` tokens at ``(row_ids, pos_ids)`` with 1 scatter backward.
+
+    Replaces per-segment Python slice loops that otherwise spawn ``M * K * 2`` ``SliceBackward0``
+    nodes, each allocating and adding a full ``(B, H, S, D)`` tensor during backward.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, x: Tensor, row_ids: Tensor, pos_ids: Tensor) -> Tensor:
+        ctx.save_for_backward(row_ids, pos_ids)
+        ctx.x_shape = x.shape
+        # permute(0, 2, 1, 3) is a zero-copy view (B, S, H, D)
+        return x.permute(0, 2, 1, 3)[row_ids, pos_ids]  # (N, H, D)
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor) -> tuple[Tensor, None, None]:
+        (grad_out,) = grad_outputs
+        row_ids, pos_ids = ctx.saved_tensors
+        grad_x = grad_out.new_zeros(ctx.x_shape)
+        grad_x.permute(0, 2, 1, 3).index_put_((row_ids, pos_ids), grad_out, accumulate=True)
+        return grad_x, None, None
+
+
+class _GatherPackedHidden(torch.autograd.Function):
+    """Gather packed ``(B, S, D)`` tokens at ``(row_ids, pos_ids)`` with 1 scatter backward."""
+
+    @staticmethod
+    def forward(ctx: Any, x: Tensor, row_ids: Tensor, pos_ids: Tensor) -> Tensor:
+        ctx.save_for_backward(row_ids, pos_ids)
+        ctx.x_shape = x.shape
+        return x[row_ids, pos_ids]  # (N, D)
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor) -> tuple[Tensor, None, None]:
+        (grad_out,) = grad_outputs
+        row_ids, pos_ids = ctx.saved_tensors
+        grad_x = grad_out.new_zeros(ctx.x_shape)
+        grad_x.index_put_((row_ids, pos_ids), grad_out, accumulate=True)
+        return grad_x, None, None
+
+
+@dataclass(frozen=True)
+class _ChunkGatherPlan:
+    """Precomputed GPU tensors for one length-sorted contact chunk."""
+
+    c_size: int
+    t_max: int
+    l_max: int
+    tok_start: int
+    tok_end: int
+    dst_idx: Tensor  # (N_chunk,) long into flattened (C * T_max,) or (C * L_max,)
+    key_valid: Tensor | None  # (C, 1, 1, T_max) bool (attention head only)
+    res_pair_mask: Tensor  # (C, 1, L_max, L_max) or (C, L_max, L_max) float32
+    inv_lens: Tensor | None  # (C, 1, 1, 1) float32 (attention head only)
+    c_lens_t: Tensor  # (C,) long
+
+
+def _build_gather_plan(
+    chunks: Sequence[Sequence[ContactMeta]],
+    *,
+    include_special: bool,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, list[_ChunkGatherPlan]]:
+    """Build one flat ``(row_ids, pos_ids)`` gather index across all chunks + per-chunk plans."""
+    all_rows: list[np.ndarray] = []
+    all_pos: list[np.ndarray] = []
+    dst_arrays: list[np.ndarray] = []
+    chunk_meta_info: list[tuple[int, int, int, int, int, list[int], list[int]]] = []
+    tok_cursor = 0
+
+    for chunk in chunks:
+        c_size = len(chunk)
+        tok_lens = [m[2] + 2 if include_special else m[3] for m in chunk]
+        c_lens = [m[3] for m in chunk]
+        t_max = max(tok_lens)
+        l_max = max(c_lens)
+        chunk_rows: list[np.ndarray] = []
+        chunk_pos: list[np.ndarray] = []
+        chunk_dst: list[np.ndarray] = []
+        for idx, ((row_idx, start_pos, _, _, _), length) in enumerate(
+            zip(chunk, tok_lens, strict=True)
+        ):
+            base_pos = start_pos if include_special else start_pos + 1
+            offsets = np.arange(length, dtype=np.int64)
+            chunk_rows.append(np.full(length, row_idx, dtype=np.int64))
+            chunk_pos.append(base_pos + offsets)
+            chunk_dst.append(idx * t_max + offsets)
+        n_chunk = sum(tok_lens)
+        all_rows.append(np.concatenate(chunk_rows))
+        all_pos.append(np.concatenate(chunk_pos))
+        dst_arrays.append(np.concatenate(chunk_dst))
+        chunk_meta_info.append(
+            (c_size, t_max, l_max, tok_cursor, tok_cursor + n_chunk, tok_lens, c_lens)
+        )
+        tok_cursor += n_chunk
+
+    row_ids = torch.from_numpy(np.concatenate(all_rows)).to(device, non_blocking=True)
+    pos_ids = torch.from_numpy(np.concatenate(all_pos)).to(device, non_blocking=True)
+
+    plans: list[_ChunkGatherPlan] = []
+    for (c_size, t_max, l_max, tok_start, tok_end, tok_lens, c_lens), dst_np in zip(
+        chunk_meta_info, dst_arrays, strict=True
+    ):
+        dst_idx = torch.from_numpy(dst_np).to(device, non_blocking=True)
+        c_lens_t = torch.tensor(c_lens, dtype=torch.long, device=device)
+        res_pos = torch.arange(l_max, device=device)
+        res_valid = res_pos[None, :] < c_lens_t[:, None]  # (C, L_max)
+        if include_special:
+            tok_pos = torch.arange(t_max, device=device)
+            tok_lens_t = torch.tensor(tok_lens, dtype=torch.long, device=device)
+            key_valid: Tensor | None = (tok_pos[None, :] < tok_lens_t[:, None])[:, None, None, :]
+            res_pair_mask = (res_valid[:, None, :, None] & res_valid[:, None, None, :]).float()
+            inv_lens: Tensor | None = (1.0 / c_lens_t.float()).view(c_size, 1, 1, 1)
+        else:
+            key_valid = None
+            res_pair_mask = (res_valid[:, :, None] & res_valid[:, None, :]).float()
+            inv_lens = None
+        plans.append(
+            _ChunkGatherPlan(
+                c_size=c_size,
+                t_max=t_max,
+                l_max=l_max,
+                tok_start=tok_start,
+                tok_end=tok_end,
+                dst_idx=dst_idx,
+                key_valid=key_valid,
+                res_pair_mask=res_pair_mask,
+                inv_lens=inv_lens,
+                c_lens_t=c_lens_t,
+            )
+        )
+    return row_ids, pos_ids, plans
 
 
 def masked_apc(mat: Tensor, lengths: Sequence[int]) -> Tensor:
@@ -58,6 +194,97 @@ def masked_apc(mat: Tensor, lengths: Sequence[int]) -> Tensor:
     safe_global = torch.where(near_zero, torch.ones_like(global_mean), global_mean)
     corrected = torch.where(near_zero, mat, mat - (row_mean * col_mean) / safe_global)
     return corrected * pair_mask.to(corrected.dtype)
+
+
+def _attn_layer_logits(
+    q_chunk: Tensor,
+    k_chunk: Tensor,
+    scale: float,
+    key_valid: Tensor,
+    res_pair_mask: Tensor,
+    inv_lens: Tensor,
+    w_l: Tensor,
+) -> Tensor:
+    """Compute one layer's weighted APC-corrected contact logits ``(C, L_max, L_max)`` in fp32.
+
+    Runs ``Q @ K^T`` in native dtype (BF16 Tensor Cores under bf16 training), then performs
+    softmax, single-pass symmetric APC (reusing ``row_mean`` for both ``col_mean`` and
+    ``global_mean``), and on-the-fly head projection in fp32 without materializing a
+    ``(C, K*H, L_max, L_max)`` tensor.
+    """
+    scores = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)).float() * scale
+    scores = scores.masked_fill(~key_valid, float("-inf"))
+    attn = F.softmax(scores, dim=-1)
+    l_max = res_pair_mask.shape[-1]
+    res_attn = attn[:, :, 1 : l_max + 1, 1 : l_max + 1] * res_pair_mask
+    sym = 0.5 * (res_attn + res_attn.transpose(-1, -2))
+    # For symmetric matrices zeroed outside L_c x L_c: col_mean == row_mean^T and
+    # global_mean == (1/L_c) * sum_i row_mean_i (one O(L^2) reduction instead of three).
+    row_mean = sym.sum(dim=-1, keepdim=True) * inv_lens
+    global_mean = row_mean.sum(dim=-2, keepdim=True) * inv_lens
+    near_zero = global_mean.abs() < 1e-8
+    safe_global = torch.where(near_zero, torch.ones_like(global_mean), global_mean)
+    apc = (
+        torch.where(near_zero, sym, sym - (row_mean * row_mean.transpose(-1, -2)) / safe_global)
+        * res_pair_mask
+    )
+    return (apc * w_l.float().view(1, -1, 1, 1)).sum(dim=1)
+
+
+def _pair_mlp_chunk(
+    u: Tensor,
+    fc1_w: Tensor,
+    fc1_b: Tensor,
+    fc2_w: Tensor,
+    fc2_b: Tensor,
+    pair_mask: Tensor,
+) -> Tensor:
+    """Compute symmetric outer-interaction MLP contact logits ``(C, L_max, L_max)`` in fp32."""
+    ui = u[:, :, None, :]
+    uj = u[:, None, :, :]
+    pair = torch.cat([ui * uj, (ui - uj).abs()], dim=-1)
+    hidden = F.gelu(F.linear(pair, fc1_w, fc1_b))
+    logits = F.linear(hidden, fc2_w, fc2_b).squeeze(-1)
+    return logits.float() * pair_mask
+
+
+def _dense_chunk_bce(
+    pred_logits: Tensor,
+    chunk_vals: Tensor,
+    c_lens_t: Tensor,
+    rel_offsets: Tensor,
+    inv_n_pairs: Tensor,
+    contact_min_sep: int,
+    pos_weight: float,
+) -> tuple[Tensor, Tensor]:
+    """Zero-sync vectorized soft BCE over all upper-triangle pairs ``j - i >= min_sep`` in a chunk.
+
+    Maps each valid ``(c, i, j)`` directly to its flat upper-triangle byte offset in ``chunk_vals``
+    via the closed-form triangular index formula, avoiding per-segment ``torch.triu_indices``,
+    boolean-index CUDA syncs, and backward scatter-adds.
+    """
+    l_max = pred_logits.shape[-1]
+    pos = torch.arange(l_max, device=pred_logits.device)
+    valid_1d = pos[None, :] < c_lens_t[:, None]  # (C, L_max)
+    sep_mask = (pos[None, :] - pos[:, None]) >= contact_min_sep  # (L_max, L_max)
+    triu_mask = sep_mask[None, :, :] & valid_1d[:, :, None] & valid_1d[:, None, :]
+
+    i = pos[None, :, None]
+    j = pos[None, None, :]
+    span = (c_lens_t - contact_min_sep)[:, None, None]
+    flat_idx = (
+        rel_offsets[:, None, None] + i * span - (i * (i - 1)) // 2 + (j - i - contact_min_sep)
+    )
+    safe_idx = torch.where(triu_mask, flat_idx, 0)
+    target_p = chunk_vals[safe_idx].float() * (1.0 / 255.0)
+
+    bce = F.binary_cross_entropy_with_logits(pred_logits, target_p, reduction="none")
+    if pos_weight != 1.0:
+        bce = bce * (1.0 + (pos_weight - 1.0) * target_p)
+    mask_f = triu_mask.float()
+    chunk_loss = (bce * (mask_f * inv_n_pairs[:, None, None])).sum()
+    chunk_pos_sum = (target_p.detach() * mask_f).sum()
+    return chunk_loss, chunk_pos_sum
 
 
 def chunk_contact_segments(
@@ -104,6 +331,51 @@ class AttentionContactHead(nn.Module):
         self.proj = nn.Linear(num_layers * num_heads, 1, bias=True)
         nn.init.trunc_normal_(self.proj.weight, mean=0.0, std=0.01, a=-0.02, b=0.02)
         nn.init.constant_(self.proj.bias, -3.0)
+        self._layer_fn: Callable[..., Tensor] = _attn_layer_logits
+
+    def compile_kernels(self) -> None:
+        """Compile the per-layer softmax/APC/projection kernel with dynamic shapes."""
+        self._layer_fn = torch.compile(_attn_layer_logits, dynamic=True)
+
+    def forward_packed_chunk(
+        self,
+        q_packed_layers: Sequence[Tensor],
+        k_packed_layers: Sequence[Tensor],
+        plan: _ChunkGatherPlan,
+    ) -> Tensor:
+        """Compute symmetric ``(C, L_max, L_max)`` fp32 logits from gathered ``(N, H, D)`` QK."""
+        if len(q_packed_layers) != self.num_layers or len(k_packed_layers) != self.num_layers:
+            raise ValueError(
+                f"Expected {self.num_layers} QK layer pairs, got {len(q_packed_layers)}"
+            )
+        assert plan.key_valid is not None and plan.inv_lens is not None
+        weight_by_layer = self.proj.weight.view(self.num_layers, self.num_heads)
+        n_heads = q_packed_layers[0].shape[1]
+        head_dim = q_packed_layers[0].shape[2]
+        logits: Tensor | None = None
+
+        for layer_idx, (q_packed, k_packed, scale) in enumerate(
+            zip(q_packed_layers, k_packed_layers, self.attn_scales, strict=True)
+        ):
+            q_buf = q_packed.new_zeros((plan.c_size * plan.t_max, n_heads, head_dim))
+            k_buf = k_packed.new_zeros((plan.c_size * plan.t_max, n_heads, head_dim))
+            q_buf.index_copy_(0, plan.dst_idx, q_packed[plan.tok_start : plan.tok_end])
+            k_buf.index_copy_(0, plan.dst_idx, k_packed[plan.tok_start : plan.tok_end])
+            q_chunk = q_buf.view(plan.c_size, plan.t_max, n_heads, head_dim).permute(0, 2, 1, 3)
+            k_chunk = k_buf.view(plan.c_size, plan.t_max, n_heads, head_dim).permute(0, 2, 1, 3)
+            layer_out = self._layer_fn(
+                q_chunk,
+                k_chunk,
+                scale,
+                plan.key_valid,
+                plan.res_pair_mask,
+                plan.inv_lens,
+                weight_by_layer[layer_idx],
+            )
+            logits = layer_out if logits is None else logits + layer_out
+
+        assert logits is not None
+        return logits + self.proj.bias.float()
 
     def forward_chunk(
         self,
@@ -113,42 +385,13 @@ class AttentionContactHead(nn.Module):
         """Compute symmetric ``(C, L_max, L_max)`` fp32 contact logits for one segment chunk."""
         if len(qk_states) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} QK layer pairs, got {len(qk_states)}")
-        c_size = len(chunk_meta)
-        t_max = max(m[2] for m in chunk_meta) + 2
-        l_max = max(m[3] for m in chunk_meta)
         device = qk_states[0][0].device
-        contact_lens = [m[3] for m in chunk_meta]
-
-        tok_pos = torch.arange(t_max, device=device)
-        tok_lens = torch.tensor([m[2] + 2 for m in chunk_meta], device=device)
-        key_valid = (tok_pos[None, :] < tok_lens[:, None])[:, None, None, :]  # (C, 1, 1, T_max)
-
-        res_pos = torch.arange(l_max, device=device)
-        c_lens_t = torch.tensor(contact_lens, device=device)
-        res_valid = res_pos[None, :] < c_lens_t[:, None]  # (C, L_max)
-        res_pair_mask = (res_valid[:, None, :, None] & res_valid[:, None, None, :]).float()
-
-        head_maps: list[Tensor] = []
-        for (q_all, k_all), scale in zip(qk_states, self.attn_scales, strict=True):
-            _, n_heads, _, head_dim = q_all.shape
-            q_chunk = q_all.new_zeros((c_size, n_heads, t_max, head_dim))
-            k_chunk = k_all.new_zeros((c_size, n_heads, t_max, head_dim))
-            for idx, (row_idx, start_pos, seg_res_len, _, _) in enumerate(chunk_meta):
-                tok_len = seg_res_len + 2
-                q_chunk[idx, :, :tok_len] = q_all[row_idx, :, start_pos : start_pos + tok_len]
-                k_chunk[idx, :, :tok_len] = k_all[row_idx, :, start_pos : start_pos + tok_len]
-            scores = torch.matmul(q_chunk.float(), k_chunk.float().transpose(-2, -1)) * scale
-            scores = scores.masked_fill(~key_valid, float("-inf"))
-            attn = F.softmax(scores, dim=-1)
-            # Slice residue-by-residue contact submatrix [1 : L_max + 1, 1 : L_max + 1]
-            res_attn = attn[:, :, 1 : l_max + 1, 1 : l_max + 1] * res_pair_mask
-            sym_attn = 0.5 * (res_attn + res_attn.transpose(-1, -2))
-            head_maps.append(masked_apc(sym_attn, contact_lens))
-
-        stacked = torch.cat(head_maps, dim=1)  # (C, K*H, L_max, L_max)
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            logits = self.proj(stacked.float().permute(0, 2, 3, 1)).squeeze(-1)
-        return logits
+        row_ids, pos_ids, plans = _build_gather_plan(
+            [chunk_meta], include_special=True, device=device
+        )
+        q_packed = [_GatherPackedQK.apply(q_all, row_ids, pos_ids) for q_all, _ in qk_states]
+        k_packed = [_GatherPackedQK.apply(k_all, row_ids, pos_ids) for _, k_all in qk_states]
+        return self.forward_packed_chunk(q_packed, k_packed, plans[0])
 
 
 class PairContactHead(nn.Module):
@@ -165,6 +408,36 @@ class PairContactHead(nn.Module):
         self.fc1 = nn.Linear(2 * pair_dim, pair_dim, bias=True)
         self.fc2 = nn.Linear(pair_dim, 1, bias=True)
         nn.init.constant_(self.fc2.bias, -3.0)
+        self._pair_fn: Callable[..., Tensor] = _pair_mlp_chunk
+
+    def compile_kernels(self) -> None:
+        """Compile the outer-interaction MLP chunk kernel with dynamic shapes."""
+        self._pair_fn = torch.compile(_pair_mlp_chunk, dynamic=True)
+
+    def project_packed_tokens(self, h_packed_layers: Sequence[Tensor]) -> Tensor:
+        """Project and layer-mix valid residue tokens ``(N, D)`` -> ``(N, pair_dim)``."""
+        if len(h_packed_layers) != self.num_layers:
+            raise ValueError(
+                f"Expected {self.num_layers} hidden states, got {len(h_packed_layers)}"
+            )
+        stacked = torch.stack([h.float() for h in h_packed_layers], dim=1)  # (N, K, D)
+        proj = self.proj(self.input_norm(stacked))  # (N, K, d_p)
+        weights = F.softmax(self.layer_weights.float(), dim=0)
+        return torch.einsum("k,nkc->nc", weights, proj)  # (N, d_p)
+
+    def forward_packed_chunk(self, u_packed: Tensor, plan: _ChunkGatherPlan) -> Tensor:
+        """Compute symmetric ``(C, L_max, L_max)`` fp32 logits from pre-projected ``(N, d_p)``."""
+        u_buf = u_packed.new_zeros((plan.c_size * plan.l_max, self.pair_dim))
+        u_buf.index_copy_(0, plan.dst_idx, u_packed[plan.tok_start : plan.tok_end])
+        u_chunk = u_buf.view(plan.c_size, plan.l_max, self.pair_dim)
+        return self._pair_fn(
+            u_chunk,
+            self.fc1.weight,
+            self.fc1.bias,
+            self.fc2.weight,
+            self.fc2.bias,
+            plan.res_pair_mask,
+        )
 
     def forward_chunk(
         self,
@@ -174,35 +447,13 @@ class PairContactHead(nn.Module):
         """Compute symmetric ``(C, L_max, L_max)`` fp32 contact logits for one segment chunk."""
         if len(hidden_states) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} hidden states, got {len(hidden_states)}")
-        c_size = len(chunk_meta)
-        l_max = max(m[3] for m in chunk_meta)
         device = hidden_states[0].device
-        d_model = hidden_states[0].shape[-1]
-
-        gathered_layers: list[Tensor] = []
-        for h_all in hidden_states:
-            h_chunk = h_all.new_zeros((c_size, l_max, d_model))
-            for idx, (row_idx, start_pos, _, contact_len, _) in enumerate(chunk_meta):
-                h_chunk[idx, :contact_len] = h_all[
-                    row_idx, start_pos + 1 : start_pos + 1 + contact_len
-                ]
-            gathered_layers.append(h_chunk.float())
-
-        stacked = torch.stack(gathered_layers, dim=2)  # (C, L_max, K, D)
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            proj = self.proj(self.input_norm(stacked))  # (C, L_max, K, d_p)
-            weights = F.softmax(self.layer_weights.float(), dim=0)
-            u = torch.einsum("k,blkc->blc", weights, proj)  # (C, L_max, d_p)
-
-            ui = u[:, :, None, :]
-            uj = u[:, None, :, :]
-            pair = torch.cat([ui * uj, (ui - uj).abs()], dim=-1)  # (C, L_max, L_max, 2*d_p)
-            logits = self.fc2(F.gelu(self.fc1(pair))).squeeze(-1)  # (C, L_max, L_max)
-        # Mask out padded residue rows/cols cleanly
-        c_lens_t = torch.tensor([m[3] for m in chunk_meta], device=device)
-        valid = torch.arange(l_max, device=device)[None, :] < c_lens_t[:, None]
-        pair_mask = (valid[:, :, None] & valid[:, None, :]).float()
-        return logits * pair_mask
+        row_ids, pos_ids, plans = _build_gather_plan(
+            [chunk_meta], include_special=False, device=device
+        )
+        h_packed = [_GatherPackedHidden.apply(h_all, row_ids, pos_ids) for h_all in hidden_states]
+        u_packed = self.project_packed_tokens(h_packed)
+        return self.forward_packed_chunk(u_packed, plans[0])
 
 
 def build_contact_head(
@@ -237,6 +488,30 @@ def build_contact_head(
     raise ValueError(f"Unsupported distill.contact_head: {distill_cfg.contact_head!r}")
 
 
+def _slice_chunk_values(
+    chunk: Sequence[ContactMeta],
+    contact_values: Tensor,
+    contact_min_sep: int,
+) -> tuple[Tensor, list[int], list[int]]:
+    """Return ``(chunk_vals, rel_offsets, n_pairs_list)`` with zero-copy contiguous fast path."""
+    n_pairs_list = [(m[3] - contact_min_sep) * (m[3] - contact_min_sep + 1) // 2 for m in chunk]
+    base0 = chunk[0][4]
+    expected = base0
+    contiguous = True
+    rel_offsets: list[int] = []
+    rel = 0
+    for m, n_p in zip(chunk, n_pairs_list, strict=True):
+        if m[4] != expected:
+            contiguous = False
+        rel_offsets.append(rel)
+        rel += n_p
+        expected += n_p
+    if contiguous:
+        return contact_values[base0 : base0 + rel], rel_offsets, n_pairs_list
+    parts = [contact_values[m[4] : m[4] + n_p] for m, n_p in zip(chunk, n_pairs_list, strict=True)]
+    return torch.cat(parts, dim=0), rel_offsets, n_pairs_list
+
+
 def compute_contact_distill_loss(
     *,
     head: Any,
@@ -247,9 +522,11 @@ def compute_contact_distill_loss(
     contact_min_sep: int,
     pos_weight: float,
     max_chunk_pairs: int,
+    bce_fn: Callable[..., tuple[Tensor, Tensor]] = _dense_chunk_bce,
 ) -> tuple[Tensor, float]:
     """Compute per-sequence averaged soft BCE over distilled segments in length-sorted chunks."""
-    if not contact_meta:
+    valid_meta = [m for m in contact_meta if m[3] > contact_min_sep]
+    if not valid_meta:
         ref = (
             qk_states[0][0]
             if qk_states
@@ -257,49 +534,84 @@ def compute_contact_distill_loss(
         )
         return ref.new_zeros((), dtype=torch.float32), 0.0
 
-    chunks = chunk_contact_segments(contact_meta, max_chunk_pairs)
+    chunks = chunk_contact_segments(valid_meta, max_chunk_pairs)
     device = contact_values.device
-    seq_losses: list[Tensor] = []
+    total_segs = float(len(valid_meta))
+    total_loss: Tensor | None = None
     pos_sum_t = contact_values.new_zeros((), dtype=torch.float32)
     total_pairs = 0
-    triu_cache: dict[int, tuple[Tensor, Tensor]] = {}
 
-    head_inputs: Any = qk_states if qk_states is not None else hidden_states
-    assert head_inputs is not None
+    if isinstance(head, AttentionContactHead):
+        assert qk_states is not None
+        row_ids, pos_ids, plans = _build_gather_plan(chunks, include_special=True, device=device)
+        q_packed: Any = [_GatherPackedQK.apply(q_all, row_ids, pos_ids) for q_all, _ in qk_states]
+        k_packed: Any = [_GatherPackedQK.apply(k_all, row_ids, pos_ids) for _, k_all in qk_states]
+        for chunk, plan in zip(chunks, plans, strict=True):
+            pred_logits = head.forward_packed_chunk(q_packed, k_packed, plan)
+            chunk_vals, rel_offsets, n_pairs_list = _slice_chunk_values(
+                chunk, contact_values, contact_min_sep
+            )
+            rel_t = torch.tensor(rel_offsets, dtype=torch.long, device=device)
+            inv_w = torch.tensor(
+                [1.0 / (total_segs * n_p) for n_p in n_pairs_list],
+                dtype=torch.float32,
+                device=device,
+            )
+            c_loss, c_pos = bce_fn(
+                pred_logits, chunk_vals, plan.c_lens_t, rel_t, inv_w, contact_min_sep, pos_weight
+            )
+            total_loss = c_loss if total_loss is None else total_loss + c_loss
+            pos_sum_t = pos_sum_t + c_pos
+            total_pairs += sum(n_pairs_list)
+    elif isinstance(head, PairContactHead):
+        assert hidden_states is not None
+        row_ids, pos_ids, plans = _build_gather_plan(chunks, include_special=False, device=device)
+        h_packed: Any = [
+            _GatherPackedHidden.apply(h_all, row_ids, pos_ids) for h_all in hidden_states
+        ]
+        u_packed = head.project_packed_tokens(h_packed)
+        for chunk, plan in zip(chunks, plans, strict=True):
+            pred_logits = head.forward_packed_chunk(u_packed, plan)
+            chunk_vals, rel_offsets, n_pairs_list = _slice_chunk_values(
+                chunk, contact_values, contact_min_sep
+            )
+            rel_t = torch.tensor(rel_offsets, dtype=torch.long, device=device)
+            inv_w = torch.tensor(
+                [1.0 / (total_segs * n_p) for n_p in n_pairs_list],
+                dtype=torch.float32,
+                device=device,
+            )
+            c_loss, c_pos = bce_fn(
+                pred_logits, chunk_vals, plan.c_lens_t, rel_t, inv_w, contact_min_sep, pos_weight
+            )
+            total_loss = c_loss if total_loss is None else total_loss + c_loss
+            pos_sum_t = pos_sum_t + c_pos
+            total_pairs += sum(n_pairs_list)
+    else:
+        head_inputs: Any = qk_states if qk_states is not None else hidden_states
+        assert head_inputs is not None
+        for chunk in chunks:
+            pred_logits = head.forward_chunk(head_inputs, chunk)
+            chunk_vals, rel_offsets, n_pairs_list = _slice_chunk_values(
+                chunk, contact_values, contact_min_sep
+            )
+            c_lens_t = torch.tensor([m[3] for m in chunk], dtype=torch.long, device=device)
+            rel_t = torch.tensor(rel_offsets, dtype=torch.long, device=device)
+            inv_w = torch.tensor(
+                [1.0 / (total_segs * n_p) for n_p in n_pairs_list],
+                dtype=torch.float32,
+                device=device,
+            )
+            c_loss, c_pos = bce_fn(
+                pred_logits, chunk_vals, c_lens_t, rel_t, inv_w, contact_min_sep, pos_weight
+            )
+            total_loss = c_loss if total_loss is None else total_loss + c_loss
+            pos_sum_t = pos_sum_t + c_pos
+            total_pairs += sum(n_pairs_list)
 
-    for chunk in chunks:
-        pred_logits: Tensor = head.forward_chunk(head_inputs, chunk)
-        for idx, (_, _, _, contact_len, offset) in enumerate(chunk):
-            if contact_len not in triu_cache:
-                ii, jj = torch.triu_indices(
-                    contact_len, contact_len, offset=contact_min_sep, device=device
-                )
-                triu_cache[contact_len] = (ii, jj)
-            else:
-                ii, jj = triu_cache[contact_len]
-            n_pairs = int(ii.numel())
-            if n_pairs == 0:
-                continue
-            pred_triu = pred_logits[idx, ii, jj]
-            target_p = contact_values[offset : offset + n_pairs].float() / 255.0
-            bce = F.binary_cross_entropy_with_logits(pred_triu, target_p, reduction="none")
-            if pos_weight != 1.0:
-                bce = bce * (1.0 + (pos_weight - 1.0) * target_p)
-            seq_losses.append(bce.mean())
-            pos_sum_t = pos_sum_t + target_p.detach().sum()
-            total_pairs += n_pairs
-
-    if not seq_losses:
-        ref = (
-            qk_states[0][0]
-            if qk_states
-            else (hidden_states[0] if hidden_states else contact_values)
-        )
-        return ref.new_zeros((), dtype=torch.float32), 0.0
-
-    loss = torch.stack(seq_losses).mean()
+    assert total_loss is not None
     mean_pos_rate = float(pos_sum_t.item()) / max(1, total_pairs)
-    return loss, mean_pos_rate
+    return total_loss, mean_pos_rate
 
 
 class AuxContactManager:
@@ -332,6 +644,13 @@ class AuxContactManager:
             betas=(0.9, 0.98),
             weight_decay=self._weight_decay,
         )
+        self.bce_fn: Callable[..., tuple[Tensor, Tensor]] = _dense_chunk_bce
+        first_param = next(self.head.parameters(), None)
+        if train_cfg.compile and first_param is not None and first_param.device.type == "cuda":
+            compile_kernels = getattr(self.head, "compile_kernels", None)
+            if callable(compile_kernels):
+                compile_kernels()
+            self.bce_fn = torch.compile(_dense_chunk_bce, dynamic=True)
 
     def broadcast_weights(self) -> None:
         """Broadcast rank-0 head weights so every rank starts bit-for-bit identical."""
