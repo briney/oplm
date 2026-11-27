@@ -239,3 +239,78 @@ def test_rotation_keeps_save_total_limit(tmp_path: Path) -> None:
 
     remaining = sorted(d.name for d in tmp_path.iterdir() if d.name.startswith("checkpoint-"))
     assert remaining == ["checkpoint-20", "checkpoint-30"]  # oldest (10) rotated out
+
+
+def test_distill_aux_sidecar_roundtrip_and_missing_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from oplm.config import DistillConfig
+    from oplm.training import remote
+    from oplm.training.contact_distill import DISTILL_AUX_SIDECAR_NAME
+    from oplm.training.task import DistillMLMTask
+
+    assert DISTILL_AUX_SIDECAR_NAME in remote._SHARED_ARTIFACT_NAMES
+
+    cfg = _cfg()
+    cfg.distill = DistillConfig(contact_weight=1.0, contact_head="attention", contact_layers=2)
+    accelerator, model, optimizer, scheduler = _prepared_model(cfg)
+    task = DistillMLMTask(cfg.distill)
+    task.prepare_aux(accelerator.unwrap_model(model), accelerator, cfg, total_steps=50)
+    task.sync_aux_schedule(10, fresh_start=True)
+    assert task._aux is not None
+    with torch.no_grad():
+        task._aux.head.proj.bias.fill_(-1.25)
+
+    ckpt_path = save_checkpoint(
+        accelerator=accelerator,
+        model=model,
+        optimizers=[optimizer],
+        schedulers=[scheduler],
+        cfg=cfg,
+        output_dir=str(tmp_path),
+        global_step=10,
+        epoch=1,
+        samples_seen=40,
+        tokens_seen=400,
+        distill_aux_task=task,
+    )
+    assert (ckpt_path / DISTILL_AUX_SIDECAR_NAME).is_file()
+    # HF export must stay vanilla OplmForMaskedLM with zero aux weights
+    reloaded_hf = OplmForMaskedLM.from_pretrained(str(ckpt_path / "hf"))
+    assert not any("contact" in k for k in reloaded_hf.state_dict())
+
+    # Restore into a fresh task
+    task2 = DistillMLMTask(cfg.distill)
+    _, model2, opt2, sched2 = _prepared_model(cfg)
+    task2.prepare_aux(accelerator.unwrap_model(model2), accelerator, cfg, total_steps=50)
+    state = load_checkpoint(
+        accelerator,
+        model2,
+        [opt2],
+        [sched2],
+        str(ckpt_path),
+        cfg,
+        distill_aux_task=task2,
+    )
+    assert state["distill_aux_restored"] is True
+    assert task2._aux is not None
+    assert task2._aux.head.proj.bias.item() == pytest.approx(-1.25)
+    assert task2._aux.aux_start_step == 10
+
+    # Loading a checkpoint without distill_aux.pt warns and returns distill_aux_restored=False
+    (ckpt_path / DISTILL_AUX_SIDECAR_NAME).unlink()
+    task3 = DistillMLMTask(cfg.distill)
+    _, model3, opt3, sched3 = _prepared_model(cfg)
+    task3.prepare_aux(accelerator.unwrap_model(model3), accelerator, cfg, total_steps=50)
+    with caplog.at_level("WARNING"):
+        state3 = load_checkpoint(
+            accelerator,
+            model3,
+            [opt3],
+            [sched3],
+            str(ckpt_path),
+            cfg,
+            distill_aux_task=task3,
+        )
+    assert state3["distill_aux_restored"] is False
+    assert any(DISTILL_AUX_SIDECAR_NAME in rec.message for rec in caplog.records)

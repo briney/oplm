@@ -73,6 +73,7 @@ _SHARED_ARTIFACT_NAMES = (
     "config.yaml",
     "scaler.pt",
     "ema.pt",
+    "distill_aux.pt",
     "KEEP",
 )
 

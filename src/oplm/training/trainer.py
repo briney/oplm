@@ -773,6 +773,11 @@ class Trainer:
         # Unwrapped live model (no DDP/compile wrapper): the EMA source and hf/ export
         # target. keep_torch_compile=False for the reason given in checkpoint.save_checkpoint.
         self._unwrapped_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        # Task-owned training-only auxiliary state (e.g. 2D contact distillation head/optimizer),
+        # constructed after accelerator/device placement and before resume/branch sidecar restore.
+        prepare_aux = getattr(self.task, "prepare_aux", None)
+        if callable(prepare_aux):
+            prepare_aux(self._unwrapped_model, self.accelerator, cfg, self.total_steps)
         # EMA (train.ema_decay). Built after prepare/compile so the copy sits on the
         # right device, and before the resume below so a checkpoint's ema.pt lands in it.
         self._ema: AveragedModel | None = None
@@ -884,6 +889,10 @@ class Trainer:
             self._resume_from_checkpoint(resume_target)
         elif branch_source is not None:
             self._branch_from_checkpoint(branch_source)
+        else:
+            sync_aux = getattr(self.task, "sync_aux_schedule", None)
+            if callable(sync_aux):
+                sync_aux(0, fresh_start=True)
         self._window_tokens_start = self.tokens_seen
         self._window_samples_start = self._samples_seen
 
@@ -1026,6 +1035,10 @@ class Trainer:
                         for optimizer in self.optimizers:
                             optimizer.step()
                             optimizer.zero_grad()
+                        if self.accelerator.sync_gradients:
+                            step_aux = getattr(self.task, "step_aux", None)
+                            if callable(step_aux):
+                                step_aux(self.accelerator, cfg.max_grad_norm, self.global_step)
 
                 # Accumulate the per-micro-batch loss so logging reports the mean
                 # across the optimizer step, not just the final micro-batch.
@@ -1717,6 +1730,7 @@ class Trainer:
             blocking=blocking,
             process_group=self._checkpoint_process_group,
             ema=self._ema,
+            distill_aux_task=self.task,
         )
         self._last_save_at = time.monotonic()
 
@@ -1857,8 +1871,12 @@ class Trainer:
             checkpoint_dir,
             self.cfg,
             ema=self._ema,
+            distill_aux_task=self.task,
         )
         self.global_step = state["global_step"]
+        sync_aux = getattr(self.task, "sync_aux_schedule", None)
+        if callable(sync_aux):
+            sync_aux(self.global_step, fresh_start=not state.get("distill_aux_restored", False))
         self.epoch = state["epoch"]
         self.tokens_seen = state["tokens_seen"]
         self._samples_seen = int(
@@ -1922,6 +1940,8 @@ class Trainer:
             self.cfg,
             validate_schedule=False,
             ema=self._ema,
+            distill_aux_task=self.task,
+            reset_aux_hparams=True,
         )
         for opt, sched, hparams in zip(self.optimizers, self.schedulers, live_hparams, strict=True):
             inner, scheduler = _unwrap_optimizer(opt), _unwrap_scheduler(sched)
@@ -1933,6 +1953,9 @@ class Trainer:
                 group["lr"] = live["initial_lr"] * lr_lambda(scheduler.last_epoch)
 
         self.global_step = state["global_step"]
+        sync_aux = getattr(self.task, "sync_aux_schedule", None)
+        if callable(sync_aux):
+            sync_aux(self.global_step, fresh_start=not state.get("distill_aux_restored", False))
         self.epoch = state["epoch"]
         self.tokens_seen = state["tokens_seen"]
         self._samples_seen = int(
@@ -2293,10 +2316,22 @@ class Trainer:
         from oplm.model.canon_kernel import canon_self_check
 
         rows = batch["input_ids"].shape[0]
+        keep_rows = min(4, rows)
         small = {
-            k: v[:4] if isinstance(v, torch.Tensor) and v.ndim and v.shape[0] == rows else v
+            k: v[:keep_rows]
+            if (
+                k != "teacher_contact_values"
+                and isinstance(v, torch.Tensor)
+                and v.ndim
+                and v.shape[0] == rows
+            )
+            else v
             for k, v in batch.items()
         }
+        if "teacher_contact_meta" in small and small["teacher_contact_meta"]:
+            small["teacher_contact_meta"] = [
+                m for m in small["teacher_contact_meta"] if m[0] < keep_rows
+            ]
 
         def run_forward() -> None:
             with self.accelerator.autocast():
