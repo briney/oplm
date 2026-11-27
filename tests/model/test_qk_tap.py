@@ -142,3 +142,30 @@ def test_return_qk_layers_rejects_out_of_range_indices() -> None:
         model(input_ids=input_ids, attention_mask=attention_mask, return_qk_layers=(-1,))
     with pytest.raises(ValueError, match="return_qk_layers"):
         model(input_ids=input_ids, attention_mask=attention_mask, return_qk_layers=(2,))
+
+
+def test_return_hidden_layers_matches_output_hidden_states_and_validates_bounds() -> None:
+    torch.manual_seed(11)
+    cfg = _small_config(num_hidden_layers=4, num_loops=2)
+    model = OplmForMaskedLM(cfg).eval()
+    input_ids = torch.randint(4, 24, (2, 12))
+    attention_mask = torch.ones_like(input_ids)
+
+    full = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+    # Effective depth is 8; hidden_states has length 9 (embed + 8 executed passes).
+    # Tapping executed passes (5, 6, 7) must match full.hidden_states[-3:] bit-for-bit.
+    tapped = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        return_hidden_layers=(5, 6, 7),
+    )
+    assert tapped.hidden_states is not None
+    assert len(tapped.hidden_states) == 3
+    for got, ref in zip(tapped.hidden_states, full.hidden_states[-3:], strict=True):
+        assert torch.equal(got, ref)
+    assert torch.equal(tapped.logits, full.logits)
+
+    with pytest.raises(ValueError, match="return_hidden_layers"):
+        model(input_ids=input_ids, attention_mask=attention_mask, return_hidden_layers=(-1,))
+    with pytest.raises(ValueError, match="return_hidden_layers"):
+        model(input_ids=input_ids, attention_mask=attention_mask, return_hidden_layers=(8,))

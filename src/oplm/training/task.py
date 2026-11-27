@@ -172,6 +172,7 @@ class DistillMLMTask(MLMTask):
         self._device_token_ids: torch.Tensor | None = None
         self._aux: AuxContactManager | None = None
         self._qk_layers: tuple[int, ...] | None = None
+        self._hidden_layers: tuple[int, ...] | None = None
 
     @property
     def has_contact_distill(self) -> bool:
@@ -193,6 +194,13 @@ class DistillMLMTask(MLMTask):
         head, qk_layers = build_contact_head(self._distill, model)
         head.to(accelerator.device)
         self._qk_layers = qk_layers
+        if qk_layers is None:
+            lm: Any = model
+            effective_depth = len(lm.oplm.backbone.layer_execution_order)
+            k = self._distill.contact_layers
+            self._hidden_layers = tuple(range(effective_depth - k, effective_depth))
+        else:
+            self._hidden_layers = None
         self._aux = AuxContactManager(head, self._distill, cfg.train, total_steps)
         self._aux.broadcast_weights()
 
@@ -237,7 +245,7 @@ class DistillMLMTask(MLMTask):
             if self._distill.contact_head == "attention":
                 forward_kwargs["return_qk_layers"] = self._qk_layers
             else:
-                forward_kwargs["output_hidden_states"] = True
+                forward_kwargs["return_hidden_layers"] = self._hidden_layers
 
         outputs = model(**forward_kwargs)
         logits = outputs["logits"].float()  # (R, T, V) fp32
@@ -322,7 +330,7 @@ class DistillMLMTask(MLMTask):
                     h_states = None
                 else:
                     qk_states = None
-                    h_states = outputs["hidden_states"][-self._distill.contact_layers :]
+                    h_states = outputs["hidden_states"]
                 loss_contact, pos_rate = compute_contact_distill_loss(
                     head=self._aux.head,
                     qk_states=qk_states,
@@ -332,6 +340,7 @@ class DistillMLMTask(MLMTask):
                     contact_min_sep=self._distill.contact_min_sep,
                     pos_weight=self._distill.contact_pos_weight,
                     max_chunk_pairs=self._distill.contact_max_chunk_pairs,
+                    bce_fn=self._aux.bce_fn,
                 )
                 loss = loss + self._distill.contact_weight * loss_contact
                 metrics["loss_contact"] = float(loss_contact.detach().item())

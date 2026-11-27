@@ -238,3 +238,141 @@ def test_contact_heads_emit_fp32_under_bf16_autocast_and_skip_zero_pair_segments
     assert torch.isfinite(loss_empty)
     assert loss_empty.item() == 0.0
     assert pos_rate == 0.0
+
+
+def test_fast_contact_loss_matches_naive_reference_fwd_and_bwd() -> None:
+    """Vectorized gather + single-pass APC + dense chunk BCE match naive reference fwd & bwd."""
+    torch.manual_seed(31)
+    bsz, n_heads, seq_len, head_dim, k_layers = 3, 4, 64, 8, 2
+    d_model = n_heads * head_dim
+    # Three segments across rows, including one prefix-cropped (seg_res_len=18, contact_len=14)
+    # and forced multi-chunk splitting plus non-contiguous offsets (like _canon_self_check).
+    seg_specs = [
+        (0, 0, 10, 10),
+        (2, 5, 18, 14),
+        (1, 10, 20, 20),
+    ]
+    min_sep = 6
+    meta: list[tuple[int, int, int, int, int]] = []
+    val_parts: list[torch.Tensor] = []
+    offset = 0
+    for r, s, seg_l, c_l in seg_specs:
+        # Insert a 7-byte gap between segments to also test non-contiguous offsets
+        if offset > 0:
+            val_parts.append(torch.full((7,), 123, dtype=torch.uint8))
+            offset += 7
+        n_pairs = (c_l - min_sep) * (c_l - min_sep + 1) // 2
+        meta.append((r, s, seg_l, c_l, offset))
+        val_parts.append(torch.randint(0, 256, (n_pairs,), dtype=torch.uint8))
+        offset += n_pairs
+    contact_values = torch.cat(val_parts)
+
+    # --- Reference naive AttentionContactHead + per-segment triu BCE ---
+    attn_head = AttentionContactHead(k_layers, n_heads, attn_scales=(0.35, 0.5))
+    qks_fast = [
+        (
+            torch.randn(bsz, n_heads, seq_len, head_dim, requires_grad=True),
+            torch.randn(bsz, n_heads, seq_len, head_dim, requires_grad=True),
+        )
+        for _ in range(k_layers)
+    ]
+    qks_ref = [
+        (q.detach().clone().requires_grad_(True), k.detach().clone().requires_grad_(True))
+        for q, k in qks_fast
+    ]
+
+    loss_fast, pos_fast = compute_contact_distill_loss(
+        head=attn_head,
+        qk_states=qks_fast,
+        hidden_states=None,
+        contact_meta=meta,
+        contact_values=contact_values,
+        contact_min_sep=min_sep,
+        pos_weight=2.5,
+        max_chunk_pairs=600,  # forces multiple chunks
+    )
+    loss_fast.backward()
+    fast_w_grad = attn_head.proj.weight.grad.detach().clone()
+    fast_b_grad = attn_head.proj.bias.grad.detach().clone()
+    fast_qk_grads = [(q.grad.detach().clone(), k.grad.detach().clone()) for q, k in qks_fast]
+    attn_head.zero_grad()
+
+    # Naive reference: one segment at a time with explicit softmax, full masked_apc, triu_indices
+    ref_losses: list[torch.Tensor] = []
+    pos_sum = 0.0
+    total_pairs = 0
+    for r, s, seg_l, c_l, off in meta:
+        tok_l = seg_l + 2
+        maps = []
+        for (q_all, k_all), sc in zip(qks_ref, attn_head.attn_scales, strict=True):
+            q_s = q_all[r : r + 1, :, s : s + tok_l].float()
+            k_s = k_all[r : r + 1, :, s : s + tok_l].float()
+            att = F.softmax(torch.matmul(q_s, k_s.transpose(-2, -1)) * sc, dim=-1)
+            res = att[:, :, 1 : c_l + 1, 1 : c_l + 1]
+            sym = 0.5 * (res + res.transpose(-1, -2))
+            maps.append(masked_apc(sym, [c_l]))
+        stacked = torch.cat(maps, dim=1)
+        logits = attn_head.proj(stacked.permute(0, 2, 3, 1)).squeeze(-1)[0]
+        ii, jj = torch.triu_indices(c_l, c_l, offset=min_sep)
+        n_p = int(ii.numel())
+        tgt = contact_values[off : off + n_p].float() / 255.0
+        bce = F.binary_cross_entropy_with_logits(logits[ii, jj], tgt, reduction="none")
+        bce = bce * (1.0 + (2.5 - 1.0) * tgt)
+        ref_losses.append(bce.mean())
+        pos_sum += float(tgt.sum().item())
+        total_pairs += n_p
+    loss_ref = torch.stack(ref_losses).mean()
+    loss_ref.backward()
+
+    assert loss_fast.item() == pytest.approx(loss_ref.item(), rel=1e-5, abs=1e-6)
+    assert pos_fast == pytest.approx(pos_sum / total_pairs, rel=1e-5, abs=1e-6)
+    torch.testing.assert_close(fast_w_grad, attn_head.proj.weight.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(fast_b_grad, attn_head.proj.bias.grad, atol=1e-5, rtol=1e-5)
+    for (fq, fk), (rq, rk) in zip(fast_qk_grads, qks_ref, strict=True):
+        torch.testing.assert_close(fq, rq.grad, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(fk, rk.grad, atol=1e-5, rtol=1e-5)
+
+    # --- Same parity check for PairContactHead ---
+    pair_head = PairContactHead(k_layers, d_model, pair_dim=16)
+    hs_fast = [torch.randn(bsz, seq_len, d_model, requires_grad=True) for _ in range(k_layers)]
+    hs_ref = [h.detach().clone().requires_grad_(True) for h in hs_fast]
+
+    ploss_fast, ppos_fast = compute_contact_distill_loss(
+        head=pair_head,
+        qk_states=None,
+        hidden_states=hs_fast,
+        contact_meta=meta,
+        contact_values=contact_values,
+        contact_min_sep=min_sep,
+        pos_weight=2.5,
+        max_chunk_pairs=600,
+    )
+    ploss_fast.backward()
+    fast_p_grads = {n: p.grad.detach().clone() for n, p in pair_head.named_parameters()}
+    fast_h_grads = [h.grad.detach().clone() for h in hs_fast]
+    pair_head.zero_grad()
+
+    pref_losses = []
+    for r, s, _seg_l, c_l, off in meta:
+        stacked = torch.stack([h[r : r + 1, s + 1 : s + 1 + c_l].float() for h in hs_ref], dim=2)
+        proj = pair_head.proj(pair_head.input_norm(stacked))
+        w = F.softmax(pair_head.layer_weights.float(), dim=0)
+        u = torch.einsum("k,blkc->blc", w, proj)
+        ui, uj = u[:, :, None, :], u[:, None, :, :]
+        pair = torch.cat([ui * uj, (ui - uj).abs()], dim=-1)
+        logits = pair_head.fc2(F.gelu(pair_head.fc1(pair))).squeeze(-1)[0]
+        ii, jj = torch.triu_indices(c_l, c_l, offset=min_sep)
+        n_p = int(ii.numel())
+        tgt = contact_values[off : off + n_p].float() / 255.0
+        bce = F.binary_cross_entropy_with_logits(logits[ii, jj], tgt, reduction="none")
+        bce = bce * (1.0 + (2.5 - 1.0) * tgt)
+        pref_losses.append(bce.mean())
+    ploss_ref = torch.stack(pref_losses).mean()
+    ploss_ref.backward()
+
+    assert ploss_fast.item() == pytest.approx(ploss_ref.item(), rel=1e-5, abs=1e-6)
+    assert ppos_fast == pytest.approx(pos_sum / total_pairs, rel=1e-5, abs=1e-6)
+    for n, p in pair_head.named_parameters():
+        torch.testing.assert_close(fast_p_grads[n], p.grad, atol=1e-5, rtol=1e-5)
+    for fh, rh in zip(fast_h_grads, hs_ref, strict=True):
+        torch.testing.assert_close(fh, rh.grad, atol=1e-5, rtol=1e-5)

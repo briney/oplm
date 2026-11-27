@@ -452,6 +452,7 @@ class OplmStack(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
         return_qk_layers: tuple[int, ...] | None = None,
+        return_hidden_layers: tuple[int, ...] | None = None,
     ) -> (
         tuple[
             torch.Tensor,
@@ -486,10 +487,25 @@ class OplmStack(nn.Module):
             )
             x = self.embed_tokens(input_ids, attention_mask)
 
-        hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
+        if output_hidden_states and return_hidden_layers is not None:
+            raise ValueError("Cannot pass both output_hidden_states=True and return_hidden_layers")
+        effective_depth = len(self.layer_execution_order)
+        if return_hidden_layers is not None:
+            invalid_h = [idx for idx in return_hidden_layers if idx < 0 or idx >= effective_depth]
+            if invalid_h:
+                raise ValueError(
+                    f"return_hidden_layers indices {invalid_h} out of range [0, {effective_depth})"
+                )
+            hidden_layer_set: set[int] | None = set(return_hidden_layers)
+            tapped_hidden: list[torch.Tensor] | None = []
+            hidden_states: tuple[torch.Tensor, ...] | None = None
+        else:
+            hidden_layer_set = None
+            tapped_hidden = None
+            hidden_states = (x,) if output_hidden_states else None
+
         attentions: tuple[torch.Tensor | None, ...] | None = () if output_attentions else None
         if return_qk_layers is not None:
-            effective_depth = len(self.layer_execution_order)
             invalid = [idx for idx in return_qk_layers if idx < 0 or idx >= effective_depth]
             if invalid:
                 raise ValueError(
@@ -545,9 +561,14 @@ class OplmStack(nn.Module):
                 qk_states.append((q_out, k_out))
             if hidden_states is not None:
                 hidden_states = hidden_states + (x,)
+            elif hidden_layer_set is not None and exec_idx in hidden_layer_set:
+                assert tapped_hidden is not None
+                tapped_hidden.append(x)
             if attentions is not None:
                 attentions = attentions + (attn,)
 
+        if tapped_hidden is not None:
+            hidden_states = tuple(tapped_hidden)
         last_hidden = self.final_norm(x)
         if qk_states is not None:
             return last_hidden, hidden_states, attentions, tuple(qk_states)
