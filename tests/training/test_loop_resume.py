@@ -101,3 +101,71 @@ def test_absent_yaml_model_falls_back_to_hf(tmp_path: Path) -> None:
     cfg = OplmConfig(model=ModelConfig(num_hidden_layers=4, num_loops=2))
     cfg.model.save_pretrained(tmp_path / "hf")
     validate_loop_resume_compat(tmp_path, cfg)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("loop_input_injection", "concat_proj"),
+        ("loop_gate", "scalar"),
+        ("loop_gate_init", 0.25),
+        ("loop_untie_norms", False),
+        ("loop_step_conditioning", "none"),
+    ],
+)
+@pytest.mark.parametrize("artifact", ["yaml", "hf"])
+def test_resume_rejects_step2_loop_extension_drift(
+    tmp_path: Path, field: str, changed: object, artifact: str
+) -> None:
+    base_kwargs = dict(
+        num_hidden_layers=4,
+        num_loops=3,
+        loop_strategy="stack",
+        loop_start=1,
+        loop_end=3,
+        loop_input_injection="decayed",
+        loop_gate="channel",
+        loop_gate_init=0.5,
+        loop_untie_norms=True,
+        loop_step_conditioning="sinusoidal",
+    )
+    saved = OplmConfig(model=ModelConfig(**base_kwargs))
+    if artifact == "yaml":
+        (tmp_path / "config.yaml").write_text(serialize_config(saved))
+    else:
+        saved.model.save_pretrained(tmp_path / "hf")
+
+    live_kwargs = dict(base_kwargs)
+    live_kwargs[field] = changed
+    live = OplmConfig(model=ModelConfig(**live_kwargs))
+    with pytest.raises(ValueError, match=field):
+        validate_loop_resume_compat(tmp_path, live)
+
+
+@pytest.mark.parametrize("artifact", ["yaml", "hf"])
+def test_legacy_checkpoint_without_step2_fields_resumes_vanilla_and_rejects_extensions(
+    tmp_path: Path, artifact: str
+) -> None:
+    if artifact == "yaml":
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  num_hidden_layers: 4\n  num_loops: 2\n  loop_strategy: stack\n"
+        )
+    else:
+        (tmp_path / "hf").mkdir()
+        (tmp_path / "hf" / "config.json").write_text(
+            json.dumps({"num_hidden_layers": 4, "num_loops": 2, "loop_strategy": "stack"})
+        )
+
+    vanilla = OplmConfig(model=ModelConfig(num_hidden_layers=4, num_loops=2, loop_strategy="stack"))
+    validate_loop_resume_compat(tmp_path, vanilla)
+
+    extended = OplmConfig(
+        model=ModelConfig(
+            num_hidden_layers=4,
+            num_loops=2,
+            loop_strategy="stack",
+            loop_input_injection="decayed",
+        )
+    )
+    with pytest.raises(ValueError, match="loop_input_injection"):
+        validate_loop_resume_compat(tmp_path, extended)

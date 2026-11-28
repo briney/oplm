@@ -975,7 +975,7 @@ def validate_loop_resume_compat(checkpoint_dir: Path, cfg: OplmConfig) -> None:
     from omegaconf import OmegaConf
 
     from oplm.model import OplmConfig as ModelConfig
-    from oplm.model.looping import resolve_layer_execution_order
+    from oplm.model.looping import resolve_layer_execution_order, validate_loop_extensions
 
     def signature(model: ModelConfig) -> dict[str, Any]:
         settings = {
@@ -984,8 +984,28 @@ def validate_loop_resume_compat(checkpoint_dir: Path, cfg: OplmConfig) -> None:
             "loop_strategy": model.loop_strategy,
             "loop_start": model.loop_start,
             "loop_end": model.num_hidden_layers if model.loop_end is None else model.loop_end,
+            "loop_input_injection": model.loop_input_injection,
+            "loop_gate": model.loop_gate,
+            "loop_gate_init": model.loop_gate_init,
+            "loop_untie_norms": model.loop_untie_norms,
+            "loop_step_conditioning": model.loop_step_conditioning,
         }
-        resolve_layer_execution_order(**settings)
+        resolve_layer_execution_order(
+            settings["num_hidden_layers"],
+            num_loops=settings["num_loops"],
+            loop_strategy=settings["loop_strategy"],
+            loop_start=settings["loop_start"],
+            loop_end=settings["loop_end"],
+        )
+        validate_loop_extensions(
+            num_loops=settings["num_loops"],
+            loop_strategy=settings["loop_strategy"],
+            loop_input_injection=settings["loop_input_injection"],
+            loop_gate=settings["loop_gate"],
+            loop_gate_init=settings["loop_gate_init"],
+            loop_untie_norms=settings["loop_untie_norms"],
+            loop_step_conditioning=settings["loop_step_conditioning"],
+        )
         return settings
 
     live = signature(cfg.model)
@@ -1011,6 +1031,11 @@ def validate_loop_resume_compat(checkpoint_dir: Path, cfg: OplmConfig) -> None:
             "loop_strategy": "stack",
             "loop_start": 0,
             "loop_end": live["num_hidden_layers"],
+            "loop_input_injection": "none",
+            "loop_gate": "none",
+            "loop_gate_init": 1.0,
+            "loop_untie_norms": False,
+            "loop_step_conditioning": "none",
         }
         if live != ordinary:
             raise ValueError(
