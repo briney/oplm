@@ -357,3 +357,250 @@ def test_mup_fanin_mult_concat_proj_width() -> None:
     assert base.mup_fanin_mult(1536) == pytest.approx(1.0)
     assert wide.mup_fanin_mult(3072) == pytest.approx(2.0)
 
+
+def test_default_loop_extensions_are_bit_identical_to_vanilla() -> None:
+    cfg = OplmConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=4,
+        num_loops=2,
+        loop_start=1,
+        loop_end=3,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+    )
+    torch.manual_seed(11)
+    stack = OplmStack(cfg).eval()
+    keys = set(stack.state_dict())
+    assert not any(
+        tag in k
+        for k in keys
+        for tag in ("loop_injector", "loop_gate_module", "loop_step_cond", "loop_attn_norms")
+    )
+    assert stack.loop_injector is None
+    assert stack.loop_gate_module is None
+    assert stack.loop_step_cond is None
+
+
+@pytest.mark.parametrize("mode", ["none", "concat_proj", "decayed", "orthogonal"])
+def test_zero_init_loop_gate_matches_unlooped_forward_exactly(mode: str) -> None:
+    from oplm.model import OplmForMaskedLM
+
+    base_cfg = OplmConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=4,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+    )
+    torch.manual_seed(12)
+    unlooped = OplmForMaskedLM(base_cfg).eval()
+
+    ext_cfg = OplmConfig(
+        **(
+            base_cfg.to_dict()
+            | {
+                "num_loops": 3,
+                "loop_strategy": "stack",
+                "loop_start": 1,
+                "loop_end": 3,
+                "loop_input_injection": mode,
+                "loop_gate": "channel",
+                "loop_gate_init": 0.0,
+                "loop_untie_norms": True,
+                "loop_step_conditioning": "sinusoidal",
+            }
+        )
+    )
+    looped = OplmForMaskedLM(ext_cfg).eval()
+    looped.load_state_dict(unlooped.state_dict(), strict=False)
+
+    ids = torch.tensor([[0, 20, 9, 32, 14, 16, 2, 1]])
+    mask = ids.ne(1).long()
+    with torch.no_grad():
+        logits_unlooped = unlooped(input_ids=ids, attention_mask=mask).logits
+        logits_looped = looped(input_ids=ids, attention_mask=mask).logits
+    assert torch.equal(logits_looped, logits_unlooped)
+
+
+def test_untied_norms_preserve_pass0_keys_and_skip_prelude_coda() -> None:
+    cfg = OplmConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=4,
+        num_loops=3,
+        loop_strategy="stack",
+        loop_start=1,
+        loop_end=3,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+        loop_untie_norms=True,
+    )
+    stack = OplmStack(cfg)
+    for idx in (0, 3):  # prelude and coda
+        blk = stack.layers[idx]
+        assert not hasattr(blk, "loop_attn_norms")
+        assert not hasattr(blk, "loop_ffn_norms")
+        assert not hasattr(blk, "loop_attn_post_norms")
+        assert not hasattr(blk, "loop_ffn_post_norms")
+        assert not hasattr(blk.attention, "loop_value_residual_lambdas")
+    for idx in (1, 2):  # core
+        blk = stack.layers[idx]
+        assert hasattr(blk, "attn_norm") and len(blk.loop_attn_norms) == 2
+        assert hasattr(blk, "ffn_norm") and len(blk.loop_ffn_norms) == 2
+        assert hasattr(blk, "attn_post_norm") and len(blk.loop_attn_post_norms) == 2
+        assert hasattr(blk, "ffn_post_norm") and len(blk.loop_ffn_post_norms) == 2
+        assert hasattr(blk.attention, "value_residual_lambda")
+        assert len(blk.attention.loop_value_residual_lambdas) == 2
+
+
+@pytest.mark.parametrize("inj", ["none", "concat_proj", "decayed", "orthogonal"])
+@pytest.mark.parametrize("gate", ["none", "scalar", "channel"])
+@pytest.mark.parametrize("untie", [False, True])
+@pytest.mark.parametrize("step_cond", ["none", "sinusoidal"])
+def test_step2_extensions_forward_and_gradients_match_manual_reference(
+    inj: str, gate: str, untie: bool, step_cond: str
+) -> None:
+    cfg = OplmConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=4,
+        num_loops=3,
+        loop_strategy="stack",
+        loop_start=1,
+        loop_end=3,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+        loop_input_injection=inj,
+        loop_gate=gate,
+        loop_gate_init=0.7,
+        loop_untie_norms=untie,
+        loop_step_conditioning=step_cond,
+    )
+    torch.manual_seed(13)
+    actual = OplmStack(cfg).train()
+    if actual.loop_step_cond is not None:
+        with torch.no_grad():
+            actual.loop_step_cond.fc2.weight.normal_(std=0.05)
+    reference = copy.deepcopy(actual)
+
+    ids = torch.tensor([[0, 20, 9, 14, 16, 2, 1]])
+    mask = ids.ne(1).long()
+
+    # Manual reference unroll
+    x = reference.embed_tokens(ids, mask)
+    expected_states = [x]
+    v1 = None
+    # Prelude: layer 0
+    x, _, v1 = reference.layers[0](x, mask, output_attentions=False, value_residual=None)
+    expected_states.append(x)
+    e = x
+    # Core passes 0, 1, 2 over layers 1, 2
+    for pass_idx in range(3):
+        z_prev = x
+        if pass_idx >= 1:
+            if reference.loop_injector is not None:
+                x = reference.loop_injector(z_prev, e)
+            if reference.loop_step_cond is not None:
+                x = reference.loop_step_cond(x, pass_idx, 3)
+        for core_pos, layer_idx in enumerate((1, 2)):
+            x, _, _ = reference.layers[layer_idx](
+                x, mask, output_attentions=False, value_residual=v1, pass_idx=pass_idx
+            )
+            if pass_idx >= 1 and core_pos == 1 and reference.loop_gate_module is not None:
+                x = reference.loop_gate_module(z_prev, x, pass_idx - 1)
+            expected_states.append(x)
+    # Coda: layer 3
+    x, _, _ = reference.layers[3](x, mask, output_attentions=False, value_residual=v1)
+    expected_states.append(x)
+    expected_last = reference.final_norm(x)
+
+    got_last, got_states, _ = actual(ids, mask, output_hidden_states=True)
+    assert got_states is not None
+    assert len(got_states) == len(actual.layer_execution_order) + 1 == len(expected_states)
+    torch.testing.assert_close(got_last, expected_last, rtol=1e-5, atol=1e-6)
+    for got_h, exp_h in zip(got_states, expected_states, strict=True):
+        torch.testing.assert_close(got_h, exp_h, rtol=1e-5, atol=1e-6)
+
+    probe = torch.randn_like(got_last)
+    (got_last * probe).sum().backward()
+    (expected_last * probe).sum().backward()
+    for (name, param), (ref_name, ref_param) in zip(
+        actual.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        assert name == ref_name
+        assert param.grad is not None and torch.isfinite(param.grad).all(), name
+        assert ref_param.grad is not None
+        torch.testing.assert_close(param.grad, ref_param.grad, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_step2_extensions_checkpointing_parity(mode: str) -> None:
+    from oplm.model import OplmForMaskedLM
+
+    cfg = OplmConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=4,
+        num_loops=3,
+        loop_strategy="stack",
+        loop_start=1,
+        loop_end=3,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+        hidden_dropout=0.1,
+        attention_dropout=0.1,
+        loop_input_injection="decayed",
+        loop_gate="channel",
+        loop_gate_init=0.6,
+        loop_untie_norms=True,
+        loop_step_conditioning="sinusoidal",
+    )
+    torch.manual_seed(14)
+    plain = OplmForMaskedLM(cfg).train()
+    with torch.no_grad():
+        plain.oplm.backbone.loop_step_cond.fc2.weight.normal_(std=0.05)
+    ckpt = copy.deepcopy(plain)
+    ckpt.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"mode": mode})
+
+    ids = torch.tensor([[0, 20, 9, 32, 14, 16, 2, 1]])
+    labels = torch.full_like(ids, -100)
+    labels[0, 3] = 9
+    mask = ids.ne(1).long()
+
+    torch.manual_seed(2026)
+    out_a = plain(
+        input_ids=ids,
+        attention_mask=mask,
+        labels=labels,
+        return_hidden_layers=(2, 4, 6),
+        return_qk_layers=(2, 4),
+    )
+    (out_a.loss + sum(h.pow(2).mean() for h in out_a.hidden_states)).backward()
+
+    torch.manual_seed(2026)
+    out_b = ckpt(
+        input_ids=ids,
+        attention_mask=mask,
+        labels=labels,
+        return_hidden_layers=(2, 4, 6),
+        return_qk_layers=(2, 4),
+    )
+    (out_b.loss + sum(h.pow(2).mean() for h in out_b.hidden_states)).backward()
+
+    torch.testing.assert_close(out_a.loss, out_b.loss, rtol=0, atol=0)
+    for ha, hb in zip(out_a.hidden_states, out_b.hidden_states, strict=True):
+        torch.testing.assert_close(ha, hb, rtol=0, atol=0)
+    for (qa, ka), (qb, kb) in zip(out_a.qk_states, out_b.qk_states, strict=True):
+        torch.testing.assert_close(qa, qb, rtol=0, atol=0)
+        torch.testing.assert_close(ka, kb, rtol=0, atol=0)
+    for name, param in plain.named_parameters():
+        other = ckpt.get_parameter(name)
+        assert (param.grad is None) == (other.grad is None), name
+        if param.grad is not None:
+            torch.testing.assert_close(param.grad, other.grad, rtol=1e-4, atol=1e-6)

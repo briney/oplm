@@ -35,7 +35,13 @@ from .configuration_oplm import _VALID_GRADIENT_CHECKPOINTING_MODES, OplmConfig
 from .conv import CanonConv
 from .embedding import cls_pool, mean_pool
 from .ffn import GEGLU, SwiGLU
-from .looping import resolve_layer_execution_order
+from .loop_modules import LoopCycleGate, LoopInputInjector, LoopStepConditioner
+from .looping import (
+    LoopSchedule,
+    resolve_layer_execution_order,
+    resolve_loop_schedule,
+    validate_loop_extensions,
+)
 from .masking import prepare_attention_mask
 from .norm import OplmLayerNorm, OplmRMSNorm, make_norm
 from .outputs import LogitsConfig, LogitsOutput
@@ -43,7 +49,13 @@ from .rope import RotaryEmbedding
 from .transformer import OplmBlock, OplmStack
 
 _REMOTE_CODE_DEPS = (
+    LoopSchedule,
     resolve_layer_execution_order,
+    resolve_loop_schedule,
+    validate_loop_extensions,
+    LoopInputInjector,
+    LoopCycleGate,
+    LoopStepConditioner,
     TRITON_AVAILABLE,
     OplmAttention,
     CanonConv,
@@ -146,6 +158,11 @@ class OplmPreTrainedModel(PreTrainedModel):
         std = self.config.initializer_range
 
         if isinstance(module, nn.Linear):
+            if getattr(module, "_init_zero", False):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                return
             if getattr(module, "_is_readout", False):
                 # μP readout: width-independent init, no 1/sqrt(m_W) factor.
                 module_std = std

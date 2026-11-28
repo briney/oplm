@@ -87,7 +87,7 @@ class OplmAttention(nn.Module):
     doc.
     """
 
-    def __init__(self, config: OplmConfig, layer_idx: int = 0) -> None:
+    def __init__(self, config: OplmConfig, layer_idx: int = 0, *, num_loop_passes: int = 1) -> None:
         super().__init__()
 
         hidden_size = config.hidden_size
@@ -149,10 +149,20 @@ class OplmAttention(nn.Module):
                 "expected one of 'none', 'fixed', 'learnable'."
             )
         self.value_residual_enabled = self.value_residual != "none"
+        self.loop_untie_norms = bool(getattr(config, "loop_untie_norms", False)) and (
+            num_loop_passes > 1
+        )
         if self.value_residual_enabled and layer_idx > 0:
             lam_init = float(getattr(config, "value_residual_lambda_init", 0.5))
             if self.value_residual == "learnable":
                 self.value_residual_lambda = nn.Parameter(torch.full((1,), lam_init))
+                if self.loop_untie_norms:
+                    self.loop_value_residual_lambdas = nn.ParameterList(
+                        [
+                            nn.Parameter(torch.full((1,), lam_init))
+                            for _ in range(num_loop_passes - 1)
+                        ]
+                    )
             else:  # "fixed" — persistent buffer (compile/DDP + HF fast-init safe)
                 self.register_buffer(
                     "value_residual_lambda", torch.tensor(lam_init), persistent=True
@@ -408,6 +418,7 @@ class OplmAttention(nn.Module):
         segment_ids: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
         return_qk: bool = False,
+        pass_idx: int = 0,
     ) -> tuple[torch.Tensor | None, ...]:
         """Run dual-path multi-head attention.
 
@@ -444,7 +455,14 @@ class OplmAttention(nn.Module):
         # ResFormer: physical layer 0 always bypasses mixing, including revisits.
         # Other layers blend toward its first execution's values.
         if self.layer_idx > 0 and value_residual is not None:
-            lam = self.value_residual_lambda
+            if (
+                pass_idx > 0
+                and self.loop_untie_norms
+                and hasattr(self, "loop_value_residual_lambdas")
+            ):
+                lam = self.loop_value_residual_lambdas[pass_idx - 1]
+            else:
+                lam = self.value_residual_lambda
             v = lam * v + (1.0 - lam) * value_residual
         q, k = self._apply_rope(q, k)
 
