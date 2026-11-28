@@ -1254,17 +1254,38 @@ For interleaving, set `model.loop_strategy=interleave`. To loop a subset, also s
 layers run once. Omitting `init_from` trains the configured looped model from
 scratch with shared parameters from the first step.
 
-Full-state resume checks physical depth and all loop settings before loading
-model or optimizer state. `loop_end=null` and an explicit end equal to physical
-depth are equivalent; other changes, including strategy changes at `num_loops=1`,
-require a new stage with `init_from`. Older checkpoints missing loop fields use
-ordinary defaults. If both saved model-config artifacts are absent, only an
-ordinary default target may resume, with a warning that compatibility cannot be
-verified.
+Stacked loops (`model.num_loops >= 2`, `model.loop_strategy=stack`) also support
+composable core-boundary and pass-differentiation extensions (`model.loop_input_injection`,
+`model.loop_gate`, `model.loop_gate_init`, `model.loop_untie_norms`, and
+`model.loop_step_conditioning`; see [config.md](config.md#shared-layer-looping) and
+[architecture.md](architecture.md#shared-layer-looping)). When warm-starting an
+unlooped or vanilla-looped checkpoint into these extensions via `train.init_from`:
+
+- Only keys belonging to newly enabled loop extensions may be absent from the
+  source checkpoint; any missing base weight, unexpected key, or shape mismatch
+  still fails.
+- Newly enabled `model.loop_untie_norms=true` copies each core layer's pass-0
+  block norms (and `value_residual_lambda` under `value_residual=learnable`)
+  into every revisit pass (`1 .. K-1`).
+- Setting `model.loop_gate=channel` (or `scalar`) with `model.loop_gate_init=0.0`
+  makes every revisit pass an exact identity at step 0, preserving the source
+  checkpoint's initial logits while letting gradients open the gates smoothly.
+- Swapping active extension modes, disabling an extension that is active in the
+  source checkpoint, or changing `model.num_loops`/range when the source already
+  carries per-pass loop modules (`loop_gate` or `loop_untie_norms`) is rejected.
+
+Full-state resume checks physical depth and all loop settings (including all five
+loop-extension fields) before loading model or optimizer state. `loop_end=null`
+and an explicit end equal to physical depth are equivalent; other changes,
+including strategy changes at `num_loops=1`, require a new stage with
+`init_from`. Older checkpoints missing loop fields use ordinary defaults. If both
+saved model-config artifacts are absent, only an ordinary default target may
+resume, with a warning that compatibility cannot be verified.
 
 Startup logs show physical depth, effective depth, loop range/strategy, and unique
 parameter count. FLOPs and throughput-derived compute metrics count every block
-execution, with the MLM head counted once. The estimator still omits attention
+execution plus any revisit input-injection matmuls (`concat_proj`, `decayed`),
+with the MLM head counted once. The estimator still omits attention
 scores, normalization, and embedding lookups. Compare looping experiments at both
 equal token budgets and equal estimated compute; shared weights leave parameter
 and optimizer-state budgets unchanged, while additional executions increase

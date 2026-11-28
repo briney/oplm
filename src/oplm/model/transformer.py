@@ -14,7 +14,8 @@ from .attention import OplmAttention
 from .conv import CanonConv
 from .embedding import OplmEmbedding
 from .ffn import make_ffn
-from .looping import resolve_layer_execution_order
+from .loop_modules import LoopCycleGate, LoopInputInjector, LoopStepConditioner
+from .looping import resolve_loop_schedule, validate_loop_extensions
 from .masking import prepare_attention_mask, segment_block_mask
 from .norm import make_norm
 
@@ -103,11 +104,15 @@ class OplmBlock(nn.Module):
     # resolves to Tensor rather than the `nn.Module.__getattr__` union.
     alpha: torch.Tensor
 
-    def __init__(self, config: OplmConfig, layer_idx: int) -> None:
+    def __init__(self, config: OplmConfig, layer_idx: int, *, num_loop_passes: int = 1) -> None:
         super().__init__()
 
         self.layer_idx = layer_idx
         self.num_hidden_layers = config.num_hidden_layers
+        self.num_loop_passes = num_loop_passes
+        self.loop_untie_norms = bool(getattr(config, "loop_untie_norms", False)) and (
+            num_loop_passes > 1
+        )
         self.norm_strategy = config.norm_strategy
         self.residual_scaling = config.residual_scaling
         self.canon_residual = bool(getattr(config, "canon_residual", True))
@@ -171,16 +176,30 @@ class OplmBlock(nn.Module):
             self.attn_norm: nn.Module = make_norm(
                 config.norm_type, config.hidden_size, eps=config.norm_eps
             )
+            if self.loop_untie_norms:
+                self.loop_attn_norms = nn.ModuleList(
+                    [
+                        make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
+                        for _ in range(num_loop_passes - 1)
+                    ]
+                )
 
         # Attention module self-configures v_norm under hybrid; the layer index
         # drives the ResFormer value-residual wiring (layer 0 exposes v1).
-        self.attention = OplmAttention(config, layer_idx)
+        self.attention = OplmAttention(config, layer_idx, num_loop_passes=num_loop_passes)
         self.value_residual_enabled = getattr(config, "value_residual", "none") != "none"
 
         # FFN pre-norm and FFN module are always present.
         self.ffn_norm: nn.Module = make_norm(
             config.norm_type, config.hidden_size, eps=config.norm_eps
         )
+        if self.loop_untie_norms:
+            self.loop_ffn_norms = nn.ModuleList(
+                [
+                    make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
+                    for _ in range(num_loop_passes - 1)
+                ]
+            )
         self.ffn = make_ffn(config, layer_idx)
 
         # Strategy-specific post-norms.
@@ -191,10 +210,30 @@ class OplmBlock(nn.Module):
             self.ffn_post_norm: nn.Module = make_norm(
                 config.norm_type, config.hidden_size, eps=config.norm_eps
             )
+            if self.loop_untie_norms:
+                self.loop_attn_post_norms = nn.ModuleList(
+                    [
+                        make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
+                        for _ in range(num_loop_passes - 1)
+                    ]
+                )
+                self.loop_ffn_post_norms = nn.ModuleList(
+                    [
+                        make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
+                        for _ in range(num_loop_passes - 1)
+                    ]
+                )
         elif config.norm_strategy == "post_sdpa":
             self.attn_post_norm = make_norm(
                 config.norm_type, config.hidden_size, eps=config.norm_eps
             )
+            if self.loop_untie_norms:
+                self.loop_attn_post_norms = nn.ModuleList(
+                    [
+                        make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
+                        for _ in range(num_loop_passes - 1)
+                    ]
+                )
 
         # Canon convs at A/B/C/D: only when canon is enabled and the position is selected.
         if getattr(config, "canon_enabled", False):
@@ -235,6 +274,13 @@ class OplmBlock(nn.Module):
             return ffn_out
         return self.ffn_gate * ffn_out
 
+    def _select_norm(
+        self, base: nn.Module, extras: nn.ModuleList | None, pass_idx: int
+    ) -> nn.Module:
+        if pass_idx > 0 and extras is not None:
+            return extras[pass_idx - 1]
+        return base
+
     def _forward_impl(
         self,
         x: torch.Tensor,
@@ -244,12 +290,21 @@ class OplmBlock(nn.Module):
         segment_ids: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
         return_qk: bool = False,
+        pass_idx: int = 0,
     ) -> tuple[torch.Tensor | None, ...]:
         # Attention sublayer. Hybrid feeds raw `x` (QKV-norm lives inside the
         # attention module); every other strategy applies the outer pre-norm.
         # Canon is restricted to norm_strategy="pre", so when conv_a exists
         # `attn_base` is always the normed stream.
-        attn_base = x if self.norm_strategy == "hybrid" else self.attn_norm(x)
+        if self.norm_strategy == "hybrid":
+            attn_base = x
+        else:
+            attn_norm = self._select_norm(
+                self.attn_norm,
+                self.loop_attn_norms if self.loop_untie_norms else None,
+                pass_idx,
+            )
+            attn_base = attn_norm(x)
 
         # Canon-A: residual conv on the attention pre-norm stream (paper-exact);
         # Canon-B (the conv on Q/K/V) is applied inside the attention module.
@@ -267,6 +322,7 @@ class OplmBlock(nn.Module):
             segment_ids=segment_ids,
             block_mask=block_mask,
             return_qk=return_qk,
+            pass_idx=pass_idx,
         )
         q_out: torch.Tensor | None = None
         k_out: torch.Tensor | None = None
@@ -284,11 +340,21 @@ class OplmBlock(nn.Module):
         assert attn_out is not None
 
         if self.norm_strategy in {"sandwich", "post_sdpa"}:
-            attn_out = self.attn_post_norm(attn_out)
+            attn_post_norm = self._select_norm(
+                self.attn_post_norm,
+                self.loop_attn_post_norms if self.loop_untie_norms else None,
+                pass_idx,
+            )
+            attn_out = attn_post_norm(attn_out)
         h = x + self.alpha * self._gate_attn(attn_out)
 
         # FFN sublayer.
-        h_norm = self.ffn_norm(h)
+        ffn_norm = self._select_norm(
+            self.ffn_norm,
+            self.loop_ffn_norms if self.loop_untie_norms else None,
+            pass_idx,
+        )
+        h_norm = ffn_norm(h)
         # Canon-C: residual conv on the FFN pre-norm stream (paper-exact);
         # Canon-D runs inside the FFN on the activation branch at intermediate
         # width and is applied by the FFN module itself.
@@ -298,7 +364,12 @@ class OplmBlock(nn.Module):
         ffn_out = self.ffn(mlp_in, attention_mask, segment_ids)
 
         if self.norm_strategy == "sandwich":
-            ffn_out = self.ffn_post_norm(ffn_out)
+            ffn_post_norm = self._select_norm(
+                self.ffn_post_norm,
+                self.loop_ffn_post_norms if self.loop_untie_norms else None,
+                pass_idx,
+            )
+            ffn_out = ffn_post_norm(ffn_out)
             y = h + self.alpha * self._gate_ffn(ffn_out)
         elif self.norm_strategy == "hybrid":
             # Hybrid reuses Norm(h) as both FFN input and FFN-side residual stream.
@@ -323,6 +394,7 @@ class OplmBlock(nn.Module):
         segment_ids: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
         return_qk: bool = False,
+        pass_idx: int = 0,
     ) -> tuple[torch.Tensor | None, ...]:
         """Run one transformer block.
 
@@ -336,6 +408,7 @@ class OplmBlock(nn.Module):
             segment_ids: `(B, T)` segment ids of a packed batch, or `None` (see `OplmAttention`).
             block_mask: FlexAttention block mask shared by every block of this forward, or `None`.
             return_qk: When `True`, also return post-RoPE `q, k` tensors from `OplmAttention`.
+            pass_idx: Zero-based core loop pass index (used when `loop_untie_norms=True`).
 
         Returns:
             Flat tuple starting with `(y, attn_weights_or_None)`, followed by
@@ -361,6 +434,7 @@ class OplmBlock(nn.Module):
                     segment_ids,
                     block_mask,
                     return_qk,
+                    pass_idx,
                     use_reentrant=False,
                     context_fn=context_fn,
                 )
@@ -374,6 +448,7 @@ class OplmBlock(nn.Module):
                 segment_ids,
                 block_mask,
                 return_qk,
+                pass_idx,
                 use_reentrant=False,
             )
         return self._forward_impl(
@@ -384,6 +459,7 @@ class OplmBlock(nn.Module):
             segment_ids,
             block_mask,
             return_qk,
+            pass_idx,
         )
 
 
@@ -406,13 +482,31 @@ class OplmStack(nn.Module):
     def __init__(self, config: OplmConfig) -> None:
         super().__init__()
         self.config = config
-        self.layer_execution_order = resolve_layer_execution_order(
+        num_loops = getattr(config, "num_loops", 1)
+        loop_strategy = getattr(config, "loop_strategy", "stack")
+        self.loop_schedule = resolve_loop_schedule(
             config.num_hidden_layers,
-            num_loops=getattr(config, "num_loops", 1),
-            loop_strategy=getattr(config, "loop_strategy", "stack"),
+            num_loops=num_loops,
+            loop_strategy=loop_strategy,
             loop_start=getattr(config, "loop_start", 0),
             loop_end=getattr(config, "loop_end", None),
         )
+        self.layer_execution_order = self.loop_schedule.execution_order
+        loop_input_injection = getattr(config, "loop_input_injection", "none")
+        loop_gate = getattr(config, "loop_gate", "none")
+        loop_gate_init = getattr(config, "loop_gate_init", 1.0)
+        loop_untie_norms = getattr(config, "loop_untie_norms", False)
+        loop_step_conditioning = getattr(config, "loop_step_conditioning", "none")
+        self._has_loop_extensions = validate_loop_extensions(
+            num_loops=num_loops,
+            loop_strategy=loop_strategy,
+            loop_input_injection=loop_input_injection,
+            loop_gate=loop_gate,
+            loop_gate_init=loop_gate_init,
+            loop_untie_norms=loop_untie_norms,
+            loop_step_conditioning=loop_step_conditioning,
+        )
+
         self.num_hidden_layers = config.num_hidden_layers
         self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
         self.gradient_checkpointing_mode = str(
@@ -421,8 +515,47 @@ class OplmStack(nn.Module):
         self.value_residual_enabled = getattr(config, "value_residual", "none") != "none"
 
         self.embed_tokens = OplmEmbedding(config)
+        core_set = set(self.loop_schedule.core)
         self.layers = nn.ModuleList(
-            [OplmBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                OplmBlock(
+                    config,
+                    layer_idx,
+                    num_loop_passes=(
+                        num_loops if loop_strategy == "stack" and layer_idx in core_set else 1
+                    ),
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.loop_injector: LoopInputInjector | None = (
+            LoopInputInjector(
+                loop_input_injection,
+                config.hidden_size,
+                norm_type=config.norm_type,
+                norm_eps=config.norm_eps,
+            )
+            if loop_input_injection != "none"
+            else None
+        )
+        self.loop_step_cond: LoopStepConditioner | None = (
+            LoopStepConditioner(
+                config.hidden_size,
+                norm_type=config.norm_type,
+                norm_eps=config.norm_eps,
+            )
+            if loop_step_conditioning == "sinusoidal"
+            else None
+        )
+        self.loop_gate_module: LoopCycleGate | None = (
+            LoopCycleGate(
+                loop_gate,
+                num_loops,
+                config.hidden_size,
+                init_val=float(loop_gate_init),
+            )
+            if loop_gate != "none"
+            else None
         )
         self.final_norm = make_norm(config.norm_type, config.hidden_size, eps=config.norm_eps)
 
@@ -531,41 +664,88 @@ class OplmStack(nn.Module):
             and getattr(self.config, "packed_attention", "sdpa") == "flex"
         ):
             block_mask = segment_block_mask(segment_ids)
-        for exec_idx, layer_index in enumerate(self.layer_execution_order):
+
+        def _run_block(
+            cur_x: torch.Tensor,
+            exec_idx: int,
+            layer_index: int,
+            pass_idx: int,
+            *,
+            gate_prev: torch.Tensor | None = None,
+            gate_idx: int | None = None,
+        ) -> torch.Tensor:
+            nonlocal v1, hidden_states, attentions
             block = self.layers[layer_index]
             want_qk = qk_layer_set is not None and exec_idx in qk_layer_set
             result = block(
-                x,
+                cur_x,
                 attention_mask,
                 output_attentions,
                 value_residual=v1,
                 segment_ids=segment_ids,
                 block_mask=block_mask,
                 return_qk=want_qk,
+                pass_idx=pass_idx,
             )
             if self.value_residual_enabled:
                 if want_qk:
-                    x, attn, v, q_out, k_out = result
+                    next_x, attn, v, q_out, k_out = result
                 else:
-                    x, attn, v = result
+                    next_x, attn, v = result
                 if v1 is None:
                     v1 = v
             else:
                 if want_qk:
-                    x, attn, q_out, k_out = result
+                    next_x, attn, q_out, k_out = result
                 else:
-                    x, attn = result
-            assert x is not None
+                    next_x, attn = result
+            assert next_x is not None
+            if gate_prev is not None and gate_idx is not None and self.loop_gate_module is not None:
+                next_x = self.loop_gate_module(gate_prev, next_x, gate_idx)
             if want_qk and qk_states is not None:
                 assert q_out is not None and k_out is not None
                 qk_states.append((q_out, k_out))
             if hidden_states is not None:
-                hidden_states = hidden_states + (x,)
+                hidden_states = hidden_states + (next_x,)
             elif hidden_layer_set is not None and exec_idx in hidden_layer_set:
                 assert tapped_hidden is not None
-                tapped_hidden.append(x)
+                tapped_hidden.append(next_x)
             if attentions is not None:
                 attentions = attentions + (attn,)
+            return next_x
+
+        if not self._has_loop_extensions:
+            for exec_idx, layer_index in enumerate(self.layer_execution_order):
+                x = _run_block(x, exec_idx, layer_index, pass_idx=0)
+        else:
+            sched = self.loop_schedule
+            exec_idx = 0
+            for layer_index in sched.prelude:
+                x = _run_block(x, exec_idx, layer_index, pass_idx=0)
+                exec_idx += 1
+            prelude_anchor = x
+            core_last_pos = len(sched.core) - 1
+            for pass_idx in range(sched.num_loops):
+                z_prev = x
+                if pass_idx >= 1:
+                    if self.loop_injector is not None:
+                        x = self.loop_injector(z_prev, prelude_anchor)
+                    if self.loop_step_cond is not None:
+                        x = self.loop_step_cond(x, pass_idx, sched.num_loops)
+                for core_pos, layer_index in enumerate(sched.core):
+                    apply_gate = pass_idx >= 1 and core_pos == core_last_pos
+                    x = _run_block(
+                        x,
+                        exec_idx,
+                        layer_index,
+                        pass_idx=pass_idx,
+                        gate_prev=z_prev if apply_gate else None,
+                        gate_idx=(pass_idx - 1) if apply_gate else None,
+                    )
+                    exec_idx += 1
+            for layer_index in sched.coda:
+                x = _run_block(x, exec_idx, layer_index, pass_idx=0)
+                exec_idx += 1
 
         if tapped_hidden is not None:
             hidden_states = tuple(tapped_hidden)

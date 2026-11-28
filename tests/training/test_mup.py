@@ -362,6 +362,119 @@ def test_mup_is_noop_at_base_width() -> None:
     assert on.lm_head.output_mult == 1.0
 
 
+@pytest.mark.parametrize("injection", ["concat_proj", "decayed", "orthogonal"])
+@pytest.mark.parametrize("optimizer", ["adamw", "muon"])
+def test_mup_is_noop_at_base_width_with_step2_loop_extensions(
+    injection: str, optimizer: str
+) -> None:
+    """With every Step 2 extension enabled, μP at base width is bit-identical to μP-off."""
+
+    def build(mup: bool) -> OplmForMaskedLM:
+        torch.manual_seed(17)
+        return OplmForMaskedLM(
+            OplmModelConfig(
+                hidden_size=_BASE_WIDTH,
+                num_attention_heads=_BASE_WIDTH // 64,
+                num_hidden_layers=4,
+                max_position_embeddings=64,
+                num_loops=3,
+                loop_strategy="stack",
+                loop_start=1,
+                loop_end=3,
+                loop_input_injection=injection,
+                loop_gate="channel",
+                loop_gate_init=0.5,
+                loop_untie_norms=True,
+                loop_step_conditioning="sinusoidal",
+                mup_enable=mup,
+                mup_base_width=_BASE_WIDTH,
+            )
+        )
+
+    on, off = build(True), build(False)
+    for (n1, p1), (n2, p2) in zip(on.named_parameters(), off.named_parameters(), strict=True):
+        assert n1 == n2
+        assert torch.equal(p1, p2), n1
+
+    cfg = TrainConfig(
+        optimizer=optimizer,
+        muon_adjust_lr_fn="original",
+        lr=1e-2,
+        weight_decay=0.01,
+        weight_decay_to_init=0.05,
+    )
+    opts_on = build_optimizers(on, cfg)
+    opts_off = build_optimizers(off, cfg)
+    assert len(opts_on) == len(opts_off)
+    for opt_a, opt_b in zip(opts_on, opts_off, strict=True):
+        assert [(len(g["params"]), g["lr"], g["weight_decay"]) for g in opt_a.param_groups] == [
+            (len(g["params"]), g["lr"], g["weight_decay"]) for g in opt_b.param_groups
+        ]
+
+    input_ids = torch.tensor([[0, 5, 6, 7, 8, 2], [0, 9, 10, 11, 12, 2]])
+    attention_mask = torch.ones_like(input_ids)
+    for model, opts in ((on, opts_on), (off, opts_off)):
+        loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids).loss
+        loss.backward()
+        for opt in opts:
+            opt.step()
+
+    for (n1, p1), (_n2, p2) in zip(on.named_parameters(), off.named_parameters(), strict=True):
+        assert torch.equal(p1, p2), n1
+
+
+def test_step2_mup_scaling_at_wider_width() -> None:
+    """At wider width, concat_proj and step_cond linears scale by 1/m (LR) and 1/sqrt(m) (init)."""
+
+    def build(mup: bool) -> OplmForMaskedLM:
+        torch.manual_seed(23)
+        return OplmForMaskedLM(
+            OplmModelConfig(
+                hidden_size=_WIDTH,
+                num_attention_heads=_HEADS,
+                num_hidden_layers=4,
+                max_position_embeddings=64,
+                num_loops=3,
+                loop_strategy="stack",
+                loop_start=1,
+                loop_end=3,
+                loop_input_injection="concat_proj",
+                loop_gate="channel",
+                loop_step_conditioning="sinusoidal",
+                mup_enable=mup,
+                mup_base_width=_BASE_WIDTH,
+            )
+        )
+
+    on, off = build(True), build(False)
+    m, _ = _mults(on)
+    on_p, off_p = dict(on.named_parameters()), dict(off.named_parameters())
+    for name in (
+        "oplm.backbone.loop_injector.proj.weight",
+        "oplm.backbone.loop_step_cond.fc1.weight",
+    ):
+        assert torch.allclose(on_p[name], off_p[name] / math.sqrt(m), rtol=1e-5, atol=1e-7), name
+
+    lr = 1e-2
+    opts = build_optimizers(on, TrainConfig(optimizer="adamw", lr=lr, weight_decay=0.01))
+    assert _group_lr("oplm.backbone.loop_injector.proj.weight", on, opts) == (
+        "AdamW",
+        pytest.approx(lr / m),
+    )
+    assert _group_lr("oplm.backbone.loop_step_cond.fc1.weight", on, opts) == (
+        "AdamW",
+        pytest.approx(lr / m),
+    )
+    assert _group_lr("oplm.backbone.loop_step_cond.fc2.weight", on, opts) == (
+        "AdamW",
+        pytest.approx(lr / m),
+    )
+    assert _group_lr("oplm.backbone.loop_gate_module.gates.0", on, opts) == (
+        "AdamW",
+        pytest.approx(lr),
+    )
+
+
 # ---------------------------------------------------------------------------
 # SweepMetricsCallback.on_train_end — result.json version provenance
 # ---------------------------------------------------------------------------

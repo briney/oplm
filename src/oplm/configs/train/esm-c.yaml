@@ -26,6 +26,11 @@ model:
   loop_strategy: stack
   loop_start: 0
   loop_end: null
+  loop_input_injection: none
+  loop_gate: none
+  loop_gate_init: 1.0
+  loop_untie_norms: false
+  loop_step_conditioning: none
 
   rope_theta: 10000.0
   rope_dim: null

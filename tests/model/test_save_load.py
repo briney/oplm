@@ -139,3 +139,147 @@ def test_legacy_checkpoint_defaults_to_one_loop(tmp_path: Path) -> None:
     assert loaded.oplm.backbone.layer_execution_order == (0, 1)
     for name, value in model.state_dict().items():
         assert torch.equal(value, loaded.state_dict()[name])
+
+
+def test_step2_loop_extensions_save_load_preserves_custom_and_mutated_weights(
+    tmp_path: Path,
+) -> None:
+    config = _tiny_config(
+        num_hidden_layers=4,
+        num_loops=3,
+        loop_strategy="stack",
+        loop_start=1,
+        loop_end=3,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+        loop_input_injection="decayed",
+        loop_gate="channel",
+        loop_gate_init=0.0,
+        loop_untie_norms=True,
+        loop_step_conditioning="sinusoidal",
+    )
+    torch.manual_seed(77)
+    model = OplmForMaskedLM(config).eval()
+    # Mutate custom-init and zero-init loop parameters to non-initial values.
+    with torch.no_grad():
+        backbone = model.oplm.backbone
+        backbone.loop_injector.log_delta.fill_(0.42)
+        backbone.loop_injector.log_state_decay.fill_(-0.25)
+        backbone.loop_injector.input_matrix_continuous.normal_(std=0.1)
+        for idx, g in enumerate(backbone.loop_gate_module.gates):
+            g.fill_(0.35 + 0.1 * idx)
+        backbone.loop_step_cond.fc2.weight.normal_(std=0.05)
+        backbone.loop_step_cond.fc2.bias.fill_(0.07)
+        backbone.layers[1].loop_attn_norms[0].weight.fill_(1.3)
+        backbone.layers[1].attention.loop_value_residual_lambdas[0].fill_(0.82)
+
+    model.save_pretrained(tmp_path)
+    loaded, info = OplmForMaskedLM.from_pretrained(tmp_path, output_loading_info=True)
+    loaded.eval()
+    assert not info["missing_keys"]
+    assert not info["unexpected_keys"]
+    assert not info["mismatched_keys"]
+    assert model.state_dict().keys() == loaded.state_dict().keys()
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, loaded.state_dict()[name]), name
+
+    batch = OplmTokenizerFast()(["MEEPQ", "MKVL"], padding=True, return_tensors="pt")
+    with torch.no_grad():
+        # Weights are bit-identical (checked above); safetensors mmap alignment after
+        # 1-element scalar params can shift CPU BLAS SIMD reduction order by ~1 ULP.
+        torch.testing.assert_close(
+            model(**batch).logits, loaded(**batch).logits, atol=1e-6, rtol=1e-6
+        )
+
+
+def test_direct_from_pretrained_unlooped_to_step2_initializes_missing_loop_params(
+    tmp_path: Path,
+) -> None:
+    """Direct HF from_pretrained into Step 2 initializes missing custom params (never empty/NaN)."""
+    import math
+
+    torch.manual_seed(13)
+    src_cfg = _tiny_config(
+        num_hidden_layers=4,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+        value_residual_lambda_init=0.6,
+    )
+    source = OplmForMaskedLM(src_cfg).eval()
+    source.save_pretrained(tmp_path)
+
+    # 1. Direct OplmForMaskedLM.from_pretrained with decayed + channel gate (0.0) + untied norms.
+    decayed_cfg = _tiny_config(
+        num_hidden_layers=4,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+        value_residual_lambda_init=0.6,
+        num_loops=3,
+        loop_strategy="stack",
+        loop_start=1,
+        loop_end=3,
+        loop_input_injection="decayed",
+        loop_gate="channel",
+        loop_gate_init=0.0,
+        loop_untie_norms=True,
+        loop_step_conditioning="sinusoidal",
+    )
+    mlm = OplmForMaskedLM.from_pretrained(tmp_path, config=decayed_cfg).eval()
+    for name, param in mlm.named_parameters():
+        assert torch.isfinite(param).all(), f"non-finite param {name}"
+    for name, value in source.state_dict().items():
+        assert torch.equal(value, mlm.state_dict()[name]), name
+
+    bb = mlm.oplm.backbone
+    expected_delta = math.log(math.expm1(0.5 * math.log(5.0)))
+    torch.testing.assert_close(
+        bb.loop_injector.log_delta,
+        torch.full_like(bb.loop_injector.log_delta, expected_delta),
+    )
+    assert torch.equal(
+        bb.loop_injector.log_state_decay,
+        torch.zeros_like(bb.loop_injector.log_state_decay),
+    )
+    assert torch.equal(
+        bb.loop_injector.input_matrix_continuous,
+        torch.eye(decayed_cfg.hidden_size),
+    )
+    for gate in bb.loop_gate_module.gates:
+        assert torch.equal(gate, torch.zeros_like(gate))
+    for lam in bb.layers[1].attention.loop_value_residual_lambdas:
+        torch.testing.assert_close(lam, torch.full_like(lam, 0.6))
+
+    batch = OplmTokenizerFast()(["MEEPQ", "MKVL"], padding=True, return_tensors="pt")
+    with torch.no_grad():
+        torch.testing.assert_close(
+            mlm(**batch).logits, source(**batch).logits, atol=1e-6, rtol=1e-6
+        )
+
+    # 2. Direct OplmForSequenceClassification.from_pretrained with orthogonal + scalar gate (0.25).
+    orth_cfg = _tiny_config(
+        num_hidden_layers=4,
+        norm_strategy="sandwich",
+        value_residual="learnable",
+        value_residual_lambda_init=0.6,
+        num_loops=3,
+        loop_strategy="stack",
+        loop_start=1,
+        loop_end=3,
+        loop_input_injection="orthogonal",
+        loop_gate="scalar",
+        loop_gate_init=0.25,
+        loop_untie_norms=True,
+        loop_step_conditioning="sinusoidal",
+    )
+    clf = OplmForSequenceClassification.from_pretrained(tmp_path, config=orth_cfg).eval()
+    for name, param in clf.named_parameters():
+        assert torch.isfinite(param).all(), f"non-finite param {name}"
+    clf_bb = clf.oplm.backbone
+    assert torch.equal(
+        clf_bb.loop_injector.inject_scale,
+        torch.ones_like(clf_bb.loop_injector.inject_scale),
+    )
+    for gate in clf_bb.loop_gate_module.gates:
+        torch.testing.assert_close(gate, torch.full_like(gate, 0.25))
+    with torch.no_grad():
+        assert torch.isfinite(clf(**batch).logits).all()

@@ -132,11 +132,22 @@ while its prefix and suffix run once. One loop reproduces ordinary execution.
 | `model.loop_strategy` | `str` | `stack` | Repeat the complete region (`stack`) or each layer (`interleave`). |
 | `model.loop_start` | `int` | `0` | Inclusive zero-based start. |
 | `model.loop_end` | `int \| null` | `null` | Exclusive end; null means `num_hidden_layers`. |
+| `model.loop_input_injection` | `str` | `none` | Prelude-anchor injection at every core revisit (`k >= 1`): `none`, `concat_proj`, `decayed`, or `orthogonal`. |
+| `model.loop_gate` | `str` | `none` | Per-pass core residual gate on revisits (`k >= 1`): `none`, `scalar`, or `channel`. |
+| `model.loop_gate_init` | `float` | `1.0` | Initial value for `loop_gate` parameters (`0.0` gives exact identity warm-start on revisits). Must be finite; inert unless `loop_gate != none`. |
+| `model.loop_untie_norms` | `bool` | `false` | Give each revisit pass (`k >= 1`) of core layers its own block norms and (under `value_residual=learnable`) `value_residual_lambda`. |
+| `model.loop_step_conditioning` | `str` | `none` | Core-entry pass conditioning on revisits (`k >= 1`): `none` or `sinusoidal` (zero-init residual FiLM). |
 
 Require positive integer loop counts and `0 <= loop_start < loop_end <=
 num_hidden_layers` after resolving null. Booleans and fractional indices/counts
 are rejected, including for one loop. Effective depth is
 `L + (num_loops - 1) * (loop_end - loop_start)`.
+
+Non-default values of `model.loop_input_injection`, `model.loop_gate`,
+`model.loop_untie_norms`, or `model.loop_step_conditioning` require
+`model.num_loops >= 2` and `model.loop_strategy == "stack"`. When all four are
+at their defaults, execution is bit-for-bit identical to vanilla looping with no
+extra parameters.
 
 ### Positional encoding
 

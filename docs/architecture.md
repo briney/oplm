@@ -350,9 +350,42 @@ invocation of block zero bypasses mixing, and revisiting it never replaces or de
 Changing loop settings requires constructing or loading a model with the new config.
 
 Training compute estimates use effective depth D for the block projections and count the MLM head
-once. Unique parameter counts use physical blocks and are unchanged by looping. Activation memory
-grows with executed depth unless reduced through activation checkpointing, because parameter sharing
-alone does not reduce it.
+once. Unique parameter counts use physical blocks and are unchanged by vanilla looping. Activation
+memory grows with executed depth unless reduced through activation checkpointing, because parameter
+sharing alone does not reduce it.
+
+**Core-boundary and pass-differentiation extensions (`loop_strategy="stack"`, `num_loops >= 2`).**
+Stacked looping splits the backbone into prelude `[0, loop_start)`, recurrent core
+`[loop_start, loop_end)` run `K = num_loops` times (`pass_idx = 0 .. K-1`), and coda
+`[loop_end, L)`. Four composable, default-off extensions operate around and inside the core on
+revisit passes (`pass_idx >= 1`), leaving pass 0 unchanged and adding zero parameters when off
+(config knobs in [config.md](config.md#shared-layer-looping)):
+
+- **Prelude input injection (`loop_input_injection`).** Captures the post-prelude anchor `e`
+  (post-embedding when `loop_start == 0`) once before pass 0 and re-injects it into the recurrent
+  state `z` before each revisit pass `k >= 1`:
+  - `concat_proj`: `proj(cat([norm_z(z), norm_e(e)], dim=-1) / sqrt(2))` (bias-free `2D -> D`
+    linear; counts `(K - 1) * 4D^2` forward FLOPs).
+  - `decayed`: continuous-time decayed state + prelude projection matching `oplm.fold.trunk.Recurrence`
+    (`exp(-delta * exp(log_state_decay)) * z + (delta[:, None] * B) @ norm(e)`, initialized with
+    `B = I`, `log_state_decay = 0`, `delta = 0.5 * ln(5)`; counts `(K - 1) * 2D^2` forward FLOPs;
+    `B` stays in AdamW with zero weight decay).
+  - `orthogonal`: projects out the component of `z` parallel to `e` in fp32 (clamped denominator
+    for zero-norm safety) and adds `inject_scale * e`.
+- **Per-cycle residual gating (`loop_gate`, `loop_gate_init`).** Wraps each revisit pass `k >= 1`
+  at the core exit as `z_k = z_{k-1} + g_k * (core_out - z_{k-1})`, where `g_k` is a per-pass 1-D
+  parameter (`(1,)` for `scalar`, `(D,)` for `channel`, stored in an `nn.ParameterList`, routed to
+  AdamW no-decay). Setting `loop_gate_init=0.0` makes every revisit an exact identity at step 0
+  while keeping gradients non-zero on `g_k`.
+- **Untied pass norms (`loop_untie_norms`).** Allocates separate block pre/post norms for passes
+  `1 .. K-1` of core layers (and separate `loop_value_residual_lambdas` when
+  `value_residual="learnable"` and `layer_idx > 0`), leaving attention/FFN projections shared.
+  Untied norm weights follow `weight_decay_to_init` toward `1.0`; lambdas never decay.
+- **Step conditioning (`loop_step_conditioning="sinusoidal"`).** At core entry on revisit passes
+  `k >= 1`, encodes normalized progress `t = k / (K - 1)` into a width-`D` sinusoidal vector and
+  applies zero-initialized residual FiLM (`z + gamma * norm(z) + beta`, where `fc2` is tagged
+  `_init_zero=True` so step 0 is an exact identity and width-`D` linears obey standard μP/Muon
+  routing).
 
 ## μP hooks
 

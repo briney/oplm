@@ -57,7 +57,15 @@ def test_custom_code_files_copied(saved_model_dir: Path) -> None:
 
     # Helper modules imported by modeling_oplm.py must come along too, or the
     # remote import fails.
-    helpers = ("attention.py", "transformer.py", "norm.py", "rope.py", "ffn.py", "looping.py")
+    helpers = (
+        "attention.py",
+        "transformer.py",
+        "norm.py",
+        "rope.py",
+        "ffn.py",
+        "looping.py",
+        "loop_modules.py",
+    )
     for helper in (*helpers, "conv.py", "canon_kernel.py", "masking.py"):
         assert helper in names, f"missing helper module {helper}"
 
@@ -94,5 +102,69 @@ def test_remote_reload_in_subprocess(saved_model_dir: Path) -> None:
         capture_output=True,
         text=True,
         timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_step2_loop_extensions_remote_reload_in_subprocess(tmp_path: Path) -> None:
+    """Step 2 loop extensions reload via trust_remote_code=True in a clean interpreter."""
+    import os
+
+    torch.manual_seed(19)
+    config = OplmConfig(
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_loops=3,
+        loop_strategy="stack",
+        loop_start=1,
+        loop_end=3,
+        loop_input_injection="decayed",
+        loop_gate="channel",
+        loop_gate_init=0.25,
+        loop_untie_norms=True,
+        loop_step_conditioning="sinusoidal",
+        tie_word_embeddings=True,
+    )
+    model = OplmForMaskedLM(config).eval()
+    tokenizer = OplmTokenizerFast()
+    model.save_pretrained(tmp_path)
+    tokenizer.save_pretrained(tmp_path)
+    assert (tmp_path / "loop_modules.py").is_file()
+
+    with torch.no_grad():
+        expected = model(**tokenizer("MEEPQ", return_tensors="pt")).logits
+    torch.save(expected, tmp_path / "expected.pt")
+
+    script = "\n".join(
+        [
+            "import sys, torch",
+            "from transformers import AutoConfig, AutoModelForMaskedLM, AutoTokenizer",
+            "assert 'oplm' not in sys.modules",
+            f"cfg = AutoConfig.from_pretrained({str(tmp_path)!r}, trust_remote_code=True)",
+            "assert cfg.loop_input_injection == 'decayed'",
+            f"m = AutoModelForMaskedLM.from_pretrained({str(tmp_path)!r}, "
+            "trust_remote_code=True).eval()",
+            f"t = AutoTokenizer.from_pretrained({str(tmp_path)!r}, trust_remote_code=True)",
+            "assert 'oplm' not in sys.modules",
+            "assert type(m).__name__ == 'OplmForMaskedLM'",
+            "assert m.config.loop_input_injection == 'decayed'",
+            "assert m.config.loop_gate == 'channel'",
+            "assert m.config.loop_untie_norms is True",
+            "assert m.config.loop_step_conditioning == 'sinusoidal'",
+            f"expected = torch.load({str(tmp_path / 'expected.pt')!r}, weights_only=True)",
+            "with torch.no_grad():",
+            "    logits = m(**t('MEEPQ', return_tensors='pt')).logits",
+            "torch.testing.assert_close(logits, expected, rtol=1e-6, atol=1e-6)",
+        ]
+    )
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["HF_HOME"] = str(tmp_path / "hf_home")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
     )
     assert result.returncode == 0, result.stderr

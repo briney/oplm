@@ -17,10 +17,21 @@ from transformers import PretrainedConfig
 from .canon_kernel import TRITON_AVAILABLE
 from .conv import resolve_canon_kernel_sizes
 from .ffn import round_up_to
-from .looping import resolve_layer_execution_order
+from .looping import (
+    LoopSchedule,
+    resolve_layer_execution_order,
+    resolve_loop_schedule,
+    validate_loop_extensions,
+)
 from .masking import prepare_attention_mask
 
-_REMOTE_CODE_DEPS = (TRITON_AVAILABLE, prepare_attention_mask)
+_REMOTE_CODE_DEPS = (
+    TRITON_AVAILABLE,
+    prepare_attention_mask,
+    LoopSchedule,
+    resolve_loop_schedule,
+    validate_loop_extensions,
+)
 
 __all__ = ["OplmConfig"]
 
@@ -64,6 +75,11 @@ class OplmConfig(PretrainedConfig):
         loop_strategy: str = "stack",
         loop_start: int = 0,
         loop_end: int | None = None,
+        loop_input_injection: str = "none",
+        loop_gate: str = "none",
+        loop_gate_init: float = 1.0,
+        loop_untie_norms: bool = False,
+        loop_step_conditioning: str = "none",
         num_attention_heads: int = 12,
         head_dim: int | None = None,
         intermediate_size: int | None = None,
@@ -126,6 +142,11 @@ class OplmConfig(PretrainedConfig):
         self.loop_strategy = loop_strategy
         self.loop_start = loop_start
         self.loop_end = loop_end
+        self.loop_input_injection = loop_input_injection
+        self.loop_gate = loop_gate
+        self.loop_gate_init = loop_gate_init
+        self.loop_untie_norms = loop_untie_norms
+        self.loop_step_conditioning = loop_step_conditioning
         self.num_attention_heads = int(num_attention_heads)
         self.head_dim = head_dim if head_dim is None else int(head_dim)
         self.intermediate_size = (
@@ -242,6 +263,16 @@ class OplmConfig(PretrainedConfig):
             loop_start=self.loop_start,
             loop_end=self.loop_end,
         )
+        validate_loop_extensions(
+            num_loops=self.num_loops,
+            loop_strategy=self.loop_strategy,
+            loop_input_injection=self.loop_input_injection,
+            loop_gate=self.loop_gate,
+            loop_gate_init=self.loop_gate_init,
+            loop_untie_norms=self.loop_untie_norms,
+            loop_step_conditioning=self.loop_step_conditioning,
+        )
+        self.loop_gate_init = float(self.loop_gate_init)
         if self.num_attention_heads <= 0:
             raise ValueError(f"num_attention_heads must be > 0; got {self.num_attention_heads}.")
         if self.hidden_size % self.num_attention_heads != 0:
@@ -426,6 +457,16 @@ class OplmConfig(PretrainedConfig):
         """
         return self._derive_intermediate_size(self.mup_base_width, self.ffn_activation)
 
+    @property
+    def has_loop_extensions(self) -> bool:
+        """Whether any Step 2 loop-boundary or pass-symmetry extension is enabled."""
+        return (
+            self.loop_input_injection != "none"
+            or self.loop_gate != "none"
+            or self.loop_untie_norms
+            or self.loop_step_conditioning != "none"
+        )
+
     def mup_fanin_mult(self, fan_in: int) -> float:
         """Per-matrix μP fan-in multiplier `m_W = fan_in / fan_in_base`.
 
@@ -435,9 +476,10 @@ class OplmConfig(PretrainedConfig):
         `lm_head.dense`, the readout) map to `mup_base_width`; `down_proj`
         (fan-in = `intermediate_size`) maps to `mup_base_intermediate_size()`, so
         FFN rounding is absorbed exactly rather than approximated by the hidden
-        multiplier `m`. Returns `1.0` when μP is disabled or at the base width (a
-        no-op). Single source of truth shared by width-aware init (model) and
-        per-group LR scaling (training).
+        multiplier `m`; and `concat_proj` (fan-in = `2 * hidden_size`) maps to
+        `2 * mup_base_width`, i.e., `m`. Returns `1.0` when μP is disabled or at
+        the base width (a no-op). Single source of truth shared by width-aware
+        init (model) and per-group LR scaling (training).
 
         Args:
             fan_in: The matrix's input dimension (`nn.Linear.in_features`). For a
@@ -448,4 +490,6 @@ class OplmConfig(PretrainedConfig):
             return 1.0
         if fan_in == self.intermediate_size:
             return fan_in / self.mup_base_intermediate_size()
+        if fan_in == 2 * self.hidden_size:
+            return self.mup_width_mult()
         return fan_in / self.mup_base_width
