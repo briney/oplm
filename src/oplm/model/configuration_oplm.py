@@ -17,7 +17,6 @@ from transformers import PretrainedConfig
 from .canon_kernel import TRITON_AVAILABLE
 from .conv import resolve_canon_kernel_sizes
 from .ffn import round_up_to
-from .loop_modules import LoopCycleGate, LoopInputInjector, LoopStepConditioner
 from .looping import (
     LoopSchedule,
     resolve_layer_execution_order,
@@ -32,9 +31,6 @@ _REMOTE_CODE_DEPS = (
     LoopSchedule,
     resolve_loop_schedule,
     validate_loop_extensions,
-    LoopInputInjector,
-    LoopCycleGate,
-    LoopStepConditioner,
 )
 
 __all__ = ["OplmConfig"]

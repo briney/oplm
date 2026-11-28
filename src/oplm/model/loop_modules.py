@@ -171,9 +171,7 @@ class LoopStepConditioner(nn.Module):
     def forward(self, z: torch.Tensor, pass_idx: int, num_loops: int) -> torch.Tensor:
         """Apply residual FiLM ``z + gamma * norm(z) + beta`` conditioned on loop progress."""
         t = pass_idx / max(num_loops - 1, 1)
-        enc_dtype = (
-            z.dtype if torch.is_autocast_enabled(z.device.type) else self.fc1.weight.dtype
-        )
+        enc_dtype = z.dtype if torch.is_autocast_enabled(z.device.type) else self.fc1.weight.dtype
         enc = _sinusoidal_encoding(t, self.hidden_size, device=z.device).to(enc_dtype)
         mod = self.fc2(F.silu(self.fc1(enc)))
         gamma, beta = mod.chunk(2, dim=-1)
