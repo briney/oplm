@@ -417,3 +417,196 @@ def test_hsdp_keeps_torch_muon() -> None:
     hsdp = build_optimizers(_model(), TrainConfig(optimizer="muon", parallelism="hsdp"))[0]
     assert type(ddp) is Muon
     assert type(hsdp) is torch.optim.Muon
+
+
+@pytest.mark.parametrize("optimizer", ["muon", "adamw"])
+def test_step2_loop_param_groups_and_no_decay_invariants(optimizer: str) -> None:
+    """Step 2 loop params route to the exact intended optimizer, decay, and target groups."""
+    model = OplmForMaskedLM(
+        OplmModelConfig(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            max_position_embeddings=64,
+            norm_type="layernorm",
+            norm_strategy="sandwich",
+            value_residual="learnable",
+            num_loops=3,
+            loop_strategy="stack",
+            loop_start=1,
+            loop_end=3,
+            loop_input_injection="decayed",
+            loop_gate="channel",
+            loop_gate_init=0.0,
+            loop_untie_norms=True,
+            loop_step_conditioning="sinusoidal",
+        )
+    )
+    id_to_name = {id(p): n for n, p in model.named_parameters()}
+    cfg = TrainConfig(optimizer=optimizer, weight_decay=0.01, weight_decay_to_init=0.1)
+    groups = partition_optimizer_params(model, cfg)
+    muon_names = _names_of(_muon_params(groups), id_to_name)
+    decay = _decay_of(groups, id_to_name)
+
+    untied_norm_weights = {
+        n
+        for n in id_to_name.values()
+        if any(
+            m in n
+            for m in (
+                ".loop_attn_norms.",
+                ".loop_ffn_norms.",
+                ".loop_attn_post_norms.",
+                ".loop_ffn_post_norms.",
+            )
+        )
+        and n.endswith(".weight")
+    }
+    assert untied_norm_weights
+    for name in untied_norm_weights:
+        assert decay[name] == (0.1, 1.0), name
+        assert name not in muon_names
+
+    untied_norm_biases = {n.removesuffix(".weight") + ".bias" for n in untied_norm_weights}
+    for name in untied_norm_biases:
+        assert decay[name] == (0.1, 0.0), name
+
+    no_decay_expected = {
+        "oplm.backbone.loop_injector.log_delta",
+        "oplm.backbone.loop_injector.log_state_decay",
+        "oplm.backbone.loop_injector.input_matrix_continuous",
+        "oplm.backbone.loop_gate_module.gates.0",
+        "oplm.backbone.loop_gate_module.gates.1",
+        "oplm.backbone.layers.1.attention.loop_value_residual_lambdas.0",
+        "oplm.backbone.layers.1.attention.loop_value_residual_lambdas.1",
+        "oplm.backbone.layers.2.attention.loop_value_residual_lambdas.0",
+        "oplm.backbone.layers.2.attention.loop_value_residual_lambdas.1",
+    }
+    for name in no_decay_expected:
+        assert decay[name] == (0.0, 0.0), name
+        assert name not in muon_names
+
+    for name in (
+        "oplm.backbone.loop_step_cond.fc1.weight",
+        "oplm.backbone.loop_step_cond.fc2.weight",
+    ):
+        if optimizer == "muon":
+            assert name in muon_names
+        else:
+            assert decay[name] == (0.01, 0.0)
+
+    # Check concat_proj and orthogonal injection parameter placement too.
+    concat_model = OplmForMaskedLM(
+        OplmModelConfig(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            max_position_embeddings=64,
+            num_loops=3,
+            loop_strategy="stack",
+            loop_start=1,
+            loop_end=3,
+            loop_input_injection="concat_proj",
+        )
+    )
+    c_map = {id(p): n for n, p in concat_model.named_parameters()}
+    c_groups = partition_optimizer_params(concat_model, cfg)
+    c_muon = _names_of(_muon_params(c_groups), c_map)
+    c_decay = _decay_of(c_groups, c_map)
+    if optimizer == "muon":
+        assert "oplm.backbone.loop_injector.proj.weight" in c_muon
+    else:
+        assert c_decay["oplm.backbone.loop_injector.proj.weight"] == (0.01, 0.0)
+    assert c_decay["oplm.backbone.loop_injector.z_norm.weight"] == (0.1, 1.0)
+    assert c_decay["oplm.backbone.loop_injector.e_norm.weight"] == (0.1, 1.0)
+
+    orth_model = OplmForMaskedLM(
+        OplmModelConfig(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            max_position_embeddings=64,
+            num_loops=3,
+            loop_strategy="stack",
+            loop_start=1,
+            loop_end=3,
+            loop_input_injection="orthogonal",
+        )
+    )
+    o_map = {id(p): n for n, p in orth_model.named_parameters()}
+    o_groups = partition_optimizer_params(orth_model, cfg)
+    assert _decay_of(o_groups, o_map)["oplm.backbone.loop_injector.inject_scale"] == (0.0, 0.0)
+
+
+def test_muon_step0_and_step1_with_zero_init_loop_gate_and_step_cond() -> None:
+    """Zero-init cycle gate + zero-init step conditioner train cleanly under Muon without NaNs."""
+    from oplm.training.optim import build_optimizers
+
+    torch.manual_seed(0)
+    model = OplmForMaskedLM(
+        OplmModelConfig(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            max_position_embeddings=64,
+            num_loops=3,
+            loop_strategy="stack",
+            loop_start=1,
+            loop_end=3,
+            loop_gate="channel",
+            loop_gate_init=0.0,
+            loop_step_conditioning="sinusoidal",
+        )
+    )
+    cfg = TrainConfig(
+        optimizer="muon",
+        muon_adjust_lr_fn="original",
+        lr=1e-2,
+        weight_decay=0.01,
+        weight_decay_to_init=0.1,
+    )
+    optimizers = build_optimizers(model, cfg)
+    input_ids = torch.tensor([[0, 5, 6, 7, 8, 2], [0, 9, 10, 11, 12, 2]])
+    labels = input_ids.clone()
+    attention_mask = torch.ones_like(input_ids)
+
+    backbone = model.oplm.backbone
+    gate0 = backbone.loop_gate_module.gates[0]
+    fc1_w = backbone.loop_step_cond.fc1.weight
+    fc2_w = backbone.loop_step_cond.fc2.weight
+
+    # Step 0: gate0 == 0 blocks grad to step_cond; gate0 itself moves away from 0.
+    for opt in optimizers:
+        opt.zero_grad()
+    loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+    loss.backward()
+    assert fc1_w.grad is not None and torch.equal(fc1_w.grad, torch.zeros_like(fc1_w.grad))
+    assert fc2_w.grad is not None and torch.equal(fc2_w.grad, torch.zeros_like(fc2_w.grad))
+    for opt in optimizers:
+        opt.step()
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+    assert gate0.abs().max().item() > 0.0
+
+    # Step 1: gate0 != 0 unlocks grad to fc2 (fc2.weight moves away from 0).
+    for opt in optimizers:
+        opt.zero_grad()
+    loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+    loss.backward()
+    assert fc2_w.grad is not None and fc2_w.grad.abs().max().item() > 0.0
+    for opt in optimizers:
+        opt.step()
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+    assert fc2_w.abs().max().item() > 0.0
+
+    # Step 2: fc2.weight != 0 unlocks grad to fc1 (fc1.weight updates from nonzero grad).
+    fc1_before = fc1_w.detach().clone()
+    for opt in optimizers:
+        opt.zero_grad()
+    loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+    loss.backward()
+    assert fc1_w.grad is not None and fc1_w.grad.abs().max().item() > 0.0
+    for opt in optimizers:
+        opt.step()
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+    # Differs from pure weight-decay shrinkage.
+    assert not torch.allclose(fc1_w, fc1_before * (1.0 - cfg.lr * cfg.weight_decay))

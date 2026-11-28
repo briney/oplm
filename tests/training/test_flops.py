@@ -63,3 +63,27 @@ def test_partial_loop_counts_repeated_blocks_and_one_head() -> None:
         assert estimate_flops_per_token(cfg) == 3 * (12 * per_block_forward + head_forward)
     cfg.num_loops = 1
     assert estimate_flops_per_token(cfg) == baseline
+
+
+def test_step2_injection_flops() -> None:
+    """Injection matmuls count (num_loops - 1) fwd+bwd passes for concat_proj and decayed."""
+    base_kwargs = {
+        "hidden_size": 256,
+        "num_attention_heads": 4,
+        "num_hidden_layers": 6,
+        "intermediate_size": 1024,
+        "num_loops": 3,
+        "loop_strategy": "stack",
+        "loop_start": 1,
+        "loop_end": 4,
+    }
+    none_flops = estimate_flops_per_token(_config(**base_kwargs, loop_input_injection="none"))
+    orth_flops = estimate_flops_per_token(_config(**base_kwargs, loop_input_injection="orthogonal"))
+    decayed_flops = estimate_flops_per_token(_config(**base_kwargs, loop_input_injection="decayed"))
+    concat_flops = estimate_flops_per_token(
+        _config(**base_kwargs, loop_input_injection="concat_proj")
+    )
+    h = 256
+    assert orth_flops == none_flops
+    assert decayed_flops - none_flops == 3 * (3 - 1) * (2 * h * h)
+    assert concat_flops - none_flops == 3 * (3 - 1) * (2 * (2 * h) * h)

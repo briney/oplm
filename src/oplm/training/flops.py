@@ -40,8 +40,17 @@ def estimate_flops_per_token(config: OplmModelConfig) -> int:
     per_layer = attn_proj_flops + ffn_flops
     backbone_flops = effective_depth * per_layer
 
+    # Core-boundary input injection runs once on each revisit pass k = 1 .. K-1.
+    injection_flops = 0
+    if config.num_loops >= 2 and config.loop_strategy == "stack":
+        injection_mode = getattr(config, "loop_input_injection", "none")
+        if injection_mode == "concat_proj":
+            injection_flops = (config.num_loops - 1) * (2 * (2 * h) * h)
+        elif injection_mode == "decayed":
+            injection_flops = (config.num_loops - 1) * (2 * h * h)
+
     # MLM head: dense projection + vocab projection
     head_flops = 2 * h * h + 2 * h * vocab_size
 
-    forward_flops = backbone_flops + head_flops
+    forward_flops = backbone_flops + injection_flops + head_flops
     return 3 * forward_flops

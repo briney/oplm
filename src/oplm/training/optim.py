@@ -72,15 +72,25 @@ class OptimizerParamGroups:
         return [p for g in self.adamw_groups if g.weight_decay == 0.0 for p in g.params]
 
 
+_UNTIED_LOOP_NORM_MARKERS = (
+    ".loop_attn_norms.",
+    ".loop_ffn_norms.",
+    ".loop_attn_post_norms.",
+    ".loop_ffn_post_norms.",
+)
+
+
 def _init_value(name: str, model_config: OplmConfig) -> float | None:
     """The initial value ``weight_decay_to_init`` pulls a 1-D param back to (None: never)."""
     if name.endswith(".bias"):
         return 0.0
-    if name.endswith("norm.weight"):  # every norm module's attribute name ends in "norm"
+    if name.endswith("norm.weight") or (
+        name.endswith(".weight") and any(marker in name for marker in _UNTIED_LOOP_NORM_MARKERS)
+    ):
         return 1.0
     if name.endswith(("attn_gate", "ffn_gate")):
         return float(getattr(model_config, "residual_gate_init", 1.0))
-    return None  # value-residual lambdas, L2 QK scales
+    return None  # value-residual lambdas, L2 QK scales, loop gates & dynamics
 
 
 def _depth_lr_multiplier(name: str, model_config: OplmConfig, cfg: TrainConfig) -> float:
@@ -136,6 +146,10 @@ def partition_optimizer_params(model: nn.Module, cfg: TrainConfig) -> OptimizerP
         elif "embed" in name:
             if cfg.embedding_weight_decay:
                 source = "embedding_weight_decay"
+        elif name.endswith("loop_injector.input_matrix_continuous"):
+            # Continuous-time input projection initialized to I: stays on AdamW
+            # with weight_decay=0.0 (never Muon, never decayed toward 0).
+            pass
         elif cfg.optimizer == "muon" and param.ndim == 2 and not name.startswith("lm_head."):
             muon_buckets.setdefault(depth_mult, []).append(param)
             continue
