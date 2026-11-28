@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from oplm.training.callbacks import TrainerCallback
+from oplm.training.optim import _UNTIED_LOOP_NORM_MARKERS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -61,7 +62,9 @@ def param_group_name(name: str, ndim: int) -> str:
         return "mlp"
     if name.endswith(("attn_gate", "ffn_gate")):
         return "residual_gate"
-    if name.endswith("norm.weight"):
+    if name.endswith("norm.weight") or (
+        name.endswith(".weight") and any(marker in name for marker in _UNTIED_LOOP_NORM_MARKERS)
+    ):
         return "norm_gain"
     if name.endswith(".bias"):
         return "bias"

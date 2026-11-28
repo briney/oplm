@@ -152,17 +152,22 @@ class OplmAttention(nn.Module):
         self.loop_untie_norms = bool(getattr(config, "loop_untie_norms", False)) and (
             num_loop_passes > 1
         )
+        self.value_residual_lambda_init = float(getattr(config, "value_residual_lambda_init", 0.5))
         if self.value_residual_enabled and layer_idx > 0:
-            lam_init = float(getattr(config, "value_residual_lambda_init", 0.5))
+            lam_init = self.value_residual_lambda_init
             if self.value_residual == "learnable":
                 self.value_residual_lambda = nn.Parameter(torch.full((1,), lam_init))
                 if self.loop_untie_norms:
-                    self.loop_value_residual_lambdas = nn.ParameterList(
+                    lambdas = nn.ParameterList(
                         [
                             nn.Parameter(torch.full((1,), lam_init))
                             for _ in range(num_loop_passes - 1)
                         ]
                     )
+                    # Tagged on the ParameterList itself (the direct owner) so HF
+                    # _initialize_weights runs _init_weights when these keys are missing.
+                    lambdas._init_const = lam_init  # ty: ignore[unresolved-attribute]
+                    self.loop_value_residual_lambdas = lambdas
             else:  # "fixed" — persistent buffer (compile/DDP + HF fast-init safe)
                 self.register_buffer(
                     "value_residual_lambda", torch.tensor(lam_init), persistent=True

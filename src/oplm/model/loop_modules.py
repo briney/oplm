@@ -19,6 +19,11 @@ def _inverse_softplus(y: float) -> float:
     return math.log(math.expm1(y))
 
 
+def _unloaded(param: torch.Tensor) -> bool:
+    """True unless transformers already loaded ``param`` (``_is_hf_initialized`` is set)."""
+    return not getattr(param, "_is_hf_initialized", False)
+
+
 class LoopInputInjector(nn.Module):
     """Re-inject the prelude representation ``e`` into the recurrent state ``z`` on pass ``k >= 1``.
 
@@ -57,25 +62,30 @@ class LoopInputInjector(nn.Module):
             self.input_matrix_continuous = nn.Parameter(torch.empty(hidden_size, hidden_size))
             self.reset_parameters()
         else:  # "orthogonal"
-            self.inject_scale = nn.Parameter(torch.ones(hidden_size))
+            self.inject_scale = nn.Parameter(torch.empty(hidden_size))
+            self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Initialize custom parameters (idempotent; skips already-loaded weights if desired)."""
+        """Initialize custom parameters, skipping tensors already loaded by transformers."""
         if self.mode == "decayed":
             delta0 = 0.5 * math.log(5.0)
             with torch.no_grad():
-                self.log_delta.fill_(_inverse_softplus(delta0))
-                self.log_state_decay.zero_()
-                self.input_matrix_continuous.copy_(
-                    torch.eye(
-                        self.hidden_size,
-                        device=self.input_matrix_continuous.device,
-                        dtype=self.input_matrix_continuous.dtype,
+                if _unloaded(self.log_delta):
+                    self.log_delta.fill_(_inverse_softplus(delta0))
+                if _unloaded(self.log_state_decay):
+                    self.log_state_decay.zero_()
+                if _unloaded(self.input_matrix_continuous):
+                    self.input_matrix_continuous.copy_(
+                        torch.eye(
+                            self.hidden_size,
+                            device=self.input_matrix_continuous.device,
+                            dtype=self.input_matrix_continuous.dtype,
+                        )
                     )
-                )
         elif self.mode == "orthogonal":
             with torch.no_grad():
-                self.inject_scale.fill_(1.0)
+                if _unloaded(self.inject_scale):
+                    self.inject_scale.fill_(1.0)
 
     def forward(self, z: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
         """Combine recurrent core state ``z`` with prelude anchor ``e``."""
@@ -112,10 +122,21 @@ class LoopCycleGate(nn.Module):
         if num_loops < 2:
             raise ValueError(f"LoopCycleGate requires num_loops >= 2; got {num_loops}.")
         self.mode = mode
+        self.init_val = float(init_val)
         shape = (1,) if mode == "scalar" else (hidden_size,)
-        self.gates = nn.ParameterList(
-            [nn.Parameter(torch.full(shape, float(init_val))) for _ in range(num_loops - 1)]
-        )
+        gates = nn.ParameterList([nn.Parameter(torch.empty(shape)) for _ in range(num_loops - 1)])
+        # Tagged on the ParameterList itself (the direct owner of the gate params) so
+        # HF PreTrainedModel._initialize_weights invokes _init_weights when missing.
+        gates._init_const = self.init_val  # ty: ignore[unresolved-attribute]  # _init_weights
+        self.gates = gates
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize per-pass gates to ``init_val``, skipping tensors already loaded by HF."""
+        with torch.no_grad():
+            for gate in self.gates:
+                if _unloaded(gate):
+                    gate.fill_(self.init_val)
 
     def forward(self, z_prev: torch.Tensor, core_out: torch.Tensor, gate_idx: int) -> torch.Tensor:
         """Blend ``core_out`` into ``z_prev`` using pass gate ``gate_idx = pass_idx - 1``."""

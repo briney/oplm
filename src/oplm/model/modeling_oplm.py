@@ -190,6 +190,16 @@ class OplmPreTrainedModel(PreTrainedModel):
             if getattr(module, "bias", None) is not None:
                 # nn.Module.__getattr__ types `.bias` as Tensor | Module; it is a Tensor here.
                 nn.init.zeros_(module.bias)  # ty: ignore[invalid-argument-type]
+        elif isinstance(module, LoopInputInjector):
+            module.reset_parameters()
+        elif isinstance(module, nn.ParameterList):
+            init_const = getattr(module, "_init_const", None)
+            if init_const is not None:
+                init_val = float(init_const)
+                with torch.no_grad():
+                    for param in module:
+                        if not getattr(param, "_is_hf_initialized", False):
+                            param.fill_(init_val)
 
     # ------------------------------------------------------------------
     # Gradient checkpointing — propagate the toggle to every OplmBlock.

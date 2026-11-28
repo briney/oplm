@@ -54,6 +54,45 @@ def test_every_parameter_lands_in_a_named_group() -> None:
     assert groups["oplm.backbone.layers.0.ffn.conv_d.conv.weight"] == "canon"
 
 
+def test_untied_loop_norms_classify_as_norm_gain() -> None:
+    """Untied revisit block norm weights land in ``norm_gain``; biases land in ``bias``."""
+    model = OplmForMaskedLM(
+        OplmModelConfig(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            max_position_embeddings=64,
+            norm_type="layernorm",
+            norm_strategy="sandwich",
+            value_residual="learnable",
+            num_loops=3,
+            loop_strategy="stack",
+            loop_start=1,
+            loop_end=3,
+            loop_untie_norms=True,
+        )
+    )
+    groups = {n: param_group_name(n, p.ndim) for n, p in model.named_parameters()}
+    untied_weights = [
+        n
+        for n in groups
+        if any(
+            m in n
+            for m in (
+                ".loop_attn_norms.",
+                ".loop_ffn_norms.",
+                ".loop_attn_post_norms.",
+                ".loop_ffn_post_norms.",
+            )
+        )
+        and n.endswith(".weight")
+    ]
+    assert untied_weights
+    for name in untied_weights:
+        assert groups[name] == "norm_gain", name
+        assert groups[name.removesuffix(".weight") + ".bias"] == "bias"
+
+
 def test_weight_rms_pools_within_a_group() -> None:
     """RMS is pooled over all elements of a group, not averaged per tensor."""
     named = [
