@@ -278,3 +278,82 @@ def test_one_loop_matches_original_traversal_exactly(strategy: str) -> None:
     assert torch.equal(got, expected)
     embedded = stack.embed_tokens(ids, mask)
     assert torch.equal(stack(inputs_embeds=embedded, attention_mask=mask)[0], got)
+
+
+def test_resolve_loop_schedule_partitions_prelude_core_coda() -> None:
+    from oplm.model.looping import LoopSchedule, resolve_loop_schedule
+
+    sched = resolve_loop_schedule(6, num_loops=3, loop_strategy="stack", loop_start=1, loop_end=5)
+    assert isinstance(sched, LoopSchedule)
+    assert sched.prelude == (0,)
+    assert sched.core == (1, 2, 3, 4)
+    assert sched.coda == (5,)
+    assert sched.num_loops == 3
+    assert sched.loop_strategy == "stack"
+    assert sched.execution_order == (0, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 5)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"num_loops": 2, "loop_input_injection": "bad"},
+        {"num_loops": 2, "loop_gate": "bad"},
+        {"num_loops": 2, "loop_step_conditioning": "bad"},
+        {"num_loops": 2, "loop_gate": "scalar", "loop_gate_init": float("nan")},
+        {"num_loops": 2, "loop_gate": "scalar", "loop_gate_init": float("inf")},
+        {"num_loops": 2, "loop_untie_norms": 1},
+        {"num_loops": 1, "loop_input_injection": "decayed"},
+        {"num_loops": 1, "loop_gate": "scalar"},
+        {"num_loops": 1, "loop_untie_norms": True},
+        {"num_loops": 1, "loop_step_conditioning": "sinusoidal"},
+        {"num_loops": 2, "loop_strategy": "interleave", "loop_input_injection": "orthogonal"},
+        {"num_loops": 2, "loop_strategy": "interleave", "loop_gate": "channel"},
+        {"num_loops": 2, "loop_strategy": "interleave", "loop_untie_norms": True},
+        {"num_loops": 2, "loop_strategy": "interleave", "loop_step_conditioning": "sinusoidal"},
+    ],
+)
+def test_loop_extension_validation_rejects_invalid_values_and_combos(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="loop"):
+        OplmConfig(num_hidden_layers=4, **overrides)
+
+
+def test_loop_extension_config_round_trip(tmp_path: Path) -> None:
+    from oplm.config import load_config, serialize_config
+
+    cfg = load_config(
+        [
+            "model.num_hidden_layers=4",
+            "model.num_loops=2",
+            "model.loop_strategy=stack",
+            "model.loop_start=1",
+            "model.loop_end=3",
+            "model.loop_input_injection=decayed",
+            "model.loop_gate=channel",
+            "model.loop_gate_init=0.0",
+            "model.loop_untie_norms=true",
+            "model.loop_step_conditioning=sinusoidal",
+        ]
+    )
+    assert cfg.model.has_loop_extensions is True
+    cfg.model.save_pretrained(tmp_path / "hf")
+    loaded_model = OplmConfig.from_pretrained(tmp_path / "hf")
+    yaml_path = tmp_path / "config.yaml"
+    yaml_path.write_text(serialize_config(cfg))
+    loaded_run = load_config(["--config", str(yaml_path)])
+    for model in (loaded_model, loaded_run.model):
+        assert model.loop_input_injection == "decayed"
+        assert model.loop_gate == "channel"
+        assert model.loop_gate_init == 0.0
+        assert model.loop_untie_norms is True
+        assert model.loop_step_conditioning == "sinusoidal"
+        assert model.has_loop_extensions is True
+
+
+def test_mup_fanin_mult_concat_proj_width() -> None:
+    base = OplmConfig(hidden_size=768, num_attention_heads=12, mup_enable=True, mup_base_width=768)
+    wide = OplmConfig(hidden_size=1536, num_attention_heads=24, mup_enable=True, mup_base_width=768)
+    assert base.mup_fanin_mult(1536) == pytest.approx(1.0)
+    assert wide.mup_fanin_mult(3072) == pytest.approx(2.0)
+
